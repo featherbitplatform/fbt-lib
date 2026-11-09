@@ -11,8 +11,6 @@
     )
 )]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn builds() {}
-}
+mod path;
+
+pub use path::{PathError, RelPath, sanitize_component, sanitize_path};
