@@ -7,6 +7,8 @@ use fbt_core::{FileLayout, InfoHashV1, InfoHashV2, InfoHashes, PieceLayout};
 
 use crate::path::{RelPath, sanitize_component, sanitize_path};
 
+/// Deepest accepted file path, in components (including the root name).
+const MAX_PATH_DEPTH: usize = 256;
 const MAX_PIECE_LEN: i64 = 268_435_456;
 
 /// Errors from [`Metainfo::from_bytes`].
@@ -247,6 +249,9 @@ fn parse_files(info: &Dict<'_>, name: &str) -> Result<(Vec<FileEntry>, bool), Me
         let path = sanitize_path(raw)
             .map_err(|_| invalid("path", "empty after sanitization"))?
             .with_root(name.to_string());
+        if path.components().len() > MAX_PATH_DEPTH {
+            return Err(invalid("path", "too deep"));
+        }
         let attr = match d.get(b"attr") {
             None => &b""[..],
             Some(a) => a
@@ -267,25 +272,32 @@ fn parse_files(info: &Dict<'_>, name: &str) -> Result<(Vec<FileEntry>, bool), Me
     Ok((out, false))
 }
 
-/// Rejects equal paths and a file that is a directory prefix of another.
+/// Rejects equal paths and a file that is a directory prefix of another,
+/// comparing components ASCII-case-insensitively (APFS/NTFS collide on case).
 /// Padding files are exempt: writers legitimately repeat `.pad/<len>`.
+///
+/// Sorted lexicographically, every extension of a path sits right after it, so
+/// comparing adjacent pairs finds all equal-or-prefix collisions.
 fn check_duplicates(files: &[FileEntry]) -> Result<(), MetainfoError> {
-    let mut seen: HashSet<&[String]> = HashSet::new();
-    let mut prefixes: HashSet<&[String]> = HashSet::new();
-    for f in files.iter().filter(|f| !f.pad) {
-        let c = f.path.components();
-        if !seen.insert(c) {
-            return Err(MetainfoError::DuplicatePath(f.path.to_string()));
-        }
-        for n in 1..c.len() {
-            if let Some(p) = c.get(..n) {
-                prefixes.insert(p);
-            }
-        }
-    }
-    for f in files.iter().filter(|f| !f.pad) {
-        if prefixes.contains(f.path.components()) {
-            return Err(MetainfoError::DuplicatePath(f.path.to_string()));
+    let mut keys: Vec<(Vec<String>, &FileEntry)> = files
+        .iter()
+        .filter(|f| !f.pad)
+        .map(|f| {
+            let k = f
+                .path
+                .components()
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            (k, f)
+        })
+        .collect();
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    for pair in keys.windows(2) {
+        if let [(a, fa), (b, _)] = pair
+            && b.starts_with(a)
+        {
+            return Err(MetainfoError::DuplicatePath(fa.path.to_string()));
         }
     }
     Ok(())

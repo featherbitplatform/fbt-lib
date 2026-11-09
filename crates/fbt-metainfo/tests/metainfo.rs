@@ -256,6 +256,40 @@ fn rejects_duplicate_and_prefix_paths() {
 }
 
 #[test]
+fn rejects_case_insensitive_collisions() {
+    let info = multi_info(vec![file(10, &["A.bin"]), file(10, &["a.bin"])], 20);
+    assert!(matches!(
+        Metainfo::from_bytes(&torrent(info, &[])),
+        Err(MetainfoError::DuplicatePath(_))
+    ));
+    let info = multi_info(vec![file(10, &["Dir"]), file(10, &["dir", "x"])], 20);
+    assert!(matches!(
+        Metainfo::from_bytes(&torrent(info, &[])),
+        Err(MetainfoError::DuplicatePath(_))
+    ));
+}
+
+#[test]
+fn deep_paths_rejected_quickly() {
+    let parts: Vec<&str> = vec!["a"; 100_000];
+    let info = multi_info(vec![file(10, &parts)], 10);
+    let t = torrent(info, &[]);
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        Metainfo::from_bytes(&t),
+        Err(MetainfoError::InvalidField {
+            field: "path",
+            reason: "too deep"
+        })
+    ));
+    // Also via one component split by sanitization.
+    let one = "a/".repeat(100_000);
+    let info = multi_info(vec![file(10, &[one.as_str()])], 10);
+    assert!(Metainfo::from_bytes(&torrent(info, &[])).is_err());
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
 fn pad_files_flagged() {
     let info = multi_info(
         vec![
