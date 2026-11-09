@@ -2,8 +2,15 @@
 
 #![forbid(unsafe_code)]
 
+mod bitfield;
+mod info_hash;
+mod layout;
+mod peer_id;
+
+pub use bitfield::{Bitfield, BitfieldError};
+pub use info_hash::{InfoHashV1, InfoHashV2, InfoHashes, ParseInfoHashError};
+pub use layout::{BLOCK_SIZE, BlockRef, FileLayout, FileSlice, LayoutError, PieceLayout};
+pub use peer_id::PeerId;
+
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn builds() {}
-}
+mod tests;
