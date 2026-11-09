@@ -21,3 +21,5 @@ all = "warn"
 # Every dependency is declared here and inherited with `dep.workspace = true`;
 # crates never pin their own versions.
 [workspace.dependencies]
+thiserror = "2"
+proptest = "1.12"

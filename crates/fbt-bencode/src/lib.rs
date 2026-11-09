@@ -11,8 +11,8 @@
     )
 )]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn builds() {}
-}
+mod decode;
+mod value;
+
+pub use decode::{DecodeError, Limits, decode, decode_prefix, decode_with};
+pub use value::{Dict, Value, ValueKind};
