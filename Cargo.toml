@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["fuzz"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/featherbitplatform/fbt-lib"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# Every dependency is declared here and inherited with `dep.workspace = true`;
+# crates never pin their own versions.
+[workspace.dependencies]

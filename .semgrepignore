@@ -1,0 +1,10 @@
+# semgrep exclusions: generated trees and scanner output.
+# semgrep's default ignores (.git, common minified assets) still apply.
+# Markdown is prose: sample commands in docs are examples, not code.
+*.md
+target/
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/
+sast-out/
+.superpowers/
