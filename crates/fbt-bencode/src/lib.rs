@@ -16,3 +16,5 @@ mod value;
 
 pub use decode::{DecodeError, Limits, decode, decode_prefix, decode_with};
 pub use value::{Dict, Value, ValueKind};
+mod encode;
+pub use encode::{DictBuilder, OwnedValue, encode, encode_into};
