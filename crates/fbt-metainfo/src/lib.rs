@@ -11,6 +11,9 @@
     )
 )]
 
+mod metainfo;
 mod path;
+
+pub use metainfo::{FileEntry, Info, Metainfo, MetainfoError};
 
 pub use path::{PathError, RelPath, sanitize_component, sanitize_path};

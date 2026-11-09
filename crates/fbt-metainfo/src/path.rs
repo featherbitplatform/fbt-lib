@@ -21,6 +21,17 @@ impl RelPath {
         &self.0
     }
 
+    /// A single-component path from an already-sanitized name.
+    pub(crate) fn single(name: String) -> Self {
+        Self(vec![name])
+    }
+
+    /// Prepends an already-sanitized root component.
+    pub(crate) fn with_root(mut self, root: String) -> Self {
+        self.0.insert(0, root);
+        self
+    }
+
     /// The path as a platform `PathBuf` (relative).
     pub fn to_path_buf(&self) -> PathBuf {
         self.0.iter().collect()
