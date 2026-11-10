@@ -81,6 +81,7 @@ fn start_ctx(have: Bitfield, layout: Option<PieceLayout>, ext: ExtConfig) -> Har
         settings: Arc::new(Settings::default()),
         events: etx,
         encrypted: false,
+        transport: crate::peer::transport::Transport::Tcp,
     };
     tokio::spawn(run_peer(ours, None, addr(), ctx, crx));
     Harness {
@@ -226,6 +227,7 @@ async fn handshake_info_hash_mismatch_disconnects() {
             key: KEY,
             reason: DisconnectReason::InfoHashMismatch,
             outstanding: vec![],
+            connect_failed: None,
         }
     );
 }
@@ -240,6 +242,7 @@ async fn handshake_self_connection_detected() {
             key: KEY,
             reason: DisconnectReason::SelfConnection,
             outstanding: vec![],
+            connect_failed: None,
         }
     );
 }
@@ -270,6 +273,7 @@ async fn sends_have_all_when_complete_and_fast() {
             reserved: reserved(true, false, false),
             addr: addr(),
             encrypted: false,
+            transport: crate::peer::transport::Transport::Tcp,
         }
     );
     assert_eq!(recv(&mut wire).await, Message::HaveAll);

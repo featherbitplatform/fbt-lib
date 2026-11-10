@@ -1,5 +1,5 @@
-//! Accepts incoming peer connections and routes them to torrents by the
-//! info hash in their handshake. The first 20 bytes tell a plaintext
+//! Accepts incoming peer connections, over TCP and uTP, and routes them to
+//! torrents by the info hash in their handshake. The first 20 bytes tell a plaintext
 //! handshake from MSE; MSE connections are answered as responder and
 //! matched to a torrent by `HASH('req2', SKEY)`.
 
@@ -7,18 +7,20 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use fbt_utp::UtpSocket;
 use fbt_wire::{
     CryptoMethods, Handshake, MseStream, is_plaintext_handshake_prefix, read_handshake, respond,
     write_handshake,
 };
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 use tracing::debug;
 
 use crate::peer::conn::{PeerStream, after};
+use crate::peer::transport::PeerTransport;
 use crate::session::{SessionInner, Shared};
 use crate::settings::EncryptionPolicy;
 
@@ -43,7 +45,7 @@ impl ListenerState {
     }
 }
 
-/// Runs one accept loop until the session goes away or the task is
+/// Runs one TCP accept loop until the session goes away or the task is
 /// aborted.
 pub(crate) fn spawn(
     listener: TcpListener,
@@ -71,7 +73,39 @@ pub(crate) fn spawn(
             let session = session.clone();
             let shared = Arc::clone(&shared);
             tokio::spawn(async move {
-                route(stream, addr, &session, &shared).await;
+                route(PeerTransport::Tcp(stream), addr, &session, &shared).await;
+                drop(permit);
+            });
+        }
+    })
+}
+
+/// Runs one uTP accept loop on `socket` until the socket shuts down, the
+/// session goes away or the task is aborted. Accepted streams take a
+/// pending-handshake permit from the same `state` as TCP ones.
+pub(crate) fn spawn_utp(
+    socket: UtpSocket,
+    state: Arc<ListenerState>,
+    session: Weak<SessionInner>,
+    shared: Arc<Shared>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            // The only error is the socket shutting down.
+            let Ok((stream, addr)) = socket.accept().await else {
+                return;
+            };
+            if session.strong_count() == 0 || shared.is_shutdown() {
+                return;
+            }
+            let Ok(permit) = Arc::clone(&state.pending).try_acquire_owned() else {
+                debug!(%addr, "too many pending handshakes; dropping uTP connection");
+                continue;
+            };
+            let session = session.clone();
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                route(PeerTransport::Utp(stream), addr, &session, &shared).await;
                 drop(permit);
             });
         }
@@ -85,7 +119,12 @@ type Refusal = std::borrow::Cow<'static, str>;
 /// to handing it to the torrent (MSE included) shares one
 /// `handshake_timeout` deadline, so a stalled peer gives its pending slot
 /// back in time.
-async fn route(stream: TcpStream, addr: SocketAddr, session: &Weak<SessionInner>, shared: &Shared) {
+async fn route(
+    stream: PeerTransport,
+    addr: SocketAddr,
+    session: &Weak<SessionInner>,
+    shared: &Shared,
+) {
     let deadline = after(Instant::now(), shared.settings.handshake_timeout);
     let (mut stream, hs) = match timeout_at(deadline, accept(stream, session, shared)).await {
         Ok(Ok(c)) => c,
@@ -130,7 +169,7 @@ async fn route(stream: TcpStream, addr: SocketAddr, session: &Weak<SessionInner>
 /// policy, runs the MSE responder if needed and reads the BitTorrent
 /// handshake. Over MSE the handshake must name the torrent of the `SKEY`.
 async fn accept(
-    mut stream: TcpStream,
+    mut stream: PeerTransport,
     session: &Weak<SessionInner>,
     shared: &Shared,
 ) -> Result<(PeerStream, Handshake), Refusal> {

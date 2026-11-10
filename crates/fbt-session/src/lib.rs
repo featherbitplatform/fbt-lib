@@ -55,7 +55,7 @@ pub use error::SessionError;
 pub use event::{Event, EventMask, EventStream, PeerSource};
 pub use fbt_dht::DhtStats;
 pub use net::ListenError;
-pub use peer::DisconnectReason;
+pub use peer::{DisconnectReason, Transport};
 pub use rate::RateMeter;
 pub use session::{AddTorrent, Priority, RemoveMode, Session, TorrentSource};
 pub use settings::{DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_METADATA_SIZE, Settings};

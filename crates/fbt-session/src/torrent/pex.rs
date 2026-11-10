@@ -20,6 +20,7 @@ use super::actor::Actor;
 use super::swarm::{Peer, dialable};
 use crate::event::PeerSource;
 use crate::peer::messages::PeerCommand;
+use crate::peer::transport::Transport;
 use crate::picker::PeerKey;
 
 /// Most addresses sent in, or taken from, one message's `added` list.
@@ -115,6 +116,9 @@ fn flags_of(p: &Peer) -> PexFlags {
     if p.encrypted {
         f |= PexFlags::ENCRYPTION;
     }
+    if p.transport == Transport::Utp {
+        f |= PexFlags::UTP;
+    }
     if p.is_seed() {
         f |= PexFlags::SEED;
     }
@@ -180,6 +184,8 @@ impl Actor {
     /// the gap since its last accepted one has passed; otherwise the first
     /// [`MAX_PEX_ADDED`] dialable `added` addresses join the known ones.
     /// `dropped` is ignored: known peers stay known until connecting fails.
+    /// An address listed with the `UTP` flag is dialled over uTP first,
+    /// even if it turned out TCP-only before.
     pub(super) fn on_pex(&mut self, key: PeerKey, msg: PexMsg) {
         if !self.pex_active() {
             return;
@@ -192,13 +198,23 @@ impl Actor {
             debug!(key = key.0, "PEX message within the receive gap; dropped");
             return;
         }
-        let addrs: Vec<SocketAddr> = msg
+        let added: Vec<(SocketAddr, PexFlags)> = msg
             .added
             .into_iter()
-            .map(|(a, _)| a)
-            .filter(dialable)
+            .filter(|(a, _)| dialable(a))
             .take(MAX_PEX_ADDED)
             .collect();
+        // Flags first, so the dials `on_found_peers` starts see them.
+        for (addr, flags) in &added {
+            if flags.contains(PexFlags::UTP)
+                && !self.retries.is_never(addr)
+                && self.remember(*addr)
+                && let Some(k) = self.known.get_mut(addr)
+            {
+                k.utp = true;
+            }
+        }
+        let addrs: Vec<SocketAddr> = added.into_iter().map(|(a, _)| a).collect();
         self.on_found_peers(PeerSource::Pex, addrs);
     }
 
@@ -351,7 +367,7 @@ mod tests {
     #[test]
     fn incoming_peer_without_listen_port_is_not_shared() {
         let (tx, _rx) = mpsc::channel(1);
-        let mut p = Peer::new(addr(1), tx, 0, 0);
+        let mut p = Peer::new(addr(1), tx, 0, 0, Transport::Tcp);
         assert_eq!(connectable_addr(&p), None);
         p.listen_port = Some(7000);
         assert_eq!(

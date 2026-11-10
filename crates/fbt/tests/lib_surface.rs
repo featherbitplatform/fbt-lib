@@ -9,7 +9,7 @@ use fbt::{
     MAX_METADATA_SIZE, Magnet, MagnetError, MemStorage, Metainfo, MetainfoError,
     ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority, RelPath, RemoveMode, Session,
     SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
-    TrackerConfig, TrackerError,
+    TrackerConfig, TrackerError, Transport,
 };
 
 fn names(
@@ -55,12 +55,34 @@ fn names(
     _: Option<TorrentStatus>,
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
+    _: Option<Transport>,
     _: Option<&dyn Storage>,
 ) {
+}
+
+/// The fields `PeerConnected` carries.
+fn peer_connected(e: &Event) -> Option<(std::net::SocketAddr, Transport, bool)> {
+    match e {
+        Event::PeerConnected {
+            addr,
+            transport,
+            encrypted,
+            ..
+        } => Some((*addr, *transport, *encrypted)),
+        _ => None,
+    }
 }
 
 #[test]
 fn surface_compiles() {
     let _: [&str; 3] = DEFAULT_DHT_BOOTSTRAP;
     let _: usize = MAX_METADATA_SIZE;
+    let _ = [Transport::Tcp, Transport::Utp];
+    let s = Settings::default();
+    let _: [bool; 4] = [
+        s.enable_outgoing_tcp,
+        s.enable_incoming_tcp,
+        s.enable_outgoing_utp,
+        s.enable_incoming_utp,
+    ];
 }

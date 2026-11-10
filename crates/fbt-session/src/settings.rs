@@ -47,7 +47,8 @@ pub enum EncryptionPolicy {
 /// (zero intervals and timeouts that drive timers, queues of zero or beyond
 /// [`MAX_EVENT_QUEUE`] / [`MAX_INCOMING_REQUESTS`], a metadata cap outside
 /// 16 KiB..=[`MAX_METADATA_SIZE`], a DHT bootstrap entry that is not
-/// `host:port`, an empty or duplicated `listen_addrs`) with
+/// `host:port`, an empty or duplicated `listen_addrs`, every transport
+/// switched off) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -151,6 +152,26 @@ pub struct Settings {
     /// Internal tunable (tests shorten it); not part of the stable API.
     #[doc(hidden)]
     pub pex_interval: Duration,
+    /// Dial peers over TCP: after a failed uTP connect, or first when uTP
+    /// cannot be used for the peer. At least one of the four transport
+    /// switches must be on.
+    pub enable_outgoing_tcp: bool,
+    /// Accept peer connections on the TCP listeners.
+    pub enable_incoming_tcp: bool,
+    /// Dial peers over uTP (BEP 29) first, from the shared UDP socket of
+    /// the peer's address family; a failed uTP connect is retried once at
+    /// once over TCP (when `enable_outgoing_tcp`), and a peer reached that
+    /// way is dialled over TCP first from then on.
+    pub enable_outgoing_utp: bool,
+    /// Accept uTP connections on the shared UDP sockets. Off, their SYNs
+    /// are never answered, so a dialler's uTP connect times out (and falls
+    /// back to TCP).
+    pub enable_incoming_utp: bool,
+    /// How long an outgoing uTP connect waits for the remote's answer
+    /// before it fails (and falls back to TCP). Internal tunable (tests
+    /// shorten it); not part of the stable API. Non-zero.
+    #[doc(hidden)]
+    pub utp_connect_timeout: Duration,
 }
 
 impl Settings {
@@ -167,11 +188,23 @@ impl Settings {
             ("dht_announce_interval", self.dht_announce_interval),
             ("dht_query_timeout", self.dht_query_timeout),
             ("pex_interval", self.pex_interval),
+            ("utp_connect_timeout", self.utp_connect_timeout),
         ];
         for (name, d) in non_zero {
             if d.is_zero() {
                 return Err(format!("{name} must be greater than zero"));
             }
+        }
+        if !(self.enable_outgoing_tcp
+            || self.enable_incoming_tcp
+            || self.enable_outgoing_utp
+            || self.enable_incoming_utp)
+        {
+            return Err(
+                "enable_outgoing_tcp, enable_incoming_tcp, enable_outgoing_utp and \
+                 enable_incoming_utp must not all be off"
+                    .to_owned(),
+            );
         }
         if !(1..=MAX_EVENT_QUEUE).contains(&self.event_queue) {
             return Err(format!(
@@ -270,6 +303,11 @@ impl Default for Settings {
             dht_query_rate_per_ip: 5,
             pex_enabled: true,
             pex_interval: Duration::from_secs(60),
+            enable_outgoing_tcp: true,
+            enable_incoming_tcp: true,
+            enable_outgoing_utp: true,
+            enable_incoming_utp: true,
+            utp_connect_timeout: Duration::from_secs(7),
         }
     }
 }

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PeerId, PieceLayout};
+use fbt_utp::{UtpError, UtpSocket};
 use fbt_wire::{
     CryptoMethods, Handshake, HandshakeError, MseStream, Reserved, WireError, initiate,
     read_handshake, write_handshake,
@@ -37,6 +38,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 use super::ext::ExtConfig;
 use super::messages::{DisconnectReason, PeerCommand, PeerEvent};
+use super::transport::{PeerTransport, Transport};
 use crate::picker::PeerKey;
 use crate::settings::Settings;
 use state::Conn;
@@ -87,37 +89,42 @@ pub(crate) struct PeerCtx {
     /// The connection is RC4-encrypted (MSE), as `MseStream::is_encrypted`
     /// reports it after the handshake; copied into `PeerEvent::Connected`.
     pub encrypted: bool,
+    /// The transport the connection runs over; copied into
+    /// `PeerEvent::Connected`.
+    pub transport: Transport,
 }
 
-/// A peer connection's transport: MSE (RC4 or plaintext after the MSE
-/// handshake) or a plain BitTorrent connection.
-pub(crate) type PeerStream = MseStream<TcpStream>;
+/// A peer connection's stream: MSE (RC4 or plaintext after the MSE
+/// handshake) or a plain BitTorrent connection, over TCP or uTP.
+pub(crate) type PeerStream = MseStream<PeerTransport>;
 
-/// Connects to `addr` and runs the peer task; returns its command channel.
-/// `mse` is the MSE `crypto_provide` to open with, `None` for a plain
-/// BitTorrent handshake.
+/// Connects to `addr` over `transport` and runs the peer task; returns its
+/// command channel. `mse` is the MSE `crypto_provide` to open with, `None`
+/// for a plain BitTorrent handshake; `utp` is the socket to dial uTP from
+/// (required for [`Transport::Utp`]).
 ///
 /// A failed or timed-out connect is reported as `Disconnected` with
-/// [`DisconnectReason::Io`]; a failed MSE handshake (timeouts included) with
-/// [`DisconnectReason::Encryption`]. The MSE and BitTorrent handshakes share
-/// one `handshake_timeout`, which starts once the connect succeeded.
+/// [`DisconnectReason::Io`] and `connect_failed: Some(transport)`; a failed
+/// MSE handshake (timeouts included) with [`DisconnectReason::Encryption`].
+/// The MSE and BitTorrent handshakes share one `handshake_timeout`, which
+/// starts once the connect succeeded.
 pub(crate) fn spawn_outgoing(
     addr: SocketAddr,
     mut ctx: PeerCtx,
     mse: Option<CryptoMethods>,
+    transport: Transport,
+    utp: Option<UtpSocket>,
 ) -> mpsc::Sender<PeerCommand> {
     let (tx, rx) = mpsc::channel(command_queue(&ctx.settings));
     tokio::spawn(async move {
-        let stream = match timeout(ctx.settings.connect_timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                return report(&ctx, DisconnectReason::Io(e.to_string()), Vec::new()).await;
-            }
-            Err(_) => {
-                let reason = DisconnectReason::Io("connect timed out".to_owned());
-                return report(&ctx, reason, Vec::new()).await;
+        let stream = match connect(addr, transport, utp, &ctx.settings).await {
+            Ok(stream) => stream,
+            Err((reason, failed)) => {
+                let failed = failed.then_some(transport);
+                return report(&ctx, reason, Vec::new(), failed).await;
             }
         };
+        ctx.transport = transport;
         let deadline = after(Instant::now(), ctx.settings.handshake_timeout);
         let stream: PeerStream = match mse {
             None => MseStream::plaintext(stream, Vec::new()),
@@ -126,11 +133,11 @@ pub(crate) fn spawn_outgoing(
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
                         let reason = DisconnectReason::Encryption(e.to_string());
-                        return report(&ctx, reason, Vec::new()).await;
+                        return report(&ctx, reason, Vec::new(), None).await;
                     }
                     Err(_) => {
                         let reason = DisconnectReason::Encryption("MSE handshake timed out".into());
-                        return report(&ctx, reason, Vec::new()).await;
+                        return report(&ctx, reason, Vec::new(), None).await;
                     }
                 }
             }
@@ -141,9 +148,55 @@ pub(crate) fn spawn_outgoing(
     tx
 }
 
+/// Opens the transport to `addr`. TCP waits up to `connect_timeout`; uTP up
+/// to the socket's connect timeout (`utp_connect_timeout`). Fails with
+/// [`DisconnectReason::Io`] and whether it was a connect failure that the
+/// other transport may get past: every TCP error and timeout, a uTP
+/// `ConnectTimeout` or `Reset`. Local uTP errors (no socket, too many
+/// connections, the socket closed) are not.
+async fn connect(
+    addr: SocketAddr,
+    transport: Transport,
+    utp: Option<UtpSocket>,
+    settings: &Settings,
+) -> Result<PeerTransport, (DisconnectReason, bool)> {
+    let io = |msg: String| DisconnectReason::Io(msg);
+    match transport {
+        Transport::Tcp => match timeout(settings.connect_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => Ok(PeerTransport::Tcp(s)),
+            Ok(Err(e)) => Err((io(e.to_string()), true)),
+            Err(_) => Err((io("connect timed out".to_owned()), true)),
+        },
+        Transport::Utp => {
+            let Some(socket) = utp else {
+                return Err((
+                    io("no uTP socket for this address family".to_owned()),
+                    false,
+                ));
+            };
+            // The socket times the connect out itself; this outer bound,
+            // a second later, only guards against one that never resolves.
+            let bound = settings
+                .utp_connect_timeout
+                .saturating_add(Duration::from_secs(1));
+            // An IPv4-mapped peer is dialled from the IPv4 socket.
+            let to = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+            match timeout(bound, socket.connect(to)).await {
+                Ok(Ok(s)) => Ok(PeerTransport::Utp(s)),
+                Ok(Err(e)) => {
+                    let failed = matches!(e, UtpError::ConnectTimeout | UtpError::Reset);
+                    Err((io(e.to_string()), failed))
+                }
+                Err(_) => Err((io(UtpError::ConnectTimeout.to_string()), true)),
+            }
+        }
+    }
+}
+
 /// Runs the peer task on an accepted stream whose handshake the listener
 /// already read (after the MSE handshake, if any); returns its command
-/// channel. `ctx.encrypted` must already say whether `stream` is encrypted.
+/// channel. `ctx.encrypted` and `ctx.transport` must already describe
+/// `stream`.
 pub(crate) fn spawn_incoming(
     stream: PeerStream,
     remote: Handshake,
@@ -189,6 +242,7 @@ async fn run_peer_until<S: AsyncRead + AsyncWrite + Unpin>(
                 reserved: theirs.reserved,
                 addr,
                 encrypted: ctx.encrypted,
+                transport: ctx.transport,
             };
             let reason = match conn.emit(connected).await {
                 Err(reason) => reason,
@@ -197,14 +251,20 @@ async fn run_peer_until<S: AsyncRead + AsyncWrite + Unpin>(
             (reason, conn.outstanding.into_keys().collect())
         }
     };
-    report(&ctx, reason, outstanding).await;
+    report(&ctx, reason, outstanding, None).await;
 }
 
-async fn report(ctx: &PeerCtx, reason: DisconnectReason, outstanding: Vec<BlockRef>) {
+async fn report(
+    ctx: &PeerCtx,
+    reason: DisconnectReason,
+    outstanding: Vec<BlockRef>,
+    connect_failed: Option<Transport>,
+) {
     let ev = PeerEvent::Disconnected {
         key: ctx.key,
         reason,
         outstanding,
+        connect_failed,
     };
     // The torrent may already be gone; nothing is left to tell then.
     let _ = ctx.events.send(ev).await;

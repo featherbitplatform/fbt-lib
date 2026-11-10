@@ -410,7 +410,8 @@ fn retry_settings() -> Settings {
 
 /// A failed outgoing connection is dialled exactly three times in all, the
 /// retries after (a twelfth of, then all of) `peer_retry_delay`, and then
-/// given up.
+/// given up. Each attempt tries uTP first (nothing answers on the UDP port,
+/// so it times out) and then TCP (refused): two disconnects per attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_connect_is_retried_three_times_then_dropped() {
     // A loopback port nobody listens on.
@@ -427,13 +428,19 @@ async fn failed_connect_is_retried_three_times_then_dropped() {
             if *addr == closed)
     };
     for attempt in 1..=3 {
-        let e = next_matching(&mut ev, ours, T)
-            .await
-            .unwrap_or_else(|| panic!("attempt {attempt} reported"));
-        assert!(
-            matches!(e, Event::PeerDisconnected { .. }),
-            "attempt {attempt}: {e:?}"
-        );
+        for transport in ["uTP", "TCP"] {
+            let e = next_matching(&mut ev, ours, T)
+                .await
+                .unwrap_or_else(|| panic!("attempt {attempt} over {transport} reported"));
+            let utp_timeout = matches!(
+                &e,
+                Event::PeerDisconnected { reason: DisconnectReason::Io(m), .. } if m.contains("uTP")
+            );
+            assert!(
+                matches!(e, Event::PeerDisconnected { .. }) && utp_timeout == (transport == "uTP"),
+                "attempt {attempt} over {transport}: {e:?}"
+            );
+        }
     }
     // Given up: nothing more over five retry delays.
     let more = next_matching(&mut ev, ours, Duration::from_millis(1500)).await;

@@ -19,6 +19,7 @@ use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
 use crate::peer::messages::{PeerCommand, PeerEvent, PeerPiecesOwned};
+use crate::peer::transport::Transport;
 use crate::picker::{PeerKey, PeerPieces, PiecePicker};
 
 impl Actor {
@@ -31,8 +32,9 @@ impl Actor {
                 peer_id,
                 addr,
                 encrypted,
+                transport,
                 ..
-            } => self.on_peer_connected(key, peer_id, addr, encrypted),
+            } => self.on_peer_connected(key, peer_id, addr, encrypted, transport),
             PeerEvent::Pieces { key, pieces } => self.on_pieces(key, pieces),
             PeerEvent::Have { key, piece } => self.on_have(key, piece),
             PeerEvent::Choked { key } => {
@@ -82,7 +84,8 @@ impl Actor {
                 key,
                 reason,
                 outstanding,
-            } => self.on_peer_disconnected(key, reason, &outstanding),
+                connect_failed,
+            } => self.on_peer_disconnected(key, reason, &outstanding, connect_failed),
         }
     }
 
@@ -94,8 +97,9 @@ impl Actor {
         peer_id: PeerId,
         addr: SocketAddr,
         encrypted: bool,
+        transport: Transport,
     ) {
-        if !self.on_connected(key, peer_id, addr, encrypted) {
+        if !self.on_connected(key, peer_id, addr, encrypted, transport) {
             return;
         }
         let Some(p) = self.peers.get_mut(&key) else {
@@ -116,10 +120,12 @@ impl Actor {
                 self.send(key, PeerCommand::Haves(missed));
             }
         }
-        debug!(%addr, encrypted, "peer connected");
+        debug!(%addr, encrypted, ?transport, "peer connected");
         self.emit(Event::PeerConnected {
             torrent: self.ih,
             addr,
+            transport,
+            encrypted,
         });
     }
 
@@ -256,8 +262,9 @@ impl Actor {
         key: PeerKey,
         reason: DisconnectReason,
         outstanding: &[BlockRef],
+        connect_failed: Option<Transport>,
     ) {
-        let Some((p, reason)) = self.on_disconnected(key, reason) else {
+        let Some((p, reason)) = self.on_disconnected(key, reason, connect_failed) else {
             return;
         };
         if let Some(m) = self.magnet.as_mut() {

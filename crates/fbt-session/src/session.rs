@@ -12,7 +12,9 @@ use fbt_dht::{Dht, DhtConfig, DhtState, DhtStats};
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
 use fbt_tracker::TrackerClient;
+use fbt_utp::UtpSocket;
 use fbt_wire::req2_hash;
+use futures_util::FutureExt;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -20,7 +22,7 @@ use tracing::warn;
 use crate::error::SessionError;
 use crate::event::{Event, EventMask, EventStream};
 use crate::listener::ListenerState;
-use crate::net::{Endpoint, ListenError, bind_all};
+use crate::net::{Endpoint, ListenError, bind_all, utp_for, utp_sockets};
 use crate::settings::Settings;
 use crate::status::TorrentStatus;
 use crate::storage::{FsStorage, Storage};
@@ -153,6 +155,9 @@ pub(crate) struct Shared {
     /// The DHT's UDP sockets; `Port` messages carry the port of the one
     /// matching the peer's address family ([`dht_port_for`]).
     pub dht_addrs: Vec<SocketAddr>,
+    /// One uTP socket per shared UDP socket, in the same order (the
+    /// endpoints', then the per-family fallbacks).
+    pub utp: Vec<UtpSocket>,
 }
 
 /// The DHT port to send a peer at `peer` in `Port`: that of our DHT socket
@@ -177,6 +182,12 @@ impl Shared {
             self.listen_port_v6
         };
         family.unwrap_or(self.listen_port)
+    }
+
+    /// The uTP socket to dial `peer` from: the first of its address family,
+    /// as for the DHT and UDP trackers. `None` without one.
+    pub(crate) fn utp_for(&self, peer: &SocketAddr) -> Option<&UtpSocket> {
+        utp_for(&self.utp, peer)
     }
 
     pub(crate) fn emit(&self, ev: Event) {
@@ -231,8 +242,12 @@ pub(crate) struct SessionInner {
     /// Shared by every accept loop of the session.
     listener_state: Arc<ListenerState>,
     registry: Mutex<Registry>,
-    /// One accept loop per listener.
+    /// One TCP accept loop per listener (with `enable_incoming_tcp`) and
+    /// one uTP accept loop per uTP socket (with `enable_incoming_utp`).
     listeners: Mutex<Vec<JoinHandle<()>>>,
+    /// The TCP sockets without an accept loop (`enable_incoming_tcp` off),
+    /// dropped with the listeners.
+    idle_tcp: Mutex<Vec<tokio::net::TcpListener>>,
 }
 
 impl SessionInner {
@@ -259,6 +274,20 @@ impl SessionInner {
         for t in tasks {
             t.abort();
         }
+        self.idle_tcp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Resets every uTP connection and stops the uTP sockets' tasks.
+    fn shutdown_utp(&self) {
+        for u in &self.shared.utp {
+            // `UtpSocket::shutdown` does all its work before its first
+            // await point, so polling it once here is enough (and works
+            // from `Drop`).
+            let _ = u.shutdown().now_or_never();
+        }
     }
 
     /// Closes every shared UDP socket, freeing its port.
@@ -272,6 +301,7 @@ impl SessionInner {
 impl Drop for SessionInner {
     fn drop(&mut self) {
         self.stop_listeners();
+        self.shutdown_utp();
         self.close_udp();
     }
 }
@@ -302,11 +332,15 @@ impl Session {
         let mut udp: Vec<SharedUdpSocket> =
             endpoints.iter().filter_map(|e| e.udp.clone()).collect();
         udp.extend(fallback_udp(&endpoints));
+        let utp = utp_sockets(&settings, &udp);
         let senders: Vec<Arc<dyn DatagramSender>> =
             udp.iter().map(SharedUdpSocket::sender).collect();
         let tracker = match TrackerClient::with_udp_sockets(settings.tracker.clone(), senders) {
             Ok(t) => t,
             Err(e) => {
+                for u in &utp {
+                    let _ = u.shutdown().now_or_never();
+                }
                 udp.iter().for_each(SharedUdpSocket::close);
                 return Err(SessionError::Tracker(e));
             }
@@ -346,6 +380,7 @@ impl Session {
             half_open: AtomicUsize::new(0),
             dht,
             dht_addrs,
+            utp,
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -358,18 +393,37 @@ impl Session {
             listener_state,
             registry: Mutex::new(Registry::default()),
             listeners: Mutex::new(Vec::new()),
+            idle_tcp: Mutex::new(Vec::new()),
         });
-        let tasks: Vec<JoinHandle<()>> = endpoints
-            .into_iter()
-            .map(|e| {
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        if shared.settings.enable_incoming_tcp {
+            tasks.extend(endpoints.into_iter().map(|e| {
                 crate::listener::spawn(
                     e.tcp,
                     Arc::clone(&inner.listener_state),
                     Arc::downgrade(&inner),
                     Arc::clone(&shared),
                 )
-            })
-            .collect();
+            }));
+        } else {
+            // Bound but not listening: kept until shutdown so the ports stay
+            // ours, while TCP dials to them are refused.
+            inner
+                .idle_tcp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(endpoints.into_iter().map(|e| e.tcp));
+        }
+        if shared.settings.enable_incoming_utp {
+            tasks.extend(shared.utp.iter().map(|u| {
+                crate::listener::spawn_utp(
+                    u.clone(),
+                    Arc::clone(&inner.listener_state),
+                    Arc::downgrade(&inner),
+                    Arc::clone(&shared),
+                )
+            }));
+        }
         *inner.listeners.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
         Ok(Session { inner })
     }
@@ -525,7 +579,8 @@ impl Session {
 
     /// Stops the listeners and every torrent, waiting for pending writes
     /// and for up to 5 s for the `stopped` announces (sent in parallel),
-    /// then the DHT, and closes the shared UDP sockets, freeing every port.
+    /// then the DHT and the uTP sockets, and closes the shared UDP sockets,
+    /// freeing every port.
     /// Idempotent; afterwards every command returns
     /// [`SessionError::Shutdown`].
     pub async fn shutdown(&self) {
@@ -550,6 +605,11 @@ impl Session {
         }
         if let Some(dht) = &self.inner.shared.dht {
             dht.shutdown().await;
+        }
+        // The peers are gone; the uTP sockets stop before the UDP sockets
+        // under them close.
+        for u in &self.inner.shared.utp {
+            u.shutdown().await;
         }
         // Last: the `stopped` announces and the DHT used these sockets.
         self.inner.close_udp();
@@ -669,6 +729,7 @@ mod tests {
             half_open: AtomicUsize::new(0),
             dht: None,
             dht_addrs: Vec::new(),
+            utp: Vec::new(),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();

@@ -299,6 +299,7 @@ mod tests {
             half_open: AtomicUsize::new(0),
             dht: None,
             dht_addrs: Vec::new(),
+            utp: Vec::new(),
         });
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(LEN as u64));
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
@@ -324,6 +325,7 @@ mod tests {
             tx,
             actor.generation,
             1,
+            crate::peer::transport::Transport::Tcp,
         );
         peer.connected = true;
         peer.seed = true;

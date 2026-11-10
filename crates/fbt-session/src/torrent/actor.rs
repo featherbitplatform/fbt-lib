@@ -643,10 +643,16 @@ mod tests {
         let mut picker = PiecePicker::new(layout, &Bitfield::new(4));
         let (tx, _rx) = mpsc::channel(1);
         let addr = SocketAddr::from(([10, 0, 0, 1], 6881));
-        let mut closing = Peer::new(addr, tx.clone(), 3, 4);
+        let mut closing = Peer::new(
+            addr,
+            tx.clone(),
+            3,
+            4,
+            crate::peer::transport::Transport::Tcp,
+        );
         closing.bits.set(0);
         closing.tx = None;
-        let mut stale = Peer::new(addr, tx, 2, 4);
+        let mut stale = Peer::new(addr, tx, 2, 4, crate::peer::transport::Transport::Tcp);
         stale.bits.set(1);
         let peers = HashMap::from([(PeerKey(1), closing), (PeerKey(2), stale)]);
         add_availability(&mut picker, &peers, 3);

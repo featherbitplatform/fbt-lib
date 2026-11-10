@@ -7,6 +7,7 @@ use fbt_core::{Bitfield, BlockRef, PeerId, PieceLayout};
 use fbt_wire::{ExtHandshake, MetadataMsg, PexMsg, Reserved};
 
 use super::ext::ExtConfig;
+use super::transport::Transport;
 use crate::picker::PeerKey;
 
 /// Why a peer connection ended.
@@ -62,6 +63,8 @@ pub(crate) enum PeerEvent {
         addr: SocketAddr,
         /// RC4-encrypted (MSE); false for plaintext, MSE-negotiated or not.
         encrypted: bool,
+        /// The transport the connection runs over.
+        transport: Transport,
     },
     /// The remote's initial piece set.
     Pieces {
@@ -112,6 +115,11 @@ pub(crate) enum PeerEvent {
         key: PeerKey,
         reason: DisconnectReason,
         outstanding: Vec<BlockRef>,
+        /// An outgoing connection could not be made over this transport
+        /// (TCP refused or timed out, a uTP connect timed out or was
+        /// reset): the torrent may retry over the other one. `None` for
+        /// every other end, a failed handshake included.
+        connect_failed: Option<Transport>,
     },
 }
 

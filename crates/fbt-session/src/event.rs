@@ -9,7 +9,7 @@ use fbt_core::InfoHashes;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::sync::ReusableBoxFuture;
 
-use crate::peer::DisconnectReason;
+use crate::peer::{DisconnectReason, Transport};
 use crate::status::TorrentState;
 
 /// Where a batch of peer addresses came from.
@@ -110,6 +110,11 @@ pub enum Event {
         torrent: InfoHashes,
         /// Remote address.
         addr: SocketAddr,
+        /// The transport the connection runs over.
+        transport: Transport,
+        /// The connection is RC4-encrypted (MSE); false for plaintext,
+        /// MSE-negotiated or not.
+        encrypted: bool,
     },
     /// A peer connection ended (or never got established).
     PeerDisconnected {
