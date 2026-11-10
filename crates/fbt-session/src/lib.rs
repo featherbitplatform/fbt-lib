@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod choker;
 pub mod error;
+pub mod picker;
 pub mod storage;
 
 #[cfg(test)]

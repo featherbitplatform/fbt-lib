@@ -21,6 +21,7 @@ fbt-tracker = { path = "../fbt-tracker" }
 fbt-core = { path = "../fbt-core" }
 fbt-metainfo = { path = "../fbt-metainfo" }
 sha1.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

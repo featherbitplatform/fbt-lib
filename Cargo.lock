@@ -454,6 +454,7 @@ dependencies = [
  "fbt-core",
  "fbt-metainfo",
  "fbt-tracker",
+ "rand",
  "sha1",
  "tempfile",
 ]
