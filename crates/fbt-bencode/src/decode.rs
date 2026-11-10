@@ -19,6 +19,7 @@ impl Default for Limits {
 
 /// Decoding failures; `pos` is the byte offset in the input.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// Input ended early.
     #[error("unexpected end of input at {pos}")]

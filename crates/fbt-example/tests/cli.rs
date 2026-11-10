@@ -124,9 +124,21 @@ fn download_from_seed_process() {
             .expect("spawn seed"),
     );
     let stdout = seed.0.stdout.take().expect("stdout");
-    let mut lines = BufReader::new(stdout);
-    let mut first = String::new();
-    lines.read_line(&mut first).expect("first line");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = BufReader::new(stdout);
+        let mut first = String::new();
+        let _ = lines.read_line(&mut first);
+        let _ = tx.send(first);
+        // Keep draining so the seed never blocks on a full pipe.
+        let mut rest = String::new();
+        while lines.read_line(&mut rest).map(|n| n > 0).unwrap_or(false) {
+            rest.clear();
+        }
+    });
+    let first = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("seed printed its listening line");
     let addr = first
         .trim()
         .strip_prefix("listening on ")

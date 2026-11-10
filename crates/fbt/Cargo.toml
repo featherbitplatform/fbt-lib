@@ -20,6 +20,7 @@ pure-rust = ["fbt-session/tls-rustcrypto"]
 
 [dependencies]
 fbt-session = { path = "../fbt-session" }
+fbt-bencode = { path = "../fbt-bencode" }
 fbt-metainfo = { path = "../fbt-metainfo" }
 fbt-core = { path = "../fbt-core" }
 fbt-tracker = { path = "../fbt-tracker" }

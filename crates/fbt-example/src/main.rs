@@ -196,7 +196,7 @@ async fn watch(handle: &TorrentHandle, seed_for: Option<Duration>, download: boo
     let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
-            _ = &mut ctrl_c => {
+            Ok(()) = &mut ctrl_c => {
                 // Graceful stop; an unfinished download is a failure.
                 let done = matches!(handle.status().state, TorrentState::Seeding);
                 return if download && !done { ExitCode::FAILURE } else { ExitCode::SUCCESS };

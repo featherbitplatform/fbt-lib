@@ -10,6 +10,7 @@ pub(crate) const MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The `event` of an announce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AnnounceEvent {
     /// A regular periodic announce.
     None,
@@ -69,6 +70,7 @@ pub struct AnnounceResponse {
 
 /// Tracker client errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TrackerError {
     /// The URL could not be parsed.
     #[error("invalid tracker url: {0}")]

@@ -13,6 +13,7 @@ const MAX_PIECE_LEN: i64 = 268_435_456;
 
 /// Errors from [`Metainfo::from_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum MetainfoError {
     /// The bencode itself is malformed.
     #[error("bencode: {0}")]

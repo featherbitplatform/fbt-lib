@@ -2,6 +2,7 @@
 
 /// Error building a [`Bitfield`] from wire bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum BitfieldError {
     /// The byte length does not equal `ceil(len / 8)`.
     #[error("bitfield has the wrong length")]

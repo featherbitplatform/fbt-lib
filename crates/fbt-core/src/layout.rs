@@ -16,6 +16,7 @@ pub struct BlockRef {
 
 /// Error building a [`PieceLayout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LayoutError {
     /// Total length is zero.
     #[error("total length must be greater than zero")]

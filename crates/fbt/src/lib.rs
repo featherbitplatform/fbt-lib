@@ -42,14 +42,18 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-pub use fbt_core::{Bitfield, InfoHashV1, InfoHashV2, InfoHashes, PeerId};
-pub use fbt_metainfo::{Metainfo, MetainfoError};
+pub use fbt_bencode::DecodeError;
+pub use fbt_core::{
+    Bitfield, BitfieldError, BlockRef, FileLayout, FileSlice, InfoHashV1, InfoHashV2, InfoHashes,
+    LayoutError, ParseInfoHashError, PeerId, PieceLayout,
+};
+pub use fbt_metainfo::{FileEntry, Info, Metainfo, MetainfoError, RelPath};
 pub use fbt_session::storage::{FsStorage, MemStorage, Storage};
 pub use fbt_session::{
     AddTorrent, DisconnectReason, Event, EventMask, EventStream, Priority, RemoveMode, Session,
     SessionError, Settings, TorrentHandle, TorrentState, TorrentStatus,
 };
-pub use fbt_tracker::TrackerConfig;
+pub use fbt_tracker::{TrackerConfig, TrackerError};
 
 #[cfg(test)]
 mod tests {

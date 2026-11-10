@@ -8,6 +8,7 @@ use sha2::Sha256;
 
 /// Error parsing an info hash from hex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ParseInfoHashError {
     /// The string has the wrong number of characters.
     #[error("info hash must be {expected} hex digits")]

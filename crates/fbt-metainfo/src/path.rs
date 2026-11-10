@@ -52,6 +52,7 @@ impl fmt::Display for RelPath {
 
 /// Errors from [`sanitize_path`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PathError {
     /// Nothing usable is left after sanitization.
     #[error("path is empty after sanitization")]
