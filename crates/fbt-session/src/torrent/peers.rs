@@ -2,7 +2,7 @@
 //! limits, peer events, interest and handing out block requests.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,21 +24,74 @@ use crate::session::{release, try_reserve};
 
 /// Connection attempts per address before it is given up.
 const MAX_ATTEMPTS: u32 = 3;
-/// Most addresses a torrent remembers for connecting; more are ignored.
+/// Most addresses a torrent remembers for connecting; beyond it the oldest
+/// address not in use is forgotten.
 const MAX_KNOWN: usize = 1000;
 /// Most never-retry addresses kept; the oldest is forgotten beyond it.
 const MAX_NEVER: usize = 1000;
 
-/// Remembers `addr` among the known addresses unless [`MAX_KNOWN`] are
-/// already known. Returns whether it is known now.
-pub(super) fn remember(known: &mut HashSet<SocketAddr>, addr: SocketAddr) -> bool {
-    if known.contains(&addr) {
-        return true;
+/// The addresses a torrent connects to (from `add_peer` and trackers),
+/// reconnected on resume. At most [`MAX_KNOWN`]; when full, the oldest
+/// address not in use makes room for a new one.
+#[derive(Debug, Default)]
+pub(super) struct Known {
+    set: HashSet<SocketAddr>,
+    /// `set` in insertion order, oldest first.
+    order: VecDeque<SocketAddr>,
+}
+
+impl Known {
+    /// Remembers `addr`. When full, forgets the oldest address for which
+    /// `in_use` is false and returns it as the second value. Returns
+    /// whether `addr` is known now (false only when every address is in
+    /// use).
+    pub(super) fn remember(
+        &mut self,
+        addr: SocketAddr,
+        in_use: impl Fn(&SocketAddr) -> bool,
+    ) -> (bool, Option<SocketAddr>) {
+        if self.set.contains(&addr) {
+            return (true, None);
+        }
+        let mut evicted = None;
+        if self.set.len() >= MAX_KNOWN {
+            let Some(at) = self.order.iter().position(|a| !in_use(a)) else {
+                return (false, None);
+            };
+            evicted = self.order.remove(at);
+            if let Some(old) = &evicted {
+                self.set.remove(old);
+            }
+        }
+        self.set.insert(addr);
+        self.order.push_back(addr);
+        (true, evicted)
     }
-    if known.len() >= MAX_KNOWN {
-        return false;
+
+    pub(super) fn remove(&mut self, addr: &SocketAddr) {
+        if self.set.remove(addr) {
+            self.order.retain(|a| a != addr);
+        }
     }
-    known.insert(addr)
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &SocketAddr> {
+        self.order.iter()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+/// An address a tracker may hand out that we would actually dial: not port
+/// 0, not unspecified, multicast or broadcast.
+pub(super) fn dialable(addr: &SocketAddr) -> bool {
+    let ip_ok = match addr.ip() {
+        IpAddr::V4(ip) => !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()),
+        IpAddr::V6(ip) => !(ip.is_unspecified() || ip.is_multicast()),
+    };
+    addr.port() != 0 && ip_ok
 }
 
 /// What a failed attempt leads to.
@@ -177,6 +230,8 @@ pub(super) struct Peer {
     pub fast_has: Option<Bitfield>,
     /// Our requests the peer task holds.
     pub requested: HashSet<BlockRef>,
+    /// Why we closed it, reported instead of `Shutdown` on `Disconnected`.
+    pub close_reason: Option<DisconnectReason>,
     /// Blocks the peer asked for (`WantBlocks`) and we have not handed out.
     pub demand: usize,
     /// Payload the peer uploads to us.
@@ -210,6 +265,7 @@ impl Peer {
             allowed_fast: HashSet::new(),
             fast_has: None,
             requested: HashSet::new(),
+            close_reason: None,
             demand: 0,
             from_rate: RateMeter::new(),
             to_rate: RateMeter::new(),
@@ -304,13 +360,31 @@ impl Actor {
         if self.retries.is_never(&addr) || self.retries.is_pending(&addr) {
             return;
         }
-        let busy = self
-            .peers
-            .values()
-            .any(|p| p.addr == addr && p.tx.is_some());
-        if !busy && !self.candidates.contains(&addr) {
+        if !self.addr_busy(&addr) && !self.candidates.contains(&addr) {
             self.candidates.push_back(addr);
         }
+    }
+
+    /// A live connection (connecting or connected) to `addr` exists.
+    fn addr_busy(&self, addr: &SocketAddr) -> bool {
+        self.peers
+            .values()
+            .any(|p| p.addr == *addr && p.tx.is_some())
+    }
+
+    /// Remembers `addr` for connecting; when the table is full, the oldest
+    /// address that is neither connected nor waiting for a retry is
+    /// forgotten (and unqueued). Returns whether it is known now.
+    pub(super) fn remember(&mut self, addr: SocketAddr) -> bool {
+        let peers = &self.peers;
+        let retries = &self.retries;
+        let (known, evicted) = self.known.remember(addr, |a| {
+            retries.is_pending(a) || peers.values().any(|p| p.addr == *a && p.tx.is_some())
+        });
+        if let Some(old) = evicted {
+            self.candidates.retain(|a| *a != old);
+        }
+        known
     }
 
     /// Queues the addresses whose retry time has come.
@@ -342,6 +416,12 @@ impl Actor {
                 release(&self.shared.global_peers);
                 break;
             };
+            // It may have connected (or connected to us) since it was queued.
+            if self.addr_busy(&addr) {
+                release(&self.shared.half_open);
+                release(&self.shared.global_peers);
+                continue;
+            }
             let key = self.new_key();
             let ctx = self.ctx(key);
             let have = ctx.have.clone();
@@ -484,6 +564,10 @@ impl Actor {
     }
 
     pub(super) fn on_connected(&mut self, key: PeerKey, peer_id: PeerId, addr: SocketAddr) {
+        let duplicate = self
+            .peers
+            .iter()
+            .any(|(k, o)| *k != key && o.connected && o.tx.is_some() && o.peer_id == Some(peer_id));
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
@@ -495,6 +579,14 @@ impl Actor {
         p.peer_id = Some(peer_id);
         if p.outgoing {
             self.retries.connected(&p.addr);
+        }
+        if duplicate {
+            // Already connected to this peer (both dialled each other, or it
+            // reconnected): keep the older connection.
+            debug!(%addr, "duplicate peer id; closing the newer connection");
+            p.close_reason = Some(DisconnectReason::Duplicate);
+            self.close_peer(key);
+            return;
         }
         // Pieces finished while it connected were skipped by `on_written`.
         let snapshot = p.have_sent.take();
@@ -645,8 +737,12 @@ impl Actor {
         reason: DisconnectReason,
         outstanding: &[BlockRef],
     ) {
-        let Some(p) = self.peers.remove(&key) else {
+        let Some(mut p) = self.peers.remove(&key) else {
             return;
+        };
+        let reason = match p.close_reason.take() {
+            Some(ours) if reason == DisconnectReason::Shutdown => ours,
+            _ => reason,
         };
         if p.connecting {
             release(&self.shared.half_open);
@@ -976,13 +1072,14 @@ mod tests {
 
     #[test]
     fn address_maps_are_bounded() {
-        let mut known = HashSet::new();
+        let mut known = Known::default();
         for i in 0..MAX_KNOWN as u32 {
-            assert!(remember(&mut known, addr(i)));
+            assert_eq!(known.remember(addr(i), |_| false), (true, None));
         }
-        // Full: new addresses are ignored, known ones still answer true.
-        assert!(!remember(&mut known, addr(5000)));
-        assert!(remember(&mut known, addr(0)));
+        // Full and everything in use: new addresses are ignored, known ones
+        // still answer true.
+        assert_eq!(known.remember(addr(5000), |_| true), (false, None));
+        assert_eq!(known.remember(addr(0), |_| true), (true, None));
         assert_eq!(known.len(), MAX_KNOWN);
 
         let mut r = Retries::new(DELAY);
@@ -995,6 +1092,39 @@ mod tests {
         // The oldest were forgotten, the newest kept.
         assert!(!r.is_never(&addr(0)) && !r.is_never(&addr(9)));
         assert!(r.is_never(&addr(10)) && r.is_never(&addr(MAX_NEVER as u32 + 9)));
+    }
+
+    #[test]
+    fn full_known_table_evicts_the_oldest_idle_address() {
+        let mut known = Known::default();
+        for i in 0..MAX_KNOWN as u32 {
+            known.remember(addr(i), |_| false);
+        }
+        // Addresses 0..10 are connected or waiting for a retry: the oldest
+        // other one (10) makes room.
+        let busy = |a: &SocketAddr| (0..10).any(|i| addr(i) == *a);
+        assert_eq!(known.remember(addr(5000), busy), (true, Some(addr(10))));
+        assert_eq!(known.len(), MAX_KNOWN);
+        assert!(known.iter().any(|a| *a == addr(5000)));
+        assert!(!known.iter().any(|a| *a == addr(10)));
+        // The next one evicts 11; a removed address frees a slot outright.
+        assert_eq!(known.remember(addr(5001), busy), (true, Some(addr(11))));
+        known.remove(&addr(3));
+        assert_eq!(known.remember(addr(5002), busy), (true, None));
+        assert_eq!(known.len(), MAX_KNOWN);
+    }
+
+    #[test]
+    fn undialable_tracker_addresses_are_filtered() {
+        let ok = |s: &str| dialable(&s.parse::<SocketAddr>().unwrap());
+        assert!(ok("10.0.0.1:6881"));
+        assert!(ok("[2001:db8::1]:6881"));
+        assert!(!ok("10.0.0.1:0"));
+        assert!(!ok("0.0.0.0:6881"));
+        assert!(!ok("[::]:6881"));
+        assert!(!ok("224.0.0.1:6881"));
+        assert!(!ok("255.255.255.255:6881"));
+        assert!(!ok("[ff02::1]:6881"));
     }
 
     #[test]

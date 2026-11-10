@@ -528,3 +528,39 @@ async fn piece_finished_while_a_peer_connects_is_announced() {
     assert!(got_have, "piece 0 never announced to the slow peer");
     s.shutdown().await;
 }
+
+/// A second connection under a peer id that is already connected is closed
+/// with `Duplicate`; the first one keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_peer_id_is_rejected() {
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let (s, _h) = seeder(&m, Arc::new(MemStorage::from_bytes(payload))).await;
+    let ih = m.info_hashes.wire_hash();
+    let id = fbt_core::PeerId([0x42; 20]);
+    let mut ev = s.subscribe(EventMask::PEER);
+    let mut first = ScriptedPeer::connect_as(s.local_addr(), ih, id, false).await;
+    next_matching(&mut ev, |e| matches!(e, Event::PeerConnected { .. }), T)
+        .await
+        .expect("first connected");
+    let mut second = ScriptedPeer::connect_as(s.local_addr(), ih, id, false).await;
+    assert_eq!(second.wait_closed(T).await, PeerEnd::Closed);
+    let e = next_matching(&mut ev, |e| matches!(e, Event::PeerDisconnected { .. }), T)
+        .await
+        .expect("second disconnected");
+    assert!(
+        matches!(
+            e,
+            Event::PeerDisconnected {
+                reason: DisconnectReason::Duplicate,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    first.send(Message::Interested).await;
+    first
+        .next_matching(|m| *m == Message::Unchoke)
+        .await
+        .expect("the first connection still works");
+    s.shutdown().await;
+}

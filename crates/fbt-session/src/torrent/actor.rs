@@ -3,7 +3,7 @@
 //! come back as [`Job`]s, and commands to peers use `try_send` (a peer whose
 //! queue is full is closed as stalled).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
@@ -21,7 +21,7 @@ use tracing::warn;
 
 use super::announcer::{self, Announcer, STOPPED_TIMEOUT, Signals};
 use super::data::Job;
-use super::peers::{Peer, Retries, remember};
+use super::peers::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
 use crate::error::SessionError;
@@ -98,7 +98,7 @@ pub(crate) struct Actor {
     /// Addresses waiting for a connection slot.
     pub(super) candidates: VecDeque<SocketAddr>,
     /// Every address given to `add_peer`, reconnected on resume.
-    pub(super) known: HashSet<SocketAddr>,
+    pub(super) known: Known,
     /// Retry schedule and never-retry set of outgoing connections.
     pub(super) retries: Retries,
     pub(super) choker: Choker,
@@ -163,7 +163,7 @@ impl Actor {
             peers: HashMap::new(),
             next_key: 0,
             candidates: VecDeque::new(),
-            known: HashSet::new(),
+            known: Known::default(),
             retries,
             choker,
             bufs: HashMap::new(),
@@ -340,10 +340,15 @@ impl Actor {
     }
 
     /// Peers from a tracker reply join the known addresses, as `add_peer`
-    /// does.
+    /// does; addresses nobody can dial (port 0, unspecified, multicast) are
+    /// dropped.
     fn on_tracker_peers(&mut self, peers: Vec<SocketAddr>) {
         for addr in peers {
-            if !self.retries.is_never(&addr) && remember(&mut self.known, addr) && self.active() {
+            if dialable(&addr)
+                && !self.retries.is_never(&addr)
+                && self.remember(addr)
+                && self.active()
+            {
                 self.queue_addr(addr);
             }
         }
@@ -467,7 +472,7 @@ impl Actor {
                 let _ = tx.send(());
             }
             Cmd::AddPeer(addr, tx) => {
-                if !self.retries.is_never(&addr) && remember(&mut self.known, addr) {
+                if !self.retries.is_never(&addr) && self.remember(addr) {
                     self.queue_addr(addr);
                     self.try_connect();
                 }

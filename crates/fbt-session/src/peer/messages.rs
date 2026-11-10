@@ -28,6 +28,9 @@ pub enum DisconnectReason {
     Closed,
     /// We closed the connection (`PeerCommand::Close` or the torrent went away).
     Shutdown,
+    /// We closed it because the same peer id is already connected to the
+    /// torrent; the older connection stays.
+    Duplicate,
 }
 
 /// The pieces a remote announced, owned.

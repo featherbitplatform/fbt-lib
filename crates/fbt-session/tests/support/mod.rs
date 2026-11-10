@@ -122,28 +122,32 @@ pub struct ScriptedPeer {
 
 impl ScriptedPeer {
     /// Connects to `addr` and exchanges handshakes for `info_hash` (no fast
-    /// extension).
+    /// extension) under a fresh random peer id.
     pub async fn connect(addr: SocketAddr, info_hash: [u8; 20]) -> ScriptedPeer {
-        Self::connect_with(addr, info_hash, Reserved::default()).await
+        Self::connect_as(addr, info_hash, random_id(), false).await
     }
 
     /// Like [`connect`](Self::connect), advertising the fast extension.
     pub async fn connect_fast(addr: SocketAddr, info_hash: [u8; 20]) -> ScriptedPeer {
-        let mut reserved = Reserved::default();
-        reserved.set_fast();
-        Self::connect_with(addr, info_hash, reserved).await
+        Self::connect_as(addr, info_hash, random_id(), true).await
     }
 
-    async fn connect_with(
+    /// Connects under the given peer id.
+    pub async fn connect_as(
         addr: SocketAddr,
         info_hash: [u8; 20],
-        reserved: Reserved,
+        peer_id: PeerId,
+        fast: bool,
     ) -> ScriptedPeer {
+        let mut reserved = Reserved::default();
+        if fast {
+            reserved.set_fast();
+        }
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let ours = Handshake {
             reserved,
             info_hash,
-            peer_id: PeerId([0x5a; 20]),
+            peer_id,
         };
         write_handshake(&mut stream, &ours)
             .await
@@ -211,6 +215,12 @@ impl ScriptedPeer {
             }
         }
     }
+}
+
+fn random_id() -> PeerId {
+    let mut id = [0u8; 20];
+    rand::rng().fill(&mut id[..]);
+    PeerId(id)
 }
 
 /// How waiting for a connection to end turned out.
