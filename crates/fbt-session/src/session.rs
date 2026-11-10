@@ -263,7 +263,7 @@ impl Session {
         shared.emit(Event::TorrentAdded { torrent: ih });
         let handle = torrent::spawn(
             params,
-            storage,
+            Some(storage),
             Arc::clone(shared),
             Arc::downgrade(&self.inner),
         );

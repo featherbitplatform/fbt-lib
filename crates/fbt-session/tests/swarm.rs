@@ -564,3 +564,23 @@ async fn duplicate_peer_id_is_rejected() {
         .expect("the first connection still works");
     s.shutdown().await;
 }
+
+/// Two sessions dialling each other at once end up with exactly one
+/// connection: both ends keep the one the lower peer id initiated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_dial_leaves_one_connection() {
+    let (m, payload) = make_torrent(&[("a", 1 << 20)], 65_536);
+    let (a, ha) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+    let (b, hb, storage) = mem_leecher(&m, payload.len()).await;
+    let mut ev = b.subscribe(EventMask::ALL);
+    let (ra, rb) = tokio::join!(ha.add_peer(b.local_addr()), hb.add_peer(a.local_addr()));
+    ra.unwrap();
+    rb.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(ha.status().num_peers, 1, "seeder peers");
+    assert_eq!(hb.status().num_peers, 1, "leecher peers");
+    finished(&mut ev).await;
+    assert!(stored(&storage, payload.len()) == payload, "data differs");
+    b.shutdown().await;
+    a.shutdown().await;
+}

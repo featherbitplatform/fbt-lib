@@ -69,7 +69,7 @@ impl Actor {
                 result,
             } => self.on_read(generation, key, block, result),
             Job::Flushed(Err(e)) => {
-                tracing::warn!(torrent = %self.meta.info.name, error = %e, "flush failed");
+                tracing::warn!(torrent = %self.name(), error = %e, "flush failed");
             }
             Job::Flushed(Ok(())) => {}
         }
@@ -85,8 +85,13 @@ impl Actor {
         };
         p.requested.remove(&block);
         let current = p.generation == generation && p.tx.is_some();
-        let picker = match self.picker.as_mut() {
-            Some(pk) if current && matches!(self.phase, Phase::Ready) => pk,
+        let ready = matches!(self.phase, Phase::Ready);
+        let Some(l) = self.loaded.as_mut() else {
+            self.counters.wasted = self.counters.wasted.saturating_add(len);
+            return;
+        };
+        let picker = match l.picker.as_mut() {
+            Some(pk) if current && ready => pk,
             _ => {
                 self.counters.wasted = self.counters.wasted.saturating_add(len);
                 return;
@@ -97,11 +102,8 @@ impl Actor {
             self.counters.wasted = self.counters.wasted.saturating_add(len);
             return;
         }
-        let size = self.layout.piece_size(block.piece) as usize;
-        let buf = self
-            .bufs
-            .entry(block.piece)
-            .or_insert_with(|| vec![0; size]);
+        let size = l.layout.piece_size(block.piece) as usize;
+        let buf = l.bufs.entry(block.piece).or_insert_with(|| vec![0; size]);
         let start = block.offset as usize;
         let Some(dst) = start
             .checked_add(data.len())
@@ -125,14 +127,20 @@ impl Actor {
             self.send(owner, PeerCommand::Cancel(block));
         }
         if res.piece_complete
-            && let Some(data) = self.bufs.remove(&block.piece)
+            && let Some(data) = self
+                .loaded
+                .as_mut()
+                .and_then(|l| l.bufs.remove(&block.piece))
         {
             self.spawn_hash(block.piece, data);
         }
     }
 
     fn spawn_hash(&mut self, piece: u32, data: Vec<u8>) {
-        let meta = Arc::clone(&self.meta);
+        let Some(l) = self.loaded.as_ref() else {
+            return;
+        };
+        let meta = Arc::clone(&l.meta);
         let generation = self.generation;
         self.jobs.spawn_blocking(move || {
             let ok = meta.info.pieces.get(piece as usize) == Some(&sha1_piece(&data));
@@ -149,9 +157,15 @@ impl Actor {
         if generation != self.generation || !matches!(self.phase, Phase::Ready) {
             return;
         }
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
         if ok {
-            let storage = Arc::clone(&self.storage);
-            let offset = self.layout.piece_offset(piece);
+            let Some(storage) = self.storage.as_ref() else {
+                return;
+            };
+            let storage = Arc::clone(storage);
+            let offset = l.layout.piece_offset(piece);
             self.jobs.spawn_blocking(move || Job::Written {
                 generation,
                 piece,
@@ -159,14 +173,12 @@ impl Actor {
             });
             return;
         }
-        debug!(torrent = %self.meta.info.name, piece, "piece failed its hash check");
-        if let Some(picker) = self.picker.as_mut() {
+        debug!(torrent = %l.meta.info.name, piece, "piece failed its hash check");
+        if let Some(picker) = l.picker.as_mut() {
             picker.piece_failed(piece);
         }
-        self.counters.wasted = self
-            .counters
-            .wasted
-            .saturating_add(u64::from(self.layout.piece_size(piece)));
+        let size = u64::from(l.layout.piece_size(piece));
+        self.counters.wasted = self.counters.wasted.saturating_add(size);
         self.emit(Event::HashFailed {
             torrent: self.ih,
             piece,
@@ -182,7 +194,7 @@ impl Actor {
             self.fail(&e, "writing a piece");
             return;
         }
-        let Some(picker) = self.picker.as_mut() else {
+        let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) else {
             return;
         };
         picker.piece_passed(piece);
@@ -209,11 +221,12 @@ impl Actor {
         if just_finished {
             self.finished_emitted = true;
             self.emit(Event::TorrentFinished { torrent: self.ih });
-            let storage = Arc::clone(&self.storage);
             // Durability point; a failure here is logged, the next write
             // would surface a real storage problem.
-            self.jobs
-                .spawn_blocking(move || Job::Flushed(storage.flush()));
+            if let Some(storage) = self.storage.clone() {
+                self.jobs
+                    .spawn_blocking(move || Job::Flushed(storage.flush()));
+            }
         }
         self.refresh_state();
         if just_finished {

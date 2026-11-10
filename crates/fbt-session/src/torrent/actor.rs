@@ -21,7 +21,7 @@ use tracing::warn;
 
 use super::announcer::{self, Announcer, STOPPED_TIMEOUT, Signals};
 use super::data::Job;
-use super::peers::{Known, Peer, Retries, dialable};
+use super::swarm::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
 use crate::error::SessionError;
@@ -69,12 +69,48 @@ enum Flow {
     Exit,
 }
 
+/// Everything that exists only once the torrent's metadata is known.
+#[derive(Debug)]
+pub(super) struct Loaded {
+    pub meta: Arc<Metainfo>,
+    pub layout: PieceLayout,
+    /// `None` while checking.
+    pub picker: Option<PiecePicker>,
+    pub piece_prio: Vec<u8>,
+    /// Bytes of pieces with a non-zero priority; follows `piece_prio`.
+    pub total_wanted: u64,
+    pub file_prio: Vec<Priority>,
+    pub sequential: bool,
+    /// Partially downloaded pieces, by index.
+    pub bufs: HashMap<u32, Vec<u8>>,
+}
+
+impl Loaded {
+    fn new(meta: Metainfo, file_prio: Vec<Priority>, sequential: bool) -> Self {
+        let meta = Arc::new(meta);
+        let layout = meta.piece_layout();
+        let piece_prio = piece_priorities(&meta, &file_prio);
+        let total_wanted = wanted_bytes(&layout, &piece_prio);
+        Loaded {
+            meta,
+            layout,
+            picker: None,
+            piece_prio,
+            total_wanted,
+            file_prio,
+            sequential,
+            bufs: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Actor {
     pub(super) ih: InfoHashes,
-    pub(super) meta: Arc<Metainfo>,
-    pub(super) layout: PieceLayout,
-    pub(super) storage: Arc<dyn Storage>,
+    /// The metadata and everything built from it; always `Some` for now.
+    pub(super) loaded: Option<Loaded>,
+    /// `None` until the metadata is known.
+    pub(super) storage: Option<Arc<dyn Storage>>,
     pub(super) shared: Arc<Shared>,
     /// The session's registry, which the actor leaves when removed.
     pub(super) session: Weak<SessionInner>,
@@ -87,12 +123,6 @@ pub(crate) struct Actor {
     pub(super) generation: u64,
     pub(super) phase: Phase,
     pub(super) paused: bool,
-    pub(super) picker: Option<PiecePicker>,
-    pub(super) piece_prio: Vec<u8>,
-    /// Bytes of pieces with a non-zero priority; follows `piece_prio`.
-    pub(super) total_wanted: u64,
-    pub(super) file_prio: Vec<Priority>,
-    pub(super) sequential: bool,
     pub(super) peers: HashMap<PeerKey, Peer>,
     pub(super) next_key: u64,
     /// Addresses waiting for a connection slot.
@@ -102,8 +132,6 @@ pub(crate) struct Actor {
     /// Retry schedule and never-retry set of outgoing connections.
     pub(super) retries: Retries,
     pub(super) choker: Choker,
-    /// Partially downloaded pieces, by index.
-    pub(super) bufs: HashMap<u32, Vec<u8>>,
     pub(super) counters: Counters,
     pub(super) last_state: TorrentState,
     /// `TorrentFinished` was emitted for the current set of wanted pieces.
@@ -118,29 +146,28 @@ pub(crate) struct Actor {
 impl Actor {
     pub(super) fn new(
         params: AddTorrent,
-        storage: Arc<dyn Storage>,
+        storage: Option<Arc<dyn Storage>>,
         shared: Arc<Shared>,
         session: Weak<SessionInner>,
         cmds: mpsc::Receiver<Cmd>,
         status_tx: watch::Sender<TorrentStatus>,
     ) -> Self {
-        let meta = Arc::new(params.metainfo);
+        let ih = params.metainfo.info_hashes;
+        let trackers = params.metainfo.trackers.clone();
+        let loaded = Loaded::new(params.metainfo, params.file_priorities, params.sequential);
         let (peer_tx, peer_rx) = mpsc::channel(PEER_EVENT_QUEUE);
-        let piece_prio = piece_priorities(&meta, &params.file_priorities);
-        let total_wanted = wanted_bytes(&meta.piece_layout(), &piece_prio);
         let choker = Choker::new(shared.settings.unchoke_slots);
         let retries = Retries::new(shared.settings.peer_retry_delay);
         let (announcer, tracker_rx) = announcer::spawn(announcer::Params {
-            ih: meta.info_hashes,
-            trackers: meta.trackers.clone(),
+            ih,
+            trackers,
             shared: Arc::clone(&shared),
             status: status_tx.subscribe(),
         })
         .unzip();
         Actor {
-            ih: meta.info_hashes,
-            layout: meta.piece_layout(),
-            meta,
+            ih,
+            loaded: Some(loaded),
             storage,
             shared,
             session,
@@ -155,18 +182,12 @@ impl Actor {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
             paused: params.paused,
-            picker: None,
-            total_wanted,
-            piece_prio,
-            file_prio: params.file_priorities,
-            sequential: params.sequential,
             peers: HashMap::new(),
             next_key: 0,
             candidates: VecDeque::new(),
             known: Known::default(),
             retries,
             choker,
-            bufs: HashMap::new(),
             counters: Counters::default(),
             last_state: TorrentState::CheckingFiles { progress: 0.0 },
             finished_emitted: false,
@@ -216,6 +237,20 @@ impl Actor {
 
     // ----- status and state -------------------------------------------------
 
+    /// The torrent's name; empty until the metadata is known.
+    pub(super) fn name(&self) -> &str {
+        self.loaded
+            .as_ref()
+            .map_or("", |l| l.meta.info.name.as_str())
+    }
+
+    /// Drops every partially downloaded piece.
+    pub(super) fn clear_bufs(&mut self) {
+        if let Some(l) = self.loaded.as_mut() {
+            l.bufs.clear();
+        }
+    }
+
     pub(super) fn emit(&self, ev: Event) {
         self.shared.emit(ev);
     }
@@ -229,7 +264,7 @@ impl Actor {
         match &self.phase {
             Phase::Error(_) => TorrentState::Error,
             Phase::Checking { done, .. } => {
-                let n = self.layout.num_pieces();
+                let n = self.loaded.as_ref().map_or(0, |l| l.layout.num_pieces());
                 let progress = if n == 0 {
                     1.0
                 } else {
@@ -239,7 +274,12 @@ impl Actor {
             }
             Phase::Ready if self.paused => TorrentState::Paused,
             Phase::Ready => {
-                if self.picker.as_ref().is_some_and(PiecePicker::is_finished) {
+                if self
+                    .loaded
+                    .as_ref()
+                    .and_then(|l| l.picker.as_ref())
+                    .is_some_and(PiecePicker::is_finished)
+                {
                     TorrentState::Seeding
                 } else {
                     TorrentState::Downloading
@@ -249,13 +289,18 @@ impl Actor {
     }
 
     pub(super) fn snapshot(&self) -> TorrentStatus {
-        let total_wanted = self.total_wanted;
+        let total_wanted = self.loaded.as_ref().map_or(0, |l| l.total_wanted);
         let wanted_done = self
-            .picker
+            .loaded
             .as_ref()
+            .and_then(|l| l.picker.as_ref())
             .map_or(0, |p| total_wanted.saturating_sub(p.wanted_left_bytes()));
         let progress = if total_wanted == 0 {
-            if self.picker.is_some() { 1.0 } else { 0.0 }
+            if self.loaded.as_ref().is_some_and(|l| l.picker.is_some()) {
+                1.0
+            } else {
+                0.0
+            }
         } else {
             wanted_done as f64 / total_wanted as f64
         };
@@ -272,7 +317,7 @@ impl Actor {
         });
         TorrentStatus {
             info_hashes: self.ih,
-            name: self.meta.info.name.clone(),
+            name: self.name().to_owned(),
             state: self.state(),
             progress,
             total_wanted,
@@ -361,16 +406,19 @@ impl Actor {
         // A check still running belongs to an older generation: stop it
         // instead of letting checks pile up.
         self.cancel_check();
+        let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_mut()) else {
+            return;
+        };
+        let storage = Arc::clone(storage);
+        l.picker = None;
+        let meta = Arc::clone(&l.meta);
+        let layout = l.layout;
         let done = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         self.phase = Phase::Checking {
             done: Arc::clone(&done),
             cancel: Arc::clone(&cancel),
         };
-        self.picker = None;
-        let storage = Arc::clone(&self.storage);
-        let meta = Arc::clone(&self.meta);
-        let layout = self.layout;
         let generation = self.generation;
         self.jobs.spawn_blocking(move || {
             let result = check_pieces(&*storage, &layout, &meta.info.pieces, |i| {
@@ -398,12 +446,15 @@ impl Actor {
         }
         match result {
             Ok(have) => {
-                let mut picker = PiecePicker::new(self.layout, &have);
-                picker.set_piece_priorities(&self.piece_prio);
-                picker.set_sequential(self.sequential);
+                let Some(l) = self.loaded.as_mut() else {
+                    return;
+                };
+                let mut picker = PiecePicker::new(l.layout, &have);
+                picker.set_piece_priorities(&l.piece_prio);
+                picker.set_sequential(l.sequential);
                 // Finishing during this session is what `TorrentFinished` reports.
                 self.finished_emitted = picker.is_finished();
-                self.picker = Some(picker);
+                l.picker = Some(picker);
                 self.phase = Phase::Ready;
                 self.refresh_state();
                 self.requeue_known();
@@ -420,7 +471,7 @@ impl Actor {
         if matches!(self.phase, Phase::Error(_)) {
             return;
         }
-        warn!(torrent = %self.meta.info.name, error = %e, "storage error while {during}");
+        warn!(torrent = %self.name(), error = %e, "storage error while {during}");
         let message = format!("{during}: {e}");
         self.phase = Phase::Error(message.clone());
         self.emit(Event::FileError {
@@ -429,7 +480,7 @@ impl Actor {
             message,
         });
         self.close_all();
-        self.bufs.clear();
+        self.clear_bufs();
         self.refresh_state();
     }
 
@@ -479,9 +530,14 @@ impl Actor {
                 let _ = tx.send(());
             }
             Cmd::Pieces(tx) => {
-                let bf = self.picker.as_ref().map_or_else(
-                    || Bitfield::new(self.layout.num_pieces()),
-                    |p| p.have().clone(),
+                let bf = self.loaded.as_ref().map_or_else(
+                    || Bitfield::new(0),
+                    |l| {
+                        l.picker.as_ref().map_or_else(
+                            || Bitfield::new(l.layout.num_pieces()),
+                            |p| p.have().clone(),
+                        )
+                    },
                 );
                 let _ = tx.send(bf);
             }
@@ -518,7 +574,7 @@ impl Actor {
             // Whatever was in flight when the error hit is unknown: forget
             // the picker and partial pieces and trust only the disk.
             self.generation = self.generation.wrapping_add(1);
-            self.bufs.clear();
+            self.clear_bufs();
             self.start_check();
         }
         self.refresh_state();
@@ -529,25 +585,28 @@ impl Actor {
     pub(super) fn recheck(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.close_all();
-        self.bufs.clear();
+        self.clear_bufs();
         self.start_check();
         self.refresh_state();
     }
 
     pub(super) fn set_priorities(&mut self, p: Vec<Priority>) {
-        self.file_prio = p;
-        self.piece_prio = piece_priorities(&self.meta, &self.file_prio);
-        self.total_wanted = wanted_bytes(&self.layout, &self.piece_prio);
-        if let Some(picker) = self.picker.as_mut() {
-            picker.set_piece_priorities(&self.piece_prio);
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        l.file_prio = p;
+        l.piece_prio = piece_priorities(&l.meta, &l.file_prio);
+        l.total_wanted = wanted_bytes(&l.layout, &l.piece_prio);
+        if let Some(picker) = l.picker.as_mut() {
+            picker.set_piece_priorities(&l.piece_prio);
             // Partial pieces no longer wanted give back their buffers.
             let skipped: Vec<u32> = picker
                 .partial_pieces()
-                .filter(|&i| self.piece_prio.get(i as usize).is_some_and(|&p| p == 0))
+                .filter(|&i| l.piece_prio.get(i as usize).is_some_and(|&p| p == 0))
                 .collect();
             for piece in skipped {
                 picker.piece_failed(piece);
-                self.bufs.remove(&piece);
+                l.bufs.remove(&piece);
             }
             if !picker.is_finished() {
                 self.finished_emitted = false;
@@ -592,17 +651,19 @@ impl Actor {
         }
         // Pending writes finish before files are flushed or deleted.
         while self.jobs.join_next().await.is_some() {}
-        let storage = Arc::clone(&self.storage);
         let delete = remove == Some(RemoveMode::DeleteData);
-        let r = tokio::task::spawn_blocking(move || {
-            if delete {
-                storage.delete_files()
-            } else {
-                storage.flush()
-            }
-        })
-        .await
-        .unwrap_or_else(|e| Err(io::Error::other(e)));
+        let r = match self.storage.clone() {
+            Some(storage) => tokio::task::spawn_blocking(move || {
+                if delete {
+                    storage.delete_files()
+                } else {
+                    storage.flush()
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e))),
+            None => Ok(()),
+        };
         if let Some(a) = self.announcer.take()
             && remove.is_none()
         {
@@ -617,7 +678,7 @@ impl Actor {
         match r {
             Ok(()) => Ok(()),
             Err(e) => {
-                warn!(torrent = %self.meta.info.name, error = %e, "flush or delete failed");
+                warn!(torrent = %self.name(), error = %e, "flush or delete failed");
                 if delete {
                     Err(SessionError::Storage(e))
                 } else {

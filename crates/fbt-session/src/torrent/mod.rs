@@ -1,8 +1,9 @@
 //! One torrent: its public handle and the actor task behind it.
 //!
 //! - `actor`: the event loop, commands, state and status.
-//! - `peers`: connections within the limits, peer events, interest and
-//!   block requests.
+//! - `swarm`: addresses to connect to, connections within the limits,
+//!   sending to and closing peers.
+//! - `peers`: peer events, interest, choking and block requests.
 //! - `data`: block buffering, piece verification and writes.
 //! - `serve`: answering block requests from peers.
 //! - `announcer`, `tiers`: announcing to the trackers (BEP 12 tiers).
@@ -12,6 +13,7 @@ mod announcer;
 mod data;
 mod peers;
 mod serve;
+mod swarm;
 mod tiers;
 
 use std::net::SocketAddr;
@@ -73,7 +75,7 @@ pub struct TorrentHandle {
 /// Starts the actor for `params` and returns its handle.
 pub(crate) fn spawn(
     params: AddTorrent,
-    storage: Arc<dyn Storage>,
+    storage: Option<Arc<dyn Storage>>,
     shared: Arc<Shared>,
     session: Weak<SessionInner>,
 ) -> TorrentHandle {
