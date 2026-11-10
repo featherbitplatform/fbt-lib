@@ -210,6 +210,11 @@ impl Task {
                     return;
                 }
                 Ok(Walk::Failed) => {
+                    if event == AnnounceEvent::Completed {
+                        // Every tracker answered with an error: nothing took
+                        // the `completed`, so it is tried again.
+                        completed_sent = false;
+                    }
                     run.not_before = Some(Instant::now() + self.backoff());
                     self.failed_walks = self.failed_walks.saturating_add(1);
                     run.reannounces = sig.reannounces;
@@ -274,6 +279,9 @@ impl Task {
         tokio::pin!(walk);
         loop {
             tokio::select! {
+                // The walk goes first, so its first request is issued
+                // before a lifecycle change can abandon it.
+                biased;
                 (w, ok) = &mut walk => {
                     if let (Walk::Ok(resp), Some(url)) = (&w, ok) {
                         self.last_ok = Some(url);

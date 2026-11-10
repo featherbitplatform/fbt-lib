@@ -573,6 +573,7 @@ impl Actor {
         if was_error {
             // Whatever was in flight when the error hit is unknown: forget
             // the picker and partial pieces and trust only the disk.
+            self.remember_left();
             self.generation = self.generation.wrapping_add(1);
             self.clear_bufs();
             self.start_check();
@@ -582,14 +583,23 @@ impl Actor {
         self.try_connect();
     }
 
-    pub(super) fn recheck(&mut self) {
-        // The announcer reports this on `stopped`, while the picker is gone.
+    /// Tells the announcer how much is left, before a check drops the
+    /// picker: it reports this on `stopped`. Without a picker the figure is
+    /// meaningless and the earlier one stays.
+    fn remember_left(&self) {
+        if self.loaded.as_ref().is_none_or(|l| l.picker.is_none()) {
+            return;
+        }
         let st = self.snapshot();
         let left = st.total_wanted.saturating_sub(st.wanted_done);
         self.signal(|s| {
             s.left = left;
             true
         });
+    }
+
+    pub(super) fn recheck(&mut self) {
+        self.remember_left();
         self.generation = self.generation.wrapping_add(1);
         self.close_all();
         self.clear_bufs();

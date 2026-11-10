@@ -326,3 +326,34 @@ async fn recheck_stopped_reports_previous_left() {
     assert_eq!(stopped.left, left);
     s.shutdown().await;
 }
+
+/// A `completed` that no tracker took (every walk failed) is retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_is_retried_after_a_failed_walk() {
+    let tracker = FakeTracker::http(Reply::ServerErrorOnFirstCompleted).await;
+    let (m, payload) = torrent(vec![vec![tracker.url.clone()]]);
+    let (seed, _sh) = seeder(&m, &payload, &tracker.url).await;
+    let mut st = settings();
+    st.tracker_retry_base = Duration::from_millis(100);
+    let leech = Session::new(st).await.unwrap();
+    let port = leech.local_addr().port();
+    let storage = Arc::new(MemStorage::new(payload.len() as u64));
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(storage);
+    leech.add_torrent(p).await.unwrap();
+    let completed = |t: &FakeTracker| {
+        t.events_of(port)
+            .iter()
+            .filter(|e| *e == "completed")
+            .count()
+    };
+    assert!(
+        wait_until(|| completed(&tracker) == 2, T).await,
+        "{:?}",
+        tracker.events_of(port)
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(completed(&tracker), 2, "{:?}", tracker.events_of(port));
+    leech.shutdown().await;
+    seed.shutdown().await;
+}

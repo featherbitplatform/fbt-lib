@@ -351,6 +351,9 @@ pub enum Reply {
     /// Peers, but a `completed` announce is answered only after the delay
     /// (HTTP only). The announce is recorded at once.
     PeersDelayCompleted(Duration),
+    /// HTTP 500 for the first `completed` announce, peers otherwise (HTTP
+    /// only).
+    ServerErrorOnFirstCompleted,
 }
 
 #[derive(Debug, Default)]
@@ -511,13 +514,26 @@ async fn http_conn(
             event: event.clone(),
             left,
         });
+    let first_completed = event == "completed"
+        && state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .announces
+            .iter()
+            .filter(|a| a.event == "completed")
+            .count()
+            == 1;
     if let Reply::PeersDelayCompleted(d) = &reply
         && event == "completed"
     {
         tokio::time::sleep(*d).await;
     }
     let (status, body) = match reply {
-        Reply::Peers | Reply::PeersDelayCompleted(_) => {
+        Reply::ServerError => ("500 Internal Server Error", Vec::new()),
+        Reply::ServerErrorOnFirstCompleted if first_completed => {
+            ("500 Internal Server Error", Vec::new())
+        }
+        Reply::Peers | Reply::PeersDelayCompleted(_) | Reply::ServerErrorOnFirstCompleted => {
             let c = compact(&peers);
             let mut body = format!("d8:intervali1800e5:peers{}:", c.len()).into_bytes();
             body.extend_from_slice(&c);
@@ -528,7 +544,6 @@ async fn http_conn(
             "200 OK",
             format!("d14:failure reason{}:{}e", msg.len(), msg).into_bytes(),
         ),
-        Reply::ServerError => ("500 Internal Server Error", Vec::new()),
     };
     let mut resp = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
