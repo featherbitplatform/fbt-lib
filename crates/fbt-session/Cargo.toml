@@ -18,3 +18,9 @@ tls-rustcrypto = ["fbt-tracker/tls-rustcrypto"]
 
 [dependencies]
 fbt-tracker = { path = "../fbt-tracker" }
+fbt-core = { path = "../fbt-core" }
+fbt-metainfo = { path = "../fbt-metainfo" }
+sha1.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

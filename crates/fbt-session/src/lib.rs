@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod error;
+pub mod storage;
+
 #[cfg(test)]
 mod tests {
     #[test]

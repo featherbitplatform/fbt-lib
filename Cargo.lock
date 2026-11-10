@@ -451,7 +451,11 @@ dependencies = [
 name = "fbt-session"
 version = "0.0.0"
 dependencies = [
+ "fbt-core",
+ "fbt-metainfo",
  "fbt-tracker",
+ "sha1",
+ "tempfile",
 ]
 
 [[package]]
