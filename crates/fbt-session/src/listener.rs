@@ -1,18 +1,26 @@
 //! Accepts incoming peer connections and routes them to torrents by the
-//! info hash in their handshake.
+//! info hash in their handshake. The first 20 bytes tell a plaintext
+//! handshake from MSE; MSE connections are answered as responder and
+//! matched to a torrent by `HASH('req2', SKEY)`.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use fbt_wire::{read_handshake, write_handshake};
+use fbt_wire::{
+    CryptoMethods, Handshake, MseStream, is_plaintext_handshake_prefix, read_handshake, respond,
+    write_handshake,
+};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 use tracing::debug;
 
+use crate::peer::conn::{PeerStream, after};
 use crate::session::{SessionInner, Shared};
+use crate::settings::EncryptionPolicy;
 
 /// Pause after a failed `accept` (for example out of file descriptors).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -56,21 +64,19 @@ pub(crate) fn spawn(
     })
 }
 
-async fn route(
-    mut stream: TcpStream,
-    addr: SocketAddr,
-    session: &Weak<SessionInner>,
-    shared: &Shared,
-) {
-    let hs = match timeout(
-        shared.settings.handshake_timeout,
-        read_handshake(&mut stream),
-    )
-    .await
-    {
-        Ok(Ok(hs)) => hs,
-        Ok(Err(e)) => {
-            debug!(%addr, error = %e, "bad incoming handshake");
+/// Why an incoming connection never reached a torrent (logged at debug).
+type Refusal = std::borrow::Cow<'static, str>;
+
+/// Classifies, decrypts and routes one accepted connection. Everything up
+/// to handing it to the torrent (MSE included) shares one
+/// `handshake_timeout` deadline, so a stalled peer gives its pending slot
+/// back in time.
+async fn route(stream: TcpStream, addr: SocketAddr, session: &Weak<SessionInner>, shared: &Shared) {
+    let deadline = after(Instant::now(), shared.settings.handshake_timeout);
+    let (mut stream, hs) = match timeout_at(deadline, accept(stream, session, shared)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(why)) => {
+            debug!(%addr, %why, "incoming connection refused");
             return;
         }
         Err(_) => {
@@ -83,11 +89,7 @@ async fn route(
         // and reports `SelfConnection` (never retried) instead of an I/O
         // error; this side is dropped without reaching the torrent.
         debug!(%addr, "dropping incoming connection from ourselves");
-        let _ = timeout(
-            shared.settings.handshake_timeout,
-            write_handshake(&mut stream, &hs),
-        )
-        .await;
+        let _ = timeout_at(deadline, write_handshake(&mut stream, &hs)).await;
         return;
     }
     let Some(session) = session.upgrade() else {
@@ -108,4 +110,52 @@ async fn route(
         }
         None => debug!(%addr, "incoming connection for an unknown torrent"),
     }
+}
+
+/// Tells plaintext from MSE by the first 20 bytes, applies the encryption
+/// policy, runs the MSE responder if needed and reads the BitTorrent
+/// handshake. Over MSE the handshake must name the torrent of the `SKEY`.
+async fn accept(
+    mut stream: TcpStream,
+    session: &Weak<SessionInner>,
+    shared: &Shared,
+) -> Result<(PeerStream, Handshake), Refusal> {
+    let policy = shared.settings.encryption;
+    let mut first = [0u8; 20];
+    // A short read is a closed peer, not a classification.
+    stream
+        .read_exact(&mut first)
+        .await
+        .map_err(|e| Refusal::Owned(format!("closed before its first bytes: {e}")))?;
+    let (mut stream, skey) = if is_plaintext_handshake_prefix(&first) {
+        if policy == EncryptionPolicy::Forced {
+            return Err("plaintext handshake under the forced encryption policy".into());
+        }
+        (MseStream::plaintext(stream, first.to_vec()), None)
+    } else {
+        let allowed = match policy {
+            EncryptionPolicy::Disabled => {
+                return Err("MSE handshake under the disabled encryption policy".into());
+            }
+            EncryptionPolicy::Forced => CryptoMethods::RC4,
+            EncryptionPolicy::Preferred => CryptoMethods::RC4 | CryptoMethods::PLAINTEXT,
+        };
+        // One map lookup per handshake, keyed by HASH('req2', SKEY).
+        let lookup = |req2: &[u8; 20]| {
+            session
+                .upgrade()
+                .and_then(|s| s.registry().by_req2.get(req2).copied())
+        };
+        let (stream, skey) = respond(stream, first.to_vec(), &lookup, allowed)
+            .await
+            .map_err(|e| Refusal::Owned(format!("MSE handshake failed: {e}")))?;
+        (stream, Some(skey))
+    };
+    let hs = read_handshake(&mut stream)
+        .await
+        .map_err(|e| Refusal::Owned(format!("bad handshake: {e}")))?;
+    if skey.is_some_and(|k| k != hs.info_hash) {
+        return Err("handshake names another torrent than the MSE SKEY".into());
+    }
+    Ok((stream, hs))
 }

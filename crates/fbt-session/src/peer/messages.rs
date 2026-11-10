@@ -3,9 +3,10 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use fbt_core::{Bitfield, BlockRef, PeerId};
-use fbt_wire::Reserved;
+use fbt_core::{Bitfield, BlockRef, PeerId, PieceLayout};
+use fbt_wire::{ExtHandshake, MetadataMsg, PexMsg, Reserved};
 
+use super::ext::ExtConfig;
 use crate::picker::PeerKey;
 
 /// Why a peer connection ended.
@@ -20,6 +21,8 @@ pub enum DisconnectReason {
     HandshakeTimeout,
     /// The remote sent nothing for the idle timeout.
     IdleTimeout,
+    /// The MSE/PE handshake failed or was refused.
+    Encryption(String),
     /// The remote broke the wire protocol.
     Protocol(String),
     /// Transport error, including connect failures and stalled writes.
@@ -31,6 +34,10 @@ pub enum DisconnectReason {
     /// We closed it because the same peer id is already connected to the
     /// torrent; the older connection stays.
     Duplicate,
+    /// The peer advertised an unacceptable metadata size or sent metadata
+    /// that is inconsistent or fails the info-hash check; it is never
+    /// dialled again.
+    BadMetadata,
 }
 
 /// The pieces a remote announced, owned.
@@ -53,6 +60,8 @@ pub(crate) enum PeerEvent {
         peer_id: PeerId,
         reserved: Reserved,
         addr: SocketAddr,
+        /// RC4-encrypted (MSE); false for plaintext, MSE-negotiated or not.
+        encrypted: bool,
     },
     /// The remote's initial piece set.
     Pieces {
@@ -87,6 +96,17 @@ pub(crate) enum PeerEvent {
     Cancel { key: PeerKey, block: BlockRef },
     /// Payload bytes dropped because they matched no outstanding request.
     Wasted { key: PeerKey, bytes: u64 },
+    /// The remote's BEP 10 extension handshake (again after each repeat).
+    /// Every field is untrusted: `metadata_size` is not capped here (the
+    /// metadata fetch applies `max_metadata_size`), `reqq` is clamped to
+    /// [`MAX_REMOTE_REQQ`](super::ext::MAX_REMOTE_REQQ).
+    ExtHandshake { key: PeerKey, hs: Box<ExtHandshake> },
+    /// A BEP 9 `ut_metadata` message.
+    Metadata { key: PeerKey, msg: MetadataMsg },
+    /// A BEP 11 `ut_pex` message.
+    Pex { key: PeerKey, msg: PexMsg },
+    /// The remote's DHT port (BEP 5 `Port`), at most once per connection.
+    DhtPort { key: PeerKey, port: u16 },
     /// The connection ended; `outstanding` lists requests never satisfied.
     Disconnected {
         key: PeerKey,
@@ -117,6 +137,15 @@ pub(crate) enum PeerCommand {
     SendBlock { block: BlockRef, data: Bytes },
     /// Refuse a queued request.
     Reject(BlockRef),
+    /// The metadata arrived: validate and replay the buffered piece
+    /// announcements against `layout`, then run normally. `ext` is what we
+    /// advertise now (our `metadata_size`, and `ut_pex` off for a private
+    /// torrent): a remote speaking BEP 10 gets a repeated handshake.
+    MetadataReady { layout: PieceLayout, ext: ExtConfig },
+    /// Send a `ut_metadata` message (dropped if the remote lacks it).
+    SendMetadata(MetadataMsg),
+    /// Send a `ut_pex` message (dropped if the remote lacks it).
+    SendPex(PexMsg),
     /// Close the connection.
     Close,
 }

@@ -1,30 +1,39 @@
 //! One torrent: its public handle and the actor task behind it.
 //!
 //! - `actor`: the event loop, commands, state and status.
-//! - `peers`: connections within the limits, peer events, interest and
-//!   block requests.
+//! - `swarm`: addresses to connect to, connections within the limits,
+//!   sending to and closing peers.
+//! - `peers`: peer events, interest, choking and block requests.
 //! - `data`: block buffering, piece verification and writes.
 //! - `serve`: answering block requests from peers.
+//! - `metadata`: fetching a magnet's metadata from peers and serving ours
+//!   (BEP 9).
 //! - `announcer`, `tiers`: announcing to the trackers (BEP 12 tiers).
+//! - `dht`: looking up and announcing on the session's DHT.
+//! - `pex`: peer exchange (BEP 11) with connected peers.
 
 mod actor;
 mod announcer;
 mod data;
+mod dht;
+mod metadata;
 mod peers;
+mod pex;
 mod serve;
+mod swarm;
 mod tiers;
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use fbt_core::{Bitfield, InfoHashes};
 use fbt_metainfo::Metainfo;
 use fbt_wire::Handshake;
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::SessionError;
-use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared};
+use crate::peer::conn::PeerStream;
+use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::Storage;
 
@@ -44,7 +53,8 @@ pub(crate) enum Cmd {
     Pieces(oneshot::Sender<Bitfield>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
-        stream: TcpStream,
+        /// Boxed: the MSE stream holds two RC4 states.
+        stream: Box<PeerStream>,
         handshake: Handshake,
         addr: SocketAddr,
     },
@@ -54,7 +64,9 @@ pub(crate) enum Cmd {
 #[derive(Debug)]
 struct HandleInner {
     info_hashes: InfoHashes,
-    num_files: usize,
+    /// Set by the actor once the metadata is known (at spawn for a
+    /// `.torrent`).
+    metainfo: Arc<OnceLock<Arc<Metainfo>>>,
     cmds: mpsc::Sender<Cmd>,
     status: watch::Receiver<TorrentStatus>,
     shared: Arc<Shared>,
@@ -73,24 +85,32 @@ pub struct TorrentHandle {
 /// Starts the actor for `params` and returns its handle.
 pub(crate) fn spawn(
     params: AddTorrent,
-    storage: Arc<dyn Storage>,
+    storage: Option<Arc<dyn Storage>>,
     shared: Arc<Shared>,
     session: Weak<SessionInner>,
 ) -> TorrentHandle {
-    let ih = params.metainfo.info_hashes;
+    let ih = params.source.info_hashes();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
-    let initial = TorrentStatus::initial(ih, params.metainfo.info.name.clone());
+    let initial = match &params.source {
+        TorrentSource::Metainfo(m) => TorrentStatus::initial(ih, m.info.name.clone(), true),
+        TorrentSource::Magnet(m) => {
+            TorrentStatus::initial(ih, m.display_name.clone().unwrap_or_default(), false)
+        }
+    };
     let (status_tx, status_rx) = watch::channel(initial);
+    let metainfo = Arc::new(OnceLock::new());
     let handle = TorrentHandle {
         inner: Arc::new(HandleInner {
             info_hashes: ih,
-            num_files: params.metainfo.info.files.len(),
+            metainfo: Arc::clone(&metainfo),
             cmds: cmd_tx,
             status: status_rx,
             shared: Arc::clone(&shared),
         }),
     };
-    let actor = actor::Actor::new(params, storage, shared, session, cmd_rx, status_tx);
+    let actor = actor::Actor::new(
+        params, storage, metainfo, shared, session, cmd_rx, status_tx,
+    );
     tokio::spawn(actor.run());
     handle
 }
@@ -128,6 +148,12 @@ impl TorrentHandle {
         self.inner.info_hashes
     }
 
+    /// The torrent's metadata; `None` for a magnet until
+    /// [`Event::MetadataReceived`](crate::Event::MetadataReceived).
+    pub fn metainfo(&self) -> Option<Arc<Metainfo>> {
+        self.inner.metainfo.get().cloned()
+    }
+
     /// The latest status snapshot. Still readable after removal or shutdown.
     pub fn status(&self) -> TorrentStatus {
         self.inner.status.borrow().clone()
@@ -152,7 +178,13 @@ impl TorrentHandle {
     }
 
     /// Disconnects every peer and checks the data again.
+    ///
+    /// Fails with [`SessionError::NoMetadata`] for a magnet whose metadata
+    /// has not arrived.
     pub async fn force_recheck(&self) -> Result<(), SessionError> {
+        if self.metainfo().is_none() {
+            return Err(SessionError::NoMetadata);
+        }
         self.call(Cmd::Recheck).await
     }
 
@@ -162,10 +194,19 @@ impl TorrentHandle {
     }
 
     /// Sets one priority per file (pad files included).
+    ///
+    /// Fails with [`SessionError::NoMetadata`] for a magnet whose metadata
+    /// has not arrived.
     pub async fn set_file_priorities(&self, p: Vec<Priority>) -> Result<(), SessionError> {
-        if p.len() != self.inner.num_files {
+        let num_files = self
+            .metainfo()
+            .ok_or(SessionError::NoMetadata)?
+            .info
+            .files
+            .len();
+        if p.len() != num_files {
             return Err(SessionError::InvalidPriorities {
-                expected: self.inner.num_files,
+                expected: num_files,
                 got: p.len(),
             });
         }
@@ -177,7 +218,8 @@ impl TorrentHandle {
         self.call(|tx| Cmd::AddPeer(addr, tx)).await
     }
 
-    /// The pieces verified so far (empty while checking).
+    /// The pieces verified so far (empty while checking, and with no bits
+    /// at all before a magnet's metadata).
     pub async fn pieces(&self) -> Result<Bitfield, SessionError> {
         self.call(Cmd::Pieces).await
     }
@@ -210,14 +252,14 @@ impl TorrentHandle {
     /// its queue is full or it is gone.
     pub(crate) fn offer_incoming(
         &self,
-        stream: TcpStream,
+        stream: PeerStream,
         handshake: Handshake,
         addr: SocketAddr,
     ) -> bool {
         self.inner
             .cmds
             .try_send(Cmd::Incoming {
-                stream,
+                stream: Box::new(stream),
                 handshake,
                 addr,
             })

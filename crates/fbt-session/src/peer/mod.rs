@@ -2,6 +2,7 @@
 //! [`messages::PeerEvent`]s and [`messages::PeerCommand`]s with the torrent.
 
 pub(crate) mod conn;
+pub(crate) mod ext;
 pub(crate) mod messages;
 
 pub use messages::DisconnectReason;

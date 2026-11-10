@@ -684,3 +684,144 @@ async fn extreme_settings_do_not_panic() {
     h.pieces().await.expect("actor alive");
     s.shutdown().await;
 }
+
+// ----- incoming handshakes through the listener ------------------------------
+
+/// A seeding session with a short handshake timeout; returns its torrent's
+/// wire hash.
+async fn listener_session() -> (Session, [u8; 20]) {
+    let mut st = test_settings();
+    st.handshake_timeout = Duration::from_millis(500);
+    let s = Session::new(st).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, payload) = make_torrent(&[("a", 40_000)], 16_384);
+    let mut p = AddTorrent::new(m.clone(), dir.path().to_path_buf());
+    p.storage = Some(std::sync::Arc::new(
+        fbt_session::storage::MemStorage::from_bytes(payload),
+    ));
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    (s, m.info_hashes.wire_hash())
+}
+
+fn raw_handshake(info_hash: [u8; 20]) -> Vec<u8> {
+    let mut v = vec![19u8];
+    v.extend_from_slice(b"BitTorrent protocol");
+    v.extend_from_slice(&[0u8; 8]);
+    v.extend_from_slice(&info_hash);
+    v.extend_from_slice(&[0x24; 20]);
+    v
+}
+
+/// Reads until the remote closes within `within`; returns the bytes read,
+/// or `None` if it stayed open.
+async fn read_to_close(s: &mut tokio::net::TcpStream, within: Duration) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(within, async {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => return got,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+async fn no_peer_connected(ev: &mut fbt_session::EventStream) -> bool {
+    next_matching(
+        ev,
+        |e| matches!(e, Event::PeerConnected { .. }),
+        Duration::from_millis(200),
+    )
+    .await
+    .is_none()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_unknown_info_hash_is_dropped() {
+    use tokio::io::AsyncWriteExt;
+    let (s, _) = listener_session().await;
+    let mut ev = s.subscribe(EventMask::PEER);
+    let mut tcp = tokio::net::TcpStream::connect(s.local_addr())
+        .await
+        .unwrap();
+    tcp.write_all(&raw_handshake([0xab; 20])).await.unwrap();
+    let got = read_to_close(&mut tcp, Duration::from_secs(2))
+        .await
+        .expect("closed");
+    assert!(got.is_empty(), "no handshake for an unknown torrent");
+    assert!(no_peer_connected(&mut ev).await);
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_garbage_is_dropped() {
+    use tokio::io::AsyncWriteExt;
+    let (s, ih) = listener_session().await;
+    let mut ev = s.subscribe(EventMask::PEER);
+    // Neither a BitTorrent handshake nor a valid MSE exchange.
+    let mut tcp = tokio::net::TcpStream::connect(s.local_addr())
+        .await
+        .unwrap();
+    tcp.write_all(&[0xff; 300]).await.unwrap();
+    assert!(
+        read_to_close(&mut tcp, Duration::from_secs(2))
+            .await
+            .is_some(),
+        "garbage connection still open"
+    );
+    // A close right after a short write is dropped too.
+    let mut tcp = tokio::net::TcpStream::connect(s.local_addr())
+        .await
+        .unwrap();
+    tcp.write_all(b"GET / HTTP/1.1").await.unwrap();
+    tcp.shutdown().await.unwrap();
+    assert!(
+        read_to_close(&mut tcp, Duration::from_secs(2))
+            .await
+            .is_some()
+    );
+    assert!(no_peer_connected(&mut ev).await);
+    // The listener still serves real peers.
+    let p = ScriptedPeer::connect(s.local_addr(), ih).await;
+    assert_eq!(p.remote.info_hash, ih);
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_slow_handshake_times_out() {
+    use tokio::io::AsyncWriteExt;
+    let (s, ih) = listener_session().await;
+    let mut tcp = tokio::net::TcpStream::connect(s.local_addr())
+        .await
+        .unwrap();
+    // Half a plaintext handshake, then nothing.
+    tcp.write_all(&raw_handshake(ih)[..30]).await.unwrap();
+    let t0 = tokio::time::Instant::now();
+    let got = read_to_close(&mut tcp, Duration::from_secs(2))
+        .await
+        .expect("closed at the handshake timeout");
+    assert!(got.is_empty());
+    assert!(
+        t0.elapsed() >= Duration::from_millis(300),
+        "closed too early"
+    );
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_valid_plaintext_handshake_is_routed() {
+    let (s, ih) = listener_session().await;
+    let mut ev = s.subscribe(EventMask::PEER);
+    let p = ScriptedPeer::connect(s.local_addr(), ih).await;
+    assert_eq!(p.remote.info_hash, ih);
+    assert_eq!(p.remote.peer_id.0[..3], *b"-FB");
+    next_matching(&mut ev, |e| matches!(e, Event::PeerConnected { .. }), T)
+        .await
+        .expect("PeerConnected");
+    s.shutdown().await;
+}

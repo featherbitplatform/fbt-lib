@@ -2,7 +2,16 @@
 
 A from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent, and an idiomatic async Rust API. It is the engine for featherbittorrent, a future client with a terminal UI, a web UI and media streaming while downloading. It has no UI of its own and runs on macOS, Linux and Windows.
 
-Status: pre-release. Milestone 1 (core download: metainfo, peer wire, HTTP and UDP trackers, a tokio session, verified storage) is complete and v0.1.0 is next; nothing is published to crates.io and the API will change.
+Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 adds the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange, and is heading for v0.2.0. Nothing is published to crates.io and the API will change.
+
+## Features
+
+- Metainfo v1 and hybrid, HTTP(S) and UDP trackers, verified storage, piece picking and a tokio session with an event stream
+- Mainline DHT (BEP 5, BEP 42 node ids) in its own crate, `fbt-dht`
+- Magnet links with metadata exchange from peers (BEP 9, BEP 10)
+- MSE/PE message stream encryption: forced, preferred (the default) or disabled
+- Peer exchange (BEP 11), off for private torrents
+- Pure Rust, no `unsafe`; hostile peer, tracker and `.torrent` input is bounded
 
 ## Usage
 
@@ -38,7 +47,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`fbt-example` is a small command-line downloader and seeder built on the same API.
+### Magnet links
+
+```rust
+use fbt::{AddTorrent, Event, EventMask, Magnet, Session, Settings};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let magnet = Magnet::parse(
+        "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a&dn=example",
+    )?;
+    let session = Session::new(Settings::default()).await?;
+    let mut events = session.subscribe(EventMask::STATUS);
+    let torrent = session
+        .add_torrent(AddTorrent::magnet(magnet, "downloads".into()))
+        .await?;
+    while let Some(event) = events.recv().await {
+        if let Event::MetadataReceived { .. } = event {
+            break;
+        }
+    }
+    println!("got metadata for {}", torrent.status().name);
+    session.shutdown().await;
+    Ok(())
+}
+```
+
+### DHT and encryption defaults
+
+`Settings::default()` turns the DHT on and bootstraps from the public routers in `DEFAULT_DHT_BOOTSTRAP` (`router.bittorrent.com`, `dht.transmissionbt.com`, `router.utorrent.com`). Override them with `dht_bootstrap_nodes` (`host:port` entries), or turn the DHT off with `dht_enabled = false`. The library keeps no state of its own: a client saves `Session::dht_state()` (an opaque blob) on shutdown and passes it back as `Settings::dht_state` next run for a fast start. Private torrents never use the DHT or PEX (`pex_enabled` switches PEX off for the rest).
+
+`Settings::encryption` defaults to `EncryptionPolicy::Preferred`: outgoing connections open with an MSE handshake and may fall back to plain text. `Forced` refuses plain text, `Disabled` never encrypts.
+
+`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`; `fbt-example dht-node` runs a bare DHT node.
 
 ## Feature flags
 
@@ -63,13 +104,13 @@ cargo deny --all-features check
 
 ## Interop and fuzzing
 
-Live interop against qBittorrent-nox and Transmission through opentracker needs Docker (details in [dev/interop/README.md](dev/interop/README.md)):
+Live interop against qBittorrent-nox and Transmission through opentracker, plus magnet via DHT, forced encryption and PEX on an isolated network with its own DHT node (no public node is contacted), needs Docker (details in [dev/interop/README.md](dev/interop/README.md)):
 
 ```
 bash dev/interop/run.sh
 ```
 
-Fuzzing needs nightly and `cargo install cargo-fuzz --locked`. Targets: `bencode`, `metainfo`, `wire_codec`, `handshake`, `http_announce`, `udp_announce`, `path`; seeds live in `fuzz/seeds/<target>/`.
+Fuzzing needs nightly and `cargo install cargo-fuzz --locked`. Targets: `bencode`, `metainfo`, `wire_codec`, `handshake`, `http_announce`, `udp_announce`, `path`, `krpc`, `extension`, `mse`, `magnet`; seeds live in `fuzz/seeds/<target>/`.
 
 ```
 mkdir -p fuzz/corpus/<target>

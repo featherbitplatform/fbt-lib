@@ -16,23 +16,38 @@ use fbt_core::PeerId;
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage, sha1_piece};
 use fbt_session::{Event, EventStream, Settings, TorrentHandle, TorrentState};
-use fbt_wire::{Handshake, Message, MessageCodec, Reserved, read_handshake, write_handshake};
+use fbt_wire::{
+    ExtHandshake, Handshake, Message, MessageCodec, Reserved, read_handshake, write_handshake,
+};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
-/// Settings for tests: loopback listener on a free port, fast status updates.
+/// Settings for tests: loopback listener on a free port, fast status
+/// updates, and no DHT (so no test ever contacts a public DHT node; the DHT
+/// tests bootstrap from a loopback node).
 pub fn test_settings() -> Settings {
     let mut s = Settings::default();
     s.listen_addr = SocketAddr::from(([127, 0, 0, 1], 0));
     s.status_interval = Duration::from_millis(50);
+    s.dht_enabled = false;
+    s.dht_bootstrap_nodes = Vec::new();
     s
 }
 
 /// A multi-file torrent named `torrent` over random data. Returns the
 /// metainfo and the concatenated payload.
 pub fn make_torrent(files: &[(&str, usize)], piece_len: u32) -> (Metainfo, Vec<u8>) {
+    build_torrent(files, piece_len, false)
+}
+
+/// [`make_torrent`] with the BEP 27 private flag set.
+pub fn make_private_torrent(files: &[(&str, usize)], piece_len: u32) -> (Metainfo, Vec<u8>) {
+    build_torrent(files, piece_len, true)
+}
+
+fn build_torrent(files: &[(&str, usize)], piece_len: u32, private: bool) -> (Metainfo, Vec<u8>) {
     let total: usize = files.iter().map(|f| f.1).sum();
     let mut payload = vec![0u8; total];
     rand::rng().fill(payload.as_mut_slice());
@@ -57,6 +72,9 @@ pub fn make_torrent(files: &[(&str, usize)], piece_len: u32) -> (Metainfo, Vec<u
     info.insert(b"name", "torrent");
     info.insert(b"piece length", i64::from(piece_len));
     info.insert(b"pieces", pieces);
+    if private {
+        info.insert(b"private", 1i64);
+    }
     let mut root = DictBuilder::new();
     root.insert(b"info", info.build());
     let bytes = encode(&root.build());
@@ -143,6 +161,49 @@ impl ScriptedPeer {
         if fast {
             reserved.set_fast();
         }
+        Self::connect_raw(addr, info_hash, peer_id, reserved).await
+    }
+
+    /// Connects advertising exactly the `reserved` bits.
+    pub async fn connect_with(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        reserved: Reserved,
+    ) -> ScriptedPeer {
+        Self::connect_raw(addr, info_hash, random_id(), reserved).await
+    }
+
+    /// Accepts one connection on `listener` (the session dialling us,
+    /// without MSE) and answers its handshake with the `reserved` bits.
+    pub async fn accept_with(listener: &TcpListener, reserved: Reserved) -> ScriptedPeer {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("dialled in time")
+            .expect("accept");
+        let remote = tokio::time::timeout(Duration::from_secs(5), read_handshake(&mut stream))
+            .await
+            .expect("handshake in time")
+            .expect("remote handshake");
+        let ours = Handshake {
+            reserved,
+            info_hash: remote.info_hash,
+            peer_id: random_id(),
+        };
+        write_handshake(&mut stream, &ours)
+            .await
+            .expect("handshake");
+        ScriptedPeer {
+            framed: Framed::new(stream, MessageCodec::new(1 << 20)),
+            remote,
+        }
+    }
+
+    async fn connect_raw(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        peer_id: PeerId,
+        reserved: Reserved,
+    ) -> ScriptedPeer {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let ours = Handshake {
             reserved,
@@ -164,6 +225,27 @@ impl ScriptedPeer {
 
     pub async fn send(&mut self, m: Message) {
         self.framed.send(m).await.expect("send");
+    }
+
+    /// Sends a BEP 10 extension handshake.
+    pub async fn send_ext_handshake(&mut self, hs: &ExtHandshake) {
+        self.send(Message::Extended {
+            id: 0,
+            payload: hs.encode(),
+        })
+        .await;
+    }
+
+    /// The payload of the next extended message with `id` within five
+    /// seconds.
+    pub async fn next_ext(&mut self, id: u8) -> Option<Bytes> {
+        match self
+            .next_matching(|m| matches!(m, Message::Extended { id: i, .. } if *i == id))
+            .await
+        {
+            Some(Message::Extended { payload, .. }) => Some(payload),
+            _ => None,
+        }
     }
 
     /// The next message matching `pred` within five seconds.
@@ -335,6 +417,8 @@ pub struct Announce {
     pub port: u16,
     /// `started`, `completed`, `stopped` or `none`.
     pub event: String,
+    /// The `left` the announcer reported.
+    pub left: u64,
 }
 
 /// How a fake tracker answers.
@@ -346,6 +430,12 @@ pub enum Reply {
     Failure(String),
     /// HTTP 500 (HTTP only).
     ServerError,
+    /// Peers, but a `completed` announce is answered only after the delay
+    /// (HTTP only). The announce is recorded at once.
+    PeersDelayCompleted(Duration),
+    /// HTTP 500 for the first `completed` announce, peers otherwise (HTTP
+    /// only).
+    ServerErrorOnFirstCompleted,
 }
 
 #[derive(Debug, Default)]
@@ -486,12 +576,14 @@ async fn http_conn(
     let mut info_hash = [0u8; 20];
     let mut port = 0u16;
     let mut event = "none".to_owned();
+    let mut left = 0u64;
     for pair in query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
             "info_hash" => info_hash.copy_from_slice(&percent_decode(v)),
             "port" => port = v.parse().unwrap(),
             "event" => event = v.to_owned(),
+            "left" => left = v.parse().unwrap(),
             _ => {}
         }
     }
@@ -501,10 +593,29 @@ async fn http_conn(
         .announce(Announce {
             info_hash,
             port,
-            event,
+            event: event.clone(),
+            left,
         });
+    let first_completed = event == "completed"
+        && state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .announces
+            .iter()
+            .filter(|a| a.event == "completed")
+            .count()
+            == 1;
+    if let Reply::PeersDelayCompleted(d) = &reply
+        && event == "completed"
+    {
+        tokio::time::sleep(*d).await;
+    }
     let (status, body) = match reply {
-        Reply::Peers => {
+        Reply::ServerError => ("500 Internal Server Error", Vec::new()),
+        Reply::ServerErrorOnFirstCompleted if first_completed => {
+            ("500 Internal Server Error", Vec::new())
+        }
+        Reply::Peers | Reply::PeersDelayCompleted(_) | Reply::ServerErrorOnFirstCompleted => {
             let c = compact(&peers);
             let mut body = format!("d8:intervali1800e5:peers{}:", c.len()).into_bytes();
             body.extend_from_slice(&c);
@@ -515,7 +626,6 @@ async fn http_conn(
             "200 OK",
             format!("d14:failure reason{}:{}e", msg.len(), msg).into_bytes(),
         ),
-        Reply::ServerError => ("500 Internal Server Error", Vec::new()),
     };
     let mut resp = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -564,6 +674,7 @@ async fn udp_loop(
                     info_hash: b[16..36].try_into().unwrap(),
                     port: u16::from_be_bytes([b[96], b[97]]),
                     event: event.to_owned(),
+                    left: u64::from_be_bytes(b[64..72].try_into().unwrap()),
                 });
             match &reply {
                 Reply::Failure(msg) => {

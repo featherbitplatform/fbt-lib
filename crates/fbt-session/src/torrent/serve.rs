@@ -23,12 +23,14 @@ impl Actor {
         let valid = self.active()
             && p.tx.is_some()
             && !p.am_choking
+            && self.storage.is_some()
             && block.len <= BLOCK_SIZE
-            && self.layout.is_valid_block(&block)
-            && self
-                .picker
-                .as_ref()
-                .is_some_and(|pk| pk.have().get(block.piece));
+            && self.loaded.as_ref().is_some_and(|l| {
+                l.layout.is_valid_block(&block)
+                    && l.picker
+                        .as_ref()
+                        .is_some_and(|pk| pk.have().get(block.piece))
+            });
         if !valid {
             debug!(
                 key = key.0,
@@ -38,8 +40,11 @@ impl Actor {
             self.send(key, PeerCommand::Reject(block));
             return;
         }
-        let storage = Arc::clone(&self.storage);
-        let offset = self.layout.piece_offset(block.piece) + u64::from(block.offset);
+        let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
+            return;
+        };
+        let storage = Arc::clone(storage);
+        let offset = l.layout.piece_offset(block.piece) + u64::from(block.offset);
         let generation = self.generation;
         self.jobs.spawn_blocking(move || {
             let mut buf = vec![0u8; block.len as usize];

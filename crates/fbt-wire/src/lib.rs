@@ -15,13 +15,24 @@
 )]
 
 mod codec;
+mod ext;
 mod fast;
 mod handshake;
 mod message;
+mod mse;
 
 pub use codec::{MessageCodec, WireError};
+pub use ext::{
+    EXT_HANDSHAKE_ID, ExtError, ExtHandshake, MAX_EXT_HANDSHAKE_LEN, MAX_PEX_ENTRIES,
+    METADATA_PIECE_LEN, MetadataMsg, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, PexFlags, PexMsg,
+    UT_METADATA, UT_PEX,
+};
 pub use fast::allowed_fast_set;
 pub use handshake::{
     HANDSHAKE_LEN, Handshake, HandshakeError, Reserved, read_handshake, write_handshake,
 };
 pub use message::Message;
+pub use mse::{
+    CryptoMethods, MSE_MAX_IA, MSE_MAX_PAD, MseError, MseStream, initiate,
+    is_plaintext_handshake_prefix, req2_hash, respond,
+};
