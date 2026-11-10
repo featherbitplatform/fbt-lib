@@ -243,7 +243,8 @@ mod tests {
         let mut out = [0u8; 100];
         s.read(0, &mut out).unwrap();
         assert!(s.open_handles() <= 64);
-        assert_eq!(out.get(99), Some(&99));
+        let expect: Vec<u8> = (0..100).collect();
+        assert_eq!(out.as_slice(), expect.as_slice());
         let _: &Path = dir.path();
     }
 
@@ -254,6 +255,28 @@ mod tests {
         let mut b = [9u8; 4];
         s.read(0, &mut b).unwrap();
         assert_eq!(b, [0, 0, 1, 2]);
-        assert!(s.read(6, &mut [0u8; 4]).is_err());
+        assert_eq!(
+            s.read(6, &mut [0u8; 4]).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn flush_syncs_files_evicted_from_the_handle_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..100).map(|i| format!("f{i}")).collect();
+        let files: Vec<(Vec<&str>, u64, bool)> =
+            names.iter().map(|n| (vec![n.as_str()], 1, false)).collect();
+        let refs: Vec<(&[&str], u64, bool)> = files
+            .iter()
+            .map(|(p, l, d)| (p.as_slice(), *l, *d))
+            .collect();
+        let s = FsStorage::new(dir.path().to_path_buf(), &torrent("t", &refs, 16));
+        for i in 0..100u64 {
+            s.write(i, &[1]).unwrap();
+        }
+        assert!(s.open_handles() <= 64);
+        s.flush().unwrap();
+        assert_eq!(s.synced_files(), 100);
     }
 }

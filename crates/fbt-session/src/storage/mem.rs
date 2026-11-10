@@ -33,8 +33,8 @@ impl Storage for MemStorage {
     fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let r = Self::range(d.len(), offset, buf.len())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        buf.copy_from_slice(d.get(r).ok_or(io::ErrorKind::NotFound)?);
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        buf.copy_from_slice(d.get(r).ok_or(io::ErrorKind::InvalidInput)?);
         Ok(())
     }
 

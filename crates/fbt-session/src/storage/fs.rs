@@ -71,6 +71,9 @@ struct State {
     /// Files whose length was already ensured by this instance.
     sized: HashSet<usize>,
     empties_created: bool,
+    /// Files synced to disk, recorded for the flush-coverage test.
+    #[cfg(test)]
+    synced: HashSet<usize>,
 }
 
 /// Filesystem storage: each torrent file lives at `save_path/<entry path>`.
@@ -107,6 +110,11 @@ impl FsStorage {
     pub fn create_empty_files(&self) -> io::Result<()> {
         let mut st = self.lock();
         self.create_empty_locked(&mut st)
+    }
+
+    #[cfg(test)]
+    pub(super) fn synced_files(&self) -> usize {
+        self.lock().synced.len()
     }
 
     #[cfg(test)]
@@ -176,6 +184,14 @@ impl FsStorage {
                     .min_by_key(|(_, h)| h.last_used)
                     .map(|(k, _)| *k);
                 if let Some(k) = lru {
+                    // Sync before dropping so `flush` covers evicted files too.
+                    if let Some(h) = st.open.get(&k)
+                        && h.writable
+                    {
+                        h.file.sync_data()?;
+                        #[cfg(test)]
+                        st.synced.insert(k);
+                    }
                     st.open.remove(&k);
                 }
             }
@@ -274,9 +290,20 @@ impl Storage for FsStorage {
     }
 
     fn flush(&self) -> io::Result<()> {
-        let st = self.lock();
-        for h in st.open.values().filter(|h| h.writable) {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut st = self.lock();
+        for (_k, h) in st.open.iter().filter(|(_, h)| h.writable) {
             h.file.sync_data()?;
+        }
+        #[cfg(test)]
+        {
+            let keys: Vec<usize> = st
+                .open
+                .iter()
+                .filter(|(_, h)| h.writable)
+                .map(|(k, _)| *k)
+                .collect();
+            st.synced.extend(keys);
         }
         Ok(())
     }
