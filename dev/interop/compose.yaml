@@ -3,9 +3,38 @@
 # exports INTEROP_DIR (target/interop, shared by every container as /interop)
 # and HOST_UID/HOST_GID (so files written there stay owned by the caller).
 # All services share one bridge network and reach each other by service name;
-# `dht-node` (our own bare DHT node) is the only DHT bootstrap for everyone.
+# `dht-node` (our own bare DHT node) is the only DHT bootstrap for fbt-example
+# and qBittorrent; Transmission also lists the helper nodes.
 
 name: fbt-interop
+
+# One node of the private DHT (see `dht-node` below), built by the `fbt`
+# service. Its output is prefixed with its service name
+# (`[dht-helper-3] dht nodes: ...`); run.sh reads the listening lines and the
+# per-node `v4=` and `torrents=` counts.
+x-dht-node: &dht-node
+  image: fbt-interop-fbt:local
+  pull_policy: never
+  init: true
+  user: "${HOST_UID:?run via run.sh}:${HOST_GID:?run via run.sh}"
+  environment: &dht-env
+    RUST_LOG: ${RUST_LOG:-info}
+  command:
+    - sh
+    - -c
+    - |
+      trap 'trap - TERM INT; kill 0' TERM INT
+      fbt-example dht-node --port 6881 $${DHT_BOOTSTRAP:+--dht-bootstrap "$$DHT_BOOTSTRAP"} 2>&1 |
+        sed -u "s/^/[$$DHT_NAME] /" &
+      wait
+  # Healthy once fbt-example runs (it binds its socket first), so the nodes
+  # and clients started after it reach it on their first attempt.
+  healthcheck:
+    test: ["CMD", "pidof", "fbt-example"]
+    interval: 1s
+    timeout: 5s
+    retries: 30
+  networks: [swarm]
 
 services:
   tracker:
@@ -25,7 +54,8 @@ services:
     volumes:
       - ${INTEROP_DIR:?run via run.sh}/qbt-config:/config
       - ${INTEROP_DIR}:/interop
-    depends_on: [dht-node]
+    depends_on:
+      dht-node: {condition: service_healthy}
     networks: [swarm]
 
   transmission:
@@ -38,39 +68,75 @@ services:
     volumes:
       - ${INTEROP_DIR}/tr-config:/config
       - ${INTEROP_DIR}:/interop
-    depends_on: [dht-node]
+    # It pings every dht.bootstrap entry once, so all of them must be up.
+    depends_on:
+      dht-node: {condition: service_healthy}
+      dht-helper-1: {condition: service_healthy}
+      dht-helper-2: {condition: service_healthy}
+      dht-helper-3: {condition: service_healthy}
+      dht-helper-4: {condition: service_healthy}
+      dht-helper-5: {condition: service_healthy}
+      dht-helper-6: {condition: service_healthy}
+      dht-helper-7: {condition: service_healthy}
+      dht-helper-8: {condition: service_healthy}
+      dht-helper-9: {condition: service_healthy}
+      dht-helper-10: {condition: service_healthy}
+      dht-helper-11: {condition: service_healthy}
     networks: [swarm]
 
+  # The private DHT: twelve bare fbt DHT nodes (no torrents), each in its own
+  # container with its own address on `swarm`, all on UDP 6881. `dht-node`
+  # has no bootstrap of its own and is the network's only bootstrap node; the
+  # eleven helpers bootstrap from it. Transmission announces to the DHT only
+  # once its routing table holds at least 4 good and 9 known nodes, hence the
+  # helpers. One address per node matters: the DHT rate-limits inbound
+  # queries per IP (5/s, burst 10), so nodes sharing an address throttle each
+  # other's join, which real DHT nodes never do.
   dht-node:
-    # Bare fbt DHT node (no torrents, no bootstrap of its own) on UDP 6881:
-    # the private network's only bootstrap node. Built by the `fbt` service.
-    # Transmission announces to the DHT only once its routing table holds at
-    # least 4 good and 9 known nodes, so eleven more bare nodes (UDP
-    # 6882-6892, bootstrapped from 6881) give the private DHT enough members.
-    image: fbt-interop-fbt:local
-    pull_policy: never
-    init: true
-    user: "${HOST_UID}:${HOST_GID}"
+    <<: *dht-node
     environment:
-      RUST_LOG: ${RUST_LOG:-info}
-    # Every node's output is prefixed with its port (`[6881] dht nodes: ...`);
-    # run.sh reads the listening lines and the per-node `torrents=` counts.
-    command:
-      - sh
-      - -c
-      - |
-        trap 'trap - TERM INT; kill 0' TERM INT
-        node() {
-          p=$$1
-          shift
-          fbt-example dht-node --port "$$p" "$$@" 2>&1 | sed -u "s/^/[$$p] /"
-        }
-        node 6881 &
-        for port in $$(seq 6882 6892); do
-          node "$$port" --dht-bootstrap dht-node:6881 &
-        done
-        wait
-    networks: [swarm]
+      <<: *dht-env
+      DHT_NAME: dht-node
+      DHT_BOOTSTRAP: ""
+  dht-helper-1: &dht-helper
+    <<: *dht-node
+    environment:
+      <<: *dht-env
+      DHT_NAME: dht-helper-1
+      DHT_BOOTSTRAP: dht-node:6881
+    depends_on:
+      dht-node:
+        condition: service_healthy
+  dht-helper-2:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-2, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-3:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-3, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-4:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-4, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-5:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-5, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-6:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-6, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-7:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-7, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-8:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-8, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-9:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-9, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-10:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-10, DHT_BOOTSTRAP: "dht-node:6881"}
+  dht-helper-11:
+    <<: *dht-helper
+    environment: {<<: *dht-env, DHT_NAME: dht-helper-11, DHT_BOOTSTRAP: "dht-node:6881"}
 
   fbt:
     build:

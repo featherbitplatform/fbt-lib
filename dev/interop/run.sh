@@ -19,12 +19,14 @@ logs="$INTEROP_DIR/logs"
 tracker_url=http://tracker:6969/announce
 # The private DHT's bootstrap node; every fbt-example run uses only this one.
 dht_bootstrap=dht-node:6881
-# DHT nodes in the dht-node container: 6881 plus the helpers 6882-6892.
-dht_nodes=12
-# Nodes there whose store must grow before the magnet test: measured, a
-# qBittorrent announce lands on 2 of them (libtorrent searches through one
-# node per /24) and a Transmission announce on 8 (the closest K).
-announced_nodes=4
+# The private DHT's nodes, one container (and address) each, all on UDP 6881.
+dht_services=(dht-node dht-helper-{1..11})
+dht_nodes=${#dht_services[@]}
+# Nodes among them whose store must grow before the magnet test: measured, a
+# qBittorrent announce alone grows 3 of them (libtorrent searches through one
+# node per /24), and once Transmission's lands too (on its closest K, which
+# include qBittorrent's own node) 7 have grown.
+announced_nodes=5
 
 dc() { docker compose -f "$here/compose.yaml" "$@"; }
 # Commands inside the long-running containers.
@@ -157,25 +159,26 @@ tr_uploaded_changed() { # tr_uploaded_changed <hash> <previous Uploaded>
     [ -n "$up" ] && [ "$up" != "$2" ]
 }
 
-dht_log() { dc logs --no-color --no-log-prefix dht-node; }
+# dht_log: every DHT node's output, each line prefixed `[<service>] `.
+dht_log() { dc logs --no-color --no-log-prefix "${dht_services[@]}"; }
 
-# dht_nodes_up: every node in the dht-node container is listening, every
-# helper knows a node, and the bootstrap node 6881 knows at least as many
-# nodes as there are helpers.
+# dht_nodes_up: every DHT node is listening, every helper knows a node, and
+# the bootstrap node dht-node knows at least as many nodes as there are
+# helpers.
 dht_nodes_up() {
     local log listening joined v4
     log=$(dht_log)
-    listening=$(echo "$log" | grep -c '^\[[0-9]*\] dht node listening on ' || true)
-    joined=$(echo "$log" | sed -n 's/^\[\(68[89][0-9]\)\] dht nodes: v4=\([0-9]*\) .*/\1 \2/p' |
-        awk '$1 != 6881 {c[$1] = $2} END {for (p in c) if (c[p] > 0) n++; print n + 0}')
-    v4=$(echo "$log" | sed -n 's/^\[6881\] dht nodes: v4=\([0-9]*\) .*/\1/p' | tail -n 1)
+    listening=$(echo "$log" | grep -c '^\[[a-z0-9-]*\] dht node listening on ' || true)
+    joined=$(echo "$log" | sed -n 's/^\[\(dht-helper-[0-9]*\)\] dht nodes: v4=\([0-9]*\) .*/\1 \2/p' |
+        awk '{c[$1] = $2} END {for (p in c) if (c[p] > 0) n++; print n + 0}')
+    v4=$(echo "$log" | sed -n 's/^\[dht-node\] dht nodes: v4=\([0-9]*\) .*/\1/p' | tail -n 1)
     [ "$listening" -eq "$dht_nodes" ] && [ "$joined" -eq $((dht_nodes - 1)) ] &&
         [ "${v4:-0}" -ge $((dht_nodes - 1)) ]
 }
 
-# dht_store_counts: "<port> <stored info hashes>" per node, latest report.
+# dht_store_counts: "<service> <stored info hashes>" per node, latest report.
 dht_store_counts() {
-    dht_log | sed -n 's/^\[\([0-9]*\)\] dht nodes: .* torrents=\([0-9]*\)$/\1 \2/p' |
+    dht_log | sed -n 's/^\[\([a-z0-9-]*\)\] dht nodes: .* torrents=\([0-9]*\)$/\1 \2/p' |
         awk '{c[$1] = $2} END {for (p in c) print p, c[p]}' | sort
 }
 
@@ -244,10 +247,14 @@ cp "$here/transmission/settings.json" "$here/transmission/dht.bootstrap" "$INTER
 echo "interop: building and starting containers"
 dc build --quiet
 dc --progress quiet pull --ignore-buildable --policy missing
+# Timed from here: `up` itself waits for dht-node (and Transmission for every
+# helper) to be healthy.
+dht_started=$SECONDS
 dc up -d --quiet-pull
 [ "$(docker network inspect fbt-interop_swarm --format '{{.Internal}}')" = true ] ||
     fail "the swarm network is not internal"
-wait_for "all $dht_nodes DHT nodes in dht-node to listen and join" 120 dht_nodes_up
+wait_for "all $dht_nodes DHT nodes to listen and join" 120 dht_nodes_up
+echo "interop: all $dht_nodes DHT nodes joined $((SECONDS - dht_started))s after starting the containers"
 wait_for "opentracker" 60 fbt curl -fsS http://tracker:6969/stats
 wait_for "qBittorrent WebUI" 120 qbt_api app/version
 wait_for "Transmission RPC" 120 trc timeout 15 transmission-remote -l
@@ -342,7 +349,7 @@ hash3=$(info_hash /interop/fixture3.torrent)
 [ -n "$hash3" ] || fail "could not read the info hash of fixture3.torrent"
 
 # Nothing else is announcing now, so a node whose store count grows from here
-# on stores fixture3. qBittorrent's announce alone grows 2 of dht-node's
+# on stores fixture3. qBittorrent's announce alone grows 3 of the DHT nodes'
 # stores; announced_nodes or more mean Transmission's has landed too.
 dht_baseline=$(dht_store_counts)
 echo "interop: seeding fixture3 from qBittorrent and Transmission (DHT only)"
@@ -352,9 +359,9 @@ trc transmission-remote -a /interop/fixture3.torrent -w /interop/payload3 >/dev/
 wait_for "qBittorrent to verify and seed fixture3" 120 qbt_seeding "$hash3"
 wait_for "Transmission to verify and seed fixture3" 120 tr_complete "$hash3"
 announce_started=$SECONDS
-wait_for "Transmission to announce fixture3 ($announced_nodes or more dht-node stores grown)" 240 \
+wait_for "Transmission to announce fixture3 ($announced_nodes or more DHT node stores grown)" 240 \
     dht_announced "$dht_baseline"
-echo "interop: fixture3 stored on $(dht_new_stores "$dht_baseline") of $dht_nodes dht-node nodes after $((SECONDS - announce_started))s"
+echo "interop: fixture3 stored on $(dht_new_stores "$dht_baseline") of $dht_nodes DHT nodes after $((SECONDS - announce_started))s"
 
 # --no-pex: with no tracker and no x.pe either, an outgoing connection to a
 # client's listen port can only come from an address the DHT handed out. Our
@@ -417,3 +424,4 @@ grep -Eq 'found .* peers via pex' "$logs/fbt-pex.log" ||
 grep -q "^peer connected $tr_ip:51413$" "$logs/fbt-pex.log" ||
     fail "never connected to Transmission, which only PEX could name (see $logs/fbt-pex.log)"
 echo "interop: PEX OK"
+echo "interop: all scenarios passed in ${SECONDS}s"
