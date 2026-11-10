@@ -42,4 +42,9 @@ cargo deny --all-features check
 # Local security scans via Docker (semgrep, deny, grype, gitleaks, sbom)
 bash dev/sast.sh              # everything
 bash dev/sast.sh semgrep      # one tool
+
+# Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec
+# handshake http_announce udp_announce path. Seeds live in fuzz/seeds/<target>/.
+mkdir -p fuzz/corpus/<target>
+cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 ```
