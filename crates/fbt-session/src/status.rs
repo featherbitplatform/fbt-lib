@@ -6,6 +6,8 @@ use fbt_core::InfoHashes;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum TorrentState {
+    /// A magnet torrent is fetching its metadata from peers.
+    DownloadingMetadata,
     /// Existing data is being hash-checked; `progress` is in `0.0..=1.0`.
     CheckingFiles {
         /// Fraction of pieces checked.
@@ -17,7 +19,8 @@ pub enum TorrentState {
     Seeding,
     /// Stopped by the user: no peers, no announces.
     Paused,
-    /// Stopped by a storage error; see [`TorrentStatus::error`].
+    /// Stopped by a storage error or invalid metadata; see
+    /// [`TorrentStatus::error`].
     Error,
 }
 
@@ -27,8 +30,12 @@ pub enum TorrentState {
 pub struct TorrentStatus {
     /// The torrent's info hashes.
     pub info_hashes: InfoHashes,
-    /// The torrent's name.
+    /// The torrent's name; for a magnet without metadata, its `dn` (or
+    /// empty).
     pub name: String,
+    /// The metadata is known (always for a `.torrent`; for a magnet once
+    /// [`Event::MetadataReceived`](crate::Event::MetadataReceived) is out).
+    pub has_metadata: bool,
     /// Current state.
     pub state: TorrentState,
     /// `wanted_done / total_wanted`, in `0.0..=1.0`.
@@ -51,16 +58,21 @@ pub struct TorrentStatus {
     pub num_peers: u32,
     /// Connected peers that have every piece.
     pub num_seeds: u32,
-    /// The storage error that stopped the torrent.
+    /// The storage or metadata error that stopped the torrent.
     pub error: Option<String>,
 }
 
 impl TorrentStatus {
-    pub(crate) fn initial(info_hashes: InfoHashes, name: String) -> Self {
+    pub(crate) fn initial(info_hashes: InfoHashes, name: String, has_metadata: bool) -> Self {
         TorrentStatus {
             info_hashes,
             name,
-            state: TorrentState::CheckingFiles { progress: 0.0 },
+            has_metadata,
+            state: if has_metadata {
+                TorrentState::CheckingFiles { progress: 0.0 }
+            } else {
+                TorrentState::DownloadingMetadata
+            },
             progress: 0.0,
             total_wanted: 0,
             wanted_done: 0,

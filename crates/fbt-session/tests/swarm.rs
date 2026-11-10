@@ -13,10 +13,13 @@ use fbt_core::BlockRef;
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage};
 use fbt_session::{
-    AddTorrent, DisconnectReason, Event, EventMask, Priority, Session, Settings, TorrentHandle,
-    TorrentState,
+    AddTorrent, DisconnectReason, EncryptionPolicy, Event, EventMask, Priority, Session, Settings,
+    TorrentHandle, TorrentState,
 };
-use fbt_wire::Message;
+use fbt_wire::{
+    ExtHandshake, Message, MetadataMsg, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, Reserved, UT_METADATA,
+    UT_PEX,
+};
 use support::*;
 
 const T: Duration = Duration::from_secs(30);
@@ -478,7 +481,10 @@ async fn piece_finished_while_a_peer_connects_is_announced() {
 
     let (m, payload) = make_torrent(&[("a", 4 * 16_384)], 16_384);
     let ih = m.info_hashes.wire_hash();
-    let (s, h, _) = mem_leecher(&m, payload.len()).await;
+    // The hand-driven remote below speaks plaintext only.
+    let mut st = settings();
+    st.encryption = EncryptionPolicy::Disabled;
+    let (s, h, _) = mem_leecher_with(st, &m, payload.len()).await;
     let mut ev = s.subscribe(EventMask::PIECE);
 
     // A remote that accepts our connection but holds back its handshake.
@@ -562,5 +568,313 @@ async fn duplicate_peer_id_is_rejected() {
         .next_matching(|m| *m == Message::Unchoke)
         .await
         .expect("the first connection still works");
+    s.shutdown().await;
+}
+
+/// Two sessions dialling each other at once end up with exactly one
+/// connection: both ends keep the one the lower peer id initiated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_dial_leaves_one_connection() {
+    let (m, payload) = make_torrent(&[("a", 1 << 20)], 65_536);
+    let (a, ha) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+    let (b, hb, storage) = mem_leecher(&m, payload.len()).await;
+    let mut ev = b.subscribe(EventMask::ALL);
+    let (ra, rb) = tokio::join!(ha.add_peer(b.local_addr()), hb.add_peer(a.local_addr()));
+    ra.unwrap();
+    rb.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(ha.status().num_peers, 1, "seeder peers");
+    assert_eq!(hb.status().num_peers, 1, "leecher peers");
+    finished(&mut ev).await;
+    assert!(stored(&storage, payload.len()) == payload, "data differs");
+    b.shutdown().await;
+    a.shutdown().await;
+}
+
+/// Two upload slots, three interested peers and a leecher: peer A uploads
+/// to us fastest and keeps its slot, while the optimistic slot rotates, so a
+/// peer that was unchoked gets a `Choke`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rechoke_chokes_peer_that_lost_its_slot() {
+    use futures_util::{SinkExt, StreamExt};
+    let piece_len = 32_768u32;
+    let (m, payload) = make_torrent(&[("a", 2 << 20)], piece_len);
+    let mut st = settings();
+    st.unchoke_slots = 2;
+    st.rechoke_interval = Duration::from_millis(200);
+    let (s, _h, _storage) = mem_leecher_with(st, &m, payload.len()).await;
+    let pieces = fbt_core::Bitfield::full(m.info.pieces.len() as u32);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    for id in 0..3usize {
+        let mut peer = ScriptedPeer::connect(s.local_addr(), m.info_hashes.wire_hash()).await;
+        let fastest = id == 0;
+        if fastest {
+            peer.send(Message::Bitfield(bytes::Bytes::copy_from_slice(
+                pieces.as_bytes(),
+            )))
+            .await;
+            peer.send(Message::Unchoke).await;
+        }
+        peer.send(Message::Interested).await;
+        let tx = tx.clone();
+        let payload = payload.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = peer.framed.next().await {
+                match msg {
+                    Message::Choke | Message::Unchoke => {
+                        if tx.send((id, msg)).is_err() {
+                            return;
+                        }
+                    }
+                    // A throttled uploader: about 1.6 MB/s.
+                    Message::Request(b) if fastest => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        let at = b.piece as usize * piece_len as usize + b.offset as usize;
+                        let data = bytes::Bytes::copy_from_slice(&payload[at..at + b.len as usize]);
+                        let piece = Message::Piece {
+                            piece: b.piece,
+                            offset: b.offset,
+                            data,
+                        };
+                        if peer.framed.send(piece).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    let mut unchoked = [false; 3];
+    let deadline = tokio::time::Instant::now() + T;
+    loop {
+        let (id, msg) = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("a Choke after an Unchoke in time")
+            .expect("peers alive");
+        if msg == Message::Choke {
+            assert_ne!(id, 0, "the fastest uploader keeps its slot");
+            if unchoked[id] {
+                break;
+            }
+        } else {
+            unchoked[id] = true;
+        }
+    }
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_while_choked_gets_reject_with_fast() {
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let (s, _h) = seeder(&m, Arc::new(MemStorage::from_bytes(payload))).await;
+    let mut peer = ScriptedPeer::connect_fast(s.local_addr(), m.info_hashes.wire_hash()).await;
+    peer.send(Message::HaveNone).await;
+    // Not interested, so still choked.
+    let block = BlockRef {
+        piece: 0,
+        offset: 0,
+        len: 16_384,
+    };
+    peer.send(Message::Request(block)).await;
+    let got = peer
+        .next_matching(|m| matches!(m, Message::RejectRequest(_) | Message::Piece { .. }))
+        .await;
+    assert_eq!(got, Some(Message::RejectRequest(block)));
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_while_choked_without_fast_is_dropped() {
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let (s, _h) = seeder(&m, Arc::new(MemStorage::from_bytes(payload))).await;
+    let mut peer = ScriptedPeer::connect(s.local_addr(), m.info_hashes.wire_hash()).await;
+    peer.send(Message::Request(BlockRef {
+        piece: 0,
+        offset: 0,
+        len: 16_384,
+    }))
+    .await;
+    let mut piece = false;
+    let end = tokio::time::timeout(Duration::from_secs(1), async {
+        use futures_util::StreamExt;
+        while let Some(Ok(m)) = peer.framed.next().await {
+            piece |= matches!(m, Message::Piece { .. });
+        }
+    })
+    .await;
+    assert!(!piece, "no Piece while choked");
+    assert!(end.is_err(), "the connection stays up");
+    s.shutdown().await;
+}
+
+/// The one upload slot rotates away from a peer with queued requests: its
+/// `Choke` is followed by a `RejectRequest` for each request that was not
+/// served yet (fast extension), and none of those is also served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn choke_rejects_queued_requests_with_fast() {
+    use futures_util::StreamExt;
+    use std::collections::HashSet;
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let mut st = settings();
+    st.unchoke_slots = 1;
+    st.rechoke_interval = Duration::from_millis(100);
+    let s = Session::new(st).await.unwrap();
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(Arc::new(SlowStorage::new(
+        payload,
+        Duration::from_millis(400),
+    )));
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+
+    let blocks: Vec<BlockRef> = (0..6)
+        .map(|i| BlockRef {
+            piece: 0,
+            offset: i * 2_000,
+            len: 2_000,
+        })
+        .collect();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    for id in 0..2usize {
+        let mut peer = ScriptedPeer::connect_fast(s.local_addr(), m.info_hashes.wire_hash()).await;
+        peer.send(Message::HaveNone).await;
+        peer.send(Message::Interested).await;
+        let tx = tx.clone();
+        let blocks = blocks.clone();
+        tokio::spawn(async move {
+            let mut asked = false;
+            while let Some(Ok(msg)) = peer.framed.next().await {
+                let first_unchoke = msg == Message::Unchoke && !asked;
+                if tx.send((id, msg)).is_err() {
+                    return;
+                }
+                if first_unchoke {
+                    asked = true;
+                    for b in &blocks {
+                        peer.send(Message::Request(*b)).await;
+                    }
+                }
+            }
+        });
+    }
+    let mut unchoked = [false; 2];
+    let mut served: [HashSet<BlockRef>; 2] = Default::default();
+    let mut rejected: [HashSet<BlockRef>; 2] = Default::default();
+    let mut choked_at = None;
+    let mut choked = None;
+    let deadline = tokio::time::Instant::now() + T;
+    loop {
+        let wait = match choked_at {
+            Some(t) => t,
+            None => deadline,
+        };
+        let Ok(Some((id, msg))) = tokio::time::timeout_at(wait, rx.recv()).await else {
+            break;
+        };
+        match msg {
+            Message::Unchoke => unchoked[id] = true,
+            Message::Choke if unchoked[id] && choked_at.is_none() => {
+                // The rejects follow in the same flush; give them a moment.
+                choked_at = Some(tokio::time::Instant::now() + Duration::from_millis(300));
+                unchoked = [false; 2];
+                unchoked[id] = true;
+                choked = Some(id);
+            }
+            Message::RejectRequest(b) => {
+                rejected[id].insert(b);
+            }
+            Message::Piece { offset, data, .. } if choked.is_none() => {
+                served[id].insert(BlockRef {
+                    piece: 0,
+                    offset,
+                    len: data.len() as u32,
+                });
+            }
+            _ => {}
+        }
+    }
+    assert!(choked_at.is_some(), "a peer got choked");
+    let id = choked.expect("the choked peer");
+    assert!(!rejected[id].is_empty(), "queued requests rejected");
+    assert!(rejected[id].iter().all(|b| blocks.contains(b)));
+    assert!(rejected[id].is_disjoint(&served[id]));
+    s.shutdown().await;
+}
+
+/// A request for a piece we lack, from a peer we do unchoke, is refused on
+/// the wire (the `Reject` command reaches the peer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_for_missing_piece_is_rejected_on_the_wire() {
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let (s, _h, _storage) = mem_leecher(&m, payload.len()).await;
+    let mut peer = ScriptedPeer::connect_fast(s.local_addr(), m.info_hashes.wire_hash()).await;
+    peer.send(Message::HaveNone).await;
+    peer.send(Message::Interested).await;
+    peer.next_matching(|m| *m == Message::Unchoke)
+        .await
+        .expect("Unchoke");
+    let block = BlockRef {
+        piece: 1,
+        offset: 0,
+        len: 16_384,
+    };
+    peer.send(Message::Request(block)).await;
+    let got = peer
+        .next_matching(|m| matches!(m, Message::RejectRequest(_) | Message::Piece { .. }))
+        .await;
+    assert_eq!(got, Some(Message::RejectRequest(block)));
+    s.shutdown().await;
+}
+
+/// A BEP 10 peer gets our extension handshake (listen port, metadata size,
+/// `ut_metadata` and `ut_pex` for a public torrent) before our pieces, and
+/// its own handshake and extended messages leave the connection up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_handshake_with_a_session() {
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let (s, _h) = seeder(&m, Arc::new(MemStorage::from_bytes(payload))).await;
+    let mut reserved = Reserved::default();
+    reserved.set_fast();
+    reserved.set_extended();
+    let mut peer =
+        ScriptedPeer::connect_with(s.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    assert!(peer.remote.reserved.supports_extended());
+    assert!(!peer.remote.reserved.supports_dht());
+    let first = peer.next_matching(|_| true).await.expect("first message");
+    let Message::Extended { id: 0, payload } = first else {
+        panic!("expected the extension handshake first, got {first:?}");
+    };
+    let hs = ExtHandshake::decode(&payload).expect("decode");
+    assert_eq!(hs.id_of(UT_METADATA), Some(OUR_UT_METADATA_ID));
+    assert_eq!(hs.id_of(UT_PEX), Some(OUR_UT_PEX_ID));
+    assert_eq!(hs.listen_port, Some(s.local_addr().port()));
+    assert_eq!(hs.metadata_size, Some(m.raw_info().len() as u32));
+    assert!(matches!(
+        peer.next_matching(|_| true).await,
+        Some(Message::HaveAll)
+    ));
+
+    let mut theirs = ExtHandshake {
+        listen_port: Some(7000),
+        ..ExtHandshake::default()
+    };
+    theirs.m.insert(UT_METADATA.to_owned(), 3);
+    peer.send_ext_handshake(&theirs).await;
+    // A metadata request and a `Port` leave the connection up.
+    peer.send(Message::Extended {
+        id: OUR_UT_METADATA_ID,
+        payload: MetadataMsg::Request { piece: 0 }.encode(),
+    })
+    .await;
+    peer.send(Message::Port(7001)).await;
+    peer.send(Message::Interested).await;
+    assert!(
+        peer.next_matching(|m| *m == Message::Unchoke)
+            .await
+            .is_some(),
+        "the seeder unchokes the interested peer"
+    );
     s.shutdown().await;
 }

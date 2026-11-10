@@ -37,4 +37,12 @@ pub enum SessionError {
     /// names the field.
     #[error("invalid settings: {0}")]
     InvalidSettings(String),
+    /// The command needs the torrent's metadata, which a magnet torrent
+    /// has not received yet.
+    #[error("the torrent's metadata is not known yet")]
+    NoMetadata,
+    /// A magnet with only a v2 (`btmh`) info hash: v2-only torrents are not
+    /// supported yet.
+    #[error("v2-only torrents are not supported")]
+    V2OnlyUnsupported,
 }

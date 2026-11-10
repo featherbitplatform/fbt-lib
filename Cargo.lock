@@ -542,6 +542,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-dht"
+version = "0.1.0"
+dependencies = [
+ "fbt-bencode",
+ "fbt-core",
+ "proptest",
+ "rand",
+ "sha1",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-example"
 version = "0.1.0"
 dependencies = [
@@ -574,6 +589,7 @@ dependencies = [
  "bytes",
  "fbt-bencode",
  "fbt-core",
+ "fbt-dht",
  "fbt-metainfo",
  "fbt-tracker",
  "fbt-wire",
@@ -611,9 +627,14 @@ dependencies = [
 name = "fbt-wire"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "bytes",
+ "crypto-bigint",
+ "fbt-bencode",
  "fbt-core",
  "proptest",
+ "rand",
+ "rc4",
  "sha1",
  "thiserror",
  "tokio",
@@ -1168,6 +1189,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
 dependencies = [
  "rand_core",
+]
+
+[[package]]
+name = "rc4"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "840038b674daa9f7a7957440d937951d15c0143c056e631e529141fd780e0c92"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]

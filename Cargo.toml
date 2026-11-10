@@ -24,10 +24,15 @@ all = "warn"
 thiserror = "2"
 bytes = "1.12"
 tokio = { version = "1", default-features = false }
+# DHT: an IPv6-only UDP socket (IPV6_V6ONLY) so both families share a port.
+socket2 = "0.6"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 proptest = "1.12"
 sha1 = "0.11"
+# MSE/PE: rc4 0.2 uses cipher 0.5, the same RustCrypto generation as sha1 0.11.
+rc4 = "0.2"
+crypto-bigint = { version = "0.7", default-features = false }
 tempfile = "3"
 sha2 = "0.11"
 rand = "0.10"

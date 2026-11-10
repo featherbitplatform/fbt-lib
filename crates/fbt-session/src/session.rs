@@ -7,11 +7,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fbt_core::{InfoHashes, PeerId};
-use fbt_metainfo::Metainfo;
+use fbt_dht::{Dht, DhtConfig, DhtError, DhtState, DhtStats};
+use fbt_metainfo::{Magnet, Metainfo};
 use fbt_tracker::TrackerClient;
+use fbt_wire::req2_hash;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::error::SessionError;
 use crate::event::{Event, EventMask, EventStream};
@@ -57,19 +60,41 @@ pub enum RemoveMode {
     DeleteData,
 }
 
+/// What a torrent is added from.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum TorrentSource {
+    /// A parsed `.torrent`.
+    Metainfo(Box<Metainfo>),
+    /// A magnet link: the metadata is fetched from peers (BEP 9) and
+    /// verified against its info hash.
+    Magnet(Magnet),
+}
+
+impl TorrentSource {
+    /// The info hashes the torrent is known by.
+    pub(crate) fn info_hashes(&self) -> InfoHashes {
+        match self {
+            TorrentSource::Metainfo(m) => m.info_hashes,
+            TorrentSource::Magnet(m) => m.info_hashes,
+        }
+    }
+}
+
 /// Parameters for [`Session::add_torrent`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct AddTorrent {
     /// The torrent.
-    pub metainfo: Metainfo,
+    pub source: TorrentSource,
     /// Directory the torrent's files live below.
     pub save_path: PathBuf,
     /// Start paused (the existing data is still checked).
     pub paused: bool,
     /// Download pieces in index order instead of rarest first.
     pub sequential: bool,
-    /// One per file (pad files included); empty means all `Normal`.
+    /// One per file (pad files included); empty means all `Normal`. Must be
+    /// empty for a magnet (its `so` selection applies instead).
     pub file_priorities: Vec<Priority>,
     /// Custom storage; `None` uses the filesystem below `save_path`.
     pub storage: Option<Arc<dyn Storage>>,
@@ -79,8 +104,18 @@ impl AddTorrent {
     /// Adds `metainfo` with its files below `save_path`, every other field
     /// at its default.
     pub fn new(metainfo: Metainfo, save_path: PathBuf) -> Self {
+        Self::from_source(TorrentSource::Metainfo(Box::new(metainfo)), save_path)
+    }
+
+    /// Adds a magnet link with its files below `save_path`, every other
+    /// field at its default.
+    pub fn magnet(magnet: Magnet, save_path: PathBuf) -> Self {
+        Self::from_source(TorrentSource::Magnet(magnet), save_path)
+    }
+
+    fn from_source(source: TorrentSource, save_path: PathBuf) -> Self {
         AddTorrent {
-            metainfo,
+            source,
             save_path,
             paused: false,
             sequential: false,
@@ -105,6 +140,22 @@ pub(crate) struct Shared {
     pub global_peers: AtomicUsize,
     /// Outgoing connections still connecting or handshaking.
     pub half_open: AtomicUsize,
+    /// The session-wide DHT node; `None` with `dht_enabled` off.
+    pub dht: Option<Dht>,
+    /// The DHT's UDP sockets; `Port` messages carry the port of the one
+    /// matching the peer's address family ([`dht_port_for`]).
+    pub dht_addrs: Vec<SocketAddr>,
+}
+
+/// The DHT port to send a peer at `peer` in `Port`: that of our DHT socket
+/// of the same address family (an IPv4-mapped IPv6 peer counts as IPv4),
+/// `None` without one, since the peer could not reach the other socket.
+pub(crate) fn dht_port_for(dht_addrs: &[SocketAddr], peer: &SocketAddr) -> Option<u16> {
+    let v4 = peer.ip().to_canonical().is_ipv4();
+    dht_addrs
+        .iter()
+        .find(|a| a.is_ipv4() == v4)
+        .map(SocketAddr::port)
 }
 
 impl Shared {
@@ -143,6 +194,9 @@ pub(crate) struct TorrentEntry {
 pub(crate) struct Registry {
     pub torrents: HashMap<InfoHashes, TorrentEntry>,
     pub by_wire: HashMap<[u8; 20], InfoHashes>,
+    /// `HASH('req2', wire hash)` to the wire hash (the MSE `SKEY`), kept
+    /// with `by_wire`, so an MSE responder finds its torrent in one lookup.
+    pub by_req2: HashMap<[u8; 20], [u8; 20]>,
 }
 
 #[derive(Debug)]
@@ -164,6 +218,7 @@ impl SessionInner {
         match reg.torrents.remove(ih) {
             Some(e) => {
                 reg.by_wire.remove(&e.wire_hash);
+                reg.by_req2.remove(&req2_hash(&e.wire_hash));
                 true
             }
             None => false,
@@ -208,6 +263,12 @@ impl Session {
         let tracker =
             TrackerClient::new(settings.tracker.clone()).map_err(SessionError::Tracker)?;
         let (events, _) = broadcast::channel(settings.event_queue);
+        let dht = if settings.dht_enabled {
+            start_dht(&settings, local_addr).await
+        } else {
+            None
+        };
+        let dht_addrs = dht.as_ref().map(Dht::local_addrs).unwrap_or_default();
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -217,7 +278,12 @@ impl Session {
             shutdown: AtomicBool::new(false),
             global_peers: AtomicUsize::new(0),
             half_open: AtomicUsize::new(0),
+            dht,
+            dht_addrs,
         });
+        if let Some(dht) = &shared.dht {
+            watch_bootstrap(dht, Arc::downgrade(&shared));
+        }
         let inner = Arc::new(SessionInner {
             shared: Arc::clone(&shared),
             local_addr,
@@ -229,25 +295,61 @@ impl Session {
         Ok(Session { inner })
     }
 
+    /// The session's DHT node, `None` with [`Settings::dht_enabled`] off.
+    pub fn dht_stats(&self) -> Option<DhtStats> {
+        self.inner.shared.dht.as_ref().map(Dht::stats)
+    }
+
+    /// The DHT's state (node ids and known nodes) for
+    /// [`Settings::dht_state`] in a later session, `None` with the DHT off.
+    /// The library never writes it anywhere: storing it is the caller's
+    /// job, typically just before [`shutdown`](Self::shutdown).
+    ///
+    /// Fails with [`SessionError::Shutdown`] once the session (and its
+    /// DHT) has shut down.
+    pub async fn dht_state(&self) -> Result<Option<Vec<u8>>, SessionError> {
+        let Some(dht) = &self.inner.shared.dht else {
+            return Ok(None);
+        };
+        let state = dht.state().await.map_err(|_| SessionError::Shutdown)?;
+        Ok(Some(state.to_bytes()))
+    }
+
     /// The address the peer listener is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
     }
 
-    /// Adds a torrent and starts checking its existing data.
+    /// Adds a torrent and starts checking its existing data. A magnet
+    /// starts in [`TorrentState::DownloadingMetadata`](crate::TorrentState)
+    /// and is registered under its own info hashes, which stay its identity
+    /// after the metadata arrives.
+    ///
+    /// Fails with [`SessionError::V2OnlyUnsupported`] for a magnet without a
+    /// v1 info hash and with [`SessionError::InvalidPriorities`] (expecting
+    /// 0) for a magnet with file priorities.
     pub async fn add_torrent(&self, params: AddTorrent) -> Result<TorrentHandle, SessionError> {
         let shared = &self.inner.shared;
         if shared.is_shutdown() {
             return Err(SessionError::Shutdown);
         }
-        let num_files = params.metainfo.info.files.len();
+        let num_files = match &params.source {
+            TorrentSource::Metainfo(m) => m.info.files.len(),
+            TorrentSource::Magnet(m) => {
+                if m.info_hashes.v1.is_none() {
+                    return Err(SessionError::V2OnlyUnsupported);
+                }
+                // Unknown until the metadata arrives.
+                0
+            }
+        };
         if !params.file_priorities.is_empty() && params.file_priorities.len() != num_files {
             return Err(SessionError::InvalidPriorities {
                 expected: num_files,
                 got: params.file_priorities.len(),
             });
         }
-        let ih = params.metainfo.info_hashes;
+        let ih = params.source.info_hashes();
         let wire_hash = ih.wire_hash();
         let mut reg = self.inner.registry();
         if shared.is_shutdown() {
@@ -256,9 +358,13 @@ impl Session {
         if reg.torrents.contains_key(&ih) || reg.by_wire.contains_key(&wire_hash) {
             return Err(SessionError::DuplicateTorrent);
         }
-        let storage: Arc<dyn Storage> = match params.storage.clone() {
-            Some(s) => s,
-            None => Arc::new(FsStorage::new(params.save_path.clone(), &params.metainfo)),
+        // A magnet's storage is built once its metadata is known.
+        let storage: Option<Arc<dyn Storage>> = match (&params.source, params.storage.clone()) {
+            (TorrentSource::Magnet(_), _) => None,
+            (TorrentSource::Metainfo(_), Some(s)) => Some(s),
+            (TorrentSource::Metainfo(m), None) => {
+                Some(Arc::new(FsStorage::new(params.save_path.clone(), m)))
+            }
         };
         shared.emit(Event::TorrentAdded { torrent: ih });
         let handle = torrent::spawn(
@@ -268,6 +374,7 @@ impl Session {
             Arc::downgrade(&self.inner),
         );
         reg.by_wire.insert(wire_hash, ih);
+        reg.by_req2.insert(req2_hash(&wire_hash), wire_hash);
         reg.torrents.insert(
             ih,
             TorrentEntry {
@@ -327,6 +434,7 @@ impl Session {
         let handles: Vec<TorrentHandle> = {
             let mut reg = self.inner.registry();
             reg.by_wire.clear();
+            reg.by_req2.clear();
             reg.torrents.drain().map(|(_, e)| e.handle).collect()
         };
         let mut waits: Vec<oneshot::Receiver<()>> = Vec::new();
@@ -338,5 +446,98 @@ impl Session {
         for rx in waits {
             let _ = rx.await;
         }
+        if let Some(dht) = &self.inner.shared.dht {
+            dht.shutdown().await;
+        }
+    }
+}
+
+/// Starts the session's DHT on the listener's IP and port (plus `[::]` on
+/// that port with `dht_ipv6`), on port 0 when that UDP port is taken. A
+/// DHT that cannot start at all is logged and left out.
+async fn start_dht(settings: &Settings, listener: SocketAddr) -> Option<Dht> {
+    let state = settings
+        .dht_state
+        .as_deref()
+        .and_then(|b| match DhtState::from_bytes(b) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(error = %e, "ignoring the saved DHT state; starting fresh");
+                None
+            }
+        });
+    let config = |port: u16| {
+        let mut c = DhtConfig::default();
+        if listener.is_ipv4() {
+            c.bind_v4 = Some(SocketAddr::new(listener.ip(), port));
+            c.bind_v6 = settings
+                .dht_ipv6
+                .then(|| SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)));
+        } else {
+            c.bind_v4 = None;
+            c.bind_v6 = Some(SocketAddr::new(listener.ip(), port));
+        }
+        c.bootstrap = settings.dht_bootstrap_nodes.clone();
+        c.read_only = settings.dht_read_only;
+        c.state = state.clone();
+        c.query_timeout = settings.dht_query_timeout;
+        c.query_rate_per_ip = settings.dht_query_rate_per_ip;
+        c
+    };
+    let first = Dht::spawn(config(listener.port())).await;
+    let r = match first {
+        Err(DhtError::Bind(_) | DhtError::NoSocket) if listener.port() != 0 => {
+            warn!(
+                port = listener.port(),
+                "DHT port taken; binding the DHT to a free port"
+            );
+            Dht::spawn(config(0)).await
+        }
+        r => r,
+    };
+    match r {
+        Ok(d) => Some(d),
+        Err(e) => {
+            warn!(error = %e, "cannot start the DHT; running without it");
+            None
+        }
+    }
+}
+
+/// Emits [`Event::DhtBootstrapped`] the first time the DHT's routing table
+/// fills, then ends; also ends with the DHT or the session.
+fn watch_bootstrap(dht: &Dht, shared: std::sync::Weak<Shared>) {
+    let mut stats = dht.subscribe_stats();
+    tokio::spawn(async move {
+        let Ok(s) = stats.wait_for(|s| s.bootstrapped).await else {
+            return;
+        };
+        let nodes = s.nodes_v4.saturating_add(s.nodes_v6);
+        drop(s);
+        if let Some(shared) = shared.upgrade() {
+            shared.emit(Event::DhtBootstrapped { nodes });
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_message_carries_the_dht_port_of_the_peers_family() {
+        let v4: SocketAddr = "0.0.0.0:7001".parse().unwrap();
+        let v6: SocketAddr = "[::]:7002".parse().unwrap();
+        let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
+        let peer6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();
+        let both = [v4, v6];
+        assert_eq!(dht_port_for(&both, &peer4), Some(7001));
+        assert_eq!(dht_port_for(&both, &peer6), Some(7002));
+        assert_eq!(dht_port_for(&both, &mapped), Some(7001));
+        // Only one family bound: the other gets no `Port`.
+        assert_eq!(dht_port_for(&[v6], &peer4), None);
+        assert_eq!(dht_port_for(&[v4], &peer6), None);
+        assert_eq!(dht_port_for(&[], &peer4), None);
     }
 }

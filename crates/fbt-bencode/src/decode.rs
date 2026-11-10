@@ -7,15 +7,30 @@ use crate::value::{Dict, Value, ValueKind};
 /// Decoder limits.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Maximum container nesting depth.
+    /// Maximum container nesting depth (clamped to [`MAX_DEPTH_CAP`]).
     pub max_depth: usize,
+    /// Maximum number of values (ints, strings, lists, dicts, dict keys).
+    pub max_items: usize,
+}
+
+impl Limits {
+    /// Builds limits from a depth and an item count.
+    pub const fn new(max_depth: usize, max_items: usize) -> Self {
+        Self {
+            max_depth,
+            max_items,
+        }
+    }
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_depth: 64 }
+        Self::new(64, 4_194_304)
     }
 }
+
+/// Hard ceiling on nesting depth, whatever `Limits::max_depth` says.
+pub const MAX_DEPTH_CAP: usize = 256;
 
 /// Decoding failures; `pos` is the byte offset in the input.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -42,6 +57,9 @@ pub enum DecodeError {
     /// Nesting deeper than `max_depth`.
     #[error("nesting too deep at {pos}")]
     DepthExceeded { pos: usize },
+    /// More values than `max_items`.
+    #[error("too many items at {pos}")]
+    TooManyItems { pos: usize },
     /// Same dictionary key twice.
     #[error("duplicate dictionary key at {pos}")]
     DuplicateKey { pos: usize },
@@ -70,7 +88,9 @@ pub fn decode_prefix(input: &[u8], limits: Limits) -> Result<(Value<'_>, usize),
     let mut p = Parser {
         input,
         pos: 0,
-        max_depth: limits.max_depth,
+        max_depth: limits.max_depth.min(MAX_DEPTH_CAP),
+        max_items: limits.max_items,
+        items: 0,
     };
     let v = p.value(0)?;
     Ok((v, p.pos))
@@ -80,6 +100,8 @@ struct Parser<'a> {
     input: &'a [u8],
     pos: usize,
     max_depth: usize,
+    max_items: usize,
+    items: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -106,7 +128,16 @@ impl<'a> Parser<'a> {
         self.input.get(start..self.pos).unwrap_or_default()
     }
 
+    fn count_item(&mut self) -> Result<(), DecodeError> {
+        self.items = self.items.saturating_add(1);
+        if self.items > self.max_items {
+            return Err(DecodeError::TooManyItems { pos: self.pos });
+        }
+        Ok(())
+    }
+
     fn value(&mut self, depth: usize) -> Result<Value<'a>, DecodeError> {
+        self.count_item()?;
         let start = self.pos;
         let kind = match self.peek()? {
             b'i' => ValueKind::Int(self.int()?),
@@ -257,6 +288,7 @@ impl<'a> Parser<'a> {
                     pos: key_pos,
                 });
             }
+            self.count_item()?;
             let key = self.bytes()?;
             if sorted {
                 match entries.last().map(|(k, _)| key.cmp(k)) {
@@ -287,6 +319,34 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_is_capped_whatever_the_limit() {
+        let deep = [b"l".repeat(300), b"e".repeat(300)].concat();
+        let r = decode_with(&deep, Limits::new(usize::MAX, usize::MAX));
+        assert!(matches!(r, Err(DecodeError::DepthExceeded { .. })));
+        let ok = [b"l".repeat(256), b"e".repeat(256)].concat();
+        assert!(decode_with(&ok, Limits::new(usize::MAX, usize::MAX)).is_ok());
+    }
+    #[test]
+    fn item_limit_counts_every_node() {
+        assert!(decode_with(b"li1ei2ei3ee", Limits::new(8, 4)).is_ok());
+        assert!(matches!(
+            decode_with(b"li1ei2ei3ee", Limits::new(8, 3)),
+            Err(DecodeError::TooManyItems { .. })
+        ));
+        assert!(matches!(
+            decode_with(b"d1:ai1ee", Limits::new(8, 2)),
+            Err(DecodeError::TooManyItems { .. })
+        ));
+    }
+    #[test]
+    fn prefix_respects_item_limit() {
+        assert!(matches!(
+            decode_prefix(b"li1ei2eeXX", Limits::new(8, 2)),
+            Err(DecodeError::TooManyItems { .. })
+        ));
+    }
 
     #[test]
     fn decodes_scalars() {

@@ -24,9 +24,17 @@ impl Reserved {
     pub fn supports_extended(&self) -> bool {
         self.0[5] & 0x10 != 0
     }
+    /// Advertises the BEP 10 extension protocol.
+    pub fn set_extended(&mut self) {
+        self.0[5] |= 0x10;
+    }
     /// BEP 5 DHT.
     pub fn supports_dht(&self) -> bool {
         self.0[7] & 0x01 != 0
+    }
+    /// Advertises the DHT.
+    pub fn set_dht(&mut self) {
+        self.0[7] |= 0x01;
     }
 }
 
