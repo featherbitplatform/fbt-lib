@@ -42,7 +42,7 @@ Set on the `fbt` crate.
 | `tls` | yes | HTTPS trackers over rustls with the `ring` provider (needs a C toolchain to build) |
 | `pure-rust` | no | HTTPS trackers over rustls with the pure-Rust RustCrypto provider: no C or assembly. Depend on `fbt` with `default-features = false, features = ["pure-rust"]`. The provider is a pre-release crate (`rustls-rustcrypto`), so expect churn |
 
-`bash dev/check-pure-rust.sh` verifies that the `pure-rust` build pulls in neither `ring` nor `cc`.
+`bash dev/check-pure-rust.sh` verifies that the `pure-rust` build pulls in neither `ring` nor `cc` (nor any other C-building crate), through normal and build dependencies.
 
 ## Build and test
 

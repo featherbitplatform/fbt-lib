@@ -13,7 +13,7 @@ Binding design: `docs/superpowers/specs/2026-11-10-fbt-lib-design.md`. Read it b
 - **From scratch.** Every BitTorrent component (bencode, metainfo, wire protocol, trackers, DHT, uTP, ...) is written here. No BitTorrent crates (librqbit, `mainline`, uTP crates, bencode crates such as `serde_bencode` or `bendy`). General-purpose crates (tokio, tracing, thiserror, sha1, ...) are fine.
 - **No unsafe.** `#![forbid(unsafe_code)]` at the top of every crate; the workspace lint forbids it too.
 - **Remote input never panics, hangs or allocates without bound.** Peers, trackers and `.torrent` bytes are hostile. `unwrap`, `expect`, indexing and `panic!` on remote-derived values are rejected; clippy denies them in non-test code of `fbt-bencode`, `fbt-metainfo`, `fbt-wire` and `fbt-tracker`.
-- **`pure-rust` feature.** `cargo tree -e normal --no-default-features --features pure-rust -p fbt` must contain neither `ring` nor `cc`; the default build may need a C toolchain only for `ring`.
+- **`pure-rust` feature.** `cargo tree -e normal,build --no-default-features --features pure-rust -p fbt` (normal and build edges) must contain neither `ring` nor `cc` (nor `cmake`, `aws-lc*` or `*-sys` crates; `windows-sys` is bindings only); the default build may need a C toolchain only for `ring`.
 - **Naming other clients is allowed.** libtorrent, qBittorrent, Transmission and opentracker may be named in code, docs and commits.
 - **Logging and errors:** `tracing` for logs (the library never installs a subscriber), `thiserror` for errors. Public enums and config structs of `fbt-session` and `fbt` are `#[non_exhaustive]`; config structs implement `Default`.
 - **Dependencies** are declared once in the root `[workspace.dependencies]`; crates inherit them, never pin their own versions. All crates are `publish = false` for now.
@@ -38,7 +38,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo deny --all-features check
-bash dev/check-pure-rust.sh   # pure-rust build has no ring or cc
+bash dev/check-pure-rust.sh   # pure-rust build has no ring, cc or other C-building crate
 
 # Release plumbing: tag check + changelog extraction (tested with fake refs)
 bash dev/test-release-version.sh
