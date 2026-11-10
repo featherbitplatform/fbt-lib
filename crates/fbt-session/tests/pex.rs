@@ -15,7 +15,7 @@ use fbt_metainfo::{Magnet, Metainfo};
 use fbt_session::storage::MemStorage;
 use fbt_session::{
     AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, PeerSource, Session, Settings,
-    TorrentHandle, TorrentState,
+    TorrentHandle, TorrentState, Transport,
 };
 use fbt_wire::{
     ExtHandshake, Message, MetadataMsg, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, PexFlags, PexMsg,
@@ -170,6 +170,45 @@ async fn third_peer_learned_through_pex() {
     }
 }
 
+/// A peer connected over uTP is listed with the `UTP` flag; the scripted
+/// peer receiving the list is on TCP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn utp_peer_is_advertised_with_the_utp_flag() {
+    let (m, payload) = make_torrent(&[("a", 300_000)], 32_768);
+    let (a, _ha) = seed_session(settings(), &m, &payload).await;
+    let mut eva = a.subscribe(EventMask::PEER);
+    let (b, hb, _evb, _db) = leech_session(settings(), &m).await;
+    hb.add_peer(a.local_addr()).await.unwrap();
+    let e = next_matching(&mut eva, |e| matches!(e, Event::PeerConnected { .. }), T).await;
+    assert!(
+        matches!(
+            e,
+            Some(Event::PeerConnected {
+                transport: Transport::Utp,
+                ..
+            })
+        ),
+        "{e:?}"
+    );
+    let mut peer =
+        ScriptedPeer::connect_with(a.local_addr(), m.info_hashes.wire_hash(), ext_reserved()).await;
+    our_ext_hs(&mut peer).await;
+    peer.send_ext_handshake(&pex_hs(Some(7000))).await;
+    let msg = pex_from_us(&mut peer, T).await.expect("a PEX message");
+    let (_, flags) = msg
+        .added
+        .iter()
+        .find(|(addr, _)| *addr == b.local_addr())
+        .unwrap_or_else(|| panic!("B not listed: {msg:?}"));
+    assert!(
+        flags.contains(PexFlags::UTP | PexFlags::CONNECTABLE),
+        "{flags:?}"
+    );
+    for s in [b, a] {
+        s.shutdown().await;
+    }
+}
+
 /// A, B and C as in [`third_peer_learned_through_pex`], plus a scripted
 /// peer at B advertising `ut_pex`: nobody exchanges peers.
 async fn no_pex_anywhere(m: &Metainfo, payload: &[u8], s: Settings) {
@@ -224,9 +263,10 @@ async fn private_magnet_stops_pex_at_metadata() {
     let (m, _payload) = make_private_torrent(&[("a", 100_000)], 32_768);
     let raw = m.raw_info().to_vec();
     let mut s = settings();
-    // The scripted metadata source answers a plain handshake only.
+    // The scripted metadata source answers a plain handshake only, over
+    // TCP only.
     s.encryption = EncryptionPolicy::Disabled;
-    let leech = Session::new(s).await.unwrap();
+    let leech = Session::new(dial_tcp(s)).await.unwrap();
     let mut ev = leech.subscribe(EventMask::PEER | EventMask::STATUS);
     let listener = TcpListener::bind(loopback(0)).await.unwrap();
     let source_addr = listener.local_addr().unwrap();

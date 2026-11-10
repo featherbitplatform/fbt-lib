@@ -38,10 +38,11 @@ pub struct ListenError {
 pub(crate) struct Endpoint {
     /// The bound address (the real port when the setting asked for 0).
     pub addr: SocketAddr,
-    /// Listening only with `enable_incoming_tcp`; otherwise the socket is
-    /// bound (holding the port) but not listening, so TCP dials to it are
-    /// refused at once.
-    pub tcp: TcpListener,
+    /// `None` with `enable_incoming_tcp` off: the TCP socket only picked
+    /// the port and was closed again, so TCP dials to it are refused at
+    /// once. (A socket left bound but not listening would not do: macOS
+    /// drops SYNs to one, so a dialler waits out its connect timeout.)
+    pub tcp: Option<TcpListener>,
     /// `None` when only the UDP side failed to bind.
     pub udp: Option<SharedUdpSocket>,
 }
@@ -87,15 +88,16 @@ pub(crate) async fn bind_all(
     Ok((endpoints, errors))
 }
 
-/// Binds TCP on `addr` (listening when `listen`), then UDP on the TCP's
-/// port. With port 0 a UDP failure retries both on a fresh port, up to
-/// [`BIND_ATTEMPTS`] times; otherwise the endpoint keeps TCP only and the
-/// UDP error comes back.
+/// Binds TCP on `addr`, then UDP on the TCP's port. With port 0 a UDP
+/// failure retries both on a fresh port, up to [`BIND_ATTEMPTS`] times;
+/// otherwise the endpoint keeps TCP only and the UDP error comes back.
+/// Without `listen` the TCP socket is closed once UDP is bound (or failed).
 fn bind_one(addr: SocketAddr, listen: bool) -> io::Result<(Endpoint, Option<io::Error>)> {
     let mut attempt = 1;
     loop {
         let tcp = bind_tcp(addr, listen)?;
         let local = tcp.local_addr()?;
+        let tcp = listen.then_some(tcp);
         match SharedUdpSocket::bind(local) {
             Ok(udp) => {
                 let ep = Endpoint {
@@ -120,7 +122,7 @@ fn bind_one(addr: SocketAddr, listen: bool) -> io::Result<(Endpoint, Option<io::
 
 /// A TCP listener on `addr`; IPv6 binds IPv6-only, so `[::]:p` does not
 /// collide with `0.0.0.0:p` on dual-stack hosts. Without `listen` the
-/// socket is only bound. Must run inside a tokio runtime.
+/// socket is only bound (to pick a port). Must run inside a tokio runtime.
 fn bind_tcp(addr: SocketAddr, listen: bool) -> io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv6() {

@@ -14,7 +14,6 @@ use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
 use fbt_tracker::TrackerClient;
 use fbt_utp::UtpSocket;
 use fbt_wire::req2_hash;
-use futures_util::FutureExt;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -245,9 +244,6 @@ pub(crate) struct SessionInner {
     /// One TCP accept loop per listener (with `enable_incoming_tcp`) and
     /// one uTP accept loop per uTP socket (with `enable_incoming_utp`).
     listeners: Mutex<Vec<JoinHandle<()>>>,
-    /// The TCP sockets without an accept loop (`enable_incoming_tcp` off),
-    /// dropped with the listeners.
-    idle_tcp: Mutex<Vec<tokio::net::TcpListener>>,
 }
 
 impl SessionInner {
@@ -274,19 +270,12 @@ impl SessionInner {
         for t in tasks {
             t.abort();
         }
-        self.idle_tcp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
     }
 
     /// Resets every uTP connection and stops the uTP sockets' tasks.
     fn shutdown_utp(&self) {
         for u in &self.shared.utp {
-            // `UtpSocket::shutdown` does all its work before its first
-            // await point, so polling it once here is enough (and works
-            // from `Drop`).
-            let _ = u.shutdown().now_or_never();
+            u.shutdown_now();
         }
     }
 
@@ -339,7 +328,7 @@ impl Session {
             Ok(t) => t,
             Err(e) => {
                 for u in &utp {
-                    let _ = u.shutdown().now_or_never();
+                    u.shutdown_now();
                 }
                 udp.iter().for_each(SharedUdpSocket::close);
                 return Err(SessionError::Tracker(e));
@@ -393,27 +382,20 @@ impl Session {
             listener_state,
             registry: Mutex::new(Registry::default()),
             listeners: Mutex::new(Vec::new()),
-            idle_tcp: Mutex::new(Vec::new()),
         });
-        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-        if shared.settings.enable_incoming_tcp {
-            tasks.extend(endpoints.into_iter().map(|e| {
+        // No TCP listeners with `enable_incoming_tcp` off.
+        let mut tasks: Vec<JoinHandle<()>> = endpoints
+            .into_iter()
+            .filter_map(|e| e.tcp)
+            .map(|tcp| {
                 crate::listener::spawn(
-                    e.tcp,
+                    tcp,
                     Arc::clone(&inner.listener_state),
                     Arc::downgrade(&inner),
                     Arc::clone(&shared),
                 )
-            }));
-        } else {
-            // Bound but not listening: kept until shutdown so the ports stay
-            // ours, while TCP dials to them are refused.
-            inner
-                .idle_tcp
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(endpoints.into_iter().map(|e| e.tcp));
-        }
+            })
+            .collect();
         if shared.settings.enable_incoming_utp {
             tasks.extend(shared.utp.iter().map(|u| {
                 crate::listener::spawn_utp(

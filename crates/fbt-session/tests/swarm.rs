@@ -410,8 +410,8 @@ fn retry_settings() -> Settings {
 
 /// A failed outgoing connection is dialled exactly three times in all, the
 /// retries after (a twelfth of, then all of) `peer_retry_delay`, and then
-/// given up. Each attempt tries uTP first (nothing answers on the UDP port,
-/// so it times out) and then TCP (refused): two disconnects per attempt.
+/// given up. Over TCP alone: nothing listens there at all, and the uTP
+/// detour of each attempt is `utp_connect_failure_falls_back_to_tcp`'s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_connect_is_retried_three_times_then_dropped() {
     // A loopback port nobody listens on.
@@ -420,7 +420,7 @@ async fn failed_connect_is_retried_three_times_then_dropped() {
         l.local_addr().unwrap()
     };
     let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
-    let (s, h, _) = mem_leecher_with(retry_settings(), &m, payload.len()).await;
+    let (s, h, _) = mem_leecher_with(dial_tcp(retry_settings()), &m, payload.len()).await;
     let mut ev = s.subscribe(EventMask::ALL);
     h.add_peer(closed).await.unwrap();
     let ours = |e: &Event| {
@@ -428,19 +428,13 @@ async fn failed_connect_is_retried_three_times_then_dropped() {
             if *addr == closed)
     };
     for attempt in 1..=3 {
-        for transport in ["uTP", "TCP"] {
-            let e = next_matching(&mut ev, ours, T)
-                .await
-                .unwrap_or_else(|| panic!("attempt {attempt} over {transport} reported"));
-            let utp_timeout = matches!(
-                &e,
-                Event::PeerDisconnected { reason: DisconnectReason::Io(m), .. } if m.contains("uTP")
-            );
-            assert!(
-                matches!(e, Event::PeerDisconnected { .. }) && utp_timeout == (transport == "uTP"),
-                "attempt {attempt} over {transport}: {e:?}"
-            );
-        }
+        let e = next_matching(&mut ev, ours, T)
+            .await
+            .unwrap_or_else(|| panic!("attempt {attempt} reported"));
+        assert!(
+            matches!(e, Event::PeerDisconnected { .. }),
+            "attempt {attempt}: {e:?}"
+        );
     }
     // Given up: nothing more over five retry delays.
     let more = next_matching(&mut ev, ours, Duration::from_millis(1500)).await;
@@ -489,8 +483,8 @@ async fn piece_finished_while_a_peer_connects_is_announced() {
 
     let (m, payload) = make_torrent(&[("a", 4 * 16_384)], 16_384);
     let ih = m.info_hashes.wire_hash();
-    // The hand-driven remote below speaks plaintext only.
-    let mut st = settings();
+    // The hand-driven remote below speaks plaintext, over TCP only.
+    let mut st = dial_tcp(settings());
     st.encryption = EncryptionPolicy::Disabled;
     let (s, h, _) = mem_leecher_with(st, &m, payload.len()).await;
     let mut ev = s.subscribe(EventMask::PIECE);

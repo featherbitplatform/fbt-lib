@@ -156,7 +156,14 @@ pub struct Settings {
     /// cannot be used for the peer. At least one of the four transport
     /// switches must be on.
     pub enable_outgoing_tcp: bool,
-    /// Accept peer connections on the TCP listeners.
+    /// Accept peer connections on the TCP listeners. Off, no TCP listener
+    /// runs: each listen address's TCP socket only picks the port (the UDP
+    /// socket binds the same number, which announces and extension
+    /// handshakes advertise) and is closed, so TCP dials to it are refused
+    /// at once and a dialler falls back to uTP without waiting. The TCP
+    /// port is then not held: another program may take it. (A socket left
+    /// bound but not listening would hold it, but macOS drops SYNs to one,
+    /// so diallers would wait out their connect timeout instead.)
     pub enable_incoming_tcp: bool,
     /// Dial peers over uTP (BEP 29) first, from the shared UDP socket of
     /// the peer's address family; a failed uTP connect is retried once at
@@ -168,8 +175,10 @@ pub struct Settings {
     /// back to TCP).
     pub enable_incoming_utp: bool,
     /// How long an outgoing uTP connect waits for the remote's answer
-    /// before it fails (and falls back to TCP). Internal tunable (tests
-    /// shorten it); not part of the stable API. Non-zero.
+    /// before it fails (and falls back to TCP). 3 s, libtorrent's
+    /// `utp_connect_timeout`: a peer that does not speak uTP costs that much
+    /// before its TCP dial. Internal tunable (tests shorten it); not part of
+    /// the stable API. Non-zero.
     #[doc(hidden)]
     pub utp_connect_timeout: Duration,
 }
@@ -307,7 +316,7 @@ impl Default for Settings {
             enable_incoming_tcp: true,
             enable_outgoing_utp: true,
             enable_incoming_utp: true,
-            utp_connect_timeout: Duration::from_secs(7),
+            utp_connect_timeout: Duration::from_secs(3),
         }
     }
 }

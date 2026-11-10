@@ -239,8 +239,9 @@ impl Retries {
         self.transport_failed.get(addr).map(|t| t.other())
     }
 
-    /// The fallback attempt to `addr` ended; the next one starts over.
-    fn clear_transport_failed(&mut self, addr: &SocketAddr) -> Option<Transport> {
+    /// The fallback attempt to `addr` ended (or will not happen); the next
+    /// one starts over.
+    pub(super) fn clear_transport_failed(&mut self, addr: &SocketAddr) -> Option<Transport> {
         let t = self.transport_failed.remove(addr)?;
         self.transport_failed_order.retain(|a| a != addr);
         Some(t)
@@ -305,6 +306,7 @@ impl Retries {
     pub(super) fn never(&mut self, addr: SocketAddr) {
         self.pending.remove(&addr);
         self.attempts.remove(&addr);
+        self.clear_transport_failed(&addr);
         if !self.never.insert(addr) {
             return;
         }
@@ -352,17 +354,30 @@ impl Retries {
     }
 
     /// The handshake over `transport` succeeded: the attempts start over.
-    /// Returns true when the address just became TCP-only (a uTP connect
-    /// to it failed and this TCP one got through).
+    /// After a fallback, the transport that worked is remembered: a TCP
+    /// success after a failed uTP connect makes the address TCP-only (and
+    /// returns true, also when it already was), a uTP success after a
+    /// failed TCP connect makes it uTP-first again.
     pub(super) fn connected(&mut self, addr: &SocketAddr, transport: Transport) -> bool {
         self.attempts.remove(addr);
         self.pending.remove(addr);
-        let utp_failed = self.clear_transport_failed(addr) == Some(Transport::Utp);
-        if utp_failed && transport == Transport::Tcp && !self.is_tcp_only(addr) {
-            self.mark_tcp_only(*addr);
-            return true;
+        match (self.clear_transport_failed(addr), transport) {
+            (Some(Transport::Utp), Transport::Tcp) => {
+                self.mark_tcp_only(*addr);
+                true
+            }
+            (Some(Transport::Tcp), Transport::Utp) => {
+                self.unmark_tcp_only(addr);
+                false
+            }
+            _ => false,
         }
-        false
+    }
+
+    fn unmark_tcp_only(&mut self, addr: &SocketAddr) {
+        if self.tcp_only.remove(addr) {
+            self.tcp_only_order.retain(|a| a != addr);
+        }
     }
 
     /// Removes and returns the addresses whose retry time has come.
@@ -655,6 +670,8 @@ impl Actor {
             // It may have connected (or connected to us) since it was
             // queued; an IP that sent bad metadata waits for the metadata.
             if self.addr_busy(&addr) || self.metadata_ip_banned(&addr) {
+                // A fallback queued for it is not dialled now: forget it.
+                self.retries.clear_transport_failed(&addr);
                 release(&self.shared.half_open);
                 release(&self.shared.global_peers);
                 continue;
@@ -907,7 +924,10 @@ impl Actor {
             // one at once, without counting an attempt.
             debug!(addr = %p.addr, failed = ?t, "connect failed; retrying over the other transport");
             self.queue_addr(p.addr);
-        } else if p.outgoing && !p.connected && reason != DisconnectReason::Shutdown {
+        } else if p.outgoing && !p.connected && reason == DisconnectReason::Shutdown {
+            // We closed the attempt: a fallback it was does not carry over.
+            self.retries.clear_transport_failed(&p.addr);
+        } else if p.outgoing && !p.connected {
             // The connection or handshake failed (we did not close it).
             if self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp {
                 // Forgotten: `requeue_known` must not dial it again.
@@ -1064,11 +1084,27 @@ mod tests {
         // uTP failed and TCP got through: TCP-only from then on.
         assert!(r.connected(&a, Transport::Tcp));
         assert!(r.is_tcp_only(&a) && r.fallback_transport(&a).is_none());
+        // A second fallback the same way (a PEX `UTP` flag made uTP first
+        // again) reports TCP-only again, so the flag is cleared again.
+        assert!(r.transport_failed(a, Transport::Utp));
+        assert!(
+            r.connected(&a, Transport::Tcp),
+            "already TCP-only: still true"
+        );
+        assert!(r.is_tcp_only(&a));
+        // TCP failing and the uTP fallback working: uTP first again.
+        assert!(r.transport_failed(a, Transport::Tcp));
+        assert_eq!(r.fallback_transport(&a), Some(Transport::Utp));
+        assert!(!r.connected(&a, Transport::Utp));
+        assert!(!r.is_tcp_only(&a) && !r.tcp_only_order.contains(&a));
         // A plain success marks nothing.
         let b = addr(2);
         assert!(!r.connected(&b, Transport::Tcp) && !r.is_tcp_only(&b));
-        assert!(r.transport_failed(b, Transport::Tcp));
-        assert!(!r.connected(&b, Transport::Utp) && !r.is_tcp_only(&b));
+        // A cleared fallback (skipped, or closed by us) is not dialled.
+        assert!(r.transport_failed(b, Transport::Utp));
+        assert_eq!(r.clear_transport_failed(&b), Some(Transport::Utp));
+        assert_eq!(r.fallback_transport(&b), None);
+        assert!(!r.connected(&b, Transport::Tcp) && !r.is_tcp_only(&b));
         for i in 10..(MAX_NEVER as u32 + 20) {
             r.transport_failed(addr(i), Transport::Utp);
             r.connected(&addr(i), Transport::Tcp);
@@ -1076,9 +1112,97 @@ mod tests {
         }
         assert_eq!(r.tcp_only.len(), MAX_NEVER);
         assert_eq!(r.tcp_only_order.len(), MAX_NEVER);
-        assert!(!r.is_tcp_only(&a), "the oldest is forgotten");
+        assert!(!r.is_tcp_only(&addr(10)), "the oldest is forgotten");
         assert!(r.transport_failed.len() <= MAX_NEVER);
         assert_eq!(r.transport_failed.len(), r.transport_failed_order.len());
+    }
+
+    /// An actor for a one-piece torrent, with nothing connected.
+    fn actor() -> Actor {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::{OnceLock, Weak};
+
+        use fbt_metainfo::Metainfo;
+        use fbt_tracker::TrackerClient;
+        use tokio::sync::{broadcast, watch};
+
+        use crate::session::{AddTorrent, Shared};
+        use crate::settings::Settings;
+        use crate::status::TorrentStatus;
+
+        let mut bytes =
+            b"d4:infod6:lengthi16384e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bytes.extend_from_slice(&[0u8; 20]);
+        bytes.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+        let settings = Settings {
+            dht_enabled: false,
+            dht_bootstrap_nodes: Vec::new(),
+            ..Settings::default()
+        };
+        let tracker = TrackerClient::new(settings.tracker.clone()).expect("tracker client");
+        let shared = Arc::new(Shared {
+            settings: Arc::new(settings),
+            peer_id: PeerId::generate(),
+            listen_port: 6881,
+            listen_port_v4: Some(6881),
+            listen_port_v6: None,
+            tracker,
+            events: broadcast::channel(64).0,
+            shutdown: AtomicBool::new(false),
+            global_peers: AtomicUsize::new(0),
+            half_open: AtomicUsize::new(0),
+            dht: None,
+            dht_addrs: Vec::new(),
+            utp: Vec::new(),
+        });
+        let add = AddTorrent::new(meta, PathBuf::from("unused"));
+        let ih = add.source.info_hashes();
+        let (status_tx, _) = watch::channel(TorrentStatus::initial(ih, "a".into(), true));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        Actor::new(
+            add,
+            None,
+            Arc::new(OnceLock::new()),
+            shared,
+            Weak::new(),
+            cmd_rx,
+            status_tx,
+        )
+    }
+
+    /// A TCP connection that got through after a failed uTP connect clears
+    /// the address's PEX `UTP` flag every time, also when it was TCP-only
+    /// already, so the flag never leaves it uTP-first for good.
+    #[tokio::test]
+    async fn tcp_success_after_utp_failure_clears_the_pex_utp_flag() {
+        let mut a = actor();
+        let peer_addr = addr(1);
+        assert!(a.remember(peer_addr));
+        for round in 0..2 {
+            // A PEX `UTP` flag came in (again).
+            a.known.get_mut(&peer_addr).expect("known").utp = true;
+            assert!(a.retries.transport_failed(peer_addr, Transport::Utp));
+            let key = a.new_key();
+            let (tx, _rx) = mpsc::channel(4);
+            let mut p = Peer::new(peer_addr, tx, a.generation, 1, Transport::Tcp);
+            p.outgoing = true;
+            a.peers.insert(key, p);
+            assert!(a.on_connected(
+                key,
+                PeerId([round + 1; 20]),
+                peer_addr,
+                false,
+                Transport::Tcp
+            ));
+            assert!(a.retries.is_tcp_only(&peer_addr), "round {round}");
+            assert!(
+                !a.known.get(&peer_addr).expect("known").utp,
+                "round {round}"
+            );
+            a.peers.remove(&key);
+        }
     }
 
     #[test]

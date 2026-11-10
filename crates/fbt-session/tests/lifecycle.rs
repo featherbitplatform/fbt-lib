@@ -635,7 +635,8 @@ async fn invalid_settings_are_rejected() {
 /// Extreme but meaningful settings work without panicking.
 #[tokio::test]
 async fn extreme_settings_do_not_panic() {
-    let mut st = test_settings();
+    // It dials a closed port below: over TCP alone, refused at once.
+    let mut st = dial_tcp(test_settings());
     st.max_peers_global = usize::MAX;
     st.max_peers_per_torrent = usize::MAX;
     st.max_half_open = usize::MAX;

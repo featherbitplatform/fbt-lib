@@ -25,23 +25,25 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 /// Settings for tests: loopback listener on a free port, fast status
-/// updates, no DHT (so no test ever contacts a public DHT node; the DHT
-/// tests bootstrap from a loopback node), and a 1 s uTP connect timeout:
-/// sessions reach each other over uTP at once on loopback, while a dial to
-/// a scripted TCP-only peer (nothing on its UDP port) falls back to TCP
-/// after 1 s instead of 7.
+/// updates, and no DHT (so no test ever contacts a public DHT node; the DHT
+/// tests bootstrap from a loopback node). Transports as by default: uTP
+/// first, TCP fallback.
 pub fn test_settings() -> Settings {
     let mut s = Settings::default();
     s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
     s.status_interval = Duration::from_millis(50);
     s.dht_enabled = false;
     s.dht_bootstrap_nodes = Vec::new();
-    s.utp_connect_timeout = UTP_CONNECT_TIMEOUT;
     s
 }
 
-/// The uTP connect timeout of [`test_settings`].
-pub const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// `s` dialling over TCP only: for a session whose test makes it dial a
+/// scripted peer that listens on TCP alone (nothing answers on its UDP
+/// port, so a uTP attempt would only wait out `utp_connect_timeout`).
+pub fn dial_tcp(mut s: Settings) -> Settings {
+    s.enable_outgoing_utp = false;
+    s
+}
 
 /// A multi-file torrent named `torrent` over random data. Returns the
 /// metainfo and the concatenated payload.
