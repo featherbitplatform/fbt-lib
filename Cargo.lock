@@ -638,6 +638,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-utp"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "fbt-core",
+ "proptest",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-wire"
 version = "0.2.0"
 dependencies = [
