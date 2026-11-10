@@ -10,7 +10,7 @@
 //! requested, and a completed buffer that fails the info hash, make the
 //! peer [`FetchStep::Bad`].
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -22,9 +22,19 @@ use crate::picker::PeerKey;
 
 /// Peers fetched from at once.
 pub(super) const MAX_METADATA_SOURCES: usize = 2;
-/// A source that answers none of its requests for this long is dropped (no
-/// ban) and becomes a candidate again after as long.
+/// A source that leaves any request unanswered for this long, counted from
+/// that request, is dropped (no ban) and becomes a candidate again after as
+/// long.
 const PIECE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A source's whole fetch must finish within this base time plus
+/// [`SOURCE_TIME_PER_PIECE`] per metadata piece, capped at
+/// [`MAX_SOURCE_DEADLINE`]; past it the source is retired like a timeout, so
+/// a peer trickling pieces just inside [`PIECE_TIMEOUT`] cannot hold its slot.
+const SOURCE_BASE_DEADLINE: Duration = Duration::from_secs(30);
+/// See [`SOURCE_BASE_DEADLINE`].
+const SOURCE_TIME_PER_PIECE: Duration = Duration::from_secs(5);
+/// See [`SOURCE_BASE_DEADLINE`].
+const MAX_SOURCE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// `ut_metadata` requests served per connection; later ones get `Reject`.
 pub(super) const MAX_METADATA_REQUESTS_PER_PEER: u32 = 256;
 /// Requests in flight to one source.
@@ -61,9 +71,11 @@ struct Source {
     received: u32,
     /// Next piece to request.
     next: u32,
-    in_flight: BTreeSet<u32>,
-    /// Last request or answer; `None` until the next tick sets it.
-    since: Option<Instant>,
+    /// Requested pieces and when each was asked for; `None` until the next
+    /// tick sets it.
+    in_flight: BTreeMap<u32, Option<Instant>>,
+    /// When it became a source; `None` until the next tick sets it.
+    started: Option<Instant>,
 }
 
 /// Fetches the info dictionary from up to [`MAX_METADATA_SOURCES`] peers.
@@ -175,7 +187,7 @@ impl MetadataFetch {
                 if !self
                     .sources
                     .get(&key)
-                    .is_some_and(|s| s.in_flight.contains(&piece))
+                    .is_some_and(|s| s.in_flight.contains_key(&piece))
                 {
                     return FetchStep::Nothing;
                 }
@@ -203,7 +215,7 @@ impl MetadataFetch {
             return self.bad(key);
         };
         if total_size != src.size
-            || !src.in_flight.remove(&piece)
+            || src.in_flight.remove(&piece).is_none()
             || piece_len(src.size, piece) != Some(data.len())
         {
             return self.bad(key);
@@ -213,9 +225,8 @@ impl MetadataFetch {
         };
         *slot = Some(data);
         src.received = src.received.saturating_add(1);
-        src.since = Some(now);
         if src.received < src.num_pieces {
-            return send_or_nothing(src.request_more(key));
+            return send_or_nothing(src.request_more(key, Some(now)));
         }
         let Some(src) = self.sources.remove(&key) else {
             return FetchStep::Nothing;
@@ -255,8 +266,9 @@ impl MetadataFetch {
         self.start_sources()
     }
 
-    /// Drops sources that answered nothing for [`PIECE_TIMEOUT`] (no ban)
-    /// and re-admits retired peers whose cool-down is over.
+    /// Drops sources (no ban) with a request unanswered for
+    /// [`PIECE_TIMEOUT`] or past their whole-fetch deadline, and re-admits
+    /// retired peers whose cool-down is over.
     pub(super) fn on_tick(&mut self, now: Instant) -> Vec<(PeerKey, MetadataMsg)> {
         self.now = Some(now);
         if self.done {
@@ -264,12 +276,8 @@ impl MetadataFetch {
         }
         let mut expired = Vec::new();
         for (key, src) in &mut self.sources {
-            match src.since {
-                None => src.since = Some(now),
-                Some(t) if !src.in_flight.is_empty() && now >= t + PIECE_TIMEOUT => {
-                    expired.push(*key);
-                }
-                Some(_) => {}
+            if src.expired(now) {
+                expired.push(*key);
             }
         }
         for key in expired {
@@ -303,7 +311,7 @@ impl MetadataFetch {
                 break;
             };
             let mut src = Source::new(size, self.now);
-            out.extend(src.request_more(key));
+            out.extend(src.request_more(key, self.now));
             self.sources.insert(key, src);
         }
         out
@@ -351,16 +359,37 @@ impl Source {
             pieces: vec![None; num_pieces as usize],
             received: 0,
             next: 0,
-            in_flight: BTreeSet::new(),
-            since: now,
+            in_flight: BTreeMap::new(),
+            started: now,
         }
     }
 
-    /// Requests the next pieces, up to [`MAX_IN_FLIGHT`] outstanding.
-    fn request_more(&mut self, key: PeerKey) -> Vec<(PeerKey, MetadataMsg)> {
+    /// How long the whole fetch from this source may take.
+    fn deadline(&self) -> Duration {
+        SOURCE_TIME_PER_PIECE
+            .saturating_mul(self.num_pieces)
+            .saturating_add(SOURCE_BASE_DEADLINE)
+            .min(MAX_SOURCE_DEADLINE)
+    }
+
+    /// A request has waited [`PIECE_TIMEOUT`] or the whole fetch is past
+    /// its [`deadline`](Self::deadline). Times still unset are set to `now`.
+    fn expired(&mut self, now: Instant) -> bool {
+        let started = *self.started.get_or_insert(now);
+        let mut late = now >= started + self.deadline();
+        for at in self.in_flight.values_mut() {
+            let at = *at.get_or_insert(now);
+            late |= now >= at + PIECE_TIMEOUT;
+        }
+        late
+    }
+
+    /// Requests the next pieces, up to [`MAX_IN_FLIGHT`] outstanding, each
+    /// timed from `now`.
+    fn request_more(&mut self, key: PeerKey, now: Option<Instant>) -> Vec<(PeerKey, MetadataMsg)> {
         let mut out = Vec::new();
         while self.in_flight.len() < MAX_IN_FLIGHT && self.next < self.num_pieces {
-            self.in_flight.insert(self.next);
+            self.in_flight.insert(self.next, now);
             out.push((key, MetadataMsg::Request { piece: self.next }));
             self.next += 1;
         }
@@ -646,12 +675,12 @@ mod tests {
 
     #[test]
     fn reject_moves_to_next_source_without_ban() {
-        let info = info(20_000);
+        let info = info(60_000);
         let mut f = fetch_for(&info);
         let now = Instant::now();
         let (a, b, c) = (PeerKey(1), PeerKey(2), PeerKey(3));
         for k in [a, b, c] {
-            f.on_ext_handshake(k, Some(20_000), true, now);
+            f.on_ext_handshake(k, Some(60_000), true, now);
         }
         assert_eq!(
             sent(f.on_message(a, MetadataMsg::Reject { piece: 0 }, now)),
@@ -659,10 +688,12 @@ mod tests {
         );
         // A's late answers are ignored, not held against it.
         assert_eq!(f.on_message(a, data(&info, 1), now), FetchStep::Nothing);
-        // B and C make progress, so they do not time out below.
+        // B and C answer both requests, so they do not time out below.
         let later = now + Duration::from_secs(10);
-        f.on_message(b, data(&info, 0), later);
-        f.on_message(c, data(&info, 0), later);
+        for k in [b, c] {
+            f.on_message(k, data(&info, 0), later);
+            f.on_message(k, data(&info, 1), later);
+        }
         // After the cool-down A is a candidate again: when B goes, A starts.
         assert!(f.on_tick(now + PIECE_TIMEOUT).is_empty());
         assert_eq!(f.on_peer_gone(b), vec![req(1, 0), req(1, 1)]);
@@ -686,6 +717,83 @@ mod tests {
         );
         assert_eq!(f.on_tick(t0 + PIECE_TIMEOUT), vec![req(3, 0), req(3, 1)]);
         assert_eq!(f.on_message(a, data(&info, 0), t1), FetchStep::Nothing);
+    }
+
+    /// Each request is timed on its own: answering one piece does not buy
+    /// time for another left unanswered.
+    #[test]
+    fn each_request_has_its_own_timeout() {
+        let info = info(60_000);
+        let mut f = fetch_for(&info);
+        let t0 = Instant::now();
+        let (a, c) = (PeerKey(1), PeerKey(3));
+        f.on_ext_handshake(a, Some(60_000), true, t0);
+        f.on_ext_handshake(PeerKey(2), Some(60_000), true, t0);
+        f.on_ext_handshake(c, Some(60_000), true, t0);
+        // Piece 0 arrives (piece 2 is asked for); piece 1 never does.
+        let t1 = t0 + Duration::from_secs(20);
+        assert_eq!(sent(f.on_message(a, data(&info, 0), t1)), vec![req(1, 2)]);
+        f.on_message(PeerKey(2), data(&info, 0), t1);
+        f.on_message(PeerKey(2), data(&info, 1), t1);
+        let sends = f.on_tick(t0 + PIECE_TIMEOUT);
+        assert_eq!(sends, vec![req(3, 0), req(3, 1)], "A retired at 30 s");
+        assert_eq!(f.on_message(a, data(&info, 1), t1), FetchStep::Nothing);
+    }
+
+    /// A source answering every request just inside [`PIECE_TIMEOUT`]
+    /// would hold its slot for ever; its whole-fetch deadline retires it
+    /// (no ban) and an honest candidate completes.
+    #[test]
+    fn trickling_sources_are_retired_by_their_deadline() {
+        let len = 20 * METADATA_PIECE_LEN;
+        let info = info(len);
+        let mut f = fetch_for(&info);
+        let t0 = Instant::now();
+        let (a, b, c) = (PeerKey(1), PeerKey(2), PeerKey(3));
+        for k in [a, b, c] {
+            f.on_ext_handshake(k, Some(len as u32), true, t0);
+        }
+        // 30 s + 20 pieces x 5 s.
+        let deadline = t0 + Duration::from_secs(130);
+        let step = Duration::from_secs(29);
+        let mut next = [0u32, 0u32];
+        let mut t = t0;
+        let mut started_c = Vec::new();
+        while started_c.is_empty() {
+            t += step;
+            assert!(t < deadline + step, "never retired");
+            // Both slow sources answer their two requests 29 s after them.
+            for (i, k) in [a, b].into_iter().enumerate() {
+                for _ in 0..MAX_IN_FLIGHT {
+                    f.on_message(k, data(&info, next[i]), t);
+                    next[i] += 1;
+                }
+            }
+            started_c = f.on_tick(t);
+        }
+        assert!(t >= deadline, "not before the deadline");
+        assert!(started_c.contains(&req(3, 0)), "{started_c:?}");
+        assert!(!f.banned.contains(&a) && !f.banned.contains(&b));
+        assert!(f.retired.contains_key(&a) && f.retired.contains_key(&b));
+        // C answers promptly and completes.
+        let mut piece = 0;
+        loop {
+            match f.on_message(c, data(&info, piece), t) {
+                FetchStep::Done(bytes) => {
+                    assert_eq!(bytes, info);
+                    break;
+                }
+                FetchStep::Send(_) | FetchStep::Nothing => piece += 1,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn source_deadline_is_capped() {
+        let src = Source::new(MAX as u32, None);
+        assert_eq!(src.deadline(), MAX_SOURCE_DEADLINE);
+        assert_eq!(Source::new(1, None).deadline(), Duration::from_secs(35));
     }
 
     #[test]
