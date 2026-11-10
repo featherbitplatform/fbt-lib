@@ -4,9 +4,10 @@
 //!
 //! Every datagram is hostile and its source may be spoofed: undecodable or
 //! oversized datagrams and malformed queries are dropped without a reply,
-//! inbound queries pass a global and a per-IP rate limit, a response is
+//! inbound queries pass a per-IP and a global rate limit, a response is
 //! accepted only from the address its query went to, and only nodes that
-//! contacted us directly (a query, or an answer to our query) enter a table.
+//! answered a query of ours enter a table: an unknown node that queries us
+//! is pinged first ([`MAX_VERIFY_PINGS`] at once) and enters when it answers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -60,6 +61,12 @@ const MAX_RESOLVED: usize = 8;
 const MAX_BOOTSTRAP_SEEDS: usize = MAX_STATE_NODES + 64;
 /// Bootstrap addresses queried at once.
 const BOOTSTRAP_CONCURRENCY: usize = 16;
+/// Pings in flight to unknown nodes that queried us (their address may be
+/// spoofed until they answer); further ones are not pinged.
+const MAX_VERIFY_PINGS: usize = 64;
+/// Random draws for a free transaction id before a scan; at most half the
+/// ids are in use ([`MAX_TIDS`]), so a draw fails at most half the time.
+const TID_DRAWS: usize = 16;
 
 /// Node configuration.
 #[derive(Debug, Clone)]
@@ -478,8 +485,25 @@ struct Pending {
     addr: SocketAddr,
     deadline: Instant,
     reply: Option<oneshot::Sender<Result<Response, QueryError>>>,
-    /// A ping of this questionable node (de-duplicated).
-    pinging: Option<NodeId>,
+    /// The ping this query is, if any (de-duplicated by node id).
+    pinging: Option<Ping>,
+}
+
+/// Why a node is pinged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ping {
+    /// A questionable table entry, before a newcomer may replace it.
+    Questionable(NodeId),
+    /// An unknown node that queried us: it enters the table by answering.
+    Verify(NodeId),
+}
+
+impl Ping {
+    fn id(self) -> NodeId {
+        match self {
+            Ping::Questionable(id) | Ping::Verify(id) => id,
+        }
+    }
 }
 
 struct Actor {
@@ -508,8 +532,9 @@ struct Actor {
     /// (deadline, tid) in send order; all queries share one timeout, so
     /// this is sorted.
     timeouts: VecDeque<(Instant, u16)>,
-    next_tid: u16,
     pinging: HashSet<NodeId>,
+    /// [`Ping::Verify`] pings in flight.
+    verifying: usize,
     refreshed: HashMap<(u8, usize), Instant>,
 
     link: mpsc::WeakSender<Cmd>,
@@ -521,6 +546,8 @@ struct Actor {
     boot_started: bool,
     boot_attempt: u32,
     boot_due: Option<Instant>,
+    /// The running bootstrap attempt; a new one waits until it is done.
+    boot_task: Option<tokio::task::JoinHandle<()>>,
     next_housekeeping: Instant,
     next_rotation: Instant,
 }
@@ -588,8 +615,6 @@ impl Actor {
         if sock_v6.is_some() {
             restored.extend(state.nodes_v6.iter().take(MAX_STATE_NODES).copied());
         }
-        let mut tid_seed = [0u8; 2];
-        rng.fill_bytes(&mut tid_seed);
         let has_seeds = !cfg.bootstrap.is_empty() || !restored.is_empty();
         let local = stats_tx.borrow().local_addrs.clone();
         Actor {
@@ -614,9 +639,8 @@ impl Actor {
             rng,
             pending: HashMap::new(),
             timeouts: VecDeque::new(),
-            // a counter from a random start: tids are not guessable off-path
-            next_tid: u16::from_be_bytes(tid_seed),
             pinging: HashSet::new(),
+            verifying: 0,
             refreshed: HashMap::new(),
             link,
             stats_tx,
@@ -627,6 +651,7 @@ impl Actor {
             boot_attempt: 0,
             // the first attempt runs as soon as the actor starts
             boot_due: has_seeds.then_some(now),
+            boot_task: None,
             next_housekeeping: after(now, HOUSEKEEPING),
             next_rotation: after(now, TOKEN_ROTATION),
         }
@@ -780,10 +805,19 @@ impl Actor {
             return None;
         }
         let p = self.pending.remove(&tid)?;
-        if let Some(id) = p.pinging {
-            self.pinging.remove(&id);
-        }
+        self.ping_done(p.pinging);
         Some(p)
+    }
+
+    /// A ping got its answer or timed out: its de-duplication slot is free.
+    fn ping_done(&mut self, ping: Option<Ping>) {
+        let Some(ping) = ping else {
+            return;
+        };
+        self.pinging.remove(&ping.id());
+        if let Ping::Verify(_) = ping {
+            self.verifying = self.verifying.saturating_sub(1);
+        }
     }
 
     fn on_query(
@@ -797,10 +831,12 @@ impl Actor {
         if self.read_only {
             return;
         }
-        if !self
-            .global_rate
-            .allow(IpAddr::V4(Ipv4Addr::UNSPECIFIED), now)
-            || !self.rate.allow(from.ip(), now)
+        // per IP first: a flood from one source must not drain the global
+        // budget everyone else shares
+        if !self.rate.allow(from.ip(), now)
+            || !self
+                .global_rate
+                .allow(IpAddr::V4(Ipv4Addr::UNSPECIFIED), now)
         {
             return;
         }
@@ -816,7 +852,7 @@ impl Actor {
         let _ = self.send(raw_from, &out);
         // BEP 43: read-only nodes are answered but never stored
         if !q.read_only {
-            self.learn(
+            self.heard_from(
                 NodeInfo {
                     id: q.id,
                     addr: from,
@@ -826,7 +862,35 @@ impl Actor {
         }
     }
 
-    /// `n` contacted us directly: try it in its table.
+    /// `n` queried us. Its source address may be spoofed: a node already in
+    /// the table at that address is refreshed, any other is pinged and
+    /// enters the table only if it answers (see [`RoutingTable::insert`]).
+    fn heard_from(&mut self, n: NodeInfo, now: Instant) {
+        let Some(table) = self.table(Family::of(&n.addr)) else {
+            return;
+        };
+        if table.contains(&n) {
+            self.learn(n, now);
+            return;
+        }
+        if self.enforce_node_id && !n.id.is_valid_for(n.addr.ip()) {
+            return;
+        }
+        if self.verifying >= MAX_VERIFY_PINGS || !self.pinging.insert(n.id) {
+            return;
+        }
+        if self
+            .send_query(n.addr, Query::Ping, None, Some(Ping::Verify(n.id)), now)
+            .is_ok()
+        {
+            self.verifying = self.verifying.saturating_add(1);
+        } else {
+            self.pinging.remove(&n.id);
+        }
+    }
+
+    /// `n` answered a query of ours at its address (or is a table entry
+    /// that queried us again from it): try it in its table.
     fn learn(&mut self, n: NodeInfo, now: Instant) {
         if self.enforce_node_id && !n.id.is_valid_for(n.addr.ip()) {
             return;
@@ -837,7 +901,13 @@ impl Actor {
         if let Insert::Pending { ping } = table.insert(n, now)
             && self.pinging.insert(ping.id)
             && self
-                .send_query(ping.addr, Query::Ping, None, Some(ping.id), now)
+                .send_query(
+                    ping.addr,
+                    Query::Ping,
+                    None,
+                    Some(Ping::Questionable(ping.id)),
+                    now,
+                )
                 .is_err()
         {
             self.pinging.remove(&ping.id);
@@ -892,7 +962,7 @@ impl Actor {
         addr: SocketAddr,
         query: Query,
         reply: Option<oneshot::Sender<Result<Response, QueryError>>>,
-        pinging: Option<NodeId>,
+        pinging: Option<Ping>,
         now: Instant,
     ) -> Result<(), QueryError> {
         self.can_send(addr)?;
@@ -900,11 +970,9 @@ impl Actor {
         let Some(own) = self.table(Family::of(&addr)).map(RoutingTable::own_id) else {
             return Err(QueryError::Timeout);
         };
-        let mut tid = self.next_tid;
-        while self.pending.contains_key(&tid) {
-            tid = tid.wrapping_add(1);
-        }
-        self.next_tid = tid.wrapping_add(1);
+        let Some(tid) = self.free_tid() else {
+            return Err(QueryError::Busy);
+        };
         let msg = Message {
             tid: tid.to_be_bytes().to_vec(),
             ip: None,
@@ -936,6 +1004,26 @@ impl Actor {
         );
         self.timeouts.push_back((deadline, tid));
         Ok(())
+    }
+
+    /// A random transaction id not in use, so ids are not guessable
+    /// off-path: a few random draws, then a scan from a random start.
+    fn free_tid(&mut self) -> Option<u16> {
+        let mut draw = || {
+            let mut b = [0u8; 2];
+            self.rng.fill_bytes(&mut b);
+            u16::from_be_bytes(b)
+        };
+        for _ in 0..TID_DRAWS {
+            let tid = draw();
+            if !self.pending.contains_key(&tid) {
+                return Some(tid);
+            }
+        }
+        let start = draw();
+        (0..=u16::MAX)
+            .map(|i| start.wrapping_add(i))
+            .find(|t| !self.pending.contains_key(t))
     }
 
     fn on_cmd(&mut self, cmd: Cmd, now: Instant) {
@@ -992,7 +1080,11 @@ impl Actor {
         if let Some(due) = self.boot_due
             && now >= due
         {
-            if !self.boot_started {
+            if self.boot_task.as_ref().is_some_and(|t| !t.is_finished()) {
+                // the last attempt is still running: no overlap; look again
+                // soon, so the next starts shortly after it ends
+                self.boot_due = Some(after(now, self.retry_base.min(self.query_timeout)));
+            } else if !self.boot_started {
                 self.boot_started = true;
                 self.start_bootstrap(now);
             } else if self.tables().all(|t| t.len() == 0) {
@@ -1020,9 +1112,7 @@ impl Actor {
             let Some(p) = self.pending.remove(&tid) else {
                 continue;
             };
-            if let Some(id) = p.pinging {
-                self.pinging.remove(&id);
-            }
+            self.ping_done(p.pinging);
             if let Some(t) = self.table_mut(Family::of(&p.addr))
                 && let Some(id) = t.id_at(&p.addr)
             {
@@ -1042,12 +1132,12 @@ impl Actor {
         ));
         let views: Vec<(Family, NodeId)> =
             self.tables().map(|t| (t.family(), t.own_id())).collect();
-        tokio::spawn(bootstrap(
+        self.boot_task = Some(tokio::spawn(bootstrap(
             Link::Weak(self.link.clone()),
             self.bootstrap.clone(),
             self.restored.clone(),
             views,
-        ));
+        )));
     }
 
     /// One `find_node` lookup per stale or empty bucket, each bucket at most
@@ -1127,14 +1217,15 @@ async fn bootstrap(
     restored: Vec<SocketAddr>,
     views: Vec<(Family, NodeId)>,
 ) {
-    let mut addrs = restored;
+    let mut routers = Vec::new();
     for e in &entries {
         match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(e.as_str())).await {
-            Ok(Ok(found)) => addrs.extend(found.take(MAX_RESOLVED)),
+            Ok(Ok(found)) => routers.extend(found.take(MAX_RESOLVED)),
             Ok(Err(err)) => debug!(entry = %e, error = %err, "DHT: bootstrap entry skipped"),
             Err(_) => debug!(entry = %e, "DHT: bootstrap entry did not resolve in time"),
         }
     }
+    let addrs = seed_order(routers, restored);
     let mut set = JoinSet::new();
     for (family, own) in views {
         let mut seen = HashSet::new();
@@ -1150,6 +1241,14 @@ async fn bootstrap(
         set.spawn(bootstrap_family(link.clone(), family, own, seeds));
     }
     while set.join_next().await.is_some() {}
+}
+
+/// The configured routers first, then the restored nodes: a saved state
+/// full of dead nodes must not delay the first router query by whole
+/// query timeouts.
+fn seed_order(mut routers: Vec<SocketAddr>, restored: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    routers.extend(restored);
+    routers
 }
 
 async fn bootstrap_family(link: Link, family: Family, own: NodeId, seeds: Vec<SocketAddr>) {
@@ -1247,11 +1346,25 @@ mod tests {
         .ok()
     }
 
+    /// Sends `query` and returns the answer, skipping the node's own
+    /// queries (its verification ping of us).
     async fn ask(sock: &UdpSocket, to: SocketAddr, query: Query) -> Option<Message> {
         sock.send_to(&query_bytes(b"aa", id(1), query, false), to)
             .await
             .unwrap();
-        recv(sock, 1000).await.map(|(m, _)| m)
+        recv_answer(sock, 1000).await
+    }
+
+    /// The next response or error within `ms`, skipping queries.
+    async fn recv_answer(sock: &UdpSocket, ms: u64) -> Option<Message> {
+        let end = tokio::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            let left = end.saturating_duration_since(tokio::time::Instant::now());
+            let (m, _) = recv(sock, left.as_millis() as u64).await?;
+            if !matches!(m.body, Body::Query(_)) {
+                return Some(m);
+            }
+        }
     }
 
     fn response(m: Message) -> Response {
@@ -1259,6 +1372,25 @@ mod tests {
             Body::Response(r) => r,
             other => panic!("not a response: {other:?}"),
         }
+    }
+
+    /// Waits for the node's next query on `sock` and answers it as `own`.
+    async fn answer_ping(sock: &UdpSocket, own: NodeId) {
+        let (m, from) = recv(sock, 2000).await.expect("a ping from the node");
+        assert!(matches!(m.body, Body::Query(_)), "{m:?}");
+        let r = Message {
+            tid: m.tid,
+            ip: None,
+            version: None,
+            body: Body::Response(Response {
+                id: own,
+                nodes: vec![],
+                nodes6: vec![],
+                values: vec![],
+                token: None,
+            }),
+        };
+        sock.send_to(&r.encode(), from).await.unwrap();
     }
 
     /// A raw node that answers every ping with `own`.
@@ -1456,11 +1588,13 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(dht.stats().nodes_v4, 0);
-        // the same pings without `ro` do enter the table
+        // the same pings without `ro` do enter the table, once we answer
+        // the node's verification ping
         sock.send_to(&query_bytes(b"aa", id(5), Query::Ping, false), addr)
             .await
             .unwrap();
         recv(&sock, 1000).await.unwrap();
+        answer_ping(&sock, id(5)).await;
         let mut rx = dht.subscribe_stats();
         timeout(Duration::from_secs(3), rx.wait_for(|s| s.nodes_v4 == 1))
             .await
@@ -1479,7 +1613,7 @@ mod tests {
             sock.send_to(&ping, addr).await.unwrap();
         }
         let mut answers = 0;
-        while recv(&sock, 300).await.is_some() {
+        while recv_answer(&sock, 300).await.is_some() {
             answers += 1;
         }
         assert!((1..=10).contains(&answers), "{answers} answers");
@@ -1831,9 +1965,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tid_counter_starts_at_random() {
-        let starts: HashSet<u16> = (0..8).map(|_| actor(cfg()).0.next_tid).collect();
-        assert!(starts.len() > 1, "{starts:?}");
+    async fn tids_are_random_and_never_reused_while_pending() {
+        let (mut a, _tx) = actor(cfg());
+        let now = Instant::now();
+        let mut tids = Vec::new();
+        for k in 0..64u8 {
+            a.send_query(far(k).addr, Query::Ping, None, None, now)
+                .unwrap();
+        }
+        tids.extend(a.timeouts.iter().map(|(_, t)| *t));
+        let distinct: HashSet<u16> = tids.iter().copied().collect();
+        assert_eq!(distinct.len(), 64, "no tid in use twice");
+        let sequential = tids
+            .windows(2)
+            .filter(|w| w[1] == w[0].wrapping_add(1))
+            .count();
+        assert!(sequential < 4, "not a counter: {tids:?}");
+        // with every id but one in use, the free one is found
+        let (mut a, _tx) = actor(cfg());
+        for t in 0..=u16::MAX {
+            if t != 4242 {
+                a.pending.insert(
+                    t,
+                    Pending {
+                        addr: far(1).addr,
+                        deadline: now,
+                        reply: None,
+                        pinging: None,
+                    },
+                );
+            }
+        }
+        assert_eq!(a.free_tid(), Some(4242));
+        a.pending.insert(
+            4242,
+            Pending {
+                addr: far(1).addr,
+                deadline: now,
+                reply: None,
+                pinging: None,
+            },
+        );
+        assert_eq!(a.free_tid(), None);
     }
 
     #[tokio::test]
@@ -1915,6 +2088,135 @@ mod tests {
         assert!(a.refreshed.values().all(|t| *t == stale + REFRESH_INTERVAL));
     }
 
+    fn ping_from(k: u8) -> QueryMsg {
+        QueryMsg {
+            id: id(k),
+            query: Query::Ping,
+            want: Want::default(),
+            read_only: false,
+        }
+    }
+
+    /// A query from an unknown source is answered but its node enters the
+    /// table only once it answers our ping; a spoofed source never does.
+    #[tokio::test]
+    async fn queries_from_unknown_nodes_are_verified_before_insert() {
+        let (mut a, _tx) = actor(cfg());
+        let now = Instant::now();
+        let sock = raw().await;
+        let me = sock.local_addr().unwrap();
+        a.on_query(me, me, b"aa", &ping_from(7), now);
+        let (pong, _) = recv(&sock, 1000).await.expect("answered");
+        assert!(matches!(pong.body, Body::Response(_)));
+        assert_eq!(a.table_v4.as_ref().unwrap().len(), 0, "not before the ping");
+        let (verify, _) = recv(&sock, 1000).await.expect("verification ping");
+        assert!(matches!(
+            verify.body,
+            Body::Query(QueryMsg {
+                query: Query::Ping,
+                ..
+            })
+        ));
+        // a second query meanwhile is not pinged again
+        a.on_query(me, me, b"ab", &ping_from(7), now);
+        recv(&sock, 1000).await.expect("answered");
+        assert_eq!(a.pending.len(), 1);
+        let answer = Message {
+            tid: verify.tid,
+            ip: None,
+            version: None,
+            body: Body::Response(Response {
+                id: id(7),
+                nodes: vec![],
+                nodes6: vec![],
+                values: vec![],
+                token: None,
+            }),
+        };
+        a.on_datagram(&answer.encode(), me, now);
+        assert_eq!(a.table_v4.as_ref().unwrap().id_at(&me), Some(id(7)));
+        assert!(a.pinging.is_empty() && a.verifying == 0);
+        // known now: its next query refreshes it without a ping
+        a.on_query(me, me, b"ac", &ping_from(7), now);
+        recv(&sock, 1000).await.expect("answered");
+        assert!(a.pending.is_empty());
+
+        // spoofed sources (nobody answers there) never enter, and at most
+        // MAX_VERIFY_PINGS pings are out at once
+        let (mut a, _tx) = actor(DhtConfig {
+            query_rate_per_ip: 1000,
+            ..cfg()
+        });
+        for k in 0..200u8 {
+            let from = far(k).addr;
+            a.on_query(from, from, b"aa", &ping_from(k), now);
+        }
+        assert_eq!(a.verifying, MAX_VERIFY_PINGS);
+        assert_eq!(a.pending.len(), MAX_VERIFY_PINGS);
+        a.expire_queries(now + Duration::from_secs(1));
+        assert_eq!(a.table_v4.as_ref().unwrap().len(), 0);
+        assert!(a.pending.is_empty() && a.pinging.is_empty() && a.verifying == 0);
+    }
+
+    /// One IP flooding past its own limit does not use up the global budget.
+    #[tokio::test]
+    async fn per_ip_limit_is_checked_before_the_global_one() {
+        let (mut a, _tx) = actor(DhtConfig {
+            query_rate_per_ip: 5,
+            ..cfg()
+        });
+        let now = Instant::now();
+        // another IP (unreachable from this loopback socket: nothing leaves)
+        let flooder: SocketAddr = "10.0.0.1:6881".parse().unwrap();
+        for _ in 0..3000 {
+            a.on_query(flooder, flooder, b"aa", &ping_from(1), now);
+        }
+        let sock = raw().await;
+        let me = sock.local_addr().unwrap();
+        a.on_query(me, me, b"aa", &ping_from(2), now);
+        assert!(recv(&sock, 1000).await.is_some(), "another IP is answered");
+    }
+
+    /// A new attempt never starts while the last one still runs.
+    #[tokio::test]
+    async fn bootstrap_attempts_do_not_overlap() {
+        let (mut a, _tx) = actor(DhtConfig {
+            bootstrap: vec!["127.0.0.1:9".into()],
+            ..cfg()
+        });
+        let t0 = Instant::now();
+        let running = tokio::spawn(std::future::pending::<()>());
+        a.boot_started = true;
+        a.boot_task = Some(running);
+        a.on_timer(t0);
+        assert_eq!(a.boot_attempt, 0, "no new attempt");
+        assert_eq!(a.boot_due, Some(t0 + a.query_timeout), "polled again soon");
+        // once it is done, the next one starts
+        if let Some(t) = a.boot_task.take() {
+            t.abort();
+            let _ = t.await;
+        }
+        a.boot_task = Some(tokio::spawn(async {}));
+        tokio::task::yield_now().await;
+        while !a.boot_task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        a.on_timer(t0 + a.retry_base);
+        assert_eq!(a.boot_attempt, 1);
+        assert!(a.boot_task.is_some());
+    }
+
+    #[test]
+    fn routers_are_tried_before_restored_nodes() {
+        let r: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let s: Vec<SocketAddr> = (2..5)
+            .map(|p| SocketAddr::from(([127, 0, 0, 1], p)))
+            .collect();
+        let order = seed_order(vec![r], s.clone());
+        assert_eq!(order[0], r);
+        assert_eq!(order[1..], s[..]);
+    }
+
     #[tokio::test]
     async fn global_query_cap_holds_against_spoofed_sources() {
         let (mut a, _tx) = actor(DhtConfig {
@@ -1945,7 +2247,9 @@ mod tests {
     async fn mapped_sources_are_canonical_and_local_nodes_from_remote_dropped() {
         let (mut a, _tx) = actor(cfg());
         let now = Instant::now();
-        let mapped: SocketAddr = "[::ffff:1.2.3.4]:6881".parse().unwrap();
+        let sock = raw().await;
+        let v4 = sock.local_addr().unwrap();
+        let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{}", v4.port()).parse().unwrap();
         let ping = Message {
             tid: b"aa".to_vec(),
             ip: None,
@@ -1958,8 +2262,26 @@ mod tests {
             }),
         };
         a.on_datagram(&ping.encode(), mapped, now);
+        // the answer goes back to the mapped source (no IPv6 socket here),
+        // the verification ping to the canonical IPv4 address
+        let (verify, _) = recv(&sock, 1000).await.expect("verification ping");
+        assert!(matches!(verify.body, Body::Query(_)), "{verify:?}");
+        assert!(a.pending.values().all(|p| p.addr == v4));
+        let answer = Message {
+            tid: verify.tid,
+            ip: None,
+            version: None,
+            body: Body::Response(Response {
+                id: id(7),
+                nodes: vec![],
+                nodes6: vec![],
+                values: vec![],
+                token: None,
+            }),
+        };
+        a.on_datagram(&answer.encode(), mapped, now);
         let t = a.table_v4.as_ref().unwrap();
-        assert_eq!(t.id_at(&"1.2.3.4:6881".parse().unwrap()), Some(id(7)));
+        assert_eq!(t.id_at(&v4), Some(id(7)));
         // a remote responder cannot hand out local addresses
         let nodes = [
             NodeInfo {

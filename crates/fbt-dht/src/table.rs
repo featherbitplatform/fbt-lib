@@ -184,10 +184,11 @@ impl RoutingTable {
     /// Adds `n`, heard from at `now`, following the bucket rules.
     ///
     /// Contract: inserting marks the node good (`last_seen = now`, failures
-    /// reset), so call this only for a node that contacted us directly (a
-    /// query from it, or a reply from it at that address). Nodes learned from
-    /// a third party's `nodes` list must be pinged first and inserted only
-    /// when they answer.
+    /// reset), so call this only for a node whose address is verified: a
+    /// reply from it at that address, or a query from a node already in the
+    /// table at that address. A query from any other source (which may be
+    /// spoofed) and nodes learned from a third party's `nodes` list must be
+    /// pinged first and inserted only when they answer.
     pub(crate) fn insert(&mut self, n: NodeInfo, now: Instant) -> Insert {
         if n.id == self.own || Family::of(&n.addr) != self.family || !dialable(&n.addr) {
             return Insert::Rejected;
@@ -379,6 +380,13 @@ impl RoutingTable {
                 stale.contains(i) || self.buckets.get(*i).is_some_and(|b| b.nodes.is_empty())
             })
             .collect()
+    }
+
+    /// `n` is in the table with this id at this address.
+    pub(crate) fn contains(&self, n: &NodeInfo) -> bool {
+        self.find(&n.id)
+            .and_then(|(b, p)| self.buckets.get(b)?.nodes.get(p))
+            .is_some_and(|e| e.info.addr == n.addr)
     }
 
     /// The id stored for `addr`, if any.

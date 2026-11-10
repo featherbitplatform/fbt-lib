@@ -65,13 +65,16 @@ impl Lookup {
         l
     }
 
+    /// Adds new candidates. One per id, address and (for non-local
+    /// addresses) IP, so one host cannot fill the candidate list with many
+    /// ids on many ports.
     fn add(&mut self, nodes: &[NodeInfo]) {
         for n in nodes {
-            if self
-                .cands
-                .iter()
-                .any(|c| c.info.id == n.id || c.info.addr == n.addr)
-            {
+            let ip = n.addr.ip();
+            let shared_ip = !is_local(ip);
+            if self.cands.iter().any(|c| {
+                c.info.id == n.id || c.info.addr == n.addr || (shared_ip && c.info.addr.ip() == ip)
+            }) {
                 continue;
             }
             let dist = n.id.distance(&self.target);
@@ -461,6 +464,38 @@ mod tests {
         assert!(l.responders().is_empty());
         // an empty lookup is done at once
         assert!(Lookup::new(TARGET, vec![]).is_done());
+    }
+
+    #[test]
+    fn one_candidate_per_public_ip() {
+        let node = |d: u32, addr: &str| NodeInfo {
+            addr: addr.parse().unwrap(),
+            ..at(d)
+        };
+        // one host, many ids and ports: only the closest-first one is kept
+        let seeds = vec![
+            node(1, "203.0.113.5:6881"),
+            node(2, "203.0.113.5:6882"),
+            node(3, "203.0.113.5:6883"),
+            node(4, "198.51.100.1:6881"),
+            node(5, "[2001:db8::1]:6881"),
+            node(6, "[2001:db8::1]:6882"),
+            // local addresses may share an IP (several nodes on one host)
+            node(7, "10.0.0.1:6881"),
+            node(8, "10.0.0.1:6882"),
+        ];
+        let l = Lookup::new(TARGET, seeds);
+        let kept: Vec<u32> = l
+            .cands
+            .iter()
+            .map(|c| u32::from_be_bytes(c.info.id.0[16..].try_into().unwrap()))
+            .collect();
+        assert_eq!(kept, [1, 4, 5, 7, 8]);
+        // a later answer cannot add another id on a known public IP either
+        let mut l = l;
+        let q = l.next_queries();
+        l.on_response(&q[0].id, &[node(0, "203.0.113.5:7000")], None);
+        assert_eq!(l.candidates(), 5);
     }
 
     #[test]

@@ -147,6 +147,8 @@ async fn silent_bootstrap_is_retried_with_backoff() {
     c.bootstrap = vec![silent.local_addr().unwrap().to_string()];
     c.bootstrap_retry_base = Duration::from_millis(50);
     c.bootstrap_retry_max = Duration::from_millis(400);
+    // each attempt ends (its query times out) well before the next is due
+    c.query_timeout = Duration::from_millis(20);
     let start = Instant::now();
     let dht = Dht::spawn(c).await.unwrap();
     let mut arrivals = Vec::new();
@@ -189,6 +191,35 @@ async fn silent_bootstrap_is_retried_with_backoff() {
         "{gaps:?}"
     );
     assert!(!dht.stats().bootstrapped);
+    dht.shutdown().await;
+}
+
+/// An attempt that outlasts the retry delay is not overlapped by the next:
+/// each one starts only after the last one's query has timed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_attempts_never_overlap() {
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut c = cfg("127.0.0.1:0");
+    c.bootstrap = vec![silent.local_addr().unwrap().to_string()];
+    c.bootstrap_retry_base = Duration::from_millis(20);
+    c.bootstrap_retry_max = Duration::from_millis(20);
+    c.query_timeout = Duration::from_millis(300);
+    let dht = Dht::spawn(c).await.unwrap();
+    let mut arrivals = Vec::new();
+    let mut buf = [0u8; 1500];
+    let end = Instant::now() + Duration::from_millis(1500);
+    while let Ok(Ok((n, _))) = tokio::time::timeout_at(end, silent.recv_from(&mut buf)).await {
+        if Message::decode(&buf[..n]).is_ok() {
+            arrivals.push(Instant::now());
+        }
+    }
+    let gaps: Vec<Duration> = arrivals.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!((2..=6).contains(&arrivals.len()), "{gaps:?}");
+    assert!(
+        gaps.iter()
+            .all(|g| *g + Duration::from_millis(20) >= Duration::from_millis(300)),
+        "an attempt started while the last one ran: {gaps:?}"
+    );
     dht.shutdown().await;
 }
 
