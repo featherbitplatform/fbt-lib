@@ -522,6 +522,7 @@ async fn magnet_announces_left_16384_until_metadata() {
 
     // Removed before any metadata: `started` and `stopped` both say 16 384.
     let session = Session::new(settings()).await.unwrap();
+    let mut trackers = session.subscribe(EventMask::TRACKER);
     let port = session.local_addr().port();
     let mut mg = magnet_of(InfoHashes::from_v1(InfoHashV1([9; 20])), vec![]);
     mg.trackers = vec![tracker.url.clone()];
@@ -529,7 +530,15 @@ async fn magnet_announces_left_16384_until_metadata() {
         .add_torrent(AddTorrent::magnet(mg, PathBuf::from("unused")))
         .await
         .unwrap();
-    assert!(wait_until(|| tracker.events_of(port) == ["started"], T).await);
+    // `stopped` follows a `started` the announcer saw answered. The tracker
+    // records the request before it replies, so removing as soon as it is
+    // recorded can abandon the walk before the reply: then nothing is
+    // stopped. Wait for the reply itself.
+    wait_event(&mut trackers, "started answered", |e| {
+        matches!(e, Event::TrackerReply { .. })
+    })
+    .await;
+    assert_eq!(tracker.events_of(port), ["started"]);
     h.remove(RemoveMode::KeepData).await.unwrap();
     assert!(
         wait_until(|| tracker.events_of(port) == ["started", "stopped"], T).await,
