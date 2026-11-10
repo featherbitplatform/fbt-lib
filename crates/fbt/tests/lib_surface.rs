@@ -5,11 +5,11 @@
 use fbt::{
     AddTorrent, Bitfield, BitfieldError, BlockRef, DEFAULT_DHT_BOOTSTRAP, DecodeError, DhtStats,
     DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, FileEntry, FileLayout,
-    FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2, InfoHashes, LayoutError, MAX_METADATA_SIZE,
-    Magnet, MagnetError, MemStorage, Metainfo, MetainfoError, ParseInfoHashError, PeerId,
-    PeerSource, PieceLayout, Priority, RelPath, RemoveMode, Session, SessionError, Settings,
-    Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus, TrackerConfig,
-    TrackerError,
+    FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2, InfoHashes, LayoutError, ListenError,
+    MAX_METADATA_SIZE, Magnet, MagnetError, MemStorage, Metainfo, MetainfoError,
+    ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority, RelPath, RemoveMode, Session,
+    SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
+    TrackerConfig, TrackerError,
 };
 
 fn names(
@@ -18,6 +18,7 @@ fn names(
     _: Option<BlockRef>,
     _: Option<FileSlice>,
     _: Option<LayoutError>,
+    _: Option<ListenError>,
     _: Option<BitfieldError>,
     _: Option<DecodeError>,
     _: Option<DisconnectReason>,

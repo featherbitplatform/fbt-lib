@@ -29,7 +29,7 @@ use tokio_util::codec::Framed;
 /// tests bootstrap from a loopback node).
 pub fn test_settings() -> Settings {
     let mut s = Settings::default();
-    s.listen_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
     s.status_interval = Duration::from_millis(50);
     s.dht_enabled = false;
     s.dht_bootstrap_nodes = Vec::new();
@@ -419,6 +419,8 @@ pub struct Announce {
     pub event: String,
     /// The `left` the announcer reported.
     pub left: u64,
+    /// Where the announce came from.
+    pub source: SocketAddr,
 }
 
 /// How a fake tracker answers.
@@ -495,8 +497,8 @@ impl FakeTracker {
         let state = std::sync::Arc::new(Mutex::new(TrackerState::default()));
         let st = state.clone();
         let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(http_conn(stream, st.clone(), reply.clone()));
+            while let Ok((stream, from)) = listener.accept().await {
+                tokio::spawn(http_conn(stream, from, st.clone(), reply.clone()));
             }
         });
         FakeTracker {
@@ -558,6 +560,7 @@ fn percent_decode(s: &str) -> Vec<u8> {
 
 async fn http_conn(
     mut stream: TcpStream,
+    source: SocketAddr,
     state: std::sync::Arc<Mutex<TrackerState>>,
     reply: Reply,
 ) {
@@ -595,6 +598,7 @@ async fn http_conn(
             port,
             event: event.clone(),
             left,
+            source,
         });
     let first_completed = event == "completed"
         && state
@@ -675,6 +679,7 @@ async fn udp_loop(
                     port: u16::from_be_bytes([b[96], b[97]]),
                     event: event.to_owned(),
                     left: u64::from_be_bytes(b[64..72].try_into().unwrap()),
+                    source: from,
                 });
             match &reply {
                 Reply::Failure(msg) => {

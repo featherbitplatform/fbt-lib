@@ -45,7 +45,6 @@ fn dht_settings(bootstrap: Vec<String>) -> Settings {
     s.rechoke_interval = Duration::from_secs(1);
     s.dht_enabled = true;
     s.dht_bootstrap_nodes = bootstrap;
-    s.dht_ipv6 = false;
     s.dht_query_timeout = Duration::from_millis(500);
     s.dht_query_rate_per_ip = 10_000;
     s
@@ -266,9 +265,14 @@ async fn dht_port_taken_falls_back() {
         }
     };
     let mut s = dht_settings(Vec::new());
-    s.listen_addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listen = SocketAddr::from(([127, 0, 0, 1], port));
+    s.listen_addrs = vec![listen];
     let session = Session::new(s).await.unwrap();
     assert_eq!(session.local_addr().port(), port);
+    let errors = session.listen_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].addr, listen);
+    assert!(errors[0].udp_only);
     let dht = session.dht_stats().expect("DHT running");
     assert_eq!(dht.local_addrs.len(), 1);
     assert_ne!(dht.local_addrs[0].port(), port);
@@ -288,6 +292,21 @@ async fn dht_on_listener_port_when_free() {
             session.local_addr().port()
         ))]
     );
+    // The DHT runs on the shared socket: a ping reaches its demultiplexer.
+    let node = loopback_dht(Vec::new()).await;
+    node.add_node(dht.local_addrs[0]);
+    assert!(
+        wait_until(
+            || session
+                .demux_stats()
+                .first()
+                .is_some_and(|(_, s)| s.dht > 0),
+            T
+        )
+        .await
+    );
+    assert!(wait_until(|| node.stats().nodes_v4 >= 1, T).await);
+    node.shutdown().await;
     session.shutdown().await;
 }
 

@@ -25,18 +25,32 @@ use crate::settings::EncryptionPolicy;
 /// Pause after a failed `accept` (for example out of file descriptors).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Runs the accept loop until the session goes away or the task is aborted.
+/// Accept-side state shared by every accept loop of the session, so the
+/// limits hold across all listen addresses together.
+#[derive(Debug)]
+pub(crate) struct ListenerState {
+    /// Connections still sending their handshake, on every accept loop
+    /// together (`max_peers_global` permits); more are dropped at once.
+    pub pending: Arc<Semaphore>,
+}
+
+impl ListenerState {
+    pub(crate) fn new(max_peers_global: usize) -> ListenerState {
+        let permits = max_peers_global.clamp(1, Semaphore::MAX_PERMITS);
+        ListenerState {
+            pending: Arc::new(Semaphore::new(permits)),
+        }
+    }
+}
+
+/// Runs one accept loop until the session goes away or the task is
+/// aborted.
 pub(crate) fn spawn(
     listener: TcpListener,
+    state: Arc<ListenerState>,
     session: Weak<SessionInner>,
     shared: Arc<Shared>,
 ) -> JoinHandle<()> {
-    // Connections still sending their handshake; more are dropped at once.
-    let permits = shared
-        .settings
-        .max_peers_global
-        .clamp(1, Semaphore::MAX_PERMITS);
-    let pending = Arc::new(Semaphore::new(permits));
     tokio::spawn(async move {
         loop {
             let (stream, addr) = match listener.accept().await {
@@ -50,7 +64,7 @@ pub(crate) fn spawn(
             if session.strong_count() == 0 || shared.is_shutdown() {
                 return;
             }
-            let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
+            let Ok(permit) = Arc::clone(&state.pending).try_acquire_owned() else {
                 debug!(%addr, "too many pending handshakes; dropping connection");
                 continue;
             };

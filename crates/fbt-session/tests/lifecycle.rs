@@ -825,3 +825,111 @@ async fn incoming_valid_plaintext_handshake_is_routed() {
         .expect("PeerConnected");
     s.shutdown().await;
 }
+
+/// True when the host can bind `[::1]`; IPv6 tests return early otherwise.
+fn ipv6_available() -> bool {
+    std::net::TcpListener::bind("[::1]:0").is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listens_on_every_address() {
+    if !ipv6_available() {
+        return;
+    }
+    let mut st = test_settings();
+    st.listen_addrs = vec![
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        "[::1]:0".parse().unwrap(),
+    ];
+    let s = Session::new(st).await.unwrap();
+    let addrs = s.local_addrs();
+    assert_eq!(addrs.len(), 2, "{addrs:?}");
+    assert!(addrs[0].is_ipv4() && addrs[1].is_ipv6(), "{addrs:?}");
+    assert_eq!(s.local_addr(), addrs[0]);
+    assert!(s.listen_errors().is_empty());
+    let (m, payload) = make_torrent(&[("a", 16_384)], 16_384);
+    let dir = tempfile::tempdir().unwrap();
+    write_payload(dir.path(), &m, &payload);
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    for addr in addrs {
+        let peer = ScriptedPeer::connect(addr, m.info_hashes.wire_hash()).await;
+        assert_eq!(peer.remote.info_hash, m.info_hashes.wire_hash(), "{addr}");
+    }
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ipv6_bind_failure_is_reported_and_skipped() {
+    let Ok(held) = std::net::TcpListener::bind("[::1]:0") else {
+        return;
+    };
+    let taken = held.local_addr().unwrap();
+    let mut st = test_settings();
+    st.listen_addrs = vec![std::net::SocketAddr::from(([127, 0, 0, 1], 0)), taken];
+    let s = Session::new(st).await.unwrap();
+    assert_eq!(s.local_addrs().len(), 1);
+    assert!(s.local_addrs()[0].is_ipv4());
+    let errors = s.listen_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].addr, taken);
+    assert!(!errors[0].udp_only);
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unspecified_v4_and_v6_share_a_port() {
+    if !ipv6_available() {
+        return;
+    }
+    // A port free for TCP and UDP on both families.
+    let port = loop {
+        let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        let free = std::net::UdpSocket::bind(("0.0.0.0", p)).is_ok()
+            && std::net::TcpListener::bind(("::", p)).is_ok()
+            && std::net::UdpSocket::bind(("::", p)).is_ok();
+        if free {
+            break p;
+        }
+    };
+    let mut st = test_settings();
+    st.listen_addrs = vec![
+        std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+        std::net::SocketAddr::from(([0u16; 8], port)),
+    ];
+    let s = Session::new(st).await.unwrap();
+    assert_eq!(s.local_addrs().len(), 2, "{:?}", s.listen_errors());
+    assert!(s.listen_errors().is_empty(), "{:?}", s.listen_errors());
+    assert!(s.local_addrs().iter().all(|a| a.port() == port));
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn empty_listen_addrs_is_invalid() {
+    let mut st = test_settings();
+    st.listen_addrs = Vec::new();
+    match Session::new(st).await {
+        Err(SessionError::InvalidSettings(msg)) => assert!(msg.contains("listen_addrs"), "{msg}"),
+        other => panic!("expected InvalidSettings, got {other:?}"),
+    }
+    let mut st = test_settings();
+    let a = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    st.listen_addrs = vec![a, a];
+    match Session::new(st).await {
+        Err(SessionError::InvalidSettings(msg)) => assert!(msg.contains("listen_addrs"), "{msg}"),
+        other => panic!("expected InvalidSettings, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn nothing_binds_is_a_bind_error() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut st = test_settings();
+    st.listen_addrs = vec![held.local_addr().unwrap()];
+    assert!(matches!(Session::new(st).await, Err(SessionError::Bind(_))));
+}

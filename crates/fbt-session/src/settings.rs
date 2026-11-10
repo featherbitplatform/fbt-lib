@@ -1,6 +1,6 @@
 //! Session settings.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use fbt_tracker::TrackerConfig;
@@ -47,13 +47,18 @@ pub enum EncryptionPolicy {
 /// (zero intervals and timeouts that drive timers, queues of zero or beyond
 /// [`MAX_EVENT_QUEUE`] / [`MAX_INCOMING_REQUESTS`], a metadata cap outside
 /// 16 KiB..=[`MAX_METADATA_SIZE`], a DHT bootstrap entry that is not
-/// `host:port`) with
+/// `host:port`, an empty or duplicated `listen_addrs`) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Settings {
-    /// Address the peer listener binds.
-    pub listen_addr: SocketAddr,
+    /// Addresses the session listens on (non-empty, no duplicates). Each
+    /// gets a TCP peer listener and, on the same port, a UDP socket shared
+    /// by the DHT and UDP tracker announces. An IPv6 address binds
+    /// IPv6-only, so `0.0.0.0:p` and `[::]:p` can share a port. An address
+    /// that cannot be bound is skipped and reported by
+    /// [`Session::listen_errors`](crate::Session::listen_errors).
+    pub listen_addrs: Vec<SocketAddr>,
     /// Connected peers per torrent.
     pub max_peers_per_torrent: usize,
     /// Connected peers across all torrents.
@@ -110,16 +115,14 @@ pub struct Settings {
     /// in bytes; peers advertising more are disconnected. 16 KiB to
     /// [`MAX_METADATA_SIZE`].
     pub max_metadata_size: usize,
-    /// Run a session-wide Mainline DHT node (BEP 5) on the listener's IP
-    /// and port (UDP; port 0 when that one is taken). Private torrents
-    /// never use it.
+    /// Run a session-wide Mainline DHT node (BEP 5) on the listen
+    /// addresses' shared UDP sockets, on the first one of each address
+    /// family (on a free port of that IP when no UDP socket could be bound).
+    /// Private torrents never use it.
     pub dht_enabled: bool,
     /// Nodes the DHT bootstraps from, as `host:port`; by default the public
     /// routers in [`DEFAULT_DHT_BOOTSTRAP`].
     pub dht_bootstrap_nodes: Vec<String>,
-    /// Also run the DHT over IPv6 (`[::]`, the same port), when the
-    /// listener is IPv4.
-    pub dht_ipv6: bool,
     /// BEP 43 read-only node: query others, answer nobody.
     pub dht_read_only: bool,
     /// A DHT state saved earlier with
@@ -186,6 +189,17 @@ impl Settings {
                 self.max_metadata_size
             ));
         }
+        if self.listen_addrs.is_empty() {
+            return Err("listen_addrs must not be empty".to_owned());
+        }
+        let addrs = &self.listen_addrs;
+        if let Some(dup) = addrs
+            .iter()
+            .enumerate()
+            .find_map(|(i, a)| addrs.iter().take(i).any(|b| b == a).then_some(a))
+        {
+            return Err(format!("listen_addrs has {dup} twice"));
+        }
         if self.dht_query_rate_per_ip == 0 {
             return Err("dht_query_rate_per_ip must be greater than zero".to_owned());
         }
@@ -220,7 +234,10 @@ fn is_host_port(entry: &str) -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            listen_addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 6881)),
+            listen_addrs: vec![
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 6881)),
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 6881)),
+            ],
             max_peers_per_torrent: 50,
             max_peers_global: 200,
             max_half_open: 10,
@@ -244,7 +261,6 @@ impl Default for Settings {
             max_metadata_size: 16 * 1024 * 1024,
             dht_enabled: true,
             dht_bootstrap_nodes: DEFAULT_DHT_BOOTSTRAP.map(str::to_owned).to_vec(),
-            dht_ipv6: true,
             dht_read_only: false,
             dht_state: None,
             dht_announce_interval: Duration::from_secs(15 * 60),

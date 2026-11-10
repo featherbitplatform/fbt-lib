@@ -273,7 +273,7 @@ async fn transfer(
     let mut settings = Settings::default();
     net.apply(&mut settings);
     if let Some(port) = port {
-        settings.listen_addr.set_port(port);
+        settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];
     }
     let session = Session::new(settings).await?;
     println!("listening on {}", session.local_addr());
@@ -307,7 +307,7 @@ async fn dht_node(
     settings.dht_enabled = true;
     settings.dht_bootstrap_nodes = bootstrap;
     if let Some(port) = port {
-        settings.listen_addr.set_port(port);
+        settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];
     }
     let session = Session::new(settings).await?;
     println!("dht node listening on {}", session.local_addr());

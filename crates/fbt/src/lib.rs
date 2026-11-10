@@ -117,8 +117,8 @@ pub use fbt_metainfo::{FileEntry, Info, Magnet, MagnetError, Metainfo, MetainfoE
 pub use fbt_session::storage::{FsStorage, MemStorage, Storage};
 pub use fbt_session::{
     AddTorrent, DEFAULT_DHT_BOOTSTRAP, DhtStats, DisconnectReason, EncryptionPolicy, Event,
-    EventMask, EventStream, MAX_METADATA_SIZE, PeerSource, Priority, RemoveMode, Session,
-    SessionError, Settings, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
+    EventMask, EventStream, ListenError, MAX_METADATA_SIZE, PeerSource, Priority, RemoveMode,
+    Session, SessionError, Settings, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 
