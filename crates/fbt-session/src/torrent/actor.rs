@@ -264,7 +264,6 @@ impl Actor {
         });
     }
 
-    /// Publishes the status and emits `StateChanged` if the state changed.
     /// Publishes the status and emits `StateChanged` only if the state
     /// changed; other changes wait for the next status tick.
     pub(super) fn refresh_state(&mut self) {

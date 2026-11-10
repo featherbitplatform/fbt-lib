@@ -1,7 +1,7 @@
 //! Peer connections of a torrent: connecting and accepting within the
 //! limits, peer events, interest and handing out block requests.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -445,6 +445,10 @@ impl Actor {
         let (Some(picker), Some(p)) = (self.picker.as_mut(), self.peers.get(&key)) else {
             return;
         };
+        let evicted = evict_orphans(picker, cap, &mut self.bufs);
+        if evicted > 0 {
+            debug!(evicted, "dropped partial pieces no connected peer has");
+        }
         if !p.connected || p.tx.is_none() || p.generation != generation {
             return;
         }
@@ -552,13 +556,35 @@ pub(super) fn pick_capped(
     out
 }
 
+/// At the cap, partial pieces no connected peer has (availability 0) can
+/// never complete and would block every new piece: they are failed back to
+/// unrequested and their buffers freed. Returns how many were evicted.
+pub(super) fn evict_orphans(
+    picker: &mut PiecePicker,
+    cap: usize,
+    bufs: &mut HashMap<u32, Vec<u8>>,
+) -> usize {
+    if picker.num_in_progress() < cap {
+        return 0;
+    }
+    let orphans: Vec<u32> = picker
+        .partial_pieces()
+        .filter(|&i| picker.availability(i) == 0)
+        .collect();
+    for &piece in &orphans {
+        picker.piece_failed(piece);
+        bufs.remove(&piece);
+    }
+    orphans.len()
+}
+
 fn has_len(picker: &PiecePicker) -> u32 {
     picker.have().len()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use fbt_core::{Bitfield, PieceLayout};
     use rand::SeedableRng;
@@ -576,6 +602,49 @@ mod tests {
 
     fn pieces_of(blocks: &[BlockRef]) -> HashSet<u32> {
         blocks.iter().map(|b| b.piece).collect()
+    }
+
+    #[test]
+    fn orphaned_partials_are_evicted_when_the_cap_is_full() {
+        let mut rng = StdRng::seed_from_u64(3);
+        // Four blocks per piece, cap 3.
+        let layout = PieceLayout::new(20 * 65_536, 65_536).expect("layout");
+        let mut p = PiecePicker::new(layout, &Bitfield::new(20));
+        let mut a_has = Bitfield::new(20);
+        for i in 0..3 {
+            a_has.set(i);
+        }
+        let mut b_has = Bitfield::new(20);
+        for i in 10..20 {
+            b_has.set(i);
+        }
+        p.add_peer_pieces(PeerPieces::Some(&a_has));
+        p.add_peer_pieces(PeerPieces::Some(&b_has));
+        let a = PeerKey(1);
+        let b = PeerKey(2);
+        let got = pick_capped(&mut p, a, PeerPieces::Some(&a_has), 12, 3, &mut rng);
+        assert_eq!(got.len(), 12);
+        let mut bufs: HashMap<u32, Vec<u8>> = HashMap::new();
+        // One block of each piece arrives; the rest is still outstanding.
+        for blk in got.iter().filter(|b| b.offset == 0) {
+            assert!(p.on_block(a, *blk).accepted);
+            bufs.insert(blk.piece, vec![0; 65_536]);
+        }
+        assert_eq!(p.num_in_progress(), 3);
+        assert_eq!(bufs.len(), 3);
+        // The only holder leaves for good.
+        p.release_peer(a);
+        p.remove_peer_pieces(PeerPieces::Some(&a_has));
+        // The cap is full of stranded partials: B gets nothing.
+        assert!(pick_capped(&mut p, b, PeerPieces::Some(&b_has), 8, 3, &mut rng).is_empty());
+        assert_eq!(evict_orphans(&mut p, 3, &mut bufs), 3);
+        assert!(bufs.is_empty());
+        assert_eq!(p.num_in_progress(), 0);
+        let blocks = pick_capped(&mut p, b, PeerPieces::Some(&b_has), 8, 3, &mut rng);
+        assert_eq!(blocks.len(), 8);
+        assert!(blocks.iter().all(|blk| blk.piece >= 10));
+        // Below the cap nothing is evicted.
+        assert_eq!(evict_orphans(&mut p, 3, &mut bufs), 0);
     }
 
     #[test]
