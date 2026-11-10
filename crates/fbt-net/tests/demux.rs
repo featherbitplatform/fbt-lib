@@ -127,3 +127,18 @@ async fn close_stops_delivery() {
     let st: DemuxStats = s.stats();
     assert_eq!((st.utp, st.dht, st.tracker, st.dropped), (1, 0, 0, 0));
 }
+
+#[tokio::test]
+async fn close_releases_the_port_and_fails_sends() {
+    let s = SharedUdpSocket::bind(lo()).unwrap();
+    let tx = s.sender();
+    let addr = s.local_addr();
+    s.close();
+    let to = UdpSocket::bind(lo()).unwrap().local_addr().unwrap();
+    let err = tx.send_to(b"x", to).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+    assert!(
+        wait_for(|| UdpSocket::bind(addr).is_ok()).await,
+        "the port must be free after close"
+    );
+}

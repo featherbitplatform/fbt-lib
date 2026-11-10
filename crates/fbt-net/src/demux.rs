@@ -48,15 +48,16 @@ pub fn classify(data: &[u8]) -> Option<PacketKind> {
     None
 }
 
-/// Datagram counts per kind since the socket was bound.
+/// Counts of datagrams dispatched to a handler, per kind, since the socket
+/// was bound.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DemuxStats {
-    /// Datagrams delivered to the uTP handler.
+    /// Datagrams dispatched to the uTP handler.
     pub utp: u64,
-    /// Datagrams delivered to the DHT handler.
+    /// Datagrams dispatched to the DHT handler.
     pub dht: u64,
-    /// Datagrams delivered to the tracker handler.
+    /// Datagrams dispatched to the tracker handler.
     pub tracker: u64,
     /// Datagrams of unknown shape or with no handler for their kind.
     pub dropped: u64,
@@ -77,9 +78,12 @@ struct Counters {
     dropped: AtomicU64,
 }
 
+/// The non-blocking send clone; `None` once the socket is closed.
+type SendHalf = Arc<Mutex<Option<std::net::UdpSocket>>>;
+
 #[derive(Debug)]
 struct Inner {
-    send: Arc<std::net::UdpSocket>,
+    send: SendHalf,
     local: SocketAddr,
     handlers: Mutex<Handlers>,
     counters: Counters,
@@ -90,6 +94,12 @@ struct Inner {
 impl Inner {
     fn stop(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        // drop the send clone so the port is released once the receive task
+        // has dropped its own handle, even while sender() Arcs live on
+        self.send
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         // notify_one stores a permit, so a task not yet waiting still sees it
         self.stop.notify_one();
     }
@@ -138,7 +148,7 @@ pub struct SharedUdpSocket {
 
 #[derive(Debug)]
 struct Sender {
-    socket: Arc<std::net::UdpSocket>,
+    socket: SendHalf,
     local: SocketAddr,
 }
 
@@ -148,7 +158,11 @@ impl DatagramSender for Sender {
     }
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
-        self.socket.send_to(data, to)
+        let guard = self.socket.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.as_ref() {
+            Some(s) => s.send_to(data, to),
+            None => Err(io::ErrorKind::NotConnected.into()),
+        }
     }
 }
 
@@ -177,7 +191,7 @@ impl SharedUdpSocket {
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local = socket.local_addr()?;
         let inner = Arc::new(Inner {
-            send: Arc::new(send),
+            send: Arc::new(Mutex::new(Some(send))),
             local,
             handlers: Mutex::new(Handlers::default()),
             counters: Counters::default(),
@@ -230,7 +244,8 @@ impl SharedUdpSocket {
         }
     }
 
-    /// Stops the receive task; idempotent. The task also ends when the last
+    /// Closes the socket; idempotent. Later sends fail with `NotConnected`
+    /// and the port is released once the receive task has exited. The task also ends when the last
     /// clone drops.
     pub fn close(&self) {
         self.inner.stop();

@@ -17,7 +17,8 @@ pub trait DatagramSender: Send + Sync + std::fmt::Debug + 'static {
 /// Receives the datagrams of one packet kind.
 ///
 /// It must not block or await (it runs on the receive task); handlers that
-/// need async work `try_send` into their own bounded channel.
+/// need async work `try_send` into their own bounded channel. It must not
+/// panic either: a panic ends delivery for every kind.
 pub trait DatagramHandler: Send + Sync + std::fmt::Debug + 'static {
     /// Called once per datagram received from `from`.
     fn handle(&self, from: SocketAddr, data: &[u8]);
