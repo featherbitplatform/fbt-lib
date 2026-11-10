@@ -80,6 +80,8 @@ pub(crate) struct Actor {
     pub(super) paused: bool,
     pub(super) picker: Option<PiecePicker>,
     pub(super) piece_prio: Vec<u8>,
+    /// Bytes of pieces with a non-zero priority; follows `piece_prio`.
+    pub(super) total_wanted: u64,
     pub(super) file_prio: Vec<Priority>,
     pub(super) sequential: bool,
     pub(super) peers: HashMap<PeerKey, Peer>,
@@ -108,6 +110,7 @@ impl Actor {
         let meta = Arc::new(params.metainfo);
         let (peer_tx, peer_rx) = mpsc::channel(PEER_EVENT_QUEUE);
         let piece_prio = piece_priorities(&meta, &params.file_priorities);
+        let total_wanted = wanted_bytes(&meta.piece_layout(), &piece_prio);
         Actor {
             ih: meta.info_hashes,
             layout: meta.piece_layout(),
@@ -125,6 +128,7 @@ impl Actor {
             },
             paused: params.paused,
             picker: None,
+            total_wanted,
             piece_prio,
             file_prio: params.file_priorities,
             sequential: params.sequential,
@@ -205,10 +209,7 @@ impl Actor {
     }
 
     pub(super) fn snapshot(&self) -> TorrentStatus {
-        let total_wanted: u64 = (0..self.layout.num_pieces())
-            .filter(|&i| self.piece_prio.get(i as usize).is_some_and(|&p| p > 0))
-            .map(|i| u64::from(self.layout.piece_size(i)))
-            .sum();
+        let total_wanted = self.total_wanted;
         let wanted_done = self
             .picker
             .as_ref()
@@ -264,10 +265,12 @@ impl Actor {
     }
 
     /// Publishes the status and emits `StateChanged` if the state changed.
+    /// Publishes the status and emits `StateChanged` only if the state
+    /// changed; other changes wait for the next status tick.
     pub(super) fn refresh_state(&mut self) {
         let state = self.state();
-        self.publish();
         if !same_state(&state, &self.last_state) {
+            self.publish();
             self.last_state = state;
             self.emit(Event::StateChanged {
                 torrent: self.ih,
@@ -414,12 +417,11 @@ impl Actor {
         let was_error = matches!(self.phase, Phase::Error(_));
         self.paused = false;
         if was_error {
-            if self.picker.is_some() {
-                self.phase = Phase::Ready;
-            } else {
-                self.generation = self.generation.wrapping_add(1);
-                self.start_check();
-            }
+            // Whatever was in flight when the error hit is unknown: forget
+            // the picker and partial pieces and trust only the disk.
+            self.generation = self.generation.wrapping_add(1);
+            self.bufs.clear();
+            self.start_check();
         }
         self.refresh_state();
         self.requeue_known();
@@ -437,14 +439,22 @@ impl Actor {
     pub(super) fn set_priorities(&mut self, p: Vec<Priority>) {
         self.file_prio = p;
         self.piece_prio = piece_priorities(&self.meta, &self.file_prio);
+        self.total_wanted = wanted_bytes(&self.layout, &self.piece_prio);
         if let Some(picker) = self.picker.as_mut() {
             picker.set_piece_priorities(&self.piece_prio);
+            // Partial pieces no longer wanted give back their buffers.
+            let skipped: Vec<u32> = picker
+                .partial_pieces()
+                .filter(|&i| self.piece_prio.get(i as usize).is_some_and(|&p| p == 0))
+                .collect();
+            for piece in skipped {
+                picker.piece_failed(piece);
+                self.bufs.remove(&piece);
+            }
             if !picker.is_finished() {
                 self.finished_emitted = false;
             }
         }
-        // Buffers of pieces no longer wanted are dropped with the picker's
-        // own progress on them when they fail or pass; keep them until then.
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
             self.update_interest(key);
@@ -497,4 +507,12 @@ impl Actor {
             }
         }
     }
+}
+
+/// Bytes of the pieces with a non-zero priority.
+fn wanted_bytes(layout: &PieceLayout, prio: &[u8]) -> u64 {
+    (0..layout.num_pieces())
+        .filter(|&i| prio.get(i as usize).is_some_and(|&p| p > 0))
+        .map(|i| u64::from(layout.piece_size(i)))
+        .sum()
 }

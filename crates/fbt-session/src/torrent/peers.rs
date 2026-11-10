@@ -15,7 +15,7 @@ use crate::event::Event;
 use crate::peer::DisconnectReason;
 use crate::peer::conn::{PeerCtx, spawn_incoming, spawn_outgoing};
 use crate::peer::messages::{PeerCommand, PeerEvent, PeerPiecesOwned};
-use crate::picker::{PeerKey, PeerPieces};
+use crate::picker::{PeerKey, PeerPieces, PiecePicker};
 use crate::session::{release, try_reserve};
 
 /// One peer connection, from spawn until its `Disconnected` event.
@@ -441,6 +441,7 @@ impl Actor {
         }
         let max = self.shared.settings.max_outstanding_requests;
         let generation = self.generation;
+        let cap = partial_cap(self.layout.piece_len());
         let (Some(picker), Some(p)) = (self.picker.as_mut(), self.peers.get(&key)) else {
             return;
         };
@@ -461,9 +462,16 @@ impl Actor {
                     fast.set(i);
                 }
             }
-            picker.pick(key, PeerPieces::Some(&fast), room, &mut self.rng)
+            pick_capped(
+                picker,
+                key,
+                PeerPieces::Some(&fast),
+                room,
+                cap,
+                &mut self.rng,
+            )
         } else {
-            picker.pick(key, p.pieces(), room, &mut self.rng)
+            pick_capped(picker, key, p.pieces(), room, cap, &mut self.rng)
         };
         if blocks.is_empty() {
             return;
@@ -486,5 +494,150 @@ impl Actor {
         for key in keys {
             self.fill(key);
         }
+    }
+}
+
+/// Memory budget for pieces being downloaded (buffered in memory).
+const PARTIAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Pieces in progress are never fewer than this, whatever the piece size.
+const MIN_PARTIAL_PIECES: usize = 8;
+
+/// Most pieces a torrent downloads at once: `max(8, 64 MiB / piece_len)`.
+pub(super) fn partial_cap(piece_len: u32) -> usize {
+    let by_bytes = PARTIAL_BYTES / u64::from(piece_len.max(1));
+    usize::try_from(by_bytes)
+        .unwrap_or(usize::MAX)
+        .max(MIN_PARTIAL_PIECES)
+}
+
+fn peer_has(has: PeerPieces, piece: u32) -> bool {
+    match has {
+        PeerPieces::Some(bf) => bf.get(piece),
+        _ => true,
+    }
+}
+
+/// Picks up to `room` blocks for `key` without ever having more than `cap`
+/// pieces in progress: below the cap at most `cap - in_progress` blocks are
+/// picked per round (each can start at most one piece); at the cap only
+/// blocks of partial pieces are handed out.
+pub(super) fn pick_capped(
+    picker: &mut PiecePicker,
+    key: PeerKey,
+    has: PeerPieces,
+    room: usize,
+    cap: usize,
+    rng: &mut impl rand::Rng,
+) -> Vec<BlockRef> {
+    let mut out = Vec::new();
+    while out.len() < room {
+        let left = room - out.len();
+        let new_allowed = cap.saturating_sub(picker.num_in_progress());
+        if new_allowed == 0 {
+            let mut partial = Bitfield::new(has_len(picker));
+            for i in picker.partial_pieces() {
+                if peer_has(has, i) {
+                    partial.set(i);
+                }
+            }
+            out.extend(picker.pick(key, PeerPieces::Some(&partial), left, rng));
+            break;
+        }
+        let got = picker.pick(key, has, left.min(new_allowed), rng);
+        if got.is_empty() {
+            break;
+        }
+        out.extend(got);
+    }
+    out
+}
+
+fn has_len(picker: &PiecePicker) -> u32 {
+    picker.have().len()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use fbt_core::{Bitfield, PieceLayout};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    use super::*;
+
+    fn picker(pieces: u32, piece_len: u32) -> PiecePicker {
+        let layout =
+            PieceLayout::new(u64::from(pieces) * u64::from(piece_len), piece_len).expect("layout");
+        let mut p = PiecePicker::new(layout, &Bitfield::new(pieces));
+        p.add_peer_pieces(PeerPieces::All);
+        p
+    }
+
+    fn pieces_of(blocks: &[BlockRef]) -> HashSet<u32> {
+        blocks.iter().map(|b| b.piece).collect()
+    }
+
+    #[test]
+    fn partial_cap_by_piece_size() {
+        assert_eq!(partial_cap(16_384), 4096);
+        assert_eq!(partial_cap(1 << 20), 64);
+        assert_eq!(partial_cap(16 << 20), 8);
+        assert_eq!(partial_cap(0), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn single_block_pieces_never_exceed_the_cap() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut p = picker(20, 16_384);
+        let got = pick_capped(&mut p, PeerKey(1), PeerPieces::All, 32, 8, &mut rng);
+        assert_eq!(got.len(), 8);
+        assert_eq!(pieces_of(&got).len(), 8);
+        assert_eq!(p.num_in_progress(), 8);
+        // At the cap with nothing partial left to hand out: nothing new starts.
+        assert!(pick_capped(&mut p, PeerKey(2), PeerPieces::All, 32, 8, &mut rng).is_empty());
+        // A finished piece frees a slot.
+        p.on_block(PeerKey(1), got[0]);
+        p.piece_passed(got[0].piece);
+        let more = pick_capped(&mut p, PeerKey(2), PeerPieces::All, 32, 8, &mut rng);
+        assert_eq!(more.len(), 1);
+        assert_eq!(p.num_in_progress(), 8);
+    }
+
+    #[test]
+    fn at_the_cap_only_partial_pieces_are_served() {
+        let mut rng = StdRng::seed_from_u64(2);
+        // Four blocks per piece.
+        let mut p = picker(20, 65_536);
+        let first = pick_capped(&mut p, PeerKey(1), PeerPieces::All, 6, 3, &mut rng);
+        assert_eq!(first.len(), 6);
+        assert!(pieces_of(&first).len() <= 3);
+        let rest = pick_capped(&mut p, PeerKey(2), PeerPieces::All, 32, 3, &mut rng);
+        let all: Vec<BlockRef> = first.iter().chain(rest.iter()).copied().collect();
+        assert_eq!(pieces_of(&all).len(), 3);
+        assert_eq!(
+            all.len(),
+            12,
+            "every block of the three pieces, nothing more"
+        );
+        assert_eq!(p.num_in_progress(), 3);
+        // A peer without any partial piece gets nothing.
+        let mut only_other = Bitfield::new(20);
+        for i in 0..20 {
+            if !pieces_of(&all).contains(&i) {
+                only_other.set(i);
+            }
+        }
+        assert!(
+            pick_capped(
+                &mut p,
+                PeerKey(3),
+                PeerPieces::Some(&only_other),
+                32,
+                3,
+                &mut rng
+            )
+            .is_empty()
+        );
     }
 }

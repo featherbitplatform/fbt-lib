@@ -299,10 +299,7 @@ async fn unwritable_save_path_puts_torrent_in_error() {
     assert!(wait_state(&bad, |s| *s == TorrentState::Error, T).await);
     assert!(bad.status().error.is_some());
     // The peer is disconnected.
-    assert!(
-        peer.next_matching(|_| false).await.is_none(),
-        "connection closed"
-    );
+    assert_eq!(peer.wait_closed(T).await, PeerEnd::Closed);
     // The other torrent is unaffected.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(good.status().state, TorrentState::Seeding);
@@ -438,4 +435,94 @@ async fn leecher_downloads_from_seeding_session() {
     assert!(sh.status().total_uploaded >= payload.len() as u64);
     leecher.shutdown().await;
     seeder.shutdown().await;
+}
+
+/// Memory storage whose writes at offset 0 fail while `fail` is set.
+#[derive(Debug)]
+struct FlakyStorage {
+    inner: fbt_session::storage::MemStorage,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl fbt_session::storage::Storage for FlakyStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        if offset == 0 && self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> std::io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// An error hit while other pieces are being hashed and written; resume
+/// rechecks from storage and the torrent still finishes with correct data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_after_error_rechecks_and_finishes() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    let s = Session::new(test_settings()).await.unwrap();
+    let mut ev = s.subscribe(EventMask::ALL);
+    let (m, payload) = make_torrent(&[("a", 8 * 16_384)], 16_384);
+    let storage = Arc::new(FlakyStorage {
+        inner: fbt_session::storage::MemStorage::new(payload.len() as u64),
+        fail: std::sync::atomic::AtomicBool::new(true),
+    });
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(storage.clone());
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+
+    // The first peer delivers every piece; the write of piece 0 fails while
+    // the others are in flight.
+    let mut peer = ScriptedPeer::connect(s.local_addr(), m.info_hashes.wire_hash()).await;
+    peer.send(Message::Bitfield(Bytes::from_static(&[0xff])))
+        .await;
+    peer.send(Message::Unchoke).await;
+    let data = payload.clone();
+    let first = tokio::spawn(async move { peer.serve(&data, 16_384).await });
+    next_matching(&mut ev, |e| matches!(e, Event::FileError { .. }), T)
+        .await
+        .expect("FileError");
+    assert!(wait_state(&h, |s| *s == TorrentState::Error, T).await);
+    tokio::time::timeout(T, first)
+        .await
+        .expect("first peer closed")
+        .unwrap();
+
+    storage.fail.store(false, Ordering::SeqCst);
+    h.resume().await.unwrap();
+    next_matching(
+        &mut ev,
+        |e| is_state(e, |s| matches!(s, TorrentState::CheckingFiles { .. })),
+        T,
+    )
+    .await
+    .expect("resume rechecks");
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+    assert!(h.status().error.is_none());
+
+    let mut peer = ScriptedPeer::connect(s.local_addr(), m.info_hashes.wire_hash()).await;
+    peer.send(Message::Bitfield(Bytes::from_static(&[0xff])))
+        .await;
+    peer.send(Message::Unchoke).await;
+    let data = payload.clone();
+    tokio::spawn(async move { peer.serve(&data, 16_384).await });
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    let mut got = vec![0u8; payload.len()];
+    fbt_session::storage::Storage::read(&*storage, 0, &mut got).unwrap();
+    assert!(got == payload, "stored bytes differ");
+    assert!(h.pieces().await.unwrap().is_full());
+    s.shutdown().await;
 }

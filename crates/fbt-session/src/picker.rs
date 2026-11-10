@@ -368,6 +368,20 @@ impl PiecePicker {
         self.wanted_left_pieces == 0
     }
 
+    /// Pieces with blocks requested or received but not all received.
+    pub fn partial_pieces(&self) -> impl Iterator<Item = u32> + '_ {
+        self.downloading
+            .keys()
+            .copied()
+            .filter(|&i| self.state_of(i) == PieceState::Partial)
+    }
+
+    /// Pieces started and not yet passed or failed (partial or awaiting
+    /// their hash check).
+    pub fn num_in_progress(&self) -> usize {
+        self.downloading.len()
+    }
+
     fn prio_of(&self, piece: u32) -> u8 {
         self.prio.get(piece as usize).copied().unwrap_or(0)
     }

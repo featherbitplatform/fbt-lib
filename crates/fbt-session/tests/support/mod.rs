@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use bytes::Bytes;
 use fbt_bencode::{DictBuilder, OwnedValue, encode};
 use fbt_core::PeerId;
 use fbt_metainfo::Metainfo;
@@ -156,4 +157,48 @@ impl ScriptedPeer {
         .ok()
         .flatten()
     }
+
+    /// Reads until the remote closes the connection (messages before the
+    /// close are skipped) or `timeout` passes.
+    pub async fn wait_closed(&mut self, timeout: Duration) -> PeerEnd {
+        let r = tokio::time::timeout(timeout, async {
+            loop {
+                match self.framed.next().await {
+                    Some(Ok(_)) => {}
+                    // A reset is a close too.
+                    Some(Err(_)) | None => return PeerEnd::Closed,
+                }
+            }
+        })
+        .await;
+        r.unwrap_or(PeerEnd::TimedOut)
+    }
+
+    /// Answers every request with the matching bytes of `payload` until the
+    /// connection closes.
+    pub async fn serve(&mut self, payload: &[u8], piece_len: u32) {
+        while let Some(Ok(m)) = self.framed.next().await {
+            if let Message::Request(b) = m {
+                let start = b.piece as usize * piece_len as usize + b.offset as usize;
+                let data = Bytes::copy_from_slice(&payload[start..start + b.len as usize]);
+                let piece = Message::Piece {
+                    piece: b.piece,
+                    offset: b.offset,
+                    data,
+                };
+                if self.framed.send(piece).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// How waiting for a connection to end turned out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeerEnd {
+    /// The remote closed (or reset) the connection.
+    Closed,
+    /// Still open when the wait ran out.
+    TimedOut,
 }
