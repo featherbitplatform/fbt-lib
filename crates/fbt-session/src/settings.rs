@@ -80,7 +80,8 @@ pub struct Settings {
     /// A request unanswered for this long is cancelled and re-picked
     /// (non-zero).
     pub request_timeout: Duration,
-    /// Wait before a failed outgoing connection is tried again. Internal
+    /// Wait before a failed outgoing connection is tried again; the first
+    /// retry after a success (or ever) waits a twelfth of it. Internal
     /// tunable (tests shorten it); not part of the stable API.
     #[doc(hidden)]
     pub peer_retry_delay: Duration,

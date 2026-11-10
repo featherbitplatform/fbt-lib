@@ -367,3 +367,54 @@ async fn incoming_mse_for_unknown_torrent_is_dropped() {
     assert!(r.is_err());
     s.shutdown().await;
 }
+
+/// The CLI race behind a CI hang: the leecher dials a seeder whose torrent
+/// is not accepting peers yet (still checking; here paused), so the first
+/// attempt ends right after the MSE handshake. The retry must come well
+/// before the full `peer_retry_delay` (60 s by default), or a lone explicit
+/// peer stalls the download for that long.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_retry_comes_soon_after_a_peer_that_was_not_ready() {
+    let delay = Duration::from_secs(12);
+    let mut st = settings(EncryptionPolicy::Forced);
+    st.peer_retry_delay = delay;
+    let (m, payload) = make_torrent(&[("a", 300_000)], 16_384);
+    let seeder = Session::new(st.clone()).await.unwrap();
+    let mut sp = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    sp.storage = Some(Arc::new(MemStorage::from_bytes(payload.clone())));
+    sp.paused = true;
+    let seed = seeder.add_torrent(sp).await.unwrap();
+    assert!(wait_state(&seed, |s| *s == TorrentState::Paused, T).await);
+
+    let leecher = Session::new(st).await.unwrap();
+    let storage = Arc::new(MemStorage::new(payload.len() as u64));
+    let mut lp = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    lp.storage = Some(storage.clone());
+    let handle = leecher.add_torrent(lp).await.unwrap();
+    assert!(wait_state(&handle, |s| *s == TorrentState::Downloading, T).await);
+    let mut events = leecher.subscribe(EventMask::ALL);
+    handle.add_peer(seeder.local_addr()).await.unwrap();
+
+    // The seeder drops the connection: one failed attempt.
+    next_matching(
+        &mut events,
+        |e| matches!(e, Event::PeerDisconnected { .. }),
+        T,
+    )
+    .await
+    .expect("first attempt fails");
+    seed.resume().await.unwrap();
+    // Well within the full delay, the retry connects and finishes.
+    next_matching(
+        &mut events,
+        |e| matches!(e, Event::TorrentFinished { .. }),
+        delay * 2 / 3,
+    )
+    .await
+    .expect("finished before the full retry delay");
+    let mut got = vec![0u8; payload.len()];
+    storage.read(0, &mut got).unwrap();
+    assert!(got == payload, "downloaded bytes differ");
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}

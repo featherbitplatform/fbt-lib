@@ -409,7 +409,8 @@ fn retry_settings() -> Settings {
 }
 
 /// A failed outgoing connection is dialled exactly three times in all, the
-/// retries after `peer_retry_delay`, and then given up.
+/// retries after (a twelfth of, then all of) `peer_retry_delay`, and then
+/// given up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_connect_is_retried_three_times_then_dropped() {
     // A loopback port nobody listens on.
