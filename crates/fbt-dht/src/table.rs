@@ -111,7 +111,7 @@ pub(crate) struct RoutingTable {
 
 /// Port 0, unspecified and multicast addresses cannot be dialed; an
 /// IPv4-mapped IPv6 address is an IPv4 node in disguise and is refused too.
-fn dialable(addr: &SocketAddr) -> bool {
+pub(crate) fn dialable(addr: &SocketAddr) -> bool {
     let ip = addr.ip();
     let mapped = matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
     addr.port() != 0 && !ip.is_unspecified() && !ip.is_multicast() && !mapped
@@ -129,6 +129,10 @@ impl RoutingTable {
 
     pub(crate) fn own_id(&self) -> NodeId {
         self.own
+    }
+
+    pub(crate) fn family(&self) -> Family {
+        self.family
     }
 
     /// Bucket index and position of `id` in the table.
@@ -267,6 +271,7 @@ impl RoutingTable {
 
     /// A reply from `id` at `addr`: it is good again. Ignored when `addr` is
     /// not the address the table holds for `id`.
+    #[cfg(test)]
     pub(crate) fn heard_from(&mut self, id: &NodeId, addr: SocketAddr, now: Instant) {
         if let Some((b, p)) = self.find(id)
             && let Some(e) = self.entry_mut(b, p)
@@ -360,6 +365,25 @@ impl RoutingTable {
             }
         }
         NodeId(id)
+    }
+
+    /// Buckets worth a refresh lookup at `now`: those up to the deepest
+    /// non-empty one plus one that are empty or stale.
+    pub(crate) fn refresh_candidates(&self, now: Instant) -> Vec<usize> {
+        let Some(deepest) = self.buckets.iter().rposition(|b| !b.nodes.is_empty()) else {
+            return Vec::new();
+        };
+        let stale = self.stale_buckets(now);
+        (0..=(deepest + 1).min(BUCKETS - 1))
+            .filter(|i| {
+                stale.contains(i) || self.buckets.get(*i).is_some_and(|b| b.nodes.is_empty())
+            })
+            .collect()
+    }
+
+    /// The id stored for `addr`, if any.
+    pub(crate) fn id_at(&self, addr: &SocketAddr) -> Option<NodeId> {
+        self.nodes().find(|n| n.addr == *addr).map(|n| n.id)
     }
 
     /// Every node in the table.

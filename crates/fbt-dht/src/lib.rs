@@ -18,14 +18,13 @@ mod id;
 /// KRPC message codec. Public for the fuzz targets; use the re-exports.
 #[doc(hidden)]
 pub mod krpc;
-// The node runtime (Task 7) drives these; until then only tests use them.
-#[allow(dead_code)]
+mod lookup;
+mod node;
 mod rate;
-#[allow(dead_code)]
+mod server;
+mod state;
 mod store;
-#[allow(dead_code)]
 mod table;
-#[allow(dead_code)]
 mod token;
 
 pub use id::{NODE_ID_LEN, NodeId, bep42_id, is_local};
@@ -34,3 +33,6 @@ pub use krpc::{
     MAX_DATAGRAM, MAX_ERROR_MESSAGE, MAX_METHOD_LEN, MAX_NODES, MAX_TID_LEN, MAX_TOKEN_LEN,
     MAX_VALUES, MAX_VERSION_LEN, Message, NodeInfo, Query, QueryMsg, Response, Want,
 };
+pub use lookup::PeerLookup;
+pub use node::{Dht, DhtConfig, DhtError, DhtStats};
+pub use state::{DhtState, MAX_STATE_NODES};

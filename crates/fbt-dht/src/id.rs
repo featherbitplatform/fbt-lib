@@ -1,7 +1,7 @@
 //! Node ids: XOR metric, BEP 42 secure ids, and the local-address exemption.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use rand::Rng;
 
@@ -75,11 +75,17 @@ const BEP42_MASK_V4: [u8; 4] = 0x030f_3fff_u32.to_be_bytes();
 const BEP42_MASK_V6: [u8; 8] = 0x0103_070f_1f3f_7fff_u64.to_be_bytes();
 
 /// IPv4-mapped IPv6 addresses are treated as the IPv4 address they carry.
-fn canonical(ip: IpAddr) -> IpAddr {
+pub(crate) fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,
     }
+}
+
+/// [`canonical`] for a socket address: an IPv4-mapped source becomes the
+/// IPv4 address and port it stands for.
+pub(crate) fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(canonical(addr.ip()), addr.port())
 }
 
 /// `crc32c((ip & mask) | (r & 7) << top-3-bits)`, the source of the first 21

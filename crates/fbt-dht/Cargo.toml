@@ -18,6 +18,9 @@ sha1.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }
+socket2.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "rt-multi-thread", "macros", "test-util"] }

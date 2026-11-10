@@ -550,7 +550,9 @@ dependencies = [
  "proptest",
  "rand",
  "sha1",
+ "socket2",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
