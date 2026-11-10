@@ -932,6 +932,298 @@ mod tests {
         assert!(!p.on_block(PeerKey(1), got[0]).accepted);
     }
 
+    /// Checks every internal invariant of the picker against the expected
+    /// availability (`avail` from bitfields, `seeds` from `HaveAll`).
+    fn check_invariants(p: &PiecePicker, avail: &[u32], seeds: u32) {
+        let n = p.layout.num_pieces();
+        assert_eq!(p.seeds, seeds, "seed count");
+        assert_eq!(p.avail, avail, "availability");
+        let mut left_pieces = 0u32;
+        let mut left_bytes = 0u64;
+        for i in 0..n {
+            let st = p.state_of(i);
+            let prio = p.prio_of(i);
+            assert_eq!(
+                p.have.get(i),
+                st == PieceState::Have,
+                "have <-> state, piece {i}"
+            );
+            if prio > 0 && st != PieceState::Have {
+                left_pieces += 1;
+                left_bytes += u64::from(p.layout.piece_size(i));
+            }
+            // Queued exactly when wanted and unrequested: no wanted piece is
+            // lost, nothing else is offered.
+            let queued = p.pos[i as usize] != NOT_QUEUED;
+            assert_eq!(
+                queued,
+                prio > 0 && st == PieceState::Unrequested,
+                "queued piece {i} ({st:?}, prio {prio})"
+            );
+            if queued {
+                let key = p.bucket_key(i);
+                let bucket = p.buckets.get(&key).expect("piece's bucket");
+                assert_eq!(
+                    bucket.get(p.pos[i as usize] as usize),
+                    Some(&i),
+                    "pos of {i}"
+                );
+            }
+            assert_eq!(p.seq.contains(&(Reverse(prio), i)), queued, "seq of {i}");
+            let downloading = p.downloading.get(&i);
+            assert_eq!(
+                downloading.is_some(),
+                matches!(st, PieceState::Partial | PieceState::PendingHash),
+                "downloading <-> state, piece {i} ({st:?})"
+            );
+            let mut partial_expected = false;
+            if let Some(d) = downloading {
+                assert_eq!(d.blocks.len(), p.layout.blocks_in_piece(i) as usize);
+                let received = d.blocks.iter().filter(|b| b.received).count();
+                let free = d
+                    .blocks
+                    .iter()
+                    .filter(|b| !b.received && b.owners.is_empty())
+                    .count();
+                assert_eq!(d.received, received, "received count of {i}");
+                assert_eq!(d.free, free, "free count of {i}");
+                assert_eq!(
+                    st == PieceState::PendingHash,
+                    received == d.blocks.len(),
+                    "pending hash <-> all received, piece {i}"
+                );
+                assert!(
+                    !(received == 0 && free == d.blocks.len()),
+                    "untouched piece {i} still downloading"
+                );
+                for (bi, slot) in (0u32..).zip(&d.blocks) {
+                    assert!(slot.owners.len() <= MAX_OWNERS, "owners of {i}/{bi}");
+                    let distinct: HashSet<_> = slot.owners.iter().collect();
+                    assert_eq!(distinct.len(), slot.owners.len(), "repeated owner");
+                    assert!(!(slot.received && !slot.owners.is_empty()));
+                    for o in &slot.owners {
+                        assert!(
+                            p.outstanding.get(o).is_some_and(|s| s.contains(&(i, bi))),
+                            "owner {o:?} of {i}/{bi} missing from outstanding"
+                        );
+                    }
+                }
+                partial_expected = st == PieceState::Partial && prio > 0 && free > 0;
+            }
+            assert_eq!(
+                p.partial.contains(&(Reverse(prio), i)),
+                partial_expected,
+                "partial set, piece {i}"
+            );
+        }
+        assert!(p.buckets.values().all(|b| !b.is_empty()), "empty bucket");
+        let queued: usize = p.buckets.values().map(Vec::len).sum();
+        assert_eq!(queued, p.seq.len());
+        assert_eq!(
+            p.partial.len(),
+            p.partial.iter().collect::<HashSet<_>>().len()
+        );
+        // Outstanding mirrors the owners exactly.
+        for (peer, set) in &p.outstanding {
+            assert!(!set.is_empty(), "empty outstanding set of {peer:?}");
+            for &(i, bi) in set {
+                let slot = p
+                    .downloading
+                    .get(&i)
+                    .and_then(|d| d.blocks.get(bi as usize))
+                    .expect("outstanding block exists");
+                assert!(slot.owners.contains(peer), "{peer:?} not owner of {i}/{bi}");
+            }
+        }
+        assert_eq!(p.wanted_left_pieces, left_pieces, "wanted_left_pieces");
+        assert_eq!(p.wanted_left_bytes, left_bytes, "wanted_left_bytes");
+    }
+
+    /// A simulated remote peer: its pieces and whether they are counted.
+    struct SimPeer {
+        bits: Bitfield,
+        seed: bool,
+        counted: bool,
+    }
+
+    impl SimPeer {
+        fn pieces(&self) -> PeerPieces<'_> {
+            if self.seed {
+                PeerPieces::All
+            } else {
+                PeerPieces::Some(&self.bits)
+            }
+        }
+    }
+
+    fn random_blocks(p: &PiecePicker, peer: PeerKey, r: &mut StdRng) -> Option<BlockRef> {
+        let set = p.outstanding.get(&peer)?;
+        let mut v: Vec<(u32, u32)> = set.iter().copied().collect();
+        v.sort_unstable();
+        let (i, bi) = v[r.random_range(0..v.len())];
+        Some(p.layout.block(i, bi))
+    }
+
+    /// Random sequences of every picker operation keep every invariant, and
+    /// the picker can always be driven to the end afterwards.
+    #[test]
+    fn random_operations_keep_invariants() {
+        for seed in 0..300u64 {
+            let mut r = StdRng::seed_from_u64(seed);
+            let blocks_per_piece = r.random_range(1..=4u32);
+            let piece_len = blocks_per_piece * B;
+            let n = r.random_range(1..=12u32);
+            // The last piece may be short, down to one byte.
+            let total =
+                u64::from(n - 1) * u64::from(piece_len) + r.random_range(1..=u64::from(piece_len));
+            let layout = PieceLayout::new(total, piece_len).unwrap();
+            let mut have = Bitfield::new(n);
+            for i in 0..n {
+                if r.random_bool(0.2) {
+                    have.set(i);
+                }
+            }
+            let mut p = PiecePicker::new(layout, &have);
+            let mut peers: Vec<SimPeer> = (0..4)
+                .map(|_| SimPeer {
+                    bits: Bitfield::new(n),
+                    seed: false,
+                    counted: false,
+                })
+                .collect();
+            let mut avail = vec![0u32; n as usize];
+            let mut seeds = 0u32;
+            let mut pending: Vec<u32> = Vec::new();
+            check_invariants(&p, &avail, seeds);
+            for _ in 0..80 {
+                let k = r.random_range(0..peers.len());
+                let key = PeerKey(k as u64);
+                match r.random_range(0..12u32) {
+                    0 | 1 => {
+                        let max = r.random_range(1..=8);
+                        let got = p.pick(key, peers[k].pieces(), max, &mut r);
+                        assert!(got.len() <= max);
+                        for b in &got {
+                            assert!(peer_has_piece(peers[k].pieces(), b.piece));
+                        }
+                    }
+                    2 | 3 => {
+                        if let Some(b) = random_blocks(&p, key, &mut r) {
+                            let res = p.on_block(key, b);
+                            assert!(res.accepted);
+                            if res.piece_complete {
+                                pending.push(b.piece);
+                            }
+                        } else {
+                            // Unrequested data is refused.
+                            let i = r.random_range(0..n);
+                            assert!(!p.on_block(key, p.layout.block(i, 0)).accepted);
+                        }
+                    }
+                    4 => {
+                        if let Some(b) = random_blocks(&p, key, &mut r) {
+                            p.release(key, b);
+                        }
+                    }
+                    5 => p.release_peer(key),
+                    6 => {
+                        if !pending.is_empty() {
+                            let i = pending.swap_remove(r.random_range(0..pending.len()));
+                            if r.random_bool(0.7) {
+                                p.piece_passed(i);
+                            } else {
+                                p.piece_failed(i);
+                            }
+                        } else {
+                            // Hash results for pieces not pending are harmless.
+                            p.piece_failed(r.random_range(0..n));
+                        }
+                    }
+                    7 => {
+                        let prio: Vec<u8> = (0..n).map(|_| r.random_range(0..=8)).collect();
+                        p.set_piece_priorities(&prio);
+                    }
+                    8 => p.set_sequential(r.random_bool(0.5)),
+                    9 => {
+                        let sp = &mut peers[k];
+                        if sp.counted {
+                            p.remove_peer_pieces(sp.pieces());
+                            if sp.seed {
+                                seeds -= 1;
+                            } else {
+                                for i in sp.bits.iter_ones() {
+                                    avail[i as usize] -= 1;
+                                }
+                            }
+                            p.release_peer(key);
+                            sp.counted = false;
+                            sp.seed = false;
+                            sp.bits = Bitfield::new(n);
+                        } else {
+                            sp.seed = r.random_bool(0.3);
+                            for i in 0..n {
+                                if r.random_bool(0.5) {
+                                    sp.bits.set(i);
+                                }
+                            }
+                            p.add_peer_pieces(sp.pieces());
+                            if sp.seed {
+                                seeds += 1;
+                            } else {
+                                for i in sp.bits.iter_ones() {
+                                    avail[i as usize] += 1;
+                                }
+                            }
+                            sp.counted = true;
+                        }
+                    }
+                    _ => {
+                        let sp = &mut peers[k];
+                        let i = r.random_range(0..n);
+                        if sp.counted && !sp.seed && !sp.bits.get(i) {
+                            sp.bits.set(i);
+                            p.peer_has(i);
+                            avail[i as usize] += 1;
+                        }
+                    }
+                }
+                check_invariants(&p, &avail, seeds);
+            }
+
+            // Drain: every simulated peer leaves, a seed finishes the rest.
+            for (k, sp) in peers.iter().enumerate() {
+                p.release_peer(PeerKey(k as u64));
+                if sp.counted {
+                    p.remove_peer_pieces(sp.pieces());
+                }
+            }
+            avail.iter_mut().for_each(|a| *a = 0);
+            seeds = 0;
+            for i in pending.drain(..) {
+                p.piece_passed(i);
+            }
+            let seed_key = PeerKey(99);
+            p.add_peer_pieces(PeerPieces::All);
+            seeds += 1;
+            check_invariants(&p, &avail, seeds);
+            for _ in 0..(n * blocks_per_piece + 2) {
+                if p.is_finished() {
+                    break;
+                }
+                for b in p.pick(seed_key, PeerPieces::All, 1000, &mut r) {
+                    let res = p.on_block(seed_key, b);
+                    assert!(res.accepted, "seed {seed}: {b:?}");
+                    if res.piece_complete {
+                        p.piece_passed(b.piece);
+                    }
+                }
+                check_invariants(&p, &avail, seeds);
+            }
+            assert!(p.is_finished(), "seed {seed}: picker never finished");
+            assert_eq!(p.wanted_left_bytes(), 0, "seed {seed}");
+        }
+    }
+
     #[test]
     #[ignore = "perf: run with --release -- --ignored"]
     fn perf_100k_pieces_10k_picks() {
