@@ -644,7 +644,10 @@ dependencies = [
  "bytes",
  "fbt-core",
  "proptest",
+ "rand",
+ "sha1",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

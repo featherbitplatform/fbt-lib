@@ -14,14 +14,33 @@
     )
 )]
 
-#[allow(dead_code)] // used by conn.rs from Task 7 on
+#[doc(hidden)]
+pub mod conn;
 mod ledbat;
 #[doc(hidden)]
 pub mod packet;
-#[allow(dead_code)] // used by conn.rs from Task 7 on
 mod rtt;
+
+pub use conn::UtpConfig;
 
 pub use packet::{
     HEADER_LEN, MAX_EXTENSIONS, MAX_SACK_LEN, Packet, PacketError, PacketType, sack_acks, seq_le,
     seq_lt,
 };
+
+/// Why a uTP connection ended or could not be made.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UtpError {
+    #[error("uTP connect timed out")]
+    ConnectTimeout,
+    #[error("uTP connection reset by the peer")]
+    Reset,
+    #[error("uTP connection timed out")]
+    TimedOut,
+    #[error("uTP connection closed")]
+    Closed,
+    #[error("too many uTP connections")]
+    TooManyConnections,
+    #[error("uTP I/O error: {0}")]
+    Io(String),
+}

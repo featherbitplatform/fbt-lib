@@ -19,3 +19,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+rand.workspace = true
+sha1.workspace = true
