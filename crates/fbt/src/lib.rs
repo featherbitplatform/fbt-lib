@@ -4,10 +4,11 @@
 //!
 //! # Example
 //!
-//! Download a torrent and stop when it finishes:
+//! Download a torrent and stop when it finishes (or turns out to be
+//! complete already, or fails):
 //!
 //! ```no_run
-//! use fbt::{AddTorrent, Event, EventMask, Metainfo, Session, Settings};
+//! use fbt::{AddTorrent, Event, EventMask, Metainfo, Session, Settings, TorrentState};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let bytes = std::fs::read("example.torrent")?;
@@ -20,8 +21,13 @@
 //!     .await?;
 //!
 //! while let Some(event) = events.recv().await {
-//!     if let Event::TorrentFinished { .. } = event {
-//!         break;
+//!     match event {
+//!         Event::TorrentFinished { .. }
+//!         | Event::StateChanged {
+//!             state: TorrentState::Seeding | TorrentState::Error,
+//!             ..
+//!         } => break,
+//!         _ => {}
 //!     }
 //! }
 //! println!("{:.1}% done", torrent.status().progress * 100.0);

@@ -7,7 +7,7 @@ Status: pre-release. Milestone 1 (core download: metainfo, peer wire, HTTP and U
 ## Usage
 
 ```rust
-use fbt::{AddTorrent, Event, EventMask, Metainfo, Session, Settings};
+use fbt::{AddTorrent, Event, EventMask, Metainfo, Session, Settings, TorrentState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,9 +20,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_torrent(AddTorrent::new(metainfo, "downloads".into()))
         .await?;
 
+    // Already complete data goes straight to Seeding without
+    // TorrentFinished; a storage error ends in Error.
     while let Some(event) = events.recv().await {
-        if let Event::TorrentFinished { .. } = event {
-            break;
+        match event {
+            Event::TorrentFinished { .. }
+            | Event::StateChanged {
+                state: TorrentState::Seeding | TorrentState::Error,
+                ..
+            } => break,
+            _ => {}
         }
     }
     println!("{:.1}% done", torrent.status().progress * 100.0);

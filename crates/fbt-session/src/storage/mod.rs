@@ -15,6 +15,9 @@ pub use mem::MemStorage;
 ///
 /// Offsets are torrent-global. Reading data that was never written either
 /// fails with [`io::ErrorKind::NotFound`] or yields zeros; both are allowed.
+///
+/// Implementors should expect methods to be added before 1.0 (with default
+/// implementations where possible, but not guaranteed).
 pub trait Storage: Send + Sync + std::fmt::Debug + 'static {
     /// Fills `buf` from `offset`.
     fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
