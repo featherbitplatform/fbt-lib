@@ -52,7 +52,8 @@ impl PexPeer {
 
     /// The next message for this peer from the `live` connectable
     /// addresses, never listing `exclude` (the recipient). `None` before
-    /// `interval` has passed since the last one or when nothing changed.
+    /// `interval` has passed since the last check or when nothing changed
+    /// (that check counts: the peer is looked at once per interval).
     pub(super) fn build(
         &mut self,
         live: &[(SocketAddr, PexFlags)],
@@ -81,6 +82,8 @@ impl PexPeer {
             .copied()
             .collect();
         if added.is_empty() && dropped.is_empty() {
+            // Checked: nothing to tell until the next interval.
+            self.last_sent = Some(now);
             return None;
         }
         for a in &dropped {
@@ -162,6 +165,10 @@ impl Actor {
         let now = Instant::now();
         if self.next_pex_due.is_some_and(|t| now < t) {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.pex_scans += 1;
         }
         let interval = self.shared.settings.pex_interval;
         let live_peer = |p: &Peer| p.connected && p.tx.is_some();
@@ -442,7 +449,7 @@ mod tests {
             a.peers.insert(key, p);
             rxs.push(rx);
         }
-        a.peers_epoch += 1;
+        a.on_peer_set_changed();
         (a, rxs)
     }
 
@@ -461,7 +468,7 @@ mod tests {
         }
         assert_eq!(a.pex_live_builds, 1);
         // A connection change invalidates it: one rebuild for all.
-        a.peers_epoch += 1;
+        a.on_peer_set_changed();
         tokio::time::advance(INTERVAL).await;
         a.pex_tick();
         assert_eq!(a.pex_live_builds, 2);
@@ -473,7 +480,7 @@ mod tests {
         a.pex_tick();
         a.pex_live_builds = 0;
         for _ in 0..100 {
-            a.peers_epoch += 1;
+            a.on_peer_set_changed();
             tokio::time::advance(Duration::from_millis(100)).await;
             a.pex_tick();
         }
@@ -483,6 +490,25 @@ mod tests {
         tokio::time::advance(INTERVAL).await;
         a.pex_tick();
         assert_eq!(a.pex_live_builds, 1);
+    }
+
+    /// Peers already checked, nothing changing: one scan per interval, not
+    /// one per tick, and the next due time is always in the future.
+    #[tokio::test(start_paused = true)]
+    async fn steady_state_ticks_scan_once_per_interval() {
+        let (mut a, _rxs) = actor_with_peers(5);
+        a.pex_tick();
+        a.pex_scans = 0;
+        a.pex_live_builds = 0;
+        for _ in 0..(3 * INTERVAL.as_secs()) {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            a.pex_tick();
+            let due = a.next_pex_due.expect("scheduled");
+            assert!(due > Instant::now(), "due time must be in the future");
+        }
+        assert!(a.pex_scans <= 4, "scans: {}", a.pex_scans);
+        // Nothing changed, so no message needed the list again.
+        assert!(a.pex_live_builds <= 4, "builds: {}", a.pex_live_builds);
     }
 
     #[tokio::test(start_paused = true)]

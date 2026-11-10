@@ -468,7 +468,7 @@ async fn pending_mse_handshakes_are_capped_per_ip() {
     .expect("refused promptly, not left waiting");
     assert!(r.is_err(), "the 21st handshake from one IP is refused");
 
-    // Another IP is not affected (macOS has no 127.0.0.2: skipped there).
+    // Another IP is not affected (skipped where 127.0.0.2 does not bind, as on macOS).
     if let Some(sock) = bind_other_loopback() {
         let tcp = sock.connect(addr).await.unwrap();
         let mut m = tokio::time::timeout(

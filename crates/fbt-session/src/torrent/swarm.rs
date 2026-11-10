@@ -796,6 +796,7 @@ impl Actor {
                 false
             }
             Err(TrySendError::Closed(_)) => {
+                self.on_peer_set_changed();
                 if let Some(p) = self.peers.get_mut(&key) {
                     p.tx = None;
                 }

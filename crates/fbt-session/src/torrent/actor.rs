@@ -182,6 +182,9 @@ pub(crate) struct Actor {
     /// Unit tests: how often the live list was built.
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
+    /// Unit tests: how often `pex_tick` got past its early return.
+    #[cfg(test)]
+    pub(super) pex_scans: u32,
 }
 
 impl Actor {
@@ -293,6 +296,8 @@ impl Actor {
             next_pex_due: None,
             #[cfg(test)]
             pex_live_builds: 0,
+            #[cfg(test)]
+            pex_scans: 0,
         };
         if actor.magnet.is_some() {
             actor.last_state = actor.state();
