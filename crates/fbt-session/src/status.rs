@@ -72,8 +72,10 @@ impl TorrentStatus {
             info_hashes,
             name,
             has_metadata,
+            // The actor's first publish says `CheckingFiles` once it has
+            // a check slot.
             state: if has_metadata {
-                TorrentState::CheckingFiles { progress: 0.0 }
+                TorrentState::QueuedForChecking
             } else {
                 TorrentState::DownloadingMetadata
             },

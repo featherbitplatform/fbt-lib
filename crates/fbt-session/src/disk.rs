@@ -1,6 +1,8 @@
-//! The session's disk pool: every storage job of every torrent runs on a
-//! blocking thread behind one of [`Settings::disk_threads`] permits, and at
-//! most [`Settings::max_active_checks`] piece checks run at once.
+//! The session's disk pool: every storage read, write and flush of every
+//! torrent runs on a blocking thread behind one of
+//! [`Settings::disk_threads`] permits. Piece checks run beside them, at most
+//! [`Settings::max_active_checks`] at once, so a long check never holds a
+//! disk thread.
 //!
 //! [`Settings::disk_threads`]: crate::Settings::disk_threads
 //! [`Settings::max_active_checks`]: crate::Settings::max_active_checks
@@ -40,27 +42,43 @@ impl DiskPool {
         jobs.spawn(async move {
             // The semaphore is never closed; were it, the job still runs.
             let permit = threads.acquire_owned().await.ok();
-            let job = tokio::task::spawn_blocking(move || {
+            blocking(move || {
                 let _permit = permit;
                 f()
-            });
-            match job.await {
-                Ok(v) => v,
-                // A panic in `f` surfaces from `jobs` as it would from
-                // `spawn_blocking`; cancellation only happens at runtime
-                // shutdown, when nobody reads `jobs` any more.
-                Err(e) => match e.try_into_panic() {
-                    Ok(payload) => std::panic::resume_unwind(payload),
-                    Err(e) => std::panic::resume_unwind(Box::new(e.to_string())),
-                },
-            }
+            })
+            .await
         });
+    }
+
+    /// Runs a piece check `f` on a blocking thread of its own, without a
+    /// disk permit: the caller holds a [`check_permit`](Self::check_permit)
+    /// slot, which bounds checks to `max_active_checks` threads on top of
+    /// `disk_threads`.
+    pub fn spawn_check<T: Send + 'static>(
+        &self,
+        jobs: &mut JoinSet<T>,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) {
+        jobs.spawn(blocking(f));
     }
 
     /// The `max_active_checks` semaphore: a check holds one of its permits
     /// while it runs.
     pub fn check_permit(&self) -> Arc<Semaphore> {
         Arc::clone(&self.checks)
+    }
+}
+
+/// `f` on `spawn_blocking`. A panic in `f` surfaces from the caller's
+/// JoinSet as it would from `spawn_blocking`; cancellation only happens at
+/// runtime shutdown, when nobody reads the JoinSet any more.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(e) => std::panic::resume_unwind(Box::new(e.to_string())),
+        },
     }
 }
 

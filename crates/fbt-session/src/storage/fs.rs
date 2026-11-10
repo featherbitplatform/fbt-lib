@@ -56,14 +56,24 @@ fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
 /// original kind wrapping one of these; [`error_path`] reads the path back.
 /// Other [`Storage`] implementations may do the same to have the session
 /// report the file in [`Event::FileError`](crate::Event::FileError).
-#[derive(Debug, thiserror::Error)]
-#[error("{}: {source}", .path.display())]
+///
+/// Its `Display` is `<path>: <source>`; [`source`](std::error::Error::source)
+/// is `None`, so an error-chain printer shows the cause once.
+#[derive(Debug)]
 pub struct StorageError {
     /// The file the operation failed on.
     pub path: PathBuf,
     /// The underlying error.
     pub source: io::Error,
 }
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for StorageError {}
 
 /// The file an I/O error names, when it wraps a [`StorageError`].
 pub fn error_path(e: &io::Error) -> Option<&Path> {
@@ -383,11 +393,15 @@ impl Storage for FsStorage {
             (open, reopen)
         };
         let mut first_err = None;
-        let mut synced = Vec::with_capacity(open.len() + reopen.len());
+        #[cfg(test)]
+        let mut synced = Vec::new();
         // An open handle that fails is tried again by the next flush.
         for (k, file) in open {
             match file.sync_data() {
-                Ok(()) => synced.push(k),
+                Ok(()) => {
+                    #[cfg(test)]
+                    synced.push(k);
+                }
                 Err(e) => {
                     first_err.get_or_insert_with(|| at(self.path_of(k), e));
                 }
@@ -401,12 +415,19 @@ impl Storage for FsStorage {
                 .open(path)
                 .and_then(|f| f.sync_data());
             match r {
-                Ok(()) => synced.push(k),
+                Ok(()) => {
+                    #[cfg(test)]
+                    synced.push(k);
+                }
+                // A file gone from disk has nothing left to sync.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // Made read-only behind our back: retrying would fail
+                // forever, and its next write reports the problem.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot reopen to sync");
+                }
                 Err(e) => {
-                    // A file gone from disk has nothing left to sync.
-                    if e.kind() != io::ErrorKind::NotFound {
-                        retry.push(k);
-                    }
+                    retry.push(k);
                     first_err.get_or_insert_with(|| at(path, e));
                 }
             }
@@ -415,8 +436,6 @@ impl Storage for FsStorage {
         st.unsynced.extend(retry);
         #[cfg(test)]
         st.synced.extend(synced);
-        #[cfg(not(test))]
-        let _ = synced;
         first_err.map_or(Ok(()), Err)
     }
 
@@ -493,6 +512,23 @@ mod tests {
         // Nothing is left to sync: a second flush only covers open handles.
         s.flush().unwrap();
         assert_eq!(s.synced_files(), MAX_OPEN + 36);
+    }
+
+    #[test]
+    fn flush_skips_evicted_files_gone_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStorage::new(dir.path().to_path_buf(), &many_files(MAX_OPEN + 36));
+        for i in 0..(MAX_OPEN + 36) as u64 {
+            s.write(i, &[1]).unwrap();
+        }
+        // `f0` was the least recently used: evicted, waiting for its sync.
+        assert!(s.lock().unsynced.contains(&0));
+        std::fs::remove_file(dir.path().join("t").join("f0")).unwrap();
+        s.flush().unwrap();
+        assert_eq!(s.synced_files(), MAX_OPEN + 35);
+        assert!(s.lock().unsynced.is_empty(), "a vanished file is retried");
+        s.flush().unwrap();
+        assert_eq!(s.synced_files(), MAX_OPEN + 35);
     }
 
     #[test]

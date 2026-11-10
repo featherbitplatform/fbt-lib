@@ -185,9 +185,11 @@ pub struct Settings {
     /// the stable API. Non-zero.
     #[doc(hidden)]
     pub utp_connect_timeout: Duration,
-    /// Storage jobs (piece reads, writes, flushes and checks) running at
-    /// once across the session, each on a blocking thread (1 to
-    /// [`MAX_DISK_THREADS`]). A running check holds one for its whole run.
+    /// Storage jobs (piece reads, writes and flushes) running at once
+    /// across the session, each on a blocking thread (1 to
+    /// [`MAX_DISK_THREADS`]). Piece checks do not count against it: they
+    /// add at most [`max_active_checks`](Self::max_active_checks) threads
+    /// on top.
     pub disk_threads: usize,
     /// Torrents hash-checking their data at once across the session (1 to
     /// 64; libtorrent's `active_checking`). The others wait as

@@ -1,7 +1,7 @@
-//! The torrent actor: one task owning a torrent's picker, peers, buffers and
-//! status. It never blocks: storage jobs run through the session's disk
-//! pool and hashing in `spawn_blocking`, and both come back as [`Job`]s, and commands to peers use `try_send` (a peer whose
-//! queue is full is closed as stalled).
+//! The torrent actor: one task owning a torrent's picker, peers, buffers and status. It never
+//! blocks: storage jobs run through the session's disk pool and hashing in `spawn_blocking`, both
+//! coming back as [`Job`]s, and commands to peers use `try_send` (a peer whose queue is full is
+//! closed as stalled).
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -18,7 +18,7 @@ use rand::rngs::StdRng;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::announcer::{self, Announcer, Signals};
 use super::data::Job;
@@ -643,8 +643,7 @@ impl Actor {
     pub(super) fn on_job_result(&mut self, r: Result<Job, JoinError>) {
         match r {
             Ok(job) => self.on_job(job),
-            // A check that left the queue.
-            Err(e) if e.is_cancelled() => {}
+            Err(e) if e.is_cancelled() => debug!(error = %e, "queued check left the queue"),
             Err(e) => warn!(error = %e, "torrent background job failed"),
         }
     }

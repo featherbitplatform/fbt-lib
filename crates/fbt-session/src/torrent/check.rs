@@ -58,8 +58,9 @@ impl Actor {
         self.refresh_state();
     }
 
-    /// Runs `check_pieces` through the disk pool, holding `permit` (the
-    /// check slot) until it returns.
+    /// Runs `check_pieces` on its own blocking thread (outside the disk
+    /// threads, so it never starves reads and writes), holding `permit`
+    /// (the check slot) until it returns.
     fn run_check(&mut self, permit: Option<OwnedSemaphorePermit>) {
         let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
             return;
@@ -74,7 +75,7 @@ impl Actor {
             cancel: Arc::clone(&cancel),
         };
         let generation = self.generation;
-        self.shared.disk.spawn(&mut self.jobs, move || {
+        self.shared.disk.spawn_check(&mut self.jobs, move || {
             let _slot = permit;
             let result = check_pieces(&*storage, &layout, &meta.info.pieces, |i| {
                 done.store(i.saturating_add(1), Ordering::Relaxed);
