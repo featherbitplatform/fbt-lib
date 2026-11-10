@@ -137,22 +137,27 @@ impl Metainfo {
         expected: InfoHashes,
         trackers: Vec<Vec<String>>,
     ) -> Result<Metainfo, MetainfoError> {
-        let val = decode_with(info, Limits::new(MAX_INFO_DEPTH, MAX_INFO_ITEMS))?;
-        let parsed = parse_info(&val)?;
-        if let Some(v1) = expected.v1
-            && v1 != parsed.info_hashes.v1.unwrap_or(InfoHashV1([0; 20]))
+        // Cheap rejection first: hash the raw bytes before any parsing.
+        if expected.v1.is_none() && expected.v2.is_none() {
+            return Err(MetainfoError::InfoHashMismatch);
+        }
+        if expected.v1.is_some_and(|h| h != InfoHashV1::of(info))
+            || expected.v2.is_some_and(|h| h != InfoHashV2::of(info))
         {
             return Err(MetainfoError::InfoHashMismatch);
         }
-        if let Some(v2) = expected.v2
-            && Some(v2) != parsed.info_hashes.v2
+        let val = decode_with(info, Limits::new(MAX_INFO_DEPTH, MAX_INFO_ITEMS))?;
+        let parsed = parse_info(&val)?;
+        // A v2 hash only matches a dictionary that declares `meta version` 2.
+        if expected.v1 != parsed.info_hashes.v1 && expected.v1.is_some()
+            || expected.v2.is_some() && expected.v2 != parsed.info_hashes.v2
         {
             return Err(MetainfoError::InfoHashMismatch);
         }
         Ok(Metainfo {
             info_hashes: parsed.info_hashes,
             info: parsed.info,
-            trackers: clean_trackers(trackers),
+            trackers: clean_trackers(trackers.iter().map(|t| t.iter().map(String::as_str))),
             comment: None,
             created_by: None,
             creation_date: None,
@@ -391,38 +396,41 @@ fn lossy(root: &Dict<'_>, key: &[u8]) -> Option<String> {
 }
 
 fn parse_trackers(root: &Dict<'_>) -> Vec<Vec<String>> {
-    let mut tiers: Vec<Vec<String>> = Vec::new();
-    if let Some(list) = root.get(b"announce-list").and_then(Value::as_list) {
-        for tier in list {
-            tiers.push(
-                tier.as_list()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect(),
-            );
-        }
-    }
-    if tiers.iter().all(|t| t.iter().all(String::is_empty))
+    let tiers = root
+        .get(b"announce-list")
+        .and_then(Value::as_list)
+        .map(|list| {
+            clean_trackers(
+                list.iter()
+                    .map(|t| t.as_list().unwrap_or(&[]).iter().filter_map(Value::as_str)),
+            )
+        })
+        .unwrap_or_default();
+    if tiers.is_empty()
         && let Some(a) = root.get(b"announce").and_then(Value::as_str)
+        && !a.is_empty()
     {
-        tiers = vec![vec![a.to_string()]];
+        return vec![vec![a.to_string()]];
     }
-    clean_trackers(tiers)
+    tiers
 }
 
 /// Drops empty and duplicate URLs and empty tiers, keeping at most
-/// `MAX_TRACKERS` URLs in tier order.
-fn clean_trackers(tiers: Vec<Vec<String>>) -> Vec<Vec<String>> {
-    let mut seen = HashSet::new();
+/// `MAX_TRACKERS` URLs in tier order; only kept URLs are copied.
+fn clean_trackers<'a, T, U>(tiers: T) -> Vec<Vec<String>>
+where
+    T: IntoIterator<Item = U>,
+    U: IntoIterator<Item = &'a str>,
+{
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut out = Vec::new();
     for tier in tiers {
         let room = MAX_TRACKERS.saturating_sub(seen.len());
         let urls: Vec<String> = tier
             .into_iter()
-            .filter(|u| !u.is_empty() && seen.insert(u.clone()))
+            .filter(|u| !u.is_empty() && seen.insert(u))
             .take(room)
+            .map(str::to_string)
             .collect();
         if !urls.is_empty() {
             out.push(urls);

@@ -1,5 +1,6 @@
 mod support;
 
+use fbt_bencode::DecodeError;
 use fbt_core::{InfoHashV1, InfoHashes};
 use fbt_metainfo::{Magnet, MagnetError, Metainfo, MetainfoError};
 use proptest::prelude::*;
@@ -99,11 +100,35 @@ fn from_info_bytes_verifies_hash() {
 
 #[test]
 fn from_info_bytes_uses_explicit_limits() {
-    let deep = [b"l".repeat(40), b"e".repeat(40)].concat();
-    // depth 40 > 32, fails before any hash check
-    assert!(
-        Metainfo::from_info_bytes(&deep, InfoHashes::from_v1(InfoHashV1([0; 20])), vec![]).is_err()
-    );
+    // A hash-correct info dict whose extra key nests 40 lists: only the depth
+    // limit (32) can reject it, so unlimited decoding would make this pass.
+    let mut v = fbt_bencode::OwnedValue::Int(0);
+    for _ in 0..40 {
+        v = fbt_bencode::OwnedValue::List(vec![v]);
+    }
+    let info = fbt_bencode::DictBuilder::new()
+        .insert(b"name", "t")
+        .insert(b"length", 1i64)
+        .insert(b"piece length", 16_384i64)
+        .insert(b"pieces", vec![0u8; 20])
+        .insert(b"zz", v)
+        .build();
+    let raw = fbt_bencode::encode(&info);
+    let ih = InfoHashes::from_v1(InfoHashV1::of(&raw));
+    assert!(matches!(
+        Metainfo::from_info_bytes(&raw, ih, vec![]),
+        Err(MetainfoError::Bencode(DecodeError::DepthExceeded { .. }))
+    ));
+}
+
+#[test]
+fn from_info_bytes_needs_an_expected_hash() {
+    let meta = Metainfo::from_bytes(&support::single_fixture()).unwrap();
+    let none = InfoHashes { v1: None, v2: None };
+    assert!(matches!(
+        Metainfo::from_info_bytes(meta.raw_info(), none, vec![]),
+        Err(MetainfoError::InfoHashMismatch)
+    ));
 }
 
 #[test]
