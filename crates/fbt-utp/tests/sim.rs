@@ -47,6 +47,12 @@ struct SimNet {
     queue: BinaryHeap<InFlight>,
     counter: u64,
     busy_until: [Option<Instant>; 2],
+    start: Option<Instant>,
+    /// Bottleneck tail drops toward endpoint 1, as time since the start.
+    drops: Vec<Duration>,
+    /// Queueing delay of each datagram enqueued toward endpoint 1, keyed by
+    /// time since the start.
+    queue_delays: Vec<(Duration, Duration)>,
 }
 
 impl SimNet {
@@ -57,6 +63,9 @@ impl SimNet {
             queue: BinaryHeap::new(),
             counter: 0,
             busy_until: [None, None],
+            start: None,
+            drops: Vec::new(),
+            queue_delays: Vec::new(),
         }
     }
 
@@ -70,10 +79,17 @@ impl SimNet {
             1
         };
         let mut depart = now;
+        let since = now - *self.start.get_or_insert(now);
         if let Some((rate, max_queue)) = self.cfg.bottleneck {
             let start = self.busy_until[to].map_or(now, |b| b.max(now));
             if start - now > max_queue {
+                if to == 1 {
+                    self.drops.push(since);
+                }
                 return; // tail drop
+            }
+            if to == 1 {
+                self.queue_delays.push((since, start - now));
             }
             depart = start + Duration::from_secs_f64(d.len() as f64 / rate);
             self.busy_until[to] = Some(depart);
@@ -179,14 +195,14 @@ struct Outcome {
 
 /// Runs until `done` or `limit` of simulated time.
 async fn run(
+    cfg: &UtpConfig,
     net: &mut SimNet,
     sides: &mut [Side; 2],
     limit: Duration,
     done: impl Fn(&[Side; 2]) -> bool,
 ) -> Outcome {
-    let cfg = UtpConfig::default();
     let start = now();
-    sides[0].conn = Some(Connection::connect(&cfg, addr(1), 4242, start));
+    sides[0].conn = Some(Connection::connect(cfg, addr(1), 4242, start));
     let mut cwnd_area = 0.0f64;
     let mut last = start;
     loop {
@@ -202,7 +218,8 @@ async fn run(
             match sides[to].conn.as_mut() {
                 Some(c) => c.on_packet(&p, t),
                 None if p.ty == PacketType::Syn => {
-                    sides[to].conn = Some(Connection::accept(&cfg, addr(0), &p, t));
+                    let isn = net.rng.random();
+                    sides[to].conn = Some(Connection::accept(cfg, addr(0), &p, isn, t));
                 }
                 None => {}
             }
@@ -267,9 +284,13 @@ async fn transfer_survives_loss_reorder_and_duplication() {
         let d1 = random_bytes(&mut data_rng, LEN);
         let mut sides = [Side::new(d0.clone()), Side::new(d1.clone())];
         let mut net = SimNet::new(seed, LinkCfg::lossy(0.10, 0.05));
-        let out = run(&mut net, &mut sides, Duration::from_secs(3600), |s| {
-            eof(&s[0]) && eof(&s[1])
-        })
+        let out = run(
+            &UtpConfig::default(),
+            &mut net,
+            &mut sides,
+            Duration::from_secs(3600),
+            |s| eof(&s[0]) && eof(&s[1]),
+        )
         .await;
         assert_eq!(sides[1].received.len(), LEN, "seed {seed}");
         assert_eq!(sides[0].received.len(), LEN, "seed {seed}");
@@ -287,7 +308,7 @@ async fn transfer_survives_loss_reorder_and_duplication() {
     }
 }
 
-async fn endless_cwnd(bottleneck: Option<(f64, Duration)>) -> f64 {
+async fn endless_cwnd(bottleneck: Option<(f64, Duration)>) -> (f64, SimNet) {
     // No jitter: per-packet reordering would trigger SACK loss recovery and
     // hide the delay signal this test is about.
     let cfg = LinkCfg {
@@ -302,18 +323,50 @@ async fn endless_cwnd(bottleneck: Option<(f64, Duration)>) -> f64 {
     receiver.keep_received = false;
     receiver.closed = true; // never closes
     let mut sides = [sender, receiver];
-    let out = run(&mut net, &mut sides, Duration::from_secs(20), |_| false).await;
+    let out = run(
+        &UtpConfig::default(),
+        &mut net,
+        &mut sides,
+        Duration::from_secs(20),
+        |_| false,
+    )
+    .await;
     assert!(sides[1].received_len > 0);
-    out.avg_cwnd
+    (out.avg_cwnd, net)
 }
 
 #[tokio::test(start_paused = true)]
 async fn ledbat_backs_off_under_queueing_delay() {
-    let free = endless_cwnd(None).await;
+    let (free, _) = endless_cwnd(None).await;
     // 100 kB/s with a 300 ms queue: LEDBAT should hold the queue near its
-    // 100 ms target, a window of roughly rate x (RTT + 100 ms).
-    let queued = endless_cwnd(Some((100_000.0, Duration::from_millis(300)))).await;
-    println!("avg cwnd: free {free:.0}, bottleneck {queued:.0}");
+    // 100 ms target, a window of roughly rate x (RTT + 100 ms). A loss-only
+    // controller would fill the queue to 300 ms and keep tail-dropping.
+    let (queued, net) = endless_cwnd(Some((100_000.0, Duration::from_millis(300)))).await;
+    let late_drops = net
+        .drops
+        .iter()
+        .filter(|d| **d >= Duration::from_secs(5))
+        .count();
+    let second_half: Vec<f64> = net
+        .queue_delays
+        .iter()
+        .filter(|(at, _)| *at >= Duration::from_secs(10))
+        .map(|(_, q)| q.as_secs_f64())
+        .collect();
+    let mean_queue = second_half.iter().sum::<f64>() / second_half.len().max(1) as f64;
+    println!(
+        "avg cwnd: free {free:.0}, bottleneck {queued:.0}; drops {} ({late_drops} after 5 s); \
+         mean queueing delay in the second half {:.1} ms over {} packets",
+        net.drops.len(),
+        mean_queue * 1000.0,
+        second_half.len()
+    );
+    assert_eq!(
+        late_drops, 0,
+        "tail drops after 5 s: LEDBAT ignored the delay"
+    );
+    assert!(!second_half.is_empty());
+    assert!(mean_queue < 0.150, "mean queueing delay {mean_queue} s");
     assert!(queued < free, "bottleneck {queued} >= free {free}");
     assert!(
         queued < 60_000.0,
@@ -332,9 +385,13 @@ async fn bulk_transfer_completes_in_bounded_time() {
     let mut net = SimNet::new(3, cfg);
     let data = random_bytes(&mut StdRng::seed_from_u64(3), LEN);
     let mut sides = [Side::new(data.clone()), Side::new(Vec::new())];
-    let out = run(&mut net, &mut sides, Duration::from_secs(120), |s| {
-        s[1].received.len() == LEN && eof(&s[1])
-    })
+    let out = run(
+        &UtpConfig::default(),
+        &mut net,
+        &mut sides,
+        Duration::from_secs(120),
+        |s| s[1].received.len() == LEN && eof(&s[1]),
+    )
     .await;
     assert_eq!(Sha1::digest(&sides[1].received), Sha1::digest(&data));
     println!("8 MiB in {:?} simulated", out.elapsed);
@@ -343,4 +400,25 @@ async fn bulk_transfer_completes_in_bounded_time() {
         "took {:?}",
         out.elapsed
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sequence_numbers_wrap_both_ways() {
+    // 100-byte packets: 7 MB is 70,000 packets each way, past the u16 wrap.
+    const LEN: usize = 7_000_000;
+    // `UtpConfig` is non-exhaustive: other crates set fields on a default.
+    let mut cfg = UtpConfig::default();
+    cfg.max_payload_v4 = 100;
+    let mut data_rng = StdRng::seed_from_u64(99);
+    let d0 = random_bytes(&mut data_rng, LEN);
+    let d1 = random_bytes(&mut data_rng, LEN);
+    let mut sides = [Side::new(d0.clone()), Side::new(d1.clone())];
+    let mut net = SimNet::new(99, LinkCfg::lossy(0.02, 0.02));
+    let out = run(&cfg, &mut net, &mut sides, Duration::from_secs(3600), |s| {
+        eof(&s[0]) && eof(&s[1])
+    })
+    .await;
+    assert_eq!(Sha1::digest(&sides[1].received), Sha1::digest(&d0));
+    assert_eq!(Sha1::digest(&sides[0].received), Sha1::digest(&d1));
+    println!("2 x 70,000 packets in {:?} simulated", out.elapsed);
 }

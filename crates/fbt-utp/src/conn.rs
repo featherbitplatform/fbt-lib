@@ -30,10 +30,24 @@ pub const MAX_REORDER_SPAN: u16 = 0x4000;
 pub const DELAYED_ACK: Duration = Duration::from_millis(100);
 /// Duplicate acks (or later packets selectively acked) that mean a loss.
 pub const DUP_ACK_THRESHOLD: u32 = 3;
+/// Room out-of-order data always leaves free, so the packet that fills the
+/// hole fits: at least the largest payload seen and 1472 bytes (an
+/// Ethernet-MTU UDP payload, above libtorrent's 1452-byte uTP packets).
+pub const HOLE_RESERVE: usize = 1472;
 /// Sequence numbers a SACK mask can describe (bits of [`MAX_SACK_LEN`]).
 const SACK_BITS: usize = MAX_SACK_LEN * 8;
 /// Sequence number of the initiator's SYN (BEP 29).
 const SYN_SEQ: u16 = 1;
+
+/// `t + d`, or `None` (no deadline) when that overflows `Instant`.
+fn after(t: Instant, d: Duration) -> Option<Instant> {
+    t.checked_add(d)
+}
+
+/// `now` is at or past `t + d`; never true when the sum overflows.
+fn reached(now: Instant, t: Instant, d: Duration) -> bool {
+    after(t, d).is_some_and(|x| now >= x)
+}
 
 /// Connection limits and timers. Shared by the sans-IO core and the socket.
 #[derive(Debug, Clone)]
@@ -147,6 +161,8 @@ pub struct Connection {
     bypass_cwnd: bool,
     /// The next packet may ignore the peer's window (RTO or window probe).
     bypass_peer_wnd: bool,
+    /// The packet last sent past the peer's window, resent when it reopens.
+    probe_seq: Option<u16>,
     last_send: Instant,
     last_data_send: Instant,
 
@@ -156,6 +172,8 @@ pub struct Connection {
     inbox: VecDeque<u8>,
     ooo: BTreeMap<u16, Vec<u8>>,
     ooo_bytes: usize,
+    /// Largest DATA payload received, for the hole reserve.
+    max_recv_payload: usize,
     remote_fin: Option<u16>,
     eof: bool,
     ack_now: bool,
@@ -168,6 +186,7 @@ pub struct Connection {
     /// Acceptor: our first sequence number, and whether the handshake
     /// STATE (which carries it) still has to go out.
     isn: u16,
+    is_acceptor: bool,
     syn_ack_pending: bool,
     /// Acceptor: the SYN's sequence number, to recognise a retransmission.
     syn_seq_seen: u16,
@@ -209,12 +228,14 @@ impl Connection {
             timeouts: 0,
             bypass_cwnd: false,
             bypass_peer_wnd: false,
+            probe_seq: None,
             last_send: now,
             last_data_send: now,
             ack_nr: 0,
             inbox: VecDeque::new(),
             ooo: BTreeMap::new(),
             ooo_bytes: 0,
+            max_recv_payload: 0,
             remote_fin: None,
             eof: false,
             ack_now: false,
@@ -224,6 +245,7 @@ impl Connection {
             last_recv: now,
             last_adv_wnd: cfg.recv_buffer,
             isn: SYN_SEQ,
+            is_acceptor: false,
             syn_ack_pending: false,
             syn_seq_seen: 0,
         }
@@ -240,14 +262,19 @@ impl Connection {
 
     /// Answers `syn` from `peer`; a STATE is queued.
     /// `recv_id = syn.conn_id + 1`, `send_id = syn.conn_id` (BEP 29).
-    ///
-    /// BEP 29 leaves the acceptor's first sequence number to the
-    /// implementation (libutp randomises it). This core takes no RNG, so it
-    /// derives one from the SYN's timestamp.
-    pub fn accept(cfg: &UtpConfig, peer: SocketAddr, syn: &Packet, now: Instant) -> Connection {
+    /// `initial_seq` is our first sequence number; BEP 29 asks for a random
+    /// one, which the caller (the socket runtime) supplies.
+    pub fn accept(
+        cfg: &UtpConfig,
+        peer: SocketAddr,
+        syn: &Packet,
+        initial_seq: u16,
+        now: Instant,
+    ) -> Connection {
         let mut c = Connection::new(cfg, peer, syn.conn_id.wrapping_add(1), syn.conn_id, now);
         c.state = ConnState::Connected;
-        c.seq_nr = (syn.timestamp_us as u16) ^ (syn.timestamp_us >> 16) as u16;
+        c.is_acceptor = true;
+        c.seq_nr = initial_seq;
         c.peer_ack = c.seq_nr.wrapping_sub(1);
         c.ack_nr = syn.seq_nr;
         c.peer_wnd = syn.wnd_size as usize;
@@ -359,13 +386,14 @@ impl Connection {
             return None;
         }
         let synsent = self.state == ConnState::SynSent;
-        let live = |d: Instant| (!synsent).then_some(d);
+        let live = |d: Option<Instant>| d.filter(|_| !synsent);
         let probe = (self.rto_at.is_none() && self.has_pending_send())
-            .then(|| self.last_data_send + self.rtt.rto());
+            .then(|| after(self.last_data_send, self.rtt.rto()))
+            .flatten();
         [
-            synsent.then(|| self.created + self.cfg.connect_timeout),
-            live(self.last_recv + self.cfg.idle_timeout),
-            live(self.last_send + self.cfg.keepalive),
+            after(self.created, self.cfg.connect_timeout).filter(|_| synsent),
+            live(after(self.last_recv, self.cfg.idle_timeout)),
+            live(after(self.last_send, self.cfg.keepalive)),
             self.ack_due.filter(|_| !synsent),
             probe.filter(|_| !synsent),
             self.rto_at,
@@ -386,13 +414,13 @@ impl Connection {
         match self.state {
             ConnState::Closed => return,
             ConnState::SynSent => {
-                if now >= self.created + self.cfg.connect_timeout {
+                if reached(now, self.created, self.cfg.connect_timeout) {
                     self.fail(UtpError::ConnectTimeout);
                     return;
                 }
             }
             ConnState::Connected | ConnState::FinSent => {
-                if now >= self.last_recv + self.cfg.idle_timeout {
+                if reached(now, self.last_recv, self.cfg.idle_timeout) {
                     self.fail(UtpError::TimedOut);
                     return;
                 }
@@ -406,7 +434,7 @@ impl Connection {
         } else if self.state != ConnState::SynSent
             && self.rto_at.is_none()
             && self.has_pending_send()
-            && now >= self.last_data_send + self.rtt.rto()
+            && reached(now, self.last_data_send, self.rtt.rto())
         {
             // Nothing in flight and the peer's window holds us back: probe.
             self.bypass_peer_wnd = true;
@@ -417,7 +445,7 @@ impl Connection {
         if self.ack_due.is_some_and(|a| now >= a) {
             self.ack_now = true;
         }
-        if now >= self.last_send + self.cfg.keepalive {
+        if reached(now, self.last_send, self.cfg.keepalive) {
             self.ack_now = true;
         }
     }
@@ -445,7 +473,7 @@ impl Connection {
 
     /// Handles one packet from the peer.
     pub fn on_packet(&mut self, p: &Packet, now: Instant) {
-        let acceptor_syn = p.ty == PacketType::Syn && p.conn_id == self.send_id;
+        let acceptor_syn = self.is_acceptor && p.ty == PacketType::Syn && p.conn_id == self.send_id;
         if p.conn_id != self.recv_id && !acceptor_syn {
             return;
         }
@@ -483,11 +511,11 @@ impl Connection {
             // Our data is refused, not lost: a live, throttled peer.
             self.timeouts = 0;
         }
-        self.process_ack(p, now);
+        self.process_ack(p, now, old_wnd);
         if old_wnd < self.mss && self.peer_wnd >= self.mss {
-            // The window reopened: whatever went out as a probe was most
-            // likely dropped for lack of room, so resend it now.
-            self.mark_in_flight_lost();
+            // The window reopened: the probe was most likely dropped for
+            // lack of room, so resend it now.
+            self.resend_probe();
         }
         match p.ty {
             PacketType::Data => self.receive_data(p, now),
@@ -497,14 +525,24 @@ impl Connection {
         self.check_closed();
     }
 
-    fn mark_in_flight_lost(&mut self) {
-        for s in self.outstanding.iter_mut() {
-            if !s.acked && !s.lost {
-                s.lost = true;
-                self.flight = self.flight.saturating_sub(s.payload.len());
-            }
+    fn resend_probe(&mut self) {
+        let Some(i) = self
+            .probe_seq
+            .take()
+            .and_then(|q| self.outstanding_index(q))
+        else {
+            return;
+        };
+        if let Some(s) = self.outstanding.get_mut(i)
+            && !s.acked
+            && !s.lost
+        {
+            s.lost = true;
+            self.flight = self.flight.saturating_sub(s.payload.len());
         }
-        self.rto_at = None;
+        if !self.outstanding.iter().any(|s| !s.acked && !s.lost) {
+            self.rto_at = None;
+        }
     }
 
     fn check_closed(&mut self) {
@@ -529,6 +567,12 @@ impl Connection {
         }
         s.acked = true;
         let len = s.payload.len();
+        // Acked data is never sent again; drop it so a SACKed-but-not-yet-
+        // cumulatively-acked packet costs no buffer.
+        s.payload = Bytes::new();
+        if self.probe_seq == Some(s.seq) {
+            self.probe_seq = None;
+        }
         if !s.lost {
             self.flight = self.flight.saturating_sub(len);
         }
@@ -540,7 +584,7 @@ impl Connection {
         Some((len, sample))
     }
 
-    fn process_ack(&mut self, p: &Packet, now: Instant) {
+    fn process_ack(&mut self, p: &Packet, now: Instant, old_wnd: usize) {
         // The ack must lie between the last one and our newest packet.
         let newest = self.seq_nr.wrapping_sub(1);
         if !seq_le(self.peer_ack, p.ack_nr) || !seq_le(p.ack_nr, newest) {
@@ -584,7 +628,10 @@ impl Connection {
             && p.payload.is_empty()
             && p.wnd_size != 0
             && self.flight > 0
+            && (p.sack.is_some() || p.wnd_size as usize == old_wnd)
         {
+            // Keepalives and window updates (a changed window, no SACK)
+            // are not duplicate acks.
             self.dup_acks += 1;
         }
         if newly > 0 {
@@ -600,7 +647,8 @@ impl Connection {
                 .outstanding
                 .iter()
                 .any(|s| !s.acked && !s.lost)
-                .then(|| now + self.rtt.rto());
+                .then(|| after(now, self.rtt.rto()))
+                .flatten();
         }
         self.detect_loss(&sacked, now);
     }
@@ -680,6 +728,7 @@ impl Connection {
             return; // too far ahead
         }
         let len = p.payload.len();
+        self.max_recv_payload = self.max_recv_payload.max(len);
         if d == 1 {
             if self.buffered_bytes() + len > self.cfg.recv_buffer {
                 self.ack_now = true; // no room: the ack shows our window
@@ -696,7 +745,7 @@ impl Connection {
                 if self.unacked_recv >= 2 {
                     self.ack_now = true;
                 } else if self.ack_due.is_none() {
-                    self.ack_due = Some(now + DELAYED_ACK);
+                    self.ack_due = after(now, DELAYED_ACK);
                 }
             }
             return;
@@ -707,10 +756,8 @@ impl Connection {
         }
         // Out-of-order data never takes the last packet's worth of room, so
         // the packet that fills the hole always fits.
-        let limit = self
-            .cfg
-            .recv_buffer
-            .saturating_sub(self.mss.max(self.min_payload));
+        let reserve = self.mss.max(self.max_recv_payload).max(HOLE_RESERVE);
+        let limit = self.cfg.recv_buffer.saturating_sub(reserve);
         if self.buffered_bytes() + len > limit {
             return;
         }
@@ -886,6 +933,9 @@ impl Connection {
         if !self.fits(len) {
             return None;
         }
+        if len > self.window_room().1 {
+            self.probe_seq = Some(seq); // sent past the peer's window
+        }
         let s = self.outstanding.get_mut(i)?;
         s.lost = false;
         s.transmissions = s.transmissions.saturating_add(1);
@@ -894,7 +944,7 @@ impl Connection {
         self.bypass_cwnd = false;
         self.bypass_peer_wnd = false;
         if self.rto_at.is_none() {
-            self.rto_at = Some(now + self.rtt.rto());
+            self.rto_at = after(now, self.rtt.rto());
         }
         if len > 0 {
             self.last_data_send = now;
@@ -915,12 +965,17 @@ impl Connection {
         }
         if !self.unsent.is_empty() {
             let mut len = self.unsent.len().min(self.mss);
-            // A receiver whose whole window is below one packet gets
-            // smaller packets rather than none.
+            // A receiver whose whole window is below one packet gets smaller
+            // packets rather than none, but never fragments below a quarter
+            // packet (silly-window avoidance): those wait for the window or
+            // the probe timer.
             if self.peer_wnd < self.mss && !self.bypass_peer_wnd {
                 let (_, w) = self.window_room();
-                if w > 0 {
-                    len = len.min(w);
+                if w < len {
+                    if w < (self.mss / 4).max(1) {
+                        return;
+                    }
+                    len = w;
                 }
             }
             if !self.fits(len) {

@@ -70,15 +70,16 @@ struct Pair {
     /// Deliver B's packets to A.
     b_to_a: bool,
     last_to_a: Instant,
-    /// (time, from A, packet type, payload length)
-    log: Vec<(Instant, bool, PacketType, usize)>,
+    /// (time, from A, packet type, payload length, seq_nr)
+    log: Vec<(Instant, bool, PacketType, usize, u16)>,
 }
 
 fn pair(cfg_a: &UtpConfig, cfg_b: &UtpConfig) -> Pair {
     let t0 = Instant::now();
     let mut a = Connection::connect(cfg_a, v4(), 100, t0);
     let syn = drain(&mut a, t0).remove(0);
-    let b = Connection::accept(cfg_b, v4(), &syn, t0 + DELAY);
+    // 0xFFF0: B's sequence numbers wrap within the first few packets.
+    let b = Connection::accept(cfg_b, v4(), &syn, 0xFFF0, t0 + DELAY);
     let mut p = Pair {
         a,
         b,
@@ -97,11 +98,13 @@ fn pair(cfg_a: &UtpConfig, cfg_b: &UtpConfig) -> Pair {
 impl Pair {
     fn flush(&mut self) {
         for pk in drain(&mut self.a, self.t) {
-            self.log.push((self.t, true, pk.ty, pk.payload.len()));
+            self.log
+                .push((self.t, true, pk.ty, pk.payload.len(), pk.seq_nr));
             self.link.push((self.t + DELAY, true, pk));
         }
         for pk in drain(&mut self.b, self.t) {
-            self.log.push((self.t, false, pk.ty, pk.payload.len()));
+            self.log
+                .push((self.t, false, pk.ty, pk.payload.len(), pk.seq_nr));
             if self.b_to_a {
                 self.link.push((self.t + DELAY, false, pk));
             }
@@ -193,7 +196,7 @@ fn handshake_ids_follow_bep29() {
     assert_eq!(syn.seq_nr, 1);
     assert_eq!(syn.wnd_size as usize, cfg.recv_buffer);
 
-    let mut b = Connection::accept(&cfg, v4(), syn, t0);
+    let mut b = Connection::accept(&cfg, v4(), syn, 777, t0);
     assert_eq!((b.recv_id(), b.send_id()), (1001, 1000));
     assert_eq!(b.state(), ConnState::Connected);
     let st = drain(&mut b, t0);
@@ -202,6 +205,7 @@ fn handshake_ids_follow_bep29() {
     assert_eq!(st.ty, PacketType::State);
     assert_eq!(st.conn_id, 1000);
     assert_eq!(st.ack_nr, 1);
+    assert_eq!(st.seq_nr, 777);
 
     a.on_packet(st, t0 + DELAY);
     assert_eq!(a.state(), ConnState::Connected);
@@ -445,7 +449,7 @@ fn accepted(cfg: &UtpConfig) -> (Connection, Instant) {
     let t0 = Instant::now();
     let mut a = Connection::connect(cfg, v4(), 100, t0);
     let syn = drain(&mut a, t0).remove(0);
-    let mut b = Connection::accept(cfg, v4(), &syn, t0);
+    let mut b = Connection::accept(cfg, v4(), &syn, 777, t0);
     drain(&mut b, t0);
     (b, t0)
 }
@@ -605,4 +609,153 @@ fn remote_garbage_never_panics() {
         drain(&mut a, now);
         assert!(a.buffered_bytes() <= cfg.recv_buffer);
     }
+}
+
+#[test]
+fn hole_filler_always_fits_after_full_reorder_buffer() {
+    // libtorrent sends up to 1452-byte payloads (v4). With this buffer the
+    // out-of-order data could end within one such packet of the limit.
+    let cfg = UtpConfig {
+        recv_buffer: 15_921,
+        ..UtpConfig::default()
+    };
+    let (mut b, t) = accepted(&cfg);
+    let mut last = 0u16;
+    for seq in 3u16..40 {
+        b.on_packet(&data_pkt(101, seq, 1452), t);
+        if b.buffered_bytes() == usize::from(seq - 2) * 1452 {
+            last = seq;
+        }
+    }
+    assert!(last >= 3, "nothing buffered out of order");
+    drain(&mut b, t);
+    b.on_packet(&data_pkt(101, 2, 1452), t);
+    let acks = drain(&mut b, t);
+    assert_eq!(
+        acks.last().map(|p| p.ack_nr),
+        Some(last),
+        "hole filler dropped"
+    );
+}
+
+#[test]
+fn acceptor_initial_seq_wraps() {
+    let cfg = UtpConfig::default();
+    let t0 = Instant::now();
+    let mut a = Connection::connect(&cfg, v4(), 9, t0);
+    let syn = drain(&mut a, t0).remove(0);
+    let mut b = Connection::accept(&cfg, v4(), &syn, 0xFFF0, t0);
+    let st = drain(&mut b, t0);
+    assert_eq!(st[0].seq_nr, 0xFFF0);
+    a.on_packet(&st[0], t0 + DELAY);
+    let data = pattern(40 * 1400);
+    assert_eq!(b.write(&data), data.len());
+    let mut p = Pair {
+        a,
+        b,
+        t: t0 + DELAY,
+        link: Vec::new(),
+        b_to_a: true,
+        last_to_a: t0,
+        log: Vec::new(),
+    };
+    let mut got = Vec::new();
+    let end = p.t + Duration::from_secs(10);
+    p.run_until(end, |p| read_all(&mut p.a, &mut got));
+    assert_eq!(got, data);
+    let seqs: Vec<u16> = p
+        .log
+        .iter()
+        .filter(|l| !l.1 && l.2 == PacketType::Data)
+        .map(|l| l.4)
+        .collect();
+    assert!(
+        seqs.contains(&0xFFFF) && seqs.contains(&0),
+        "no wrap: {seqs:?}"
+    );
+}
+
+#[test]
+fn initiator_ignores_stray_syn() {
+    let cfg = UtpConfig::default();
+    let (mut a, t) = hand_connected(&cfg, 1 << 20);
+    drain(&mut a, t);
+    let mut syn = state_pkt(a.send_id(), 1, 0, 1 << 20);
+    syn.ty = PacketType::Syn;
+    a.on_packet(&syn, t);
+    assert!(drain(&mut a, t).is_empty());
+    assert_eq!(a.state(), ConnState::Connected);
+}
+
+#[test]
+fn sacked_payloads_free_send_buffer() {
+    let cfg = UtpConfig::default();
+    let (mut a, mut t) = hand_connected(&cfg, 1 << 20);
+    let batch = batch_of(&mut a, &mut t, 5);
+    // Fill the send buffer, then SACK four packets after a hole.
+    while a.write(&[0u8; 4096]) > 0 {}
+    let mut st = state_pkt(100, 500, batch[0].seq_nr.wrapping_sub(1), 1 << 20);
+    st.sack = Some(vec![0b0000_1111, 0, 0, 0]);
+    a.on_packet(&st, t + Duration::from_millis(20));
+    let freed: usize = batch[1..5].iter().map(|p| p.payload.len()).sum();
+    assert_eq!(a.write(&vec![0u8; 1 << 20]), freed);
+}
+
+#[test]
+fn window_update_is_not_a_dup_ack() {
+    let cfg = UtpConfig::default();
+    let (mut a, mut t) = hand_connected(&cfg, 1 << 20);
+    let batch = batch_of(&mut a, &mut t, 5);
+    let ack = batch[0].seq_nr.wrapping_sub(1);
+    t += Duration::from_millis(20);
+    // Three STATEs with the same ack but a changing window: updates.
+    for w in [500_000u32, 600_000, 700_000] {
+        a.on_packet(&state_pkt(100, 500, ack, w), t);
+        let out = drain(&mut a, t);
+        assert!(!data_of(&out).iter().any(|p| p.seq_nr == batch[0].seq_nr));
+    }
+}
+
+#[test]
+fn small_peer_window_avoids_silly_fragments() {
+    let cfg = UtpConfig::default();
+    let (mut a, t) = hand_connected(&cfg, 1000);
+    a.write(&[1u8; 5000]);
+    let out = drain(&mut a, t);
+    let lens: Vec<usize> = data_of(&out).iter().map(|p| p.payload.len()).collect();
+    assert_eq!(lens, vec![1000]);
+
+    let (mut a, t) = hand_connected(&cfg, 200);
+    a.write(&[1u8; 5000]);
+    assert!(
+        data_of(&drain(&mut a, t)).is_empty(),
+        "sent a fragment below mss/4"
+    );
+    // The probe timer still gets data out.
+    let d = a.next_deadline().unwrap();
+    a.on_timer(d);
+    assert_eq!(data_of(&drain(&mut a, d)).len(), 1);
+}
+
+#[test]
+fn huge_timeouts_never_panic() {
+    let cfg = UtpConfig {
+        idle_timeout: Duration::MAX,
+        connect_timeout: Duration::MAX,
+        keepalive: Duration::MAX,
+        ..UtpConfig::default()
+    };
+    let t0 = Instant::now();
+    let mut a = Connection::connect(&cfg, v4(), 5, t0);
+    drain(&mut a, t0);
+    let d = a.next_deadline().unwrap();
+    a.on_timer(d);
+    let mut p = pair(&cfg, &cfg);
+    p.a.write(&[1u8; 10_000]);
+    let mut got = Vec::new();
+    let end = p.t + Duration::from_secs(5);
+    p.run_until(end, |p| read_all(&mut p.b, &mut got));
+    assert_eq!(got.len(), 10_000);
+    p.a.on_timer(p.t + Duration::from_secs(3600));
+    assert_eq!(p.a.state(), ConnState::Connected);
 }
