@@ -13,8 +13,8 @@ use fbt_core::BlockRef;
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage};
 use fbt_session::{
-    AddTorrent, DisconnectReason, Event, EventMask, Priority, Session, Settings, TorrentHandle,
-    TorrentState,
+    AddTorrent, DisconnectReason, EncryptionPolicy, Event, EventMask, Priority, Session, Settings,
+    TorrentHandle, TorrentState,
 };
 use fbt_wire::{
     ExtHandshake, Message, MetadataMsg, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, Reserved, UT_METADATA,
@@ -481,7 +481,10 @@ async fn piece_finished_while_a_peer_connects_is_announced() {
 
     let (m, payload) = make_torrent(&[("a", 4 * 16_384)], 16_384);
     let ih = m.info_hashes.wire_hash();
-    let (s, h, _) = mem_leecher(&m, payload.len()).await;
+    // The hand-driven remote below speaks plaintext only.
+    let mut st = settings();
+    st.encryption = EncryptionPolicy::Disabled;
+    let (s, h, _) = mem_leecher_with(st, &m, payload.len()).await;
     let mut ev = s.subscribe(EventMask::PIECE);
 
     // A remote that accepts our connection but holds back its handshake.

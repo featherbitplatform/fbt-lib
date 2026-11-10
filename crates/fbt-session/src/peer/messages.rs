@@ -20,6 +20,8 @@ pub enum DisconnectReason {
     HandshakeTimeout,
     /// The remote sent nothing for the idle timeout.
     IdleTimeout,
+    /// The MSE/PE handshake failed or was refused.
+    Encryption(String),
     /// The remote broke the wire protocol.
     Protocol(String),
     /// Transport error, including connect failures and stalled writes.
@@ -53,6 +55,8 @@ pub(crate) enum PeerEvent {
         peer_id: PeerId,
         reserved: Reserved,
         addr: SocketAddr,
+        /// RC4-encrypted (MSE); false for plaintext, MSE-negotiated or not.
+        encrypted: bool,
     },
     /// The remote's initial piece set.
     Pieces {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
-use fbt_wire::ExtHandshake;
+use fbt_wire::{CryptoMethods, ExtHandshake};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
@@ -15,12 +15,13 @@ use tracing::debug;
 
 use super::actor::Actor;
 use crate::peer::DisconnectReason;
-use crate::peer::conn::{MAX_ALLOWED_FAST, PeerCtx, spawn_incoming, spawn_outgoing};
+use crate::peer::conn::{MAX_ALLOWED_FAST, PeerCtx, PeerStream, spawn_incoming, spawn_outgoing};
 use crate::peer::ext::ExtConfig;
 use crate::peer::messages::PeerCommand;
 use crate::picker::{PeerKey, PeerPieces};
 use crate::rate::RateMeter;
 use crate::session::{release, try_reserve};
+use crate::settings::EncryptionPolicy;
 
 /// Connection attempts per address before it is given up.
 const MAX_ATTEMPTS: u32 = 3;
@@ -28,6 +29,7 @@ const MAX_ATTEMPTS: u32 = 3;
 /// address not in use is forgotten.
 const MAX_KNOWN: usize = 1000;
 /// Most never-retry addresses kept; the oldest is forgotten beyond it.
+/// Also bounds the plaintext-only addresses.
 const MAX_NEVER: usize = 1000;
 
 /// The addresses a torrent connects to (from `add_peer` and trackers),
@@ -136,6 +138,11 @@ pub(super) struct Retries {
     never: HashSet<SocketAddr>,
     /// `never` in insertion order, to forget the oldest.
     never_order: VecDeque<SocketAddr>,
+    /// Addresses whose MSE handshake failed under `Preferred`: dialled with
+    /// a plain BitTorrent handshake from then on (the last [`MAX_NEVER`]).
+    plaintext_only: HashSet<SocketAddr>,
+    /// `plaintext_only` in insertion order, to forget the oldest.
+    plaintext_order: VecDeque<SocketAddr>,
 }
 
 impl Retries {
@@ -146,7 +153,30 @@ impl Retries {
             pending: HashMap::new(),
             never: HashSet::new(),
             never_order: VecDeque::new(),
+            plaintext_only: HashSet::new(),
+            plaintext_order: VecDeque::new(),
         }
+    }
+
+    /// An MSE handshake to `addr` failed. True when a plaintext retry is
+    /// due: the first such failure marks the address plaintext-only (and
+    /// counts no attempt); later ones are ordinary failures.
+    pub(super) fn encryption_failed(&mut self, addr: SocketAddr) -> bool {
+        if !self.plaintext_only.insert(addr) {
+            return false;
+        }
+        self.plaintext_order.push_back(addr);
+        while self.plaintext_order.len() > MAX_NEVER {
+            if let Some(old) = self.plaintext_order.pop_front() {
+                self.plaintext_only.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// Dial `addr` without MSE.
+    pub(super) fn is_plaintext_only(&self, addr: &SocketAddr) -> bool {
+        self.plaintext_only.contains(addr)
     }
 
     /// Never connect to `addr` again.
@@ -260,6 +290,8 @@ pub(super) struct Peer {
     pub ext: Option<Box<ExtHandshake>>,
     /// The listen port from that handshake (`p`).
     pub listen_port: Option<u16>,
+    /// The connection is RC4-encrypted (for PEX flags).
+    pub encrypted: bool,
 }
 
 impl Peer {
@@ -293,6 +325,7 @@ impl Peer {
             to_rate: RateMeter::new(),
             ext: None,
             listen_port: None,
+            encrypted: false,
         }
     }
 
@@ -370,6 +403,7 @@ impl Actor {
             ext: self.ext_config(),
             settings: Arc::clone(&self.shared.settings),
             events: self.peer_tx.clone(),
+            encrypted: false,
         }
     }
 
@@ -474,7 +508,7 @@ impl Actor {
             let ctx = self.ctx(key);
             let have = ctx.have.clone();
             let num_pieces = ctx.have.len();
-            let tx = spawn_outgoing(addr, ctx);
+            let tx = spawn_outgoing(addr, ctx, self.mse_provide(&addr));
             let mut peer = Peer::new(addr, tx, self.generation, num_pieces);
             peer.outgoing = true;
             peer.connecting = true;
@@ -483,9 +517,21 @@ impl Actor {
         }
     }
 
+    /// The MSE `crypto_provide` for dialling `addr`, `None` for a plain
+    /// BitTorrent handshake.
+    fn mse_provide(&self, addr: &SocketAddr) -> Option<CryptoMethods> {
+        match self.shared.settings.encryption {
+            EncryptionPolicy::Forced => Some(CryptoMethods::RC4),
+            EncryptionPolicy::Preferred if !self.retries.is_plaintext_only(addr) => {
+                Some(CryptoMethods::RC4 | CryptoMethods::PLAINTEXT)
+            }
+            EncryptionPolicy::Preferred | EncryptionPolicy::Disabled => None,
+        }
+    }
+
     pub(super) fn on_incoming(
         &mut self,
-        stream: tokio::net::TcpStream,
+        stream: PeerStream,
         hs: fbt_wire::Handshake,
         addr: SocketAddr,
     ) {
@@ -499,7 +545,8 @@ impl Actor {
             return;
         }
         let key = self.new_key();
-        let ctx = self.ctx(key);
+        let mut ctx = self.ctx(key);
+        ctx.encrypted = stream.is_encrypted();
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();
         let tx = spawn_incoming(stream, hs, addr, ctx);
@@ -560,7 +607,13 @@ impl Actor {
     /// Bookkeeping for a finished handshake: slots, retries and the
     /// duplicate peer-id guard. Returns whether the connection stays; the
     /// caller then catches it up on our pieces.
-    pub(super) fn on_connected(&mut self, key: PeerKey, peer_id: PeerId, addr: SocketAddr) -> bool {
+    pub(super) fn on_connected(
+        &mut self,
+        key: PeerKey,
+        peer_id: PeerId,
+        addr: SocketAddr,
+        encrypted: bool,
+    ) -> bool {
         let duplicate = self
             .peers
             .iter()
@@ -577,6 +630,7 @@ impl Actor {
         }
         p.connected = true;
         p.peer_id = Some(peer_id);
+        p.encrypted = encrypted;
         if p.outgoing {
             self.retries.connected(&p.addr);
         }
@@ -617,6 +671,16 @@ impl Actor {
             self.retries.never(p.addr);
             self.known.remove(&p.addr);
             self.candidates.retain(|a| *a != p.addr);
+        } else if p.outgoing
+            && !p.connected
+            && matches!(reason, DisconnectReason::Encryption(_))
+            && self.shared.settings.encryption == EncryptionPolicy::Preferred
+            && self.retries.encryption_failed(p.addr)
+        {
+            // The first failed MSE handshake to this address: dial it again
+            // at once, in plaintext, without counting an attempt.
+            debug!(addr = %p.addr, "MSE handshake failed; retrying in plaintext");
+            self.queue_addr(p.addr);
         } else if p.outgoing && !p.connected && reason != DisconnectReason::Shutdown {
             // The connection or handshake failed (we did not close it).
             if self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp {
@@ -724,6 +788,30 @@ mod tests {
         // The oldest were forgotten, the newest kept.
         assert!(!r.is_never(&addr(0)) && !r.is_never(&addr(9)));
         assert!(r.is_never(&addr(10)) && r.is_never(&addr(MAX_NEVER as u32 + 9)));
+    }
+
+    #[test]
+    fn plaintext_retry_is_due_once_per_address_and_bounded() {
+        let a = addr(1);
+        let mut r = Retries::new(DELAY);
+        assert!(!r.is_plaintext_only(&a));
+        assert!(
+            r.encryption_failed(a),
+            "first MSE failure: retry in plaintext"
+        );
+        assert!(r.is_plaintext_only(&a));
+        assert!(!r.encryption_failed(a), "only once");
+        assert!(
+            r.attempts.is_empty() && !r.is_pending(&a),
+            "no attempt counted"
+        );
+        for i in 2..(MAX_NEVER as u32 + 12) {
+            r.encryption_failed(addr(i));
+        }
+        assert_eq!(r.plaintext_only.len(), MAX_NEVER);
+        assert_eq!(r.plaintext_order.len(), MAX_NEVER);
+        assert!(!r.is_plaintext_only(&a), "the oldest is forgotten");
+        assert!(r.is_plaintext_only(&addr(MAX_NEVER as u32 + 11)));
     }
 
     #[test]

@@ -545,7 +545,7 @@ impl Actor {
                 stream,
                 handshake,
                 addr,
-            } => self.on_incoming(stream, handshake, addr),
+            } => self.on_incoming(*stream, handshake, addr),
             Cmd::Remove(mode, tx) => {
                 let r = self.stop(Some(mode)).await;
                 // Done here rather than by the caller, whose future may be

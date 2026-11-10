@@ -21,8 +21,12 @@ impl Actor {
     pub(super) fn on_peer_event(&mut self, ev: PeerEvent) {
         match ev {
             PeerEvent::Connected {
-                key, peer_id, addr, ..
-            } => self.on_peer_connected(key, peer_id, addr),
+                key,
+                peer_id,
+                addr,
+                encrypted,
+                ..
+            } => self.on_peer_connected(key, peer_id, addr, encrypted),
             PeerEvent::Pieces { key, pieces } => self.on_pieces(key, pieces),
             PeerEvent::Have { key, piece } => self.on_have(key, piece),
             PeerEvent::Choked { key } => {
@@ -82,8 +86,14 @@ impl Actor {
 
     /// A handshake finished: unless the swarm side closed it as a
     /// duplicate, the peer learns the pieces finished while it connected.
-    fn on_peer_connected(&mut self, key: PeerKey, peer_id: PeerId, addr: SocketAddr) {
-        if !self.on_connected(key, peer_id, addr) {
+    fn on_peer_connected(
+        &mut self,
+        key: PeerKey,
+        peer_id: PeerId,
+        addr: SocketAddr,
+        encrypted: bool,
+    ) {
+        if !self.on_connected(key, peer_id, addr, encrypted) {
             return;
         }
         let Some(p) = self.peers.get_mut(&key) else {
@@ -104,7 +114,7 @@ impl Actor {
                 self.send(key, PeerCommand::Haves(missed));
             }
         }
-        debug!(%addr, "peer connected");
+        debug!(%addr, encrypted, "peer connected");
         self.emit(Event::PeerConnected {
             torrent: self.ih,
             addr,

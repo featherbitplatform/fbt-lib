@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use fbt_core::{InfoHashes, PeerId};
 use fbt_metainfo::Metainfo;
 use fbt_tracker::TrackerClient;
+use fbt_wire::req2_hash;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -143,6 +144,9 @@ pub(crate) struct TorrentEntry {
 pub(crate) struct Registry {
     pub torrents: HashMap<InfoHashes, TorrentEntry>,
     pub by_wire: HashMap<[u8; 20], InfoHashes>,
+    /// `HASH('req2', wire hash)` to the wire hash (the MSE `SKEY`), kept
+    /// with `by_wire`, so an MSE responder finds its torrent in one lookup.
+    pub by_req2: HashMap<[u8; 20], [u8; 20]>,
 }
 
 #[derive(Debug)]
@@ -164,6 +168,7 @@ impl SessionInner {
         match reg.torrents.remove(ih) {
             Some(e) => {
                 reg.by_wire.remove(&e.wire_hash);
+                reg.by_req2.remove(&req2_hash(&e.wire_hash));
                 true
             }
             None => false,
@@ -268,6 +273,7 @@ impl Session {
             Arc::downgrade(&self.inner),
         );
         reg.by_wire.insert(wire_hash, ih);
+        reg.by_req2.insert(req2_hash(&wire_hash), wire_hash);
         reg.torrents.insert(
             ih,
             TorrentEntry {
@@ -327,6 +333,7 @@ impl Session {
         let handles: Vec<TorrentHandle> = {
             let mut reg = self.inner.registry();
             reg.by_wire.clear();
+            reg.by_req2.clear();
             reg.torrents.drain().map(|(_, e)| e.handle).collect()
         };
         let mut waits: Vec<oneshot::Receiver<()>> = Vec::new();

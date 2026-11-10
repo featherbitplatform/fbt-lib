@@ -22,10 +22,10 @@ use std::sync::{Arc, Weak};
 use fbt_core::{Bitfield, InfoHashes};
 use fbt_metainfo::Metainfo;
 use fbt_wire::Handshake;
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::SessionError;
+use crate::peer::conn::PeerStream;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::Storage;
@@ -46,7 +46,8 @@ pub(crate) enum Cmd {
     Pieces(oneshot::Sender<Bitfield>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
-        stream: TcpStream,
+        /// Boxed: the MSE stream holds two RC4 states.
+        stream: Box<PeerStream>,
         handshake: Handshake,
         addr: SocketAddr,
     },
@@ -212,14 +213,14 @@ impl TorrentHandle {
     /// its queue is full or it is gone.
     pub(crate) fn offer_incoming(
         &self,
-        stream: TcpStream,
+        stream: PeerStream,
         handshake: Handshake,
         addr: SocketAddr,
     ) -> bool {
         self.inner
             .cmds
             .try_send(Cmd::Incoming {
-                stream,
+                stream: Box::new(stream),
                 handshake,
                 addr,
             })

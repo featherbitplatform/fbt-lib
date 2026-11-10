@@ -12,6 +12,22 @@ pub const MAX_EVENT_QUEUE: usize = 1 << 20;
 /// queue is sized from it.
 pub const MAX_INCOMING_REQUESTS: usize = 1 << 16;
 
+/// Whether peer connections use MSE/PE (message stream encryption).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum EncryptionPolicy {
+    /// Encrypted (RC4) connections only, in both directions.
+    Forced,
+    /// Outgoing connections try MSE (offering RC4 or plaintext) and fall
+    /// back to a plain BitTorrent handshake once per address when the MSE
+    /// handshake fails; incoming connections may be either.
+    #[default]
+    Preferred,
+    /// Plain BitTorrent handshakes only; incoming MSE connections are
+    /// refused.
+    Disabled,
+}
+
 /// Tunables for a session and its torrents.
 ///
 /// Build with [`Settings::default`] and assign the fields to change.
@@ -39,8 +55,10 @@ pub struct Settings {
     pub max_incoming_requests: usize,
     /// TCP connect timeout.
     pub connect_timeout: Duration,
-    /// Time allowed for the handshake exchange.
+    /// Time allowed for the handshake exchange, the MSE handshake included.
     pub handshake_timeout: Duration,
+    /// MSE/PE policy for outgoing and incoming connections.
+    pub encryption: EncryptionPolicy,
     /// A peer that sends nothing for this long is disconnected (non-zero).
     pub peer_idle_timeout: Duration,
     /// A keepalive goes out after this much send silence (non-zero).
@@ -114,6 +132,7 @@ impl Default for Settings {
             max_incoming_requests: 250,
             connect_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(10),
+            encryption: EncryptionPolicy::default(),
             peer_idle_timeout: Duration::from_secs(120),
             keepalive_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(60),

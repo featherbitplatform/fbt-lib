@@ -23,14 +23,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PeerId, PieceLayout};
 use fbt_wire::{
-    Handshake, HandshakeError, Message, MessageCodec, Reserved, WireError, read_handshake,
-    write_handshake,
+    CryptoMethods, Handshake, HandshakeError, Message, MessageCodec, MseStream, Reserved,
+    WireError, initiate, read_handshake, write_handshake,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_util::codec::Framed;
 
 use super::ext::{self, ExtConfig, Incoming, RemoteIds};
@@ -81,31 +81,68 @@ pub(crate) struct PeerCtx {
     pub ext: ExtConfig,
     pub settings: Arc<Settings>,
     pub events: mpsc::Sender<PeerEvent>,
+    /// The connection is RC4-encrypted (MSE), as `MseStream::is_encrypted`
+    /// reports it after the handshake; copied into `PeerEvent::Connected`.
+    pub encrypted: bool,
 }
 
+/// A peer connection's transport: MSE (RC4 or plaintext after the MSE
+/// handshake) or a plain BitTorrent connection.
+pub(crate) type PeerStream = MseStream<TcpStream>;
+
 /// Connects to `addr` and runs the peer task; returns its command channel.
+/// `mse` is the MSE `crypto_provide` to open with, `None` for a plain
+/// BitTorrent handshake.
 ///
 /// A failed or timed-out connect is reported as `Disconnected` with
-/// [`DisconnectReason::Io`].
-pub(crate) fn spawn_outgoing(addr: SocketAddr, ctx: PeerCtx) -> mpsc::Sender<PeerCommand> {
+/// [`DisconnectReason::Io`]; a failed MSE handshake (timeouts included) with
+/// [`DisconnectReason::Encryption`]. The MSE and BitTorrent handshakes share
+/// one `handshake_timeout`, which starts once the connect succeeded.
+pub(crate) fn spawn_outgoing(
+    addr: SocketAddr,
+    mut ctx: PeerCtx,
+    mse: Option<CryptoMethods>,
+) -> mpsc::Sender<PeerCommand> {
     let (tx, rx) = mpsc::channel(command_queue(&ctx.settings));
     tokio::spawn(async move {
-        match timeout(ctx.settings.connect_timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => run_peer(stream, None, addr, ctx, rx).await,
-            Ok(Err(e)) => report(&ctx, DisconnectReason::Io(e.to_string()), Vec::new()).await,
+        let stream = match timeout(ctx.settings.connect_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                return report(&ctx, DisconnectReason::Io(e.to_string()), Vec::new()).await;
+            }
             Err(_) => {
                 let reason = DisconnectReason::Io("connect timed out".to_owned());
-                report(&ctx, reason, Vec::new()).await;
+                return report(&ctx, reason, Vec::new()).await;
             }
-        }
+        };
+        let deadline = after(Instant::now(), ctx.settings.handshake_timeout);
+        let stream: PeerStream = match mse {
+            None => MseStream::plaintext(stream, Vec::new()),
+            Some(provide) => {
+                match timeout_at(deadline, initiate(stream, &ctx.info_hash, provide, b"")).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        let reason = DisconnectReason::Encryption(e.to_string());
+                        return report(&ctx, reason, Vec::new()).await;
+                    }
+                    Err(_) => {
+                        let reason = DisconnectReason::Encryption("MSE handshake timed out".into());
+                        return report(&ctx, reason, Vec::new()).await;
+                    }
+                }
+            }
+        };
+        ctx.encrypted = stream.is_encrypted();
+        run_peer_until(stream, None, addr, ctx, rx, deadline).await;
     });
     tx
 }
 
 /// Runs the peer task on an accepted stream whose handshake the listener
-/// already read; returns its command channel.
-pub(crate) fn spawn_incoming<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
-    stream: S,
+/// already read (after the MSE handshake, if any); returns its command
+/// channel. `ctx.encrypted` must already say whether `stream` is encrypted.
+pub(crate) fn spawn_incoming(
+    stream: PeerStream,
     remote: Handshake,
     addr: SocketAddr,
     ctx: PeerCtx,
@@ -118,14 +155,28 @@ pub(crate) fn spawn_incoming<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>
 /// Runs one connection to completion. `remote` is the already-read handshake
 /// of an incoming connection, or `None` for an outgoing one. Always ends with
 /// exactly one `Disconnected` event.
+/// The handshake must finish within `handshake_timeout`.
 pub(crate) async fn run_peer<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    remote: Option<Handshake>,
+    addr: SocketAddr,
+    ctx: PeerCtx,
+    cmds: mpsc::Receiver<PeerCommand>,
+) {
+    let deadline = after(Instant::now(), ctx.settings.handshake_timeout);
+    run_peer_until(stream, remote, addr, ctx, cmds, deadline).await;
+}
+
+/// [`run_peer`] with the handshake due by `deadline`.
+async fn run_peer_until<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     remote: Option<Handshake>,
     addr: SocketAddr,
     ctx: PeerCtx,
     mut cmds: mpsc::Receiver<PeerCommand>,
+    deadline: Instant,
 ) {
-    let (reason, outstanding) = match handshake(&mut stream, remote, &ctx).await {
+    let (reason, outstanding) = match handshake(&mut stream, remote, &ctx, deadline).await {
         Err(reason) => (reason, Vec::new()),
         Ok(theirs) => {
             let mut conn = Conn::new(stream, &theirs, addr.ip(), &ctx);
@@ -134,6 +185,7 @@ pub(crate) async fn run_peer<S: AsyncRead + AsyncWrite + Unpin>(
                 peer_id: theirs.peer_id,
                 reserved: theirs.reserved,
                 addr,
+                encrypted: ctx.encrypted,
             };
             let reason = match conn.emit(connected).await {
                 Err(reason) => reason,
@@ -155,11 +207,12 @@ async fn report(ctx: &PeerCtx, reason: DisconnectReason, outstanding: Vec<BlockR
     let _ = ctx.events.send(ev).await;
 }
 
-/// Exchanges handshakes within `handshake_timeout` and checks the remote's.
+/// Exchanges handshakes by `deadline` and checks the remote's.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     remote: Option<Handshake>,
     ctx: &PeerCtx,
+    deadline: Instant,
 ) -> Result<Handshake, DisconnectReason> {
     let mut reserved = Reserved::default();
     reserved.set_fast();
@@ -191,7 +244,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     };
-    timeout(ctx.settings.handshake_timeout, exchange)
+    timeout_at(deadline, exchange)
         .await
         .map_err(|_| DisconnectReason::HandshakeTimeout)?
 }
@@ -218,7 +271,7 @@ fn protocol(msg: &str) -> DisconnectReason {
 }
 
 /// `t + d`, saturating far in the future instead of overflowing.
-fn after(t: Instant, d: Duration) -> Instant {
+pub(crate) fn after(t: Instant, d: Duration) -> Instant {
     t.checked_add(d)
         .or_else(|| t.checked_add(Duration::from_secs(86_400 * 365)))
         .unwrap_or(t)
@@ -881,6 +934,7 @@ mod tests {
             ext,
             settings: Arc::new(Settings::default()),
             events: etx,
+            encrypted: false,
         };
         tokio::spawn(run_peer(ours, None, addr(), ctx, crx));
         Harness {
@@ -1069,6 +1123,7 @@ mod tests {
                 peer_id: THEIR_ID,
                 reserved: reserved(true, false, false),
                 addr: addr(),
+                encrypted: false,
             }
         );
         assert_eq!(recv(&mut wire).await, Message::HaveAll);

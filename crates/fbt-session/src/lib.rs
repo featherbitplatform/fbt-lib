@@ -25,7 +25,7 @@ pub use event::{Event, EventMask, EventStream};
 pub use peer::DisconnectReason;
 pub use rate::RateMeter;
 pub use session::{AddTorrent, Priority, RemoveMode, Session};
-pub use settings::Settings;
+pub use settings::{EncryptionPolicy, Settings};
 pub use status::{TorrentState, TorrentStatus};
 pub use torrent::TorrentHandle;
 
