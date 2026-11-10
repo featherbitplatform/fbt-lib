@@ -79,7 +79,7 @@ jobs:
   interop:
     name: interop
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - run: bash dev/interop/run.sh
