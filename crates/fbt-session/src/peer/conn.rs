@@ -31,8 +31,17 @@ use super::messages::{DisconnectReason, PeerCommand, PeerEvent, PeerPiecesOwned}
 use crate::picker::PeerKey;
 use crate::settings::Settings;
 
-/// Capacity of each peer task's command channel.
-const COMMAND_QUEUE: usize = 256;
+/// Command queue room beyond `max_incoming_requests`: every queued remote
+/// request may be answered by one command, plus control commands.
+const COMMAND_HEADROOM: usize = 64;
+
+/// Capacity of a peer task's command channel. A full queue closes the peer
+/// as stalled, so it must hold an answer for every request we accept.
+pub(crate) fn command_queue(settings: &Settings) -> usize {
+    settings
+        .max_incoming_requests
+        .saturating_add(COMMAND_HEADROOM)
+}
 /// Most allowed-fast pieces kept per connection; further `AllowedFast`
 /// messages are ignored (BEP 6 sets are around ten pieces).
 pub(crate) const MAX_ALLOWED_FAST: usize = 64;
@@ -54,7 +63,7 @@ pub(crate) struct PeerCtx {
 /// A failed or timed-out connect is reported as `Disconnected` with
 /// [`DisconnectReason::Io`].
 pub(crate) fn spawn_outgoing(addr: SocketAddr, ctx: PeerCtx) -> mpsc::Sender<PeerCommand> {
-    let (tx, rx) = mpsc::channel(COMMAND_QUEUE);
+    let (tx, rx) = mpsc::channel(command_queue(&ctx.settings));
     tokio::spawn(async move {
         match timeout(ctx.settings.connect_timeout, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => run_peer(stream, None, addr, ctx, rx).await,
@@ -76,7 +85,7 @@ pub(crate) fn spawn_incoming<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>
     addr: SocketAddr,
     ctx: PeerCtx,
 ) -> mpsc::Sender<PeerCommand> {
-    let (tx, rx) = mpsc::channel(COMMAND_QUEUE);
+    let (tx, rx) = mpsc::channel(command_queue(&ctx.settings));
     tokio::spawn(run_peer(stream, Some(remote), addr, ctx, rx));
     tx
 }
@@ -1019,6 +1028,14 @@ mod tests {
                 block: block(1, 0),
             }
         );
+    }
+
+    #[test]
+    fn command_queue_holds_every_accepted_request() {
+        let mut s = Settings::default();
+        assert_eq!(command_queue(&s), 250 + COMMAND_HEADROOM);
+        s.max_incoming_requests = 4000;
+        assert_eq!(command_queue(&s), 4000 + COMMAND_HEADROOM);
     }
 
     #[tokio::test(start_paused = true)]

@@ -33,4 +33,8 @@ pub enum SessionError {
     /// A storage operation failed.
     #[error("storage error: {0}")]
     Storage(#[source] io::Error),
+    /// A [`Settings`](crate::Settings) value is out of range; the message
+    /// names the field.
+    #[error("invalid settings: {0}")]
+    InvalidSettings(String),
 }

@@ -24,7 +24,11 @@ pub(crate) fn spawn(
     shared: Arc<Shared>,
 ) -> JoinHandle<()> {
     // Connections still sending their handshake; more are dropped at once.
-    let pending = Arc::new(Semaphore::new(shared.settings.max_peers_global.max(1)));
+    let permits = shared
+        .settings
+        .max_peers_global
+        .clamp(1, Semaphore::MAX_PERMITS);
+    let pending = Arc::new(Semaphore::new(permits));
     tokio::spawn(async move {
         loop {
             let (stream, addr) = match listener.accept().await {

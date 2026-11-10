@@ -196,14 +196,18 @@ pub struct Session {
 impl Session {
     /// Starts a session and binds its peer listener on
     /// `settings.listen_addr`.
+    ///
+    /// Fails with [`SessionError::InvalidSettings`] for settings it cannot
+    /// work with (see [`Settings`]).
     pub async fn new(settings: Settings) -> Result<Session, SessionError> {
+        settings.validate().map_err(SessionError::InvalidSettings)?;
         let listener = TcpListener::bind(settings.listen_addr)
             .await
             .map_err(SessionError::Bind)?;
         let local_addr = listener.local_addr().map_err(SessionError::Bind)?;
         let tracker =
             TrackerClient::new(settings.tracker.clone()).map_err(SessionError::Tracker)?;
-        let (events, _) = broadcast::channel(settings.event_queue.max(1));
+        let (events, _) = broadcast::channel(settings.event_queue);
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),

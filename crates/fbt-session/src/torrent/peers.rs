@@ -110,7 +110,11 @@ impl Retries {
         let n = self.attempts.entry(addr).or_insert(0);
         *n = n.saturating_add(1);
         if *n < MAX_ATTEMPTS {
-            self.pending.insert(addr, now + self.delay);
+            // A huge delay means "not in this process's lifetime".
+            let at = now
+                .checked_add(self.delay)
+                .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
+            self.pending.insert(addr, at);
             AfterFailure::Retry
         } else {
             self.attempts.remove(&addr);

@@ -595,3 +595,92 @@ async fn dropped_remove_future_still_unregisters() {
         .expect("re-added");
     s.shutdown().await;
 }
+
+/// Settings that would panic or spin are refused with `InvalidSettings`.
+#[tokio::test]
+async fn invalid_settings_are_rejected() {
+    type Tweak = fn(&mut fbt_session::Settings);
+    let bad: [(&str, Tweak); 10] = [
+        ("status_interval", |s| s.status_interval = Duration::ZERO),
+        ("rechoke_interval", |s| s.rechoke_interval = Duration::ZERO),
+        ("keepalive_interval", |s| {
+            s.keepalive_interval = Duration::ZERO
+        }),
+        ("request_timeout", |s| s.request_timeout = Duration::ZERO),
+        ("peer_idle_timeout", |s| {
+            s.peer_idle_timeout = Duration::ZERO
+        }),
+        ("tracker_retry_base", |s| {
+            s.tracker_retry_base = Duration::ZERO
+        }),
+        ("event_queue", |s| s.event_queue = 0),
+        ("event_queue", |s| s.event_queue = usize::MAX),
+        ("max_incoming_requests", |s| {
+            s.max_incoming_requests = usize::MAX
+        }),
+        ("max_incoming_requests", |s| s.max_incoming_requests = 0),
+    ];
+    for (field, tweak) in bad {
+        let mut st = test_settings();
+        tweak(&mut st);
+        match Session::new(st).await {
+            Err(SessionError::InvalidSettings(msg)) => {
+                assert!(msg.contains(field), "{field}: {msg}");
+            }
+            other => panic!("{field}: expected InvalidSettings, got {other:?}"),
+        }
+    }
+}
+
+/// Extreme but meaningful settings work without panicking.
+#[tokio::test]
+async fn extreme_settings_do_not_panic() {
+    let mut st = test_settings();
+    st.max_peers_global = usize::MAX;
+    st.max_peers_per_torrent = usize::MAX;
+    st.max_half_open = usize::MAX;
+    st.unchoke_slots = usize::MAX;
+    st.max_outstanding_requests = usize::MAX;
+    st.max_incoming_requests = 1 << 16;
+    st.rechoke_interval = Duration::MAX;
+    st.keepalive_interval = Duration::MAX;
+    st.peer_idle_timeout = Duration::MAX;
+    st.request_timeout = Duration::MAX;
+    st.connect_timeout = Duration::MAX;
+    st.handshake_timeout = Duration::MAX;
+    st.peer_retry_delay = Duration::MAX;
+    st.tracker_retry_base = Duration::MAX;
+    st.event_queue = 1 << 16;
+    let s = Session::new(st).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, payload) = make_torrent(&[("a", 40_000)], 16_384);
+    write_payload(dir.path(), &m, &payload);
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    // A peer connects through the listener and is served.
+    let mut peer = ScriptedPeer::connect(s.local_addr(), m.info_hashes.wire_hash()).await;
+    peer.send(Message::Interested).await;
+    peer.next_matching(|m| *m == Message::Unchoke)
+        .await
+        .expect("unchoked");
+    // A failed outgoing connection schedules its retry "never".
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let mut ev = s.subscribe(EventMask::PEER);
+    h.add_peer(closed).await.unwrap();
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == closed),
+        T,
+    )
+    .await
+    .expect("connect failed");
+    assert_eq!(h.status().state, TorrentState::Seeding, "actor alive");
+    h.pieces().await.expect("actor alive");
+    s.shutdown().await;
+}
