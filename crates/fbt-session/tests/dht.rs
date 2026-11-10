@@ -337,7 +337,21 @@ async fn bootstrap_entries_validated() {
     assert!(
         matches!(Session::new(s).await, Err(SessionError::InvalidSettings(m)) if m.contains("dht_bootstrap_nodes"))
     );
-    for bad in ["host:99999", ":6881", "host:", "host:x"] {
+    for bad in [
+        "host:99999",
+        ":6881",
+        "host:",
+        "host:x",
+        "host:+1",
+        " host:6881",
+        "host :6881",
+        "host:6881\n",
+        "ho st:6881",
+        "::1:6881",
+        "[::1:6881",
+        "::1]:6881",
+        "[]:6881",
+    ] {
         let mut s = test_settings();
         s.dht_bootstrap_nodes = vec![bad.into()];
         assert!(
@@ -351,7 +365,21 @@ async fn bootstrap_entries_validated() {
         matches!(Session::new(s).await, Err(SessionError::InvalidSettings(m)) if m.contains("dht_announce_interval"))
     );
     let mut s = test_settings();
-    s.dht_bootstrap_nodes = vec!["[::1]:6881".into(), "127.0.0.1:1".into()];
+    s.dht_query_timeout = Duration::ZERO;
+    assert!(
+        matches!(Session::new(s).await, Err(SessionError::InvalidSettings(m)) if m.contains("dht_query_timeout"))
+    );
+    let mut s = test_settings();
+    s.dht_query_rate_per_ip = 0;
+    assert!(
+        matches!(Session::new(s).await, Err(SessionError::InvalidSettings(m)) if m.contains("dht_query_rate_per_ip"))
+    );
+    let mut s = test_settings();
+    s.dht_bootstrap_nodes = vec![
+        "[::1]:6881".into(),
+        "127.0.0.1:1".into(),
+        "router.example:65535".into(),
+    ];
     Session::new(s).await.unwrap().shutdown().await;
 }
 

@@ -52,5 +52,8 @@ services:
     networks: [swarm]
 
 networks:
+  # No route out: nothing in the interop run (the DHT included) can reach a
+  # public host. run.sh talks to the containers through `docker compose exec`.
   swarm:
     driver: bridge
+    internal: true

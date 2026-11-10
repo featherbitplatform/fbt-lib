@@ -142,7 +142,7 @@ wait_for "Transmission to verify and seed fixture" 120 tr_complete "$hash1"
 
 echo "interop: fbt-example download (timeout 300s)"
 set +e
-fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt --port 6890 \
+fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt --port 6890 --no-dht \
     >"$logs/fbt-download.log" 2>&1
 status=$?
 set -e
@@ -166,7 +166,7 @@ hash2=$(info_hash /interop/fixture2.torrent)
 [ -n "$hash2" ] || fail "could not read the info hash of fixture2.torrent"
 
 echo "interop: fbt-example seed (420s)"
-fbt fbt-example seed /interop/fixture2.torrent --data /interop/payload2 --port 6891 \
+fbt fbt-example seed /interop/fixture2.torrent --data /interop/payload2 --port 6891 --no-dht \
     --seed-for 420 >"$logs/fbt-seed.log" 2>&1 &
 seed_pid=$!
 seed_ready() {

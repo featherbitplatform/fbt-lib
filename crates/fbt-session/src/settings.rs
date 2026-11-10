@@ -151,6 +151,7 @@ impl Settings {
             ("status_interval", self.status_interval),
             ("tracker_retry_base", self.tracker_retry_base),
             ("dht_announce_interval", self.dht_announce_interval),
+            ("dht_query_timeout", self.dht_query_timeout),
         ];
         for (name, d) in non_zero {
             if d.is_zero() {
@@ -175,6 +176,9 @@ impl Settings {
                 self.max_metadata_size
             ));
         }
+        if self.dht_query_rate_per_ip == 0 {
+            return Err("dht_query_rate_per_ip must be greater than zero".to_owned());
+        }
         if let Some(bad) = self.dht_bootstrap_nodes.iter().find(|e| !is_host_port(e)) {
             return Err(format!(
                 "dht_bootstrap_nodes entries must be host:port, got {bad:?}"
@@ -184,11 +188,23 @@ impl Settings {
     }
 }
 
-/// `host:port` with a non-empty host and a `u16` port (`[v6]:port` too).
+/// `host:port` with a non-empty host and a `u16` port, no whitespace; a
+/// host containing `:` (IPv6) must be bracketed: `[::1]:6881`.
 fn is_host_port(entry: &str) -> bool {
-    entry
-        .rsplit_once(':')
-        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+    if entry.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((host, port)) = entry.rsplit_once(':') else {
+        return false;
+    };
+    let digits = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    if !digits || port.parse::<u16>().is_err() || host.is_empty() {
+        return false;
+    }
+    match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) => !inner.is_empty() && !inner.contains(['[', ']']),
+        None => !host.contains([':', '[', ']']),
+    }
 }
 
 impl Default for Settings {

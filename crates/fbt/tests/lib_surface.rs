@@ -3,11 +3,12 @@
 #![allow(dead_code, unused_imports, clippy::too_many_arguments)]
 
 use fbt::{
-    AddTorrent, Bitfield, BitfieldError, BlockRef, DecodeError, DisconnectReason, Event, EventMask,
-    EventStream, FileEntry, FileLayout, FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2,
-    InfoHashes, LayoutError, MemStorage, Metainfo, MetainfoError, ParseInfoHashError, PeerId,
-    PieceLayout, Priority, RelPath, RemoveMode, Session, SessionError, Settings, Storage,
-    TorrentHandle, TorrentState, TorrentStatus, TrackerConfig, TrackerError,
+    AddTorrent, Bitfield, BitfieldError, BlockRef, DEFAULT_DHT_BOOTSTRAP, DecodeError, DhtStats,
+    DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, FileEntry, FileLayout,
+    FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2, InfoHashes, LayoutError, MemStorage,
+    Metainfo, MetainfoError, ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority,
+    RelPath, RemoveMode, Session, SessionError, Settings, Storage, TorrentHandle, TorrentState,
+    TorrentStatus, TrackerConfig, TrackerError,
 };
 
 fn names(
@@ -19,6 +20,9 @@ fn names(
     _: Option<BitfieldError>,
     _: Option<DecodeError>,
     _: Option<DisconnectReason>,
+    _: Option<DhtStats>,
+    _: Option<EncryptionPolicy>,
+    _: Option<PeerSource>,
     _: Option<Event>,
     _: Option<EventMask>,
     _: Option<EventStream>,
@@ -51,4 +55,6 @@ fn names(
 }
 
 #[test]
-fn surface_compiles() {}
+fn surface_compiles() {
+    let _: [&str; 3] = DEFAULT_DHT_BOOTSTRAP;
+}
