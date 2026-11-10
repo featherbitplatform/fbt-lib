@@ -82,7 +82,11 @@ mod tests {
         }
         assert_eq!(e.rto(), MIN_RTO);
         e.on_sample(Duration::from_secs(2));
-        assert!(e.rto() > MIN_RTO);
+        // var after 8x100ms = 0.05 * 0.75^7 = 0.0066742; then the 2 s sample:
+        // var = 0.0066742 + (1.9 - 0.0066742)/4 = 0.4800056, rtt = 0.1 + 1.9/8
+        // = 0.3375, rto = 0.3375 + 4 * 0.4800056 = 2.2575226 s.
+        let diff = e.rto().as_secs_f64() - 2.257_522_6;
+        assert!(diff.abs() < 0.001, "rto {:?}", e.rto());
 
         let mut b = RttEstimator::new();
         b.backoff();

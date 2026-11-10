@@ -95,9 +95,12 @@ impl Ledbat {
     }
 
     fn floor(&self) -> f64 {
-        f64::from(MIN_CWND_PACKETS) * f64::from(self.mss)
+        (f64::from(MIN_CWND_PACKETS) * f64::from(self.mss)).min(f64::from(u32::MAX))
     }
 
+    /// Process an ACK. Application-limited rule: the window does not grow
+    /// when at least one more full packet would have fit (`flight + mss <=
+    /// cwnd`, compared in f64), so a fractional `cwnd` never stalls growth.
     pub fn on_ack(&mut self, bytes_acked: u32, delay_sample_us: u32, flight: u32, now: Instant) {
         self.history.add_sample(delay_sample_us, now);
         let queuing = f64::from(self.history.delay(delay_sample_us));
@@ -108,7 +111,7 @@ impl Ledbat {
         if !delta.is_finite() {
             return;
         }
-        if delta > 0.0 && f64::from(flight) < self.cwnd {
+        if delta > 0.0 && f64::from(flight) + f64::from(self.mss) <= self.cwnd {
             return; // application-limited: no growth
         }
         self.cwnd += delta;
@@ -125,7 +128,9 @@ impl Ledbat {
 
     /// Halve the window (caller limits this to once per RTT).
     pub fn on_loss(&mut self) {
-        self.below_floor = false;
+        if self.below_floor {
+            return; // already at one packet after a timeout
+        }
         self.cwnd = (self.cwnd / 2.0).max(self.floor());
     }
 
@@ -166,13 +171,17 @@ mod tests {
         let now = Instant::now();
         let mut l = Ledbat::new(MSS);
         l.on_ack(MSS, 10_000, 2 * MSS, now); // establishes base 10 ms
-        let mut prev = l.cwnd();
+        let start = l.cwnd();
+        let mut prev = start;
         for _ in 0..100 {
             full_ack(&mut l, 10_000, now);
-            assert!(l.cwnd() >= prev);
+            assert!(l.cwnd() > prev);
             prev = l.cwnd();
         }
-        assert!(prev > 2 * MSS);
+        // Each ack adds 3000 * 1400 / cwnd = 4.2e6 / cwnd bytes; cwnd stays
+        // below 30000 over 100 acks (cwnd^2 grows ~8.4e6 per ack from
+        // ~4300), so each adds at least 140: total >= 14000, we assert 10000.
+        assert!(prev >= start + 10_000);
         for _ in 0..1000 {
             full_ack(&mut l, 250_000, now);
             assert!(l.cwnd() >= 2 * MSS);
@@ -196,7 +205,9 @@ mod tests {
         let now = Instant::now();
         let mut l = Ledbat::new(MSS);
         let before = l.cwnd();
-        l.on_ack(MSS, 0, 0, now);
+        for _ in 0..10 {
+            l.on_ack(MSS, 0, 0, now);
+        }
         assert_eq!(l.cwnd(), before);
     }
 
@@ -214,6 +225,36 @@ mod tests {
             full_ack(&mut l, 0, now);
         }
         assert!(l.cwnd() >= 2 * MSS);
+    }
+
+    #[test]
+    fn loss_below_floor_keeps_one_packet() {
+        let mut l = Ledbat::new(MSS);
+        l.on_timeout();
+        l.on_loss();
+        assert_eq!(l.cwnd(), MSS);
+    }
+
+    #[test]
+    fn on_ack_extremes_stay_bounded() {
+        let now = Instant::now();
+        for mss in [0u32, MSS, u32::MAX] {
+            let mut l = Ledbat::new(mss);
+            let floor = 2u64 * u64::from(mss);
+            for (bytes, sample, flight) in [
+                (u32::MAX, u32::MAX, u32::MAX),
+                (u32::MAX, 0, u32::MAX),
+                (0, u32::MAX, 0),
+                (1, 0, u32::MAX),
+            ] {
+                l.on_ack(bytes, sample, flight, now);
+                assert!(u64::from(l.cwnd()) >= floor.min(u64::from(u32::MAX)));
+            }
+            l.on_loss();
+            l.on_timeout();
+            l.on_ack(u32::MAX, u32::MAX, u32::MAX, now);
+            let _ = l.cwnd();
+        }
     }
 
     #[test]
