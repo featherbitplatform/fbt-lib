@@ -32,7 +32,8 @@ fbt-bencode = { path = "../fbt-bencode" }
 fbt-core = { path = "../fbt-core" }
 thiserror.workspace = true
 bytes.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "net", "sync", "rt"] }
+rand.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true

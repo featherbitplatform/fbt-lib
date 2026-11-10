@@ -219,7 +219,7 @@ async fn redirect_limit() {
 }
 
 #[tokio::test]
-async fn http_error_status_and_udp_unsupported() {
+async fn http_error_status_and_unsupported_scheme() {
     let (addr, _) = serve(vec![
         b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .to_vec(),
@@ -231,7 +231,7 @@ async fn http_error_status_and_udp_unsupported() {
         .unwrap_err();
     assert!(matches!(err, TrackerError::HttpStatus(503)), "{err:?}");
     let err = client()
-        .announce("udp://127.0.0.1:1/announce", &request())
+        .announce("wss://127.0.0.1:1/announce", &request())
         .await
         .unwrap_err();
     assert!(matches!(err, TrackerError::UnsupportedScheme(_)), "{err:?}");

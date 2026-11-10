@@ -12,11 +12,11 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 use crate::tls::{self, Connector};
+use crate::types::MIN_INTERVAL;
 use crate::urlencode::url_encode_bytes;
 use crate::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerConfig, TrackerError};
 
 const MAX_REDIRECTS: usize = 3;
-const MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MIN_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct HttpClient {

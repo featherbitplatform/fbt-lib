@@ -14,6 +14,7 @@
 mod http;
 mod tls;
 mod types;
+mod udp;
 mod urlencode;
 
 use std::sync::Arc;
@@ -21,6 +22,8 @@ use std::sync::Arc;
 #[doc(hidden)]
 pub use http::parse_http_announce;
 pub use types::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerConfig, TrackerError};
+#[doc(hidden)]
+pub use udp::parse_udp_announce;
 pub use urlencode::url_encode_bytes;
 
 /// A tracker client; cheap to clone.
@@ -32,6 +35,7 @@ pub struct TrackerClient {
 #[derive(Debug)]
 struct Inner {
     http: http::HttpClient,
+    udp: udp::UdpClient,
 }
 
 impl TrackerClient {
@@ -40,13 +44,12 @@ impl TrackerClient {
         Ok(TrackerClient {
             inner: Arc::new(Inner {
                 http: http::HttpClient::new(&cfg)?,
+                udp: udp::UdpClient::new(&cfg),
             }),
         })
     }
 
     /// Announces to `url`, dispatching on its scheme (`http`, `https`, `udp`).
-    ///
-    /// `udp://` is not implemented yet and yields `UnsupportedScheme`.
     pub async fn announce(
         &self,
         url: &str,
@@ -58,6 +61,7 @@ impl TrackerClient {
             .ok_or_else(|| TrackerError::InvalidUrl("missing scheme".to_owned()))?;
         match scheme.as_str() {
             "http" | "https" => self.inner.http.announce(url, req).await,
+            "udp" => self.inner.udp.announce(url, req).await,
             other => Err(TrackerError::UnsupportedScheme(other.to_owned())),
         }
     }

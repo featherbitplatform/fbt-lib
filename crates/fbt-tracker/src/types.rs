@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use fbt_core::PeerId;
 
+/// Floor applied to every tracker-supplied announce interval.
+pub(crate) const MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The `event` of an announce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnounceEvent {
