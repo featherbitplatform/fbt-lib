@@ -36,3 +36,9 @@ pub use mse::{
     CryptoMethods, MSE_MAX_IA, MSE_MAX_PAD, MseError, MseStream, initiate,
     is_plaintext_handshake_prefix, req2_hash, respond,
 };
+
+/// Fixed-key MSE handshake for the fuzz crate. Not part of the API.
+#[doc(hidden)]
+pub mod mse_fuzzing {
+    pub use crate::mse::fuzzing::{initiate_fixed, respond_fixed};
+}

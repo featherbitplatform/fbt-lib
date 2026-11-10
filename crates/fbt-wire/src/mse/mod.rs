@@ -9,6 +9,7 @@
 //! pad and initial payload is bounded by a named constant.
 
 mod dh;
+pub(crate) mod fuzzing;
 mod handshake;
 mod stream;
 
