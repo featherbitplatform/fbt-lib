@@ -62,15 +62,27 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
       - name: Fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          DISPATCH_SECONDS: ${{ inputs.seconds }}
+          EVENT: ${{ github.event_name }}
         run: |
-          mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo +nightly fuzz run ${{ matrix.target }} \
-            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
-            -- -max_total_time=${{ github.event_name == 'workflow_dispatch' && inputs.seconds || (github.event_name == 'schedule' && 1200 || 60) }}
+          case "$EVENT" in
+            workflow_dispatch) FUZZ_SECONDS=$DISPATCH_SECONDS ;;
+            schedule) FUZZ_SECONDS=1200 ;;
+            *) FUZZ_SECONDS=60 ;;
+          esac
+          case $FUZZ_SECONDS in ''|*[!0-9]*) echo "bad duration: $FUZZ_SECONDS"; exit 1;; esac
+          mkdir -p "fuzz/corpus/$TARGET"
+          cargo +nightly fuzz run "$TARGET" \
+            "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" \
+            -- -max_total_time="$FUZZ_SECONDS"
       - name: Minimize corpus
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          cargo +nightly fuzz cmin ${{ matrix.target }} fuzz/corpus/${{ matrix.target }}
+          cargo +nightly fuzz cmin "$TARGET" "fuzz/corpus/$TARGET"
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
