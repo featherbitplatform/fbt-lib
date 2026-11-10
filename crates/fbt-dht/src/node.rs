@@ -15,6 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fbt_core::udp::{DatagramHandler, DatagramSender};
 use rand::Rng;
 use rand::rngs::StdRng;
 use tokio::net::UdpSocket;
@@ -150,6 +151,9 @@ pub enum DhtError {
     /// No socket is configured or none could be bound.
     #[error("no DHT socket could be bound")]
     NoSocket,
+    /// [`Dht::spawn_on`] got two sockets of one address family.
+    #[error("two DHT sockets of the same address family")]
+    DuplicateFamily,
     /// The node has shut down.
     #[error("the DHT node has shut down")]
     Shutdown,
@@ -192,6 +196,8 @@ pub(crate) enum Cmd {
         reply: oneshot::Sender<Vec<FamilyView>>,
     },
     State(oneshot::Sender<DhtState>),
+    /// A bootstrap attempt ended: the next is due a backoff from now.
+    BootstrapDone,
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -248,19 +254,24 @@ pub struct Dht {
 
 /// Votes on our external address from the `ip` field of answers (BEP 42).
 #[derive(Debug, Default)]
-pub(crate) struct ExternalIp {
+pub struct ExternalIpVotes {
     /// (reporter, reported address), oldest first; one entry per reporter.
     votes: VecDeque<(IpAddr, IpAddr)>,
     current: Option<IpAddr>,
 }
 
-impl ExternalIp {
+impl ExternalIpVotes {
+    /// An empty vote set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Records `reporter`'s view of our address. Returns a new, non-local
     /// address once it leads the held votes: at least
     /// [`EXTERNAL_IP_QUORUM`] distinct reporters agree on it and strictly
     /// more than on any other address. A minority, however many Sybils it
     /// has, never overrides the majority; a tie keeps the current address.
-    pub(crate) fn vote(&mut self, reporter: IpAddr, ip: IpAddr) -> Option<IpAddr> {
+    pub fn vote(&mut self, reporter: IpAddr, ip: IpAddr) -> Option<IpAddr> {
         let ip = canonical(ip);
         let reporter = canonical(reporter);
         if is_local(ip) || ip.is_unspecified() {
@@ -364,6 +375,54 @@ fn split(s: std::net::UdpSocket) -> io::Result<(UdpSocket, std::net::UdpSocket)>
     Ok((UdpSocket::from_std(s)?, send))
 }
 
+/// A [`DatagramSender`] over a standalone non-blocking socket.
+#[derive(Debug)]
+struct StdSender {
+    sock: std::net::UdpSocket,
+    local: SocketAddr,
+}
+
+impl DatagramSender for StdSender {
+    fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
+        self.sock.send_to(data, to)
+    }
+}
+
+/// A queued datagram: its source and a copy of its bytes.
+type InputDatagram = (SocketAddr, Box<[u8]>);
+
+/// Datagrams [`DhtInput`] queues for the node; more are dropped.
+pub const DHT_INPUT_QUEUE: usize = 1024;
+
+/// Where a node on shared sockets receives its datagrams: register it as the
+/// handler of the DHT packet kind. It copies each datagram into a bounded
+/// queue and never blocks; a full queue drops the datagram.
+#[derive(Debug, Clone)]
+pub struct DhtInput {
+    tx: mpsc::Sender<InputDatagram>,
+}
+
+impl DatagramHandler for DhtInput {
+    fn handle(&self, from: SocketAddr, data: &[u8]) {
+        // one byte past the maximum, so an oversized datagram is still
+        // detected (and dropped) by the node
+        let data = data.get(..=MAX_DATAGRAM).unwrap_or(data);
+        let _ = self.tx.try_send((from, data.into()));
+    }
+}
+
+/// Where the actor's datagrams come from: its own sockets (standalone) or
+/// the [`DhtInput`] queue (shared sockets).
+struct Inbound {
+    v4: Option<UdpSocket>,
+    v6: Option<UdpSocket>,
+    input: Option<mpsc::Receiver<InputDatagram>>,
+}
+
 impl Dht {
     /// Binds the sockets and starts the node. A restored `state` provides
     /// the ids and the first nodes to contact; with neither `state` nor
@@ -386,10 +445,73 @@ impl Dht {
         }
         let (recv_v4, send_v4) = sock_v4.unzip();
         let (recv_v6, send_v6) = sock_v6.unzip();
+        let wrap = |s: std::net::UdpSocket| -> Option<Arc<dyn DatagramSender>> {
+            let local = s.local_addr().ok()?;
+            Some(Arc::new(StdSender { sock: s, local }))
+        };
+        let send_v4 = send_v4.and_then(wrap);
+        let send_v6 = send_v6.and_then(wrap);
+        Ok(Self::start(
+            cfg,
+            send_v4,
+            send_v6,
+            Inbound {
+                v4: recv_v4,
+                v6: recv_v6,
+                input: None,
+            },
+        ))
+    }
+
+    /// Starts a node on sockets owned by someone else, such as the shared
+    /// UDP socket. It ignores `bind_v4` and `bind_v6` and takes one sender
+    /// per address family, by its `local_addr()`. Received datagrams reach
+    /// the node through the returned [`DhtInput`]. Fails with
+    /// [`DhtError::NoSocket`] without senders and with
+    /// [`DhtError::DuplicateFamily`] for two of one family.
+    pub async fn spawn_on(
+        cfg: DhtConfig,
+        sockets: Vec<Arc<dyn DatagramSender>>,
+    ) -> Result<(Dht, DhtInput), DhtError> {
+        let (mut v4, mut v6) = (None, None);
+        for s in sockets {
+            let slot = if s.local_addr().is_ipv4() {
+                &mut v4
+            } else {
+                &mut v6
+            };
+            if slot.replace(s).is_some() {
+                return Err(DhtError::DuplicateFamily);
+            }
+        }
+        if v4.is_none() && v6.is_none() {
+            return Err(DhtError::NoSocket);
+        }
+        let (in_tx, in_rx) = mpsc::channel(DHT_INPUT_QUEUE);
+        let dht = Self::start(
+            cfg,
+            v4,
+            v6,
+            Inbound {
+                v4: None,
+                v6: None,
+                input: Some(in_rx),
+            },
+        );
+        Ok((dht, DhtInput { tx: in_tx }))
+    }
+
+    /// Everything past the sockets, shared by both entry points.
+    fn start(
+        cfg: DhtConfig,
+        send_v4: Option<Arc<dyn DatagramSender>>,
+        send_v6: Option<Arc<dyn DatagramSender>>,
+        inbound: Inbound,
+    ) -> Dht {
         let local: Vec<SocketAddr> = [&send_v4, &send_v6]
             .into_iter()
             .flatten()
-            .filter_map(|s| s.local_addr().ok())
+            .map(|s| s.local_addr())
             .collect();
         let (tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
         let stats = DhtStats {
@@ -405,12 +527,12 @@ impl Dht {
             stats_tx,
             Instant::now(),
         );
-        tokio::spawn(actor.run(cmd_rx, recv_v4, recv_v6));
-        Ok(Dht {
+        tokio::spawn(actor.run(cmd_rx, inbound));
+        Dht {
             tx,
             stats: stats_rx,
             local: local.into(),
-        })
+        }
     }
 
     /// The bound socket addresses (IPv4 first).
@@ -516,16 +638,16 @@ struct Actor {
     retry_base: Duration,
     retry_max: Duration,
 
-    sock_v4: Option<std::net::UdpSocket>,
-    sock_v6: Option<std::net::UdpSocket>,
+    sock_v4: Option<Arc<dyn DatagramSender>>,
+    sock_v6: Option<Arc<dyn DatagramSender>>,
     table_v4: Option<RoutingTable>,
     table_v6: Option<RoutingTable>,
     tokens: Tokens,
     store: PeerStore,
     rate: RateLimiter,
     global_rate: RateLimiter,
-    ext_v4: ExternalIp,
-    ext_v6: ExternalIp,
+    ext_v4: ExternalIpVotes,
+    ext_v6: ExternalIpVotes,
     rng: StdRng,
 
     pending: HashMap<u16, Pending>,
@@ -567,8 +689,16 @@ async fn recv(sock: &Option<UdpSocket>, buf: &mut [u8]) -> io::Result<(usize, So
     }
 }
 
+async fn recv_input(input: &mut Option<mpsc::Receiver<InputDatagram>>) -> Option<InputDatagram> {
+    match input {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 enum Event {
     Datagram(io::Result<(usize, SocketAddr)>, Family),
+    Input(Option<InputDatagram>),
     Cmd(Option<Cmd>),
     Timer,
 }
@@ -587,8 +717,8 @@ fn family_key(f: Family) -> u8 {
 impl Actor {
     fn new(
         cfg: DhtConfig,
-        sock_v4: Option<std::net::UdpSocket>,
-        sock_v6: Option<std::net::UdpSocket>,
+        sock_v4: Option<Arc<dyn DatagramSender>>,
+        sock_v6: Option<Arc<dyn DatagramSender>>,
         link: mpsc::WeakSender<Cmd>,
         stats_tx: watch::Sender<DhtStats>,
         now: Instant,
@@ -634,8 +764,8 @@ impl Actor {
             store: PeerStore::new(cfg.max_stored_torrents, cfg.max_peers_per_torrent),
             rate: RateLimiter::new(cfg.query_rate_per_ip, MAX_IPS),
             global_rate: RateLimiter::new(GLOBAL_QUERY_RATE.max(cfg.query_rate_per_ip), 1),
-            ext_v4: ExternalIp::default(),
-            ext_v6: ExternalIp::default(),
+            ext_v4: ExternalIpVotes::new(),
+            ext_v6: ExternalIpVotes::new(),
             rng,
             pending: HashMap::new(),
             timeouts: VecDeque::new(),
@@ -657,12 +787,12 @@ impl Actor {
         }
     }
 
-    async fn run(
-        mut self,
-        mut cmd_rx: mpsc::Receiver<Cmd>,
-        sock_v4: Option<UdpSocket>,
-        sock_v6: Option<UdpSocket>,
-    ) {
+    async fn run(mut self, mut cmd_rx: mpsc::Receiver<Cmd>, inbound: Inbound) {
+        let Inbound {
+            v4: sock_v4,
+            v6: sock_v6,
+            input: mut input_rx,
+        } = inbound;
         let mut buf_v4 = vec![0u8; MAX_DATAGRAM + 1];
         let mut buf_v6 = vec![0u8; MAX_DATAGRAM + 1];
         let mut stop = None;
@@ -671,6 +801,7 @@ impl Actor {
             let event = tokio::select! {
                 r = recv(&sock_v4, &mut buf_v4) => Event::Datagram(r, Family::V4),
                 r = recv(&sock_v6, &mut buf_v6) => Event::Datagram(r, Family::V6),
+                d = recv_input(&mut input_rx) => Event::Input(d),
                 c = cmd_rx.recv() => Event::Cmd(c),
                 () = tokio::time::sleep_until(wake) => Event::Timer,
             };
@@ -690,6 +821,13 @@ impl Actor {
                 }
                 // e.g. ICMP port unreachable surfacing as a reset on Windows
                 Event::Datagram(Err(e), _) => debug!(error = %e, "DHT: recv failed"),
+                Event::Input(Some((from, data))) => {
+                    if data.len() <= MAX_DATAGRAM {
+                        self.on_datagram(&data, from, now);
+                    }
+                }
+                // every DhtInput is gone: nothing more will arrive
+                Event::Input(None) => input_rx = None,
                 Event::Cmd(None) => break,
                 Event::Cmd(Some(Cmd::Shutdown(reply))) => {
                     stop = Some(reply);
@@ -707,7 +845,7 @@ impl Actor {
         }
         drop(cmd_rx);
         drop(self);
-        drop((sock_v4, sock_v6));
+        drop((sock_v4, sock_v6, input_rx));
         if let Some(reply) = stop {
             let _ = reply.send(());
         }
@@ -1062,6 +1200,12 @@ impl Actor {
                     nodes_v6: nodes(self.table_v6.as_ref()),
                 });
             }
+            Cmd::BootstrapDone => {
+                self.boot_due = Some(after(
+                    now,
+                    backoff(self.retry_base, self.retry_max, self.boot_attempt),
+                ));
+            }
             Cmd::Shutdown(_) => {}
         }
     }
@@ -1086,10 +1230,10 @@ impl Actor {
                 self.boot_due = Some(after(now, self.retry_base.min(self.query_timeout)));
             } else if !self.boot_started {
                 self.boot_started = true;
-                self.start_bootstrap(now);
+                self.start_bootstrap();
             } else if self.tables().all(|t| t.len() == 0) {
                 self.boot_attempt = self.boot_attempt.saturating_add(1);
-                self.start_bootstrap(now);
+                self.start_bootstrap();
             } else {
                 self.boot_due = None;
             }
@@ -1125,19 +1269,19 @@ impl Actor {
     }
 
     /// Starts a bootstrap attempt and schedules the next one.
-    fn start_bootstrap(&mut self, now: Instant) {
-        self.boot_due = Some(after(
-            now,
-            backoff(self.retry_base, self.retry_max, self.boot_attempt),
-        ));
+    fn start_bootstrap(&mut self) {
+        // the next attempt is due a backoff after this one ends
+        // ([`Cmd::BootstrapDone`]), not after it started
+        self.boot_due = None;
         let views: Vec<(Family, NodeId)> =
             self.tables().map(|t| (t.family(), t.own_id())).collect();
-        self.boot_task = Some(tokio::spawn(bootstrap(
-            Link::Weak(self.link.clone()),
-            self.bootstrap.clone(),
-            self.restored.clone(),
-            views,
-        )));
+        let link = Link::Weak(self.link.clone());
+        let (bootstrap_link, entries, restored) =
+            (link.clone(), self.bootstrap.clone(), self.restored.clone());
+        self.boot_task = Some(tokio::spawn(async move {
+            bootstrap(bootstrap_link, entries, restored, views).await;
+            let _ = link.send(Cmd::BootstrapDone).await;
+        }));
     }
 
     /// One `find_node` lookup per stale or empty bucket, each bucket at most
@@ -1725,6 +1869,72 @@ mod tests {
         assert!(ask(&sock, addrs[0], Query::Ping).await.is_some());
     }
 
+    /// A node on an externally owned socket: a pump task plays the demux.
+    async fn spawn_shared(c: DhtConfig) -> (Dht, DhtInput, SocketAddr) {
+        let std_sock = bind_v4("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local = std_sock.local_addr().unwrap();
+        let send = std_sock.try_clone().unwrap();
+        send.set_nonblocking(true).unwrap();
+        let sender: Arc<dyn DatagramSender> = Arc::new(StdSender { sock: send, local });
+        let (dht, input) = Dht::spawn_on(c, vec![sender]).await.unwrap();
+        let recv = UdpSocket::from_std(std_sock).unwrap();
+        let pump = input.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, from)) = recv.recv_from(&mut buf).await {
+                pump.handle(from, &buf[..n]);
+            }
+        });
+        (dht, input, local)
+    }
+
+    #[tokio::test]
+    async fn spawn_on_answers_ping_through_the_shared_sender() {
+        let (dht, _input, addr) = spawn_shared(cfg()).await;
+        assert_eq!(dht.local_addrs(), vec![addr]);
+        let sock = raw().await;
+        let m = ask(&sock, addr, Query::Ping).await.expect("pong");
+        assert!(matches!(m.body, Body::Response(_)), "{m:?}");
+        dht.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn full_input_queue_drops_instead_of_blocking() {
+        let (dht, input, addr) = spawn_shared(cfg()).await;
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let junk = vec![0xffu8; 100];
+        let started = std::time::Instant::now();
+        for _ in 0..5000 {
+            input.handle(from, &junk);
+        }
+        // oversize datagrams are cut and dropped, never an error
+        input.handle(from, &vec![b'x'; 70_000]);
+        assert!(started.elapsed() < Duration::from_secs(1), "handle blocked");
+        let sock = raw().await;
+        let m = ask(&sock, addr, Query::Ping)
+            .await
+            .expect("still answering");
+        assert!(matches!(m.body, Body::Response(_)), "{m:?}");
+        dht.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_on_rejects_no_socket_and_duplicate_families() {
+        assert!(matches!(
+            Dht::spawn_on(cfg(), Vec::new()).await,
+            Err(DhtError::NoSocket)
+        ));
+        let mk = || -> Arc<dyn DatagramSender> {
+            let s = bind_v4("127.0.0.1:0".parse().unwrap()).unwrap();
+            let local = s.local_addr().unwrap();
+            Arc::new(StdSender { sock: s, local })
+        };
+        assert!(matches!(
+            Dht::spawn_on(cfg(), vec![mk(), mk()]).await,
+            Err(DhtError::DuplicateFamily)
+        ));
+    }
+
     #[tokio::test]
     async fn no_socket_at_all_is_an_error() {
         let mut c = cfg();
@@ -1734,7 +1944,7 @@ mod tests {
 
     #[test]
     fn external_ip_votes_regenerate_id() {
-        let mut e = ExternalIp::default();
+        let mut e = ExternalIpVotes::new();
         let ext: IpAddr = "203.0.113.7".parse().unwrap();
         let r = |k: u8| IpAddr::from([198, 51, 100, k]);
         assert_eq!(e.vote(r(1), ext), None);
@@ -1744,12 +1954,12 @@ mod tests {
         assert_eq!(e.vote(r(4), ext), None, "already our external IP");
         // local addresses never win
         let local: IpAddr = "192.168.1.2".parse().unwrap();
-        let mut e = ExternalIp::default();
+        let mut e = ExternalIpVotes::new();
         for k in 1..=10 {
             assert_eq!(e.vote(r(k), local), None);
         }
         // memory is bounded
-        let mut e = ExternalIp::default();
+        let mut e = ExternalIpVotes::new();
         for k in 0..1000u32 {
             e.vote(
                 IpAddr::V4((0x0100_0000 + k).into()),
@@ -1765,7 +1975,7 @@ mod tests {
         let b: IpAddr = "198.18.0.1".parse().unwrap();
         let c: IpAddr = "198.18.0.2".parse().unwrap();
         let r = |k: u32| IpAddr::V4((0x0500_0000 + k).into());
-        let mut e = ExternalIp::default();
+        let mut e = ExternalIpVotes::new();
         let mut switches = Vec::new();
         for k in 0..20 {
             switches.extend(e.vote(r(k), a));
@@ -1781,7 +1991,7 @@ mod tests {
             assert_eq!(e.vote(r(k), ip), None, "vote {k}");
         }
         // a tie keeps the current address
-        let mut t = ExternalIp::default();
+        let mut t = ExternalIpVotes::new();
         for k in 0..3 {
             t.vote(r(k), a);
         }
@@ -1795,7 +2005,7 @@ mod tests {
         let old: IpAddr = "203.0.113.7".parse().unwrap();
         let new: IpAddr = "198.51.100.200".parse().unwrap();
         let r = |k: u32| IpAddr::V4((0x0500_0000 + k).into());
-        let mut e = ExternalIp::default();
+        let mut e = ExternalIpVotes::new();
         for k in 0..10 {
             e.vote(r(k), old);
         }
@@ -1808,7 +2018,7 @@ mod tests {
         }
         assert_eq!(switched_at, Some(5), "once new holds 6 of 10");
         // and old votes ageing out of the window move us back
-        let mut e = ExternalIp::default();
+        let mut e = ExternalIpVotes::new();
         for k in 0..MAX_EXTERNAL_VOTES as u32 {
             e.vote(r(k), old);
         }
@@ -1884,6 +2094,8 @@ mod tests {
         let s = bind_v4(c.bind_v4.unwrap()).unwrap();
         let (tx, _rx) = mpsc::channel(1);
         let stats = watch::channel(DhtStats::default()).0;
+        let local = s.local_addr().unwrap();
+        let s: Arc<dyn DatagramSender> = Arc::new(StdSender { sock: s, local });
         let a = Actor::new(c, Some(s), None, tx.downgrade(), stats, Instant::now());
         (a, tx)
     }
