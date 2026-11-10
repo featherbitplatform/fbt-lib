@@ -10,6 +10,7 @@
 //!   (BEP 9).
 //! - `announcer`, `tiers`: announcing to the trackers (BEP 12 tiers).
 //! - `dht`: looking up and announcing on the session's DHT.
+//! - `pex`: peer exchange (BEP 11) with connected peers.
 
 mod actor;
 mod announcer;
@@ -17,6 +18,7 @@ mod data;
 mod dht;
 mod metadata;
 mod peers;
+mod pex;
 mod serve;
 mod swarm;
 mod tiers;

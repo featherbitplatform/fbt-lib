@@ -347,6 +347,7 @@ impl Actor {
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
                     self.metadata_tick();
+                    self.pex_tick();
                     self.queue_retries();
                     self.try_connect();
                     self.publish();
@@ -534,10 +535,10 @@ impl Actor {
         self.signals.send_if_modified(f);
     }
 
-    /// Peers from a tracker reply or a DHT lookup join the known addresses,
+    /// Peers from a tracker reply, a DHT lookup or PEX join the known addresses,
     /// as `add_peer` does (bounded, oldest unused evicted); addresses nobody
     /// can dial (port 0, unspecified, multicast) are dropped.
-    fn on_found_peers(&mut self, source: PeerSource, peers: Vec<SocketAddr>) {
+    pub(super) fn on_found_peers(&mut self, source: PeerSource, peers: Vec<SocketAddr>) {
         let mut count = 0usize;
         for addr in peers {
             if !dialable(&addr) {
@@ -736,9 +737,10 @@ impl Actor {
         // Peers were set up with no pieces; they get the layout now.
         let n = layout.num_pieces();
         if self.is_private() {
-            // The magnet exception ends here: off the DHT at once.
+            // The magnet exception ends here: off the DHT and PEX at once.
             self.dht_announcer = None;
             self.dht_rx = None;
+            self.drop_pex_peers();
         }
         let ext = self.ext_config();
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();

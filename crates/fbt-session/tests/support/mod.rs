@@ -21,7 +21,7 @@ use fbt_wire::{
 };
 use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 /// Settings for tests: loopback listener on a free port, fast status
@@ -171,6 +171,31 @@ impl ScriptedPeer {
         reserved: Reserved,
     ) -> ScriptedPeer {
         Self::connect_raw(addr, info_hash, random_id(), reserved).await
+    }
+
+    /// Accepts one connection on `listener` (the session dialling us,
+    /// without MSE) and answers its handshake with the `reserved` bits.
+    pub async fn accept_with(listener: &TcpListener, reserved: Reserved) -> ScriptedPeer {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("dialled in time")
+            .expect("accept");
+        let remote = tokio::time::timeout(Duration::from_secs(5), read_handshake(&mut stream))
+            .await
+            .expect("handshake in time")
+            .expect("remote handshake");
+        let ours = Handshake {
+            reserved,
+            info_hash: remote.info_hash,
+            peer_id: random_id(),
+        };
+        write_handshake(&mut stream, &ours)
+            .await
+            .expect("handshake");
+        ScriptedPeer {
+            framed: Framed::new(stream, MessageCodec::new(1 << 20)),
+            remote,
+        }
     }
 
     async fn connect_raw(

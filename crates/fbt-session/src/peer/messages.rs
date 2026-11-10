@@ -145,10 +145,6 @@ pub(crate) enum PeerCommand {
     /// Send a `ut_metadata` message (dropped if the remote lacks it).
     SendMetadata(MetadataMsg),
     /// Send a `ut_pex` message (dropped if the remote lacks it).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "sent by the torrent from Task 15 on")
-    )]
     SendPex(PexMsg),
     /// Close the connection.
     Close,

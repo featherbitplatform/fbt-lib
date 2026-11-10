@@ -6,13 +6,14 @@ use std::net::SocketAddr;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
 use fbt_metainfo::Metainfo;
-use fbt_wire::{ExtHandshake, MetadataMsg, UT_METADATA};
+use fbt_wire::{ExtHandshake, MetadataMsg, UT_METADATA, UT_PEX};
 use tokio::time::Instant;
 use tracing::debug;
 
 use super::actor::Actor;
 use super::data::Job;
 use super::metadata::{FetchStep, MAX_METADATA_REQUESTS_PER_PEER, serve_metadata};
+use super::pex::PexPeer;
 use super::swarm::BanTarget;
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
@@ -75,9 +76,7 @@ impl Actor {
             }
             PeerEvent::ExtHandshake { key, hs } => self.on_ext_handshake(key, hs),
             PeerEvent::Metadata { key, msg } => self.on_metadata_msg(key, msg),
-            // PEX comes with Task 15 (a private torrent, magnets included
-            // once their metadata says so, ignores it).
-            PeerEvent::Pex { .. } => {}
+            PeerEvent::Pex { key, msg } => self.on_pex(key, msg),
             PeerEvent::DhtPort { key, port } => self.on_dht_port(key, port),
             PeerEvent::Disconnected {
                 key,
@@ -300,10 +299,17 @@ impl Actor {
     fn on_ext_handshake(&mut self, key: PeerKey, hs: Box<ExtHandshake>) {
         let size = hs.metadata_size;
         let supports = hs.id_of(UT_METADATA).is_some();
+        let pex = self.pex_active() && hs.id_of(UT_PEX).is_some();
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
         p.listen_port = hs.listen_port;
+        // A repeat keeps the PEX state; one turning `ut_pex` off ends it.
+        if !pex {
+            p.pex = None;
+        } else if p.pex.is_none() {
+            p.pex = Some(PexPeer::default());
+        }
         p.ext = Some(hs);
         let Some(m) = self.magnet.as_mut() else {
             return;

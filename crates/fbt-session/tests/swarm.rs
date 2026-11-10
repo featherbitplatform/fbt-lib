@@ -862,7 +862,7 @@ async fn extension_handshake_with_a_session() {
     };
     theirs.m.insert(UT_METADATA.to_owned(), 3);
     peer.send_ext_handshake(&theirs).await;
-    // Metadata and PEX are not acted on yet; the connection stays up.
+    // A metadata request and a `Port` leave the connection up.
     peer.send(Message::Extended {
         id: OUR_UT_METADATA_ID,
         payload: MetadataMsg::Request { piece: 0 }.encode(),

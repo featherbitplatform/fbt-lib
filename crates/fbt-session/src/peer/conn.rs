@@ -607,7 +607,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// Routes an extended message by the id we assigned.
     async fn on_extended(&mut self, id: u8, payload: &Bytes) -> Flow {
         let key = self.key;
-        let msg = ext::decode(id, payload)
+        let msg = ext::decode(id, payload, self.ext.pex)
             .map_err(|e| DisconnectReason::Protocol(format!("extended message {id}: {e}")))?;
         match msg {
             Incoming::Handshake(hs) => {
@@ -1794,6 +1794,30 @@ mod tests {
         assert_eq!(r.next().await, PeerEvent::Pex { key: KEY, msg: pex });
         // An id we never assigned is ignored; the connection stays up.
         send(&mut wire, ext_msg(9, Bytes::from_static(b"junk"))).await;
+        send(&mut wire, Message::Interested).await;
+        assert_eq!(r.next().await, PeerEvent::Interested { key: KEY });
+    }
+
+    /// Without `ut_pex` advertised (a private torrent, PEX disabled) its id
+    /// is not ours: a PEX message, malformed or not, is ignored and the
+    /// connection stays up.
+    #[tokio::test(start_paused = true)]
+    async fn ut_pex_ignored_unless_advertised() {
+        let mut cfg = ext_cfg();
+        cfg.pex = false;
+        let h = start_ctx(Bitfield::new(PIECES), Some(layout(PIECES)), cfg);
+        let (mut wire, mut r, _) = connect_ext(h, reserved(true, true, false)).await;
+        our_ext(&mut wire).await;
+        let pex = PexMsg {
+            added: vec![(SocketAddr::from(([10, 0, 0, 1], 6881)), PexFlags::SEED)],
+            dropped: vec![],
+        };
+        send(&mut wire, ext_msg(OUR_UT_PEX_ID, pex.encode())).await;
+        send(
+            &mut wire,
+            ext_msg(OUR_UT_PEX_ID, Bytes::from_static(b"d5:added3:abce")),
+        )
+        .await;
         send(&mut wire, Message::Interested).await;
         assert_eq!(r.next().await, PeerEvent::Interested { key: KEY });
     }

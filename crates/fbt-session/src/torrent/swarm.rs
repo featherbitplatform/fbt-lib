@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use super::actor::{Actor, Phase};
+use super::pex::PexPeer;
 use crate::peer::DisconnectReason;
 use crate::peer::conn::{MAX_ALLOWED_FAST, PeerCtx, PeerStream, spawn_incoming, spawn_outgoing};
 use crate::peer::ext::ExtConfig;
@@ -331,6 +332,9 @@ pub(super) struct Peer {
     /// `ut_metadata` requests it sent (served up to
     /// [`MAX_METADATA_REQUESTS_PER_PEER`](super::metadata::MAX_METADATA_REQUESTS_PER_PEER)).
     pub metadata_requests: u32,
+    /// PEX state; `Some` while PEX runs with this peer (it advertised
+    /// `ut_pex`, the setting is on and the torrent is not private).
+    pub pex: Option<PexPeer>,
 }
 
 impl Peer {
@@ -367,6 +371,7 @@ impl Peer {
             encrypted: false,
             connected_at: None,
             metadata_requests: 0,
+            pex: None,
         }
     }
 
@@ -449,13 +454,14 @@ impl Actor {
     }
 
     /// What new connections advertise. A torrent without metadata may be
-    /// private; until it is known, PEX is advertised (the magnet exception).
+    /// private; until it is known, PEX is advertised (the magnet exception)
+    /// when `pex_enabled`.
     pub(super) fn ext_config(&self) -> ExtConfig {
         let meta = self.loaded.as_ref().map(|l| &l.meta);
         ExtConfig {
             listen_port: self.shared.listen_port,
             metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),
-            pex: !meta.is_some_and(|m| m.info.private),
+            pex: self.shared.settings.pex_enabled && !meta.is_some_and(|m| m.info.private),
             // No DHT bit or `Port` for a private torrent (a magnet's
             // privacy is unknown until its metadata: it advertises both).
             dht_port: self.shared.dht_port.filter(|_| !self.is_private()),

@@ -137,6 +137,14 @@ pub struct Settings {
     /// (tests raise it); not part of the stable API.
     #[doc(hidden)]
     pub dht_query_rate_per_ip: u32,
+    /// Exchange peers with connected peers (BEP 11 `ut_pex`). Private
+    /// torrents never do, whatever this says.
+    pub pex_enabled: bool,
+    /// Time between PEX messages to one peer (non-zero); a peer's own
+    /// messages are accepted at most once per three quarters of it.
+    /// Internal tunable (tests shorten it); not part of the stable API.
+    #[doc(hidden)]
+    pub pex_interval: Duration,
 }
 
 impl Settings {
@@ -152,6 +160,7 @@ impl Settings {
             ("tracker_retry_base", self.tracker_retry_base),
             ("dht_announce_interval", self.dht_announce_interval),
             ("dht_query_timeout", self.dht_query_timeout),
+            ("pex_interval", self.pex_interval),
         ];
         for (name, d) in non_zero {
             if d.is_zero() {
@@ -240,6 +249,8 @@ impl Default for Settings {
             dht_announce_interval: Duration::from_secs(15 * 60),
             dht_query_timeout: Duration::from_secs(3),
             dht_query_rate_per_ip: 5,
+            pex_enabled: true,
+            pex_interval: Duration::from_secs(60),
         }
     }
 }

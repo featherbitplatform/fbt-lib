@@ -115,8 +115,10 @@ pub(crate) enum Incoming {
     Unknown,
 }
 
-/// Decodes the extended message `id` (one of ours) with `payload`.
-pub(crate) fn decode(id: u8, payload: &Bytes) -> Result<Incoming, ExtError> {
+/// Decodes the extended message `id` (one of ours) with `payload`. With
+/// `pex` off (we did not advertise `ut_pex`) its id is one we never
+/// assigned: the message is [`Incoming::Unknown`], not even decoded.
+pub(crate) fn decode(id: u8, payload: &Bytes, pex: bool) -> Result<Incoming, ExtError> {
     Ok(match id {
         EXT_HANDSHAKE_ID => {
             let mut hs = ExtHandshake::decode(payload)?;
@@ -124,7 +126,7 @@ pub(crate) fn decode(id: u8, payload: &Bytes) -> Result<Incoming, ExtError> {
             Incoming::Handshake(Box::new(hs))
         }
         OUR_UT_METADATA_ID => Incoming::Metadata(MetadataMsg::decode(payload)?),
-        OUR_UT_PEX_ID => Incoming::Pex(PexMsg::decode(payload)?),
+        OUR_UT_PEX_ID if pex => Incoming::Pex(PexMsg::decode(payload)?),
         _ => Incoming::Unknown,
     })
 }
@@ -162,10 +164,25 @@ mod tests {
             reqq: Some(u32::MAX),
             ..ExtHandshake::default()
         };
-        let Ok(Incoming::Handshake(hs)) = decode(EXT_HANDSHAKE_ID, &hs.encode()) else {
+        let Ok(Incoming::Handshake(hs)) = decode(EXT_HANDSHAKE_ID, &hs.encode(), true) else {
             panic!("decode");
         };
         assert_eq!(hs.reqq, Some(MAX_REMOTE_REQQ));
+    }
+
+    #[test]
+    fn pex_id_is_unknown_unless_advertised() {
+        let junk = Bytes::from_static(b"not bencode");
+        assert!(matches!(
+            decode(OUR_UT_PEX_ID, &junk, false),
+            Ok(Incoming::Unknown)
+        ));
+        assert!(decode(OUR_UT_PEX_ID, &junk, true).is_err());
+        let msg = PexMsg::default().encode();
+        assert!(matches!(
+            decode(OUR_UT_PEX_ID, &msg, true),
+            Ok(Incoming::Pex(_))
+        ));
     }
 
     #[test]
