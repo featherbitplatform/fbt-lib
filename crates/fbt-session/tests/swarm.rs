@@ -40,7 +40,16 @@ async fn seeder(m: &Metainfo, storage: Arc<dyn Storage>) -> (Session, TorrentHan
 /// A leecher session for `m` over fresh memory storage, waited until
 /// `Downloading`.
 async fn mem_leecher(m: &Metainfo, len: usize) -> (Session, TorrentHandle, Arc<MemStorage>) {
-    let s = Session::new(settings()).await.unwrap();
+    mem_leecher_with(settings(), m, len).await
+}
+
+/// [`mem_leecher`] with the given settings.
+async fn mem_leecher_with(
+    st: Settings,
+    m: &Metainfo,
+    len: usize,
+) -> (Session, TorrentHandle, Arc<MemStorage>) {
+    let s = Session::new(st).await.unwrap();
     let storage = Arc::new(MemStorage::new(len as u64));
     let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
     p.storage = Some(storage.clone());
@@ -233,7 +242,9 @@ async fn skipped_file_is_not_downloaded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn self_connection_is_dropped_and_not_retried() {
     let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
-    let (s, h, _) = mem_leecher(&m, payload.len()).await;
+    // A short retry delay: were the self-connection treated as an ordinary
+    // failure, it would be dialled again many times within the window below.
+    let (s, h, _) = mem_leecher_with(retry_settings(), &m, payload.len()).await;
     let mut ev = s.subscribe(EventMask::ALL);
     h.add_peer(s.local_addr()).await.unwrap();
     let first = next_matching(&mut ev, |e| matches!(e, Event::PeerDisconnected { .. }), T)
@@ -249,7 +260,7 @@ async fn self_connection_is_dropped_and_not_retried() {
         ),
         "got {first:?}"
     );
-    // Asking again does nothing: the address is never retried.
+    // Asking again does nothing, and no retry follows over 15 retry delays.
     h.add_peer(s.local_addr()).await.unwrap();
     let again = next_matching(
         &mut ev,
@@ -385,5 +396,43 @@ async fn rechoke_rotates_a_single_slot() {
         unchoked[id] = on;
         ever[id] |= on;
     }
+    s.shutdown().await;
+}
+
+fn retry_settings() -> Settings {
+    let mut s = settings();
+    s.peer_retry_delay = Duration::from_millis(200);
+    s
+}
+
+/// A failed outgoing connection is dialled exactly three times in all, the
+/// retries after `peer_retry_delay`, and then given up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_connect_is_retried_three_times_then_dropped() {
+    // A loopback port nobody listens on.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
+    let (s, h, _) = mem_leecher_with(retry_settings(), &m, payload.len()).await;
+    let mut ev = s.subscribe(EventMask::ALL);
+    h.add_peer(closed).await.unwrap();
+    let ours = |e: &Event| {
+        matches!(e, Event::PeerDisconnected { addr, .. } | Event::PeerConnected { addr, .. }
+            if *addr == closed)
+    };
+    for attempt in 1..=3 {
+        let e = next_matching(&mut ev, ours, T)
+            .await
+            .unwrap_or_else(|| panic!("attempt {attempt} reported"));
+        assert!(
+            matches!(e, Event::PeerDisconnected { .. }),
+            "attempt {attempt}: {e:?}"
+        );
+    }
+    // Given up: nothing more over five retry delays.
+    let more = next_matching(&mut ev, ours, Duration::from_millis(1500)).await;
+    assert!(more.is_none(), "a fourth attempt: {more:?}");
     s.shutdown().await;
 }

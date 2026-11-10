@@ -35,6 +35,10 @@ pub struct Settings {
     pub keepalive_interval: Duration,
     /// A request unanswered for this long is cancelled and re-picked.
     pub request_timeout: Duration,
+    /// Wait before a failed outgoing connection is tried again. Internal
+    /// tunable (tests shorten it); not part of the stable API.
+    #[doc(hidden)]
+    pub peer_retry_delay: Duration,
     /// Time between choker runs.
     pub rechoke_interval: Duration,
     /// Time between status updates.
@@ -62,6 +66,7 @@ impl Default for Settings {
             peer_idle_timeout: Duration::from_secs(120),
             keepalive_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(60),
+            peer_retry_delay: Duration::from_secs(60),
             rechoke_interval: Duration::from_secs(10),
             status_interval: Duration::from_millis(500),
             event_queue: 4096,

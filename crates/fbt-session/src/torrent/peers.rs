@@ -1,7 +1,7 @@
 //! Peer connections of a torrent: connecting and accepting within the
 //! limits, peer events, interest and handing out block requests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,29 +22,75 @@ use crate::picker::{PeerKey, PeerPieces, PiecePicker};
 use crate::rate::RateMeter;
 use crate::session::{release, try_reserve};
 
-/// A failed outgoing connection is retried after this long.
-const RETRY_DELAY: Duration = Duration::from_secs(60);
 /// Connection attempts per address before it is given up.
 const MAX_ATTEMPTS: u32 = 3;
+/// Most addresses a torrent remembers for connecting; more are ignored.
+const MAX_KNOWN: usize = 1000;
+/// Most never-retry addresses kept; the oldest is forgotten beyond it.
+const MAX_NEVER: usize = 1000;
 
-/// Outgoing connection retries: failed addresses come back after
-/// [`RETRY_DELAY`], at most [`MAX_ATTEMPTS`] attempts in all; an address
-/// that turned out to be ourselves is never tried again.
-#[derive(Debug, Default)]
+/// Remembers `addr` among the known addresses unless [`MAX_KNOWN`] are
+/// already known. Returns whether it is known now.
+pub(super) fn remember(known: &mut HashSet<SocketAddr>, addr: SocketAddr) -> bool {
+    if known.contains(&addr) {
+        return true;
+    }
+    if known.len() >= MAX_KNOWN {
+        return false;
+    }
+    known.insert(addr)
+}
+
+/// What a failed attempt leads to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AfterFailure {
+    /// Tried again after the delay.
+    Retry,
+    /// Attempts used up (or a never-retry address): forget it.
+    GiveUp,
+}
+
+/// Outgoing connection retries: failed addresses come back after `delay`
+/// (`Settings::peer_retry_delay`), at most [`MAX_ATTEMPTS`] attempts in all;
+/// an address that turned out to be ourselves is never tried again (the
+/// last [`MAX_NEVER`] such addresses are kept).
+#[derive(Debug)]
 pub(super) struct Retries {
-    /// Failed attempts since the last successful connection.
+    delay: Duration,
+    /// Failed attempts since the last successful connection; dropped once
+    /// the attempts are used up.
     attempts: HashMap<SocketAddr, u32>,
     /// Addresses waiting for their retry time.
     pending: HashMap<SocketAddr, Instant>,
     never: HashSet<SocketAddr>,
+    /// `never` in insertion order, to forget the oldest.
+    never_order: VecDeque<SocketAddr>,
 }
 
 impl Retries {
+    pub(super) fn new(delay: Duration) -> Self {
+        Retries {
+            delay,
+            attempts: HashMap::new(),
+            pending: HashMap::new(),
+            never: HashSet::new(),
+            never_order: VecDeque::new(),
+        }
+    }
+
     /// Never connect to `addr` again.
     pub(super) fn never(&mut self, addr: SocketAddr) {
-        self.never.insert(addr);
         self.pending.remove(&addr);
         self.attempts.remove(&addr);
+        if !self.never.insert(addr) {
+            return;
+        }
+        self.never_order.push_back(addr);
+        while self.never_order.len() > MAX_NEVER {
+            if let Some(old) = self.never_order.pop_front() {
+                self.never.remove(&old);
+            }
+        }
     }
 
     pub(super) fn is_never(&self, addr: &SocketAddr) -> bool {
@@ -57,14 +103,18 @@ impl Retries {
     }
 
     /// An attempt failed; schedules a retry unless attempts are used up.
-    pub(super) fn failed(&mut self, addr: SocketAddr, now: Instant) {
+    pub(super) fn failed(&mut self, addr: SocketAddr, now: Instant) -> AfterFailure {
         if self.never.contains(&addr) {
-            return;
+            return AfterFailure::GiveUp;
         }
         let n = self.attempts.entry(addr).or_insert(0);
         *n = n.saturating_add(1);
         if *n < MAX_ATTEMPTS {
-            self.pending.insert(addr, now + RETRY_DELAY);
+            self.pending.insert(addr, now + self.delay);
+            AfterFailure::Retry
+        } else {
+            self.attempts.remove(&addr);
+            AfterFailure::GiveUp
         }
     }
 
@@ -537,7 +587,11 @@ impl Actor {
             self.candidates.retain(|a| *a != p.addr);
         } else if p.outgoing && !p.connected && reason != DisconnectReason::Shutdown {
             // The connection or handshake failed (we did not close it).
-            self.retries.failed(p.addr, Instant::now());
+            if self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp {
+                // Forgotten: `requeue_known` must not dial it again.
+                self.known.remove(&p.addr);
+                self.candidates.retain(|a| *a != p.addr);
+            }
         }
         match &reason {
             DisconnectReason::Protocol(msg) => {
@@ -806,49 +860,76 @@ mod tests {
         assert_eq!(evict_orphans(&mut p, 3, &mut bufs), 0);
     }
 
+    const DELAY: Duration = Duration::from_secs(60);
+
+    fn addr(i: u32) -> SocketAddr {
+        SocketAddr::from((std::net::Ipv4Addr::from(0x0a00_0000 + i), 6881))
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn failed_connects_retry_after_a_minute_three_attempts_in_all() {
-        let addr: SocketAddr = "10.0.0.1:6881".parse().expect("addr");
-        let mut r = Retries::default();
+    async fn failed_connects_retry_after_the_delay_three_attempts_in_all() {
+        let a = addr(1);
+        let mut r = Retries::new(DELAY);
         let mut attempts = 1;
-        loop {
-            r.failed(addr, Instant::now());
-            if !r.is_pending(&addr) {
-                break;
-            }
-            tokio::time::advance(RETRY_DELAY - Duration::from_secs(1)).await;
-            assert!(r.due(Instant::now()).is_empty(), "not before 60 s");
+        while r.failed(a, Instant::now()) == AfterFailure::Retry {
+            assert!(r.is_pending(&a));
+            tokio::time::advance(DELAY - Duration::from_secs(1)).await;
+            assert!(r.due(Instant::now()).is_empty(), "not before the delay");
             tokio::time::advance(Duration::from_secs(1)).await;
-            assert_eq!(r.due(Instant::now()), vec![addr]);
-            assert!(!r.is_pending(&addr));
+            assert_eq!(r.due(Instant::now()), vec![a]);
+            assert!(!r.is_pending(&a));
             attempts += 1;
         }
         assert_eq!(attempts, MAX_ATTEMPTS);
-        tokio::time::advance(RETRY_DELAY * 10).await;
+        // Given up: nothing pending and the counter is gone.
+        assert!(!r.is_pending(&a));
+        assert!(r.attempts.is_empty());
+        tokio::time::advance(DELAY * 10).await;
         assert!(r.due(Instant::now()).is_empty());
     }
 
     #[tokio::test(start_paused = true)]
     async fn success_resets_attempts_and_self_is_never_retried() {
-        let a: SocketAddr = "10.0.0.1:6881".parse().expect("addr");
-        let me: SocketAddr = "10.0.0.2:6881".parse().expect("addr");
-        let mut r = Retries::default();
+        let a = addr(1);
+        let me = addr(2);
+        let mut r = Retries::new(DELAY);
         r.failed(a, Instant::now());
         r.failed(a, Instant::now());
         r.connected(&a);
-        assert!(!r.is_pending(&a));
+        assert!(!r.is_pending(&a) && r.attempts.is_empty());
         // A fresh series: two more failures still schedule retries.
-        r.failed(a, Instant::now());
-        assert!(r.is_pending(&a));
-        r.failed(a, Instant::now());
-        assert!(r.is_pending(&a));
+        assert_eq!(r.failed(a, Instant::now()), AfterFailure::Retry);
+        assert_eq!(r.failed(a, Instant::now()), AfterFailure::Retry);
         r.failed(me, Instant::now());
         r.never(me);
         assert!(r.is_never(&me) && !r.is_pending(&me));
-        r.failed(me, Instant::now());
+        assert_eq!(r.failed(me, Instant::now()), AfterFailure::GiveUp);
         assert!(!r.is_pending(&me));
-        tokio::time::advance(RETRY_DELAY).await;
+        tokio::time::advance(DELAY).await;
         assert_eq!(r.due(Instant::now()), vec![a]);
+    }
+
+    #[test]
+    fn address_maps_are_bounded() {
+        let mut known = HashSet::new();
+        for i in 0..MAX_KNOWN as u32 {
+            assert!(remember(&mut known, addr(i)));
+        }
+        // Full: new addresses are ignored, known ones still answer true.
+        assert!(!remember(&mut known, addr(5000)));
+        assert!(remember(&mut known, addr(0)));
+        assert_eq!(known.len(), MAX_KNOWN);
+
+        let mut r = Retries::new(DELAY);
+        for i in 0..(MAX_NEVER as u32 + 10) {
+            r.never(addr(i));
+            r.never(addr(i));
+        }
+        assert_eq!(r.never.len(), MAX_NEVER);
+        assert_eq!(r.never_order.len(), MAX_NEVER);
+        // The oldest were forgotten, the newest kept.
+        assert!(!r.is_never(&addr(0)) && !r.is_never(&addr(9)));
+        assert!(r.is_never(&addr(10)) && r.is_never(&addr(MAX_NEVER as u32 + 9)));
     }
 
     #[test]

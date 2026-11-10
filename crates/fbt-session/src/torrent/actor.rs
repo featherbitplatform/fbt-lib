@@ -19,7 +19,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::warn;
 
 use super::data::Job;
-use super::peers::{Peer, Retries};
+use super::peers::{Peer, Retries, remember};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
 use crate::error::SessionError;
@@ -116,6 +116,7 @@ impl Actor {
         let piece_prio = piece_priorities(&meta, &params.file_priorities);
         let total_wanted = wanted_bytes(&meta.piece_layout(), &piece_prio);
         let choker = Choker::new(shared.settings.unchoke_slots);
+        let retries = Retries::new(shared.settings.peer_retry_delay);
         Actor {
             ih: meta.info_hashes,
             layout: meta.piece_layout(),
@@ -141,7 +142,7 @@ impl Actor {
             next_key: 0,
             candidates: VecDeque::new(),
             known: HashSet::new(),
-            retries: Retries::default(),
+            retries,
             choker,
             bufs: HashMap::new(),
             counters: Counters::default(),
@@ -386,8 +387,7 @@ impl Actor {
                 let _ = tx.send(());
             }
             Cmd::AddPeer(addr, tx) => {
-                if !self.retries.is_never(&addr) {
-                    self.known.insert(addr);
+                if !self.retries.is_never(&addr) && remember(&mut self.known, addr) {
                     self.queue_addr(addr);
                     self.try_connect();
                 }
