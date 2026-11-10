@@ -451,12 +451,17 @@ dependencies = [
 name = "fbt-session"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fbt-core",
  "fbt-metainfo",
  "fbt-tracker",
+ "fbt-wire",
+ "futures-util",
  "rand",
  "sha1",
  "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -553,6 +558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
+ "futures-sink",
  "futures-task",
  "pin-project-lite",
 ]

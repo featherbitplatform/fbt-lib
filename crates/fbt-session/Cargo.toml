@@ -20,8 +20,14 @@ tls-rustcrypto = ["fbt-tracker/tls-rustcrypto"]
 fbt-tracker = { path = "../fbt-tracker" }
 fbt-core = { path = "../fbt-core" }
 fbt-metainfo = { path = "../fbt-metainfo" }
+fbt-wire = { path = "../fbt-wire" }
+bytes.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+tokio-util.workspace = true
+futures-util.workspace = true
 sha1.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
