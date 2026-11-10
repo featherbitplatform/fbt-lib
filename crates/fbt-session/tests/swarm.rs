@@ -436,3 +436,34 @@ async fn failed_connect_is_retried_three_times_then_dropped() {
     assert!(more.is_none(), "a fourth attempt: {more:?}");
     s.shutdown().await;
 }
+
+/// A fast-extension peer flooding `AllowedFast` while choking us: the actor
+/// stays responsive, requests nothing the peer lacks, and requests an
+/// allowed-fast piece as soon as the peer announces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allowed_fast_flood_keeps_the_actor_responsive() {
+    let (m, payload) = make_torrent(&[("a", 64 * 16_384)], 16_384);
+    let (s, h, _) = mem_leecher(&m, payload.len()).await;
+    let mut peer = ScriptedPeer::connect_fast(s.local_addr(), m.info_hashes.wire_hash()).await;
+    peer.send(Message::HaveNone).await;
+    for i in 0..10_000u32 {
+        peer.send(Message::AllowedFast(i % 64)).await;
+    }
+    let t0 = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), h.pieces())
+        .await
+        .expect("actor answers during the flood")
+        .unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(2));
+    // Still choked, the peer gets a request for the allowed-fast piece it
+    // just announced, and for nothing else.
+    peer.send(Message::Have(3)).await;
+    let Some(Message::Request(b)) = peer
+        .next_matching(|m| matches!(m, Message::Request(_)))
+        .await
+    else {
+        panic!("no request for the allowed-fast piece");
+    };
+    assert_eq!(b.piece, 3);
+    s.shutdown().await;
+}

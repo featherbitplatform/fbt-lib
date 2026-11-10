@@ -16,7 +16,7 @@ use super::actor::Actor;
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
-use crate::peer::conn::{PeerCtx, spawn_incoming, spawn_outgoing};
+use crate::peer::conn::{MAX_ALLOWED_FAST, PeerCtx, spawn_incoming, spawn_outgoing};
 use crate::peer::messages::{PeerCommand, PeerEvent, PeerPiecesOwned};
 use crate::picker::{PeerKey, PeerPieces, PiecePicker};
 use crate::rate::RateMeter;
@@ -160,7 +160,13 @@ pub(super) struct Peer {
     pub am_interested: bool,
     pub peer_interested: bool,
     pub am_choking: bool,
+    /// Pieces the peer lets us request while it chokes us (at most
+    /// [`MAX_ALLOWED_FAST`]).
     pub allowed_fast: HashSet<u32>,
+    /// The `allowed_fast` pieces the peer has, as the picker wants them;
+    /// allocated with the first allowed-fast piece and kept up to date
+    /// instead of being rebuilt on every fill.
+    pub fast_has: Option<Bitfield>,
     /// Our requests the peer task holds.
     pub requested: HashSet<BlockRef>,
     /// Blocks the peer asked for (`WantBlocks`) and we have not handed out.
@@ -193,6 +199,7 @@ impl Peer {
             peer_interested: false,
             am_choking: true,
             allowed_fast: HashSet::new(),
+            fast_has: None,
             requested: HashSet::new(),
             demand: 0,
             from_rate: RateMeter::new(),
@@ -214,6 +221,33 @@ impl Peer {
 
     pub(super) fn is_seed(&self) -> bool {
         self.seed || self.bits.is_full()
+    }
+
+    /// Adds an allowed-fast piece; returns whether it is new and the peer
+    /// has it (only then can it be requested now).
+    pub(super) fn allow_fast(&mut self, piece: u32) -> bool {
+        if self.allowed_fast.len() >= MAX_ALLOWED_FAST || !self.allowed_fast.insert(piece) {
+            return false;
+        }
+        self.sync_fast(piece)
+    }
+
+    /// Mirrors `piece` into `fast_has` if it is allowed-fast and the peer
+    /// has it; returns whether it is set there.
+    pub(super) fn sync_fast(&mut self, piece: u32) -> bool {
+        if !self.allowed_fast.contains(&piece) || !self.has(piece) {
+            return false;
+        }
+        let n = self.bits.len();
+        self.fast_has
+            .get_or_insert_with(|| Bitfield::new(n))
+            .set(piece);
+        true
+    }
+
+    /// Some allowed-fast piece can be requested.
+    fn can_request_fast(&self) -> bool {
+        self.fast_has.is_some() && self.allowed_fast.iter().any(|&i| self.has(i))
     }
 
     /// Connected, not closed, and we do not choke it.
@@ -403,10 +437,15 @@ impl Actor {
             PeerEvent::Block { key, block, data } => self.on_block(key, block, data),
             PeerEvent::Rejected { key, block } => self.on_rejected(key, block),
             PeerEvent::AllowedFast { key, piece } => {
-                if let Some(p) = self.peers.get_mut(&key) {
-                    p.allowed_fast.insert(piece);
+                // Only a piece the peer has can be requested now; one it
+                // lacks becomes requestable with its `Have`.
+                if self
+                    .peers
+                    .get_mut(&key)
+                    .is_some_and(|p| p.allow_fast(piece))
+                {
+                    self.fill(key);
                 }
-                self.fill(key);
             }
             PeerEvent::WantBlocks { key, count } => {
                 if let Some(p) = self.peers.get_mut(&key) {
@@ -459,6 +498,10 @@ impl Actor {
             PeerPiecesOwned::None => {}
             PeerPiecesOwned::Bits(bits) => p.bits = bits,
         }
+        let fast: Vec<u32> = p.allowed_fast.iter().copied().collect();
+        for piece in fast {
+            p.sync_fast(piece);
+        }
         if p.generation == generation
             && let Some(picker) = self.picker.as_mut()
         {
@@ -477,6 +520,7 @@ impl Actor {
             return;
         }
         p.bits.set(piece);
+        p.sync_fast(piece);
         if p.generation == generation
             && let Some(picker) = self.picker.as_mut()
         {
@@ -670,19 +714,13 @@ impl Actor {
             return;
         }
         let blocks = if p.choked_us {
-            if p.allowed_fast.is_empty() {
+            let (true, Some(fast)) = (p.can_request_fast(), p.fast_has.as_ref()) else {
                 return;
-            }
-            let mut fast = Bitfield::new(self.layout.num_pieces());
-            for &i in &p.allowed_fast {
-                if p.has(i) {
-                    fast.set(i);
-                }
-            }
+            };
             pick_capped(
                 picker,
                 key,
-                PeerPieces::Some(&fast),
+                PeerPieces::Some(fast),
                 room,
                 cap,
                 &mut self.rng,

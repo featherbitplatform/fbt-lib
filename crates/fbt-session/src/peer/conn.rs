@@ -33,6 +33,9 @@ use crate::settings::Settings;
 
 /// Capacity of each peer task's command channel.
 const COMMAND_QUEUE: usize = 256;
+/// Most allowed-fast pieces kept per connection; further `AllowedFast`
+/// messages are ignored (BEP 6 sets are around ten pieces).
+pub(crate) const MAX_ALLOWED_FAST: usize = 64;
 
 /// Everything a peer task needs from its torrent.
 #[derive(Debug, Clone)]
@@ -204,7 +207,8 @@ struct Conn<S> {
     remote_interested: bool,
     /// A bitfield, have, `HaveAll` or `HaveNone` arrived.
     pieces_seen: bool,
-    /// Pieces the remote lets us request while choked (at most `num_pieces`).
+    /// Pieces the remote lets us request while choked (at most
+    /// [`MAX_ALLOWED_FAST`]).
     allowed_fast: HashSet<u32>,
     /// Our requests in flight, with their send time.
     outstanding: BTreeMap<BlockRef, Instant>,
@@ -332,6 +336,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 if !self.choked {
                     self.choked = true;
                     self.emit(PeerEvent::Choked { key }).await?;
+                    // The torrent drops our demand on `Choked`; allowed-fast
+                    // pieces may still be requested.
+                    if self.fast && !self.allowed_fast.is_empty() {
+                        self.want_blocks().await?;
+                    }
                 }
                 // Without fast, a choke silently drops every pending request.
                 if !self.fast {
@@ -409,9 +418,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
             Message::AllowedFast(piece) => {
                 self.require_fast()?;
-                if piece < self.num_pieces && self.allowed_fast.insert(piece) {
+                // A remote may send any number of these: only the first
+                // [`MAX_ALLOWED_FAST`] distinct pieces count, and only the
+                // first one opens the pipeline (the torrent keeps the demand
+                // and tops it up as more pieces become requestable).
+                if piece < self.num_pieces
+                    && self.allowed_fast.len() < MAX_ALLOWED_FAST
+                    && self.allowed_fast.insert(piece)
+                {
                     self.emit(PeerEvent::AllowedFast { key, piece }).await?;
-                    self.want_blocks().await?;
+                    if self.allowed_fast.len() == 1 {
+                        self.want_blocks().await?;
+                    }
                 }
             }
             Message::SuggestPiece(_) => self.require_fast()?,
@@ -646,6 +664,11 @@ mod tests {
 
     /// Starts an outgoing-style peer task over a duplex pipe.
     fn start(have: Bitfield) -> Harness {
+        start_with(have, PIECES)
+    }
+
+    /// [`start`] for a torrent of `pieces` pieces.
+    fn start_with(have: Bitfield, pieces: u32) -> Harness {
         let (ours, remote) = tokio::io::duplex(1 << 20);
         let (etx, events) = mpsc::channel(1024);
         let (cmds, crx) = mpsc::channel(256);
@@ -653,7 +676,7 @@ mod tests {
             key: KEY,
             info_hash: HASH,
             our_id: OUR_ID,
-            layout: PieceLayout::new(u64::from(PIECE) * u64::from(PIECES), PIECE).expect("layout"),
+            layout: PieceLayout::new(u64::from(PIECE) * u64::from(pieces), PIECE).expect("layout"),
             have,
             settings: Arc::new(Settings::default()),
             events: etx,
@@ -986,6 +1009,59 @@ mod tests {
             PeerEvent::Rejected {
                 key: KEY,
                 block: block(1, 0),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn allowed_fast_flood_is_capped() {
+        const N: u32 = 10_000;
+        let (mut wire, mut r) = start_with(Bitfield::new(N), N).connect(true).await;
+        let writer = tokio::spawn(async move {
+            for piece in 0..N {
+                send(&mut wire, Message::AllowedFast(piece)).await;
+            }
+            // A marker after the flood.
+            send(&mut wire, Message::Interested).await;
+            wire
+        });
+        let mut fast = Vec::new();
+        let mut want = 0;
+        loop {
+            match r.next().await {
+                PeerEvent::AllowedFast { piece, .. } => fast.push(piece),
+                PeerEvent::WantBlocks { .. } => want += 1,
+                PeerEvent::Interested { .. } => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        // The first 64 pieces count, and only the first opened the pipeline.
+        assert_eq!(fast, (0..MAX_ALLOWED_FAST as u32).collect::<Vec<_>>());
+        assert_eq!(want, 1);
+        // The connection is still healthy.
+        let _wire = writer.await.expect("writer");
+        r.cmd(PeerCommand::Close).await;
+        assert_eq!(r.disconnected().await.0, DisconnectReason::Shutdown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn choke_keeps_requesting_allowed_fast_pieces() {
+        let (mut wire, mut r) = start(Bitfield::new(PIECES)).connect(true).await;
+        send(&mut wire, Message::AllowedFast(2)).await;
+        assert!(matches!(r.next().await, PeerEvent::AllowedFast { .. }));
+        assert!(matches!(r.next().await, PeerEvent::WantBlocks { .. }));
+        send(&mut wire, Message::Unchoke).await;
+        assert_eq!(r.next().await, PeerEvent::Unchoked { key: KEY });
+        assert!(matches!(r.next().await, PeerEvent::WantBlocks { .. }));
+        // Choked again with nothing outstanding: the torrent drops our
+        // demand, so the pipeline asks again for the allowed-fast piece.
+        send(&mut wire, Message::Choke).await;
+        assert_eq!(r.next().await, PeerEvent::Choked { key: KEY });
+        assert_eq!(
+            r.next().await,
+            PeerEvent::WantBlocks {
+                key: KEY,
+                count: 32
             }
         );
     }
