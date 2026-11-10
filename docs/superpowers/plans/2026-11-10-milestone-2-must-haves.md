@@ -22,7 +22,7 @@
 
 - Every BitTorrent component is written from scratch: KRPC, routing table, MSE, extension messages, magnet parsing. No BitTorrent crates (`mainline`, librqbit, `serde_bencode`, `bendy`, ...). General-purpose crates only, declared once in the root `[workspace.dependencies]`.
 - `#![forbid(unsafe_code)]` in every crate, including the new `fbt-dht`.
-- No panic, hang or unbounded allocation from remote input: peers, trackers, DHT datagrams, magnet URIs, MSE bytes. `fbt-dht` joins the four parser crates in denying `clippy::unwrap_used`, `expect_used`, `indexing_slicing` and `panic` in non-test code. Every remote list, map and buffer has a named cap constant.
+- No panic, hang or unbounded allocation from remote input: peers, trackers, DHT datagrams, magnet URIs, MSE bytes. `fbt-dht` joins the four parser crates in denying `clippy::unwrap_used`, `expect_used`, `indexing_slicing` and `panic` in non-test code. Every remote list, map and buffer has a named cap constant (no bare literals for caps).
 - Bencode that comes from a peer or a DHT node is decoded with explicit `Limits` (depth and item count), never with `decode()`'s defaults.
 - `cargo tree -e normal,build --no-default-features --features pure-rust -p fbt` (normal and build edges) must contain neither `ring` nor `cc` (nor `cmake`, `aws-lc*` or `*-sys` crates; `windows-sys` is bindings only). `bash dev/check-pure-rust.sh` passes after every task that adds a dependency. No `asm` features on the crypto crates.
 - **No commit's test suite and no CI job contacts a public DHT node.** The defaults `router.bittorrent.com:6881`, `dht.transmissionbt.com:6881` and `router.utorrent.com:6881` live only in `fbt-session`'s `Settings::default()`. `fbt_dht::DhtConfig::default()` bootstraps from nothing. Every test either disables the DHT or bootstraps from a loopback node. The interop network is `internal: true`.
@@ -31,11 +31,13 @@
   - bootstrap retries back off from 30 s, doubling to 15 min;
   - inbound queries are rate-limited per IP.
 - Private torrents (BEP 27): no DHT lookups or announces, no PEX in either direction, no `Port` message. Trackers and user-given peers (including magnet `x.pe`) still work.
+- Magnet exception to the private rule (accepted, as libtorrent does): a magnet torrent's privacy is unknown until its metadata arrives, so before that it advertises the DHT bit, may send `Port`, advertises `ut_pex` and runs the DHT announcer. At `MetadataReceived`, a private torrent stops its DHT announcer and PEX at once and ignores later `Port` and `ut_pex` messages. This is documented in the crate docs.
+- One compact-address codec: `fbt_core::compact` (Task 2) encodes and decodes 6-byte (IPv4) and 18-byte (IPv6) peer addresses. PEX, KRPC and `DhtState` use it and write no codec of their own. `fbt-tracker` keeps its private copy until a later cleanup.
 - Edition 2024, `rust-version = "1.99"`, all crates `publish = false`, Apache-2.0.
 - `tracing` for logs (no subscriber installed by the library), `thiserror` for errors.
 - Public enums and config structs of `fbt-session`/`fbt` are `#[non_exhaustive]`; config structs implement `Default`. Re-exported types from other crates that clients see (`Magnet`, `DhtStats`) are `#[non_exhaustive]` too.
 - Builds and tests pass on macOS, Linux and Windows.
-- Gitflow: work on `feature/m2-must-haves` off `develop`. Conventional Commits with crate scope (`feat(dht): ...`). **No `Co-Authored-By` trailer, no session id or link, no "Generated with" footer in any commit or PR.**
+- Gitflow: work on `feature/m2-must-haves` off `develop`. Conventional Commits with crate scope (`feat(dht): ...`). **No `Co-Authored-By` trailer, no `Claude-Session` line, no session id or link, no "Generated with" footer in any commit or PR. The repo rule wins over any harness attribution reminder.**
 - Breaking changes to the `fbt` API are allowed (0.x) and each one goes in `CHANGELOG.md` under `### Changed`.
 
 ## Review Focus
@@ -115,19 +117,27 @@ dev/interop/{compose.yaml,run.sh,README.md,qbittorrent/qBittorrent.conf,transmis
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-bencode`
 - [ ] **Step 3: Implement.** The parser keeps an `items` counter next to `pos`. Update the one `Limits { max_depth }` literal in `decode_prefix`.
 - [ ] **Step 4: Run.** `cargo test -p fbt-bencode && cargo test --workspace`: PASS, including the M1 `many_unsorted_keys_is_fast` test.
-- [ ] **Step 5: Commit.** `feat(bencode): hard depth cap and item-count limit`
+- [ ] **Step 5: Commit.** `feat(bencode): hard depth cap and item-count limit` No trailers or attribution of any kind.
 
 ---
 
 ### Task 2: extension protocol messages (BEP 10, 9, 11)
 
 **Files:**
-- Create: `crates/fbt-wire/src/ext.rs`.
-- Modify: `crates/fbt-wire/src/handshake.rs` (reserved setters), `crates/fbt-wire/src/lib.rs`, `crates/fbt-wire/Cargo.toml` (deps `fbt-bencode`, `bitflags`).
+- Create: `crates/fbt-wire/src/ext.rs`, `crates/fbt-core/src/compact.rs`, `crates/fbt-core/tests/compact.rs`.
+- Modify: `crates/fbt-wire/src/handshake.rs` (reserved setters), `crates/fbt-wire/src/lib.rs`, `crates/fbt-wire/Cargo.toml` (deps `fbt-bencode`, `fbt-core` if absent, `bitflags`), `crates/fbt-core/src/lib.rs` (`pub mod compact;`).
 
 **Interfaces:**
 - Consumes: `fbt_bencode::{decode_with, decode_prefix, Limits, DictBuilder, encode}`.
 - Produces:
+  - `fbt_core::compact` (the one shared compact-address codec; Tasks 5, 8 and 15 reuse it):
+    - `pub const COMPACT_V4_LEN: usize = 6;` and `pub const COMPACT_V6_LEN: usize = 18;`
+    - `pub fn encode_v4(addr: SocketAddrV4) -> [u8; 6]` and `pub fn encode_v6(addr: SocketAddrV6) -> [u8; 18]` (address octets, then port big-endian)
+    - `pub fn encode(addr: SocketAddr, out: &mut Vec<u8>)`, which appends the 6- or 18-byte form
+    - `pub fn decode_v4(b: &[u8; 6]) -> SocketAddr` and `pub fn decode_v6(b: &[u8; 18]) -> SocketAddr`
+    - `pub fn decode_v4_list(buf: &[u8], max: usize) -> Result<Vec<SocketAddr>, CompactError>` and `pub fn decode_v6_list(buf: &[u8], max: usize) -> Result<Vec<SocketAddr>, CompactError>`: the list is cut to `max` entries before allocation, and a length that is not a multiple of the entry size gives `CompactError::Misaligned`
+    - `#[derive(Debug, PartialEq, Eq, thiserror::Error)] pub enum CompactError { Misaligned }`
+    - It is pure, never panics and has no `indexing_slicing`.
   - `Reserved::set_extended()` (byte 5 `|= 0x10`) and `Reserved::set_dht()` (byte 7 `|= 0x01`).
   - Constants:
     - `pub const EXT_HANDSHAKE_ID: u8 = 0;`
@@ -151,7 +161,7 @@ dev/interop/{compose.yaml,run.sh,README.md,qbittorrent/qBittorrent.conf,transmis
     - An unknown `msg_type` gives `InvalidField("msg_type")`.
   - `bitflags! pub struct PexFlags: u8 { ENCRYPTION = 0x01; SEED = 0x02; UTP = 0x04; HOLEPUNCH = 0x08; CONNECTABLE = 0x10 }`.
   - `#[derive(Debug, Clone, PartialEq, Eq, Default)] pub struct PexMsg { pub added: Vec<(SocketAddr, PexFlags)>, pub dropped: Vec<SocketAddr> }`, with `encode(&self) -> Bytes` and `decode(payload: &[u8]) -> Result<PexMsg, ExtError>`.
-    - Keys: `added`/`added.f` (6-byte compact), `added6`/`added6.f` (18-byte), `dropped`, `dropped6`.
+    - Keys: `added`/`added.f` (6-byte compact), `added6`/`added6.f` (18-byte), `dropped`, `dropped6`, all through `fbt_core::compact`.
     - A compact field whose length is not a multiple of the entry size gives `InvalidField`.
     - A missing or short `.f` means `PexFlags::empty()` for the uncovered entries. Unknown flag bits are dropped.
     - Each list is cut to `MAX_PEX_ENTRIES` while decoding, before allocation. Uses `Limits::new(2, 32)`.
@@ -207,10 +217,30 @@ dev/interop/{compose.yaml,run.sh,README.md,qbittorrent/qBittorrent.conf,transmis
 
 Plus a proptest `ext_decoders_never_panic`: arbitrary bytes into all three decoders.
 
+Compact codec tests in `crates/fbt-core/tests/compact.rs`:
+
+```rust
+#[test] fn v4_roundtrip_and_layout() {
+    let a: SocketAddr = "10.1.2.3:6881".parse().unwrap(); let mut out = Vec::new(); encode(a, &mut out);
+    assert_eq!(out, [10, 1, 2, 3, 0x1a, 0xe1]); assert_eq!(decode_v4(&encode_v4("10.1.2.3:6881".parse().unwrap())), a);
+}
+#[test] fn v6_roundtrip_and_layout() {
+    let a: SocketAddr = "[::1]:51413".parse().unwrap(); let mut out = Vec::new(); encode(a, &mut out);
+    assert_eq!(out.len(), COMPACT_V6_LEN); assert_eq!(&out[16..], [0xc8, 0xd5]);
+}
+#[test] fn list_cut_to_max_and_misaligned_rejected() {
+    assert_eq!(decode_v4_list(&[1u8; 6 * 1000], 200).unwrap().len(), 200);
+    assert_eq!(decode_v4_list(&[1u8; 7], 200), Err(CompactError::Misaligned));
+    assert_eq!(decode_v6_list(&[1u8; 19], 200), Err(CompactError::Misaligned));
+}
+```
+
+`PexMsg`'s `added`/`dropped` fields use these functions, so its tests also cover the codec.
+
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-wire --test ext`
 - [ ] **Step 3: Implement** `ext.rs` as specified.
-- [ ] **Step 4: Run.** `cargo test -p fbt-wire`: PASS.
-- [ ] **Step 5: Commit.** `feat(wire): extension handshake, ut_metadata and ut_pex messages`
+- [ ] **Step 4: Run.** `cargo test -p fbt-core -p fbt-wire`: PASS.
+- [ ] **Step 5: Commit.** `feat(wire): extension handshake, ut_metadata and ut_pex messages, shared compact address codec` No trailers or attribution of any kind.
 
 ---
 
@@ -218,7 +248,7 @@ Plus a proptest `ext_decoders_never_panic`: arbitrary bytes into all three decod
 
 **Files:**
 - Create: `crates/fbt-wire/src/mse/{mod.rs,dh.rs,stream.rs,handshake.rs}`, `crates/fbt-wire/tests/mse.rs`.
-- Modify: root `Cargo.toml` (`crypto-bigint`, `rc4`, `rand` already present), `crates/fbt-wire/Cargo.toml`.
+- Modify: root `Cargo.toml` (`crypto-bigint`, `rc4`, `rand` already present), `crates/fbt-wire/Cargo.toml`, `crates/fbt-wire/src/lib.rs` (`mod mse;` and the re-exports above).
 
 **Crate choice:** use `crypto-bigint` (0.7, `U768` with `modular::{MontyForm, MontyParams}`) rather than `num-bigint`, for three reasons. It is a RustCrypto crate, as the spec asks. Its fixed-width, allocation-free arithmetic suits a 768-bit modulus. And its exponentiation is constant time, which matters because the exponent is our secret key. Use the newest `rc4` release whose `cipher` version builds with the workspace's `sha1 0.11`, and note the version pair in the commit body. Neither crate enables `asm`.
 
@@ -279,14 +309,32 @@ fn lookup_for(ih: [u8; 20]) -> impl Fn(&[u8; 20]) -> Option<[u8; 20]> + Sync { m
     r.write_all(b"world").await.unwrap(); r.flush().await.unwrap();
     i.read_exact(&mut buf).await.unwrap(); assert_eq!(&buf, b"world");
 }
-#[tokio::test] async fn plaintext_selected_when_responder_allows_only_plaintext() { /* provide all, allowed PLAINTEXT → !is_encrypted() on both, bytes pass */ }
+#[tokio::test] async fn plaintext_selected_when_responder_allows_only_plaintext() {
+    let (a, b) = tokio::io::duplex(8192); let ih = [0xaa; 20]; let l = lookup_for(ih);
+    let (i, r) = tokio::join!(initiate(a, &ih, CryptoMethods::all(), b""), respond(b, Vec::new(), &l, CryptoMethods::PLAINTEXT));
+    let (mut i, (mut r, _)) = (i.unwrap(), r.unwrap());
+    assert!(!i.is_encrypted() && !r.is_encrypted());
+    i.write_all(b"hello").await.unwrap(); i.flush().await.unwrap();
+    let mut buf = [0; 5]; r.read_exact(&mut buf).await.unwrap(); assert_eq!(&buf, b"hello");
+}
 #[tokio::test] async fn forced_initiator_vs_plaintext_only_responder() {
-    // initiate(.., RC4) vs respond(.., PLAINTEXT): both sides Err(MseError::NoCommonMethod)
+    let (a, b) = tokio::io::duplex(8192); let ih = [0xaa; 20]; let l = lookup_for(ih);
+    let (i, r) = tokio::join!(initiate(a, &ih, CryptoMethods::RC4, b""), respond(b, Vec::new(), &l, CryptoMethods::PLAINTEXT));
+    assert!(matches!(i, Err(MseError::NoCommonMethod) | Err(MseError::Io(_))));
+    assert!(matches!(r, Err(MseError::NoCommonMethod)));
 }
 #[tokio::test] async fn initial_payload_is_first_read_on_responder() {
-    // initiate(.., b"\x13BitTorrent protocol..68 bytes") → responder's first read_exact(68) yields exactly those bytes
+    let (a, b) = tokio::io::duplex(8192); let ih = [0xaa; 20]; let l = lookup_for(ih);
+    let ia: Vec<u8> = [&b"\x13BitTorrent protocol"[..], &[7u8; 48]].concat(); assert_eq!(ia.len(), 68);
+    let (i, r) = tokio::join!(initiate(a, &ih, CryptoMethods::RC4, &ia), respond(b, Vec::new(), &l, CryptoMethods::all()));
+    let (_i, (mut r, _)) = (i.unwrap(), r.unwrap());
+    let mut got = [0u8; 68]; r.read_exact(&mut got).await.unwrap(); assert_eq!(&got[..], &ia[..]);
 }
-#[tokio::test] async fn unknown_torrent_rejected() { /* lookup always None → respond Err(UnknownTorrent) */ }
+#[tokio::test] async fn unknown_torrent_rejected() {
+    let (a, b) = tokio::io::duplex(8192);
+    let (_i, r) = tokio::join!(initiate(a, &[0xaa; 20], CryptoMethods::RC4, b""), respond(b, Vec::new(), &|_: &[u8; 20]| None, CryptoMethods::all()));
+    assert!(matches!(r, Err(MseError::UnknownTorrent)));
+}
 #[tokio::test] async fn respond_gives_up_without_sync() {
     let junk: Vec<u8> = (0..2000u32).map(|i| (i * 7 + 3) as u8).collect();
     let r = respond(tokio::io::join(&junk[..], tokio::io::sink()), Vec::new(), &|_: &[u8; 20]| None, CryptoMethods::all()).await;
@@ -307,7 +355,7 @@ Unit tests in `dh.rs`: `shared_secret_agrees` (two key pairs, `a.shared(&b.publi
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-wire --test mse`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test -p fbt-wire && bash dev/check-pure-rust.sh && cargo deny --all-features check`: PASS.
-- [ ] **Step 5: Commit.** `feat(wire): MSE/PE handshake and encrypted stream`
+- [ ] **Step 5: Commit.** `feat(wire): MSE/PE handshake and encrypted stream` No trailers or attribution of any kind.
 
 ---
 
@@ -319,6 +367,7 @@ Unit tests in `dh.rs`: `shared_secret_agrees` (two key pairs, `a.shared(&b.publi
 
 **Interfaces:**
 - Consumes: `fbt_core::{InfoHashes, InfoHashV1, InfoHashV2}`.
+- Named caps in `magnet.rs`: `pub const MAX_MAGNET_LEN: usize = 65_536;`, `MAX_MAGNET_TRACKERS: usize = 64`, `MAX_MAGNET_PEERS: usize = 200`, `MAX_SELECT_ENTRIES: usize = 1000`, `MAX_SELECT_INDEX: usize = 1_000_000`.
 - Produces:
   - `#[derive(Debug, Clone, PartialEq, Eq)] #[non_exhaustive] pub struct Magnet`. Fields:
     - `pub info_hashes: InfoHashes`
@@ -334,11 +383,11 @@ Unit tests in `dh.rs`: `shared_secret_agrees` (two key pairs, `a.shared(&b.publi
     - `is_selected(&self, file: usize) -> bool`, which is true when `select_only` is `None`.
   - `#[derive(Debug, thiserror::Error)] pub enum MagnetError { NotMagnet, TooLong, BadEncoding, MissingInfoHash, InvalidInfoHash(String), ConflictingInfoHash, InvalidSelection }`.
   - `impl Metainfo { pub fn magnet(&self) -> Magnet }`: info hashes, name and the first tracker of each tier.
-  - `impl Metainfo { pub fn from_info_bytes(info: &[u8], expected: InfoHashes, trackers: Vec<Vec<String>>) -> Result<Metainfo, MetainfoError> }`. It parses `info` with the same rules as `from_bytes` by sharing one `parse_info` helper. It checks SHA-1 against `expected.v1` and SHA-256 against `expected.v2` (when the info dict has `meta version 2`). A mismatch gives `MetainfoError::InfoHashMismatch`. Trackers go through the same dedup and 64-URL cap. `comment`, `created_by` and `creation_date` are `None`.
+  - `impl Metainfo { pub fn from_info_bytes(info: &[u8], expected: InfoHashes, trackers: Vec<Vec<String>>) -> Result<Metainfo, MetainfoError> }`. It parses `info` with the same rules as `from_bytes` by sharing one `parse_info` helper. It checks SHA-1 against `expected.v1` and SHA-256 against `expected.v2` (when the info dict has `meta version 2`). The peer-supplied bytes are decoded with explicit limits inside the shared helper: `decode_with(info, Limits::new(32, MAX_INFO_ITEMS))`, where `const MAX_INFO_ITEMS: usize = 4_194_304`, never with `decode()`'s defaults. A mismatch gives `MetainfoError::InfoHashMismatch`. Trackers go through the same dedup and 64-URL cap. `comment`, `created_by` and `creation_date` are `None`.
 
 Parsing rules:
 
-- The scheme `magnet:?` is matched case-insensitively. The whole URI is at most 65_536 bytes (`TooLong`). Parameters are split on `&`, values are percent-decoded (`+` means space in `dn`), and invalid escapes give `BadEncoding`.
+- The scheme `magnet:?` is matched case-insensitively. The whole URI is at most `MAX_MAGNET_LEN` bytes (`TooLong`). Parameters are split on `&`, values are percent-decoded (`+` means space in `dn`), and invalid escapes give `BadEncoding`.
 - **`xt`.**
   - `urn:btih:` takes 40 hex digits or 32 base32 characters (RFC 4648, either case).
   - `urn:btmh:1220` takes 64 hex digits, a SHA-256 multihash; other multihash codes give `InvalidInfoHash`.
@@ -347,10 +396,10 @@ Parsing rules:
   - With no `xt`, the result is `MissingInfoHash`.
 - **`dn`, `tr`, `x.pe`.**
   - `dn` is sanitized with `sanitize_component`.
-  - `tr` and `tr.N` are taken in order, deduplicated, at most 64.
-  - `x.pe` and `x.pe.N` accept only IP-literal socket addresses (hostnames and port 0 are dropped), at most 200.
+  - `tr` and `tr.N` are taken in order, deduplicated, at most `MAX_MAGNET_TRACKERS`.
+  - `x.pe` and `x.pe.N` accept only IP-literal socket addresses (hostnames and port 0 are dropped), at most `MAX_MAGNET_PEERS`.
   - Unknown keys are ignored.
-- **`so` (BEP 53).** Comma-separated indices and `a-b` ranges, at most 1000 entries, indices up to 1_000_000. `b < a` or junk gives `InvalidSelection`.
+- **`so` (BEP 53).** Comma-separated indices and `a-b` ranges, at most `MAX_SELECT_ENTRIES` entries, indices up to `MAX_SELECT_INDEX`. `b < a` or junk gives `InvalidSelection`.
 
 - [ ] **Step 1: Write failing tests** in `crates/fbt-metainfo/tests/magnet.rs`
 
@@ -383,9 +432,12 @@ const HEX: &str = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
     assert!(matches!(Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}&so=5-2")), Err(MagnetError::InvalidSelection)));
     assert!(matches!(Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}&tr={}", "a".repeat(70_000))), Err(MagnetError::TooLong)));
 }
-#[test] fn to_uri_roundtrips() { /* parse(m.to_uri()) == m for the full magnet above */ }
+#[test] fn to_uri_roundtrips() {
+    let m = Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}&dn=My+Name&tr=udp%3A%2F%2Ft.example%3A80&x.pe=10.0.0.1:6881&x.pe=[::1]:51413&so=0,2,4-6")).unwrap();
+    assert_eq!(Magnet::parse(&m.to_uri()).unwrap(), m);
+}
 #[test] fn from_info_bytes_verifies_hash() {
-    let (meta, _) = support::single_file_torrent();
+    let meta = Metainfo::from_bytes(&support::single_fixture()).unwrap();
     let raw = meta.raw_info().to_vec();
     let again = Metainfo::from_info_bytes(&raw, meta.info_hashes, vec![vec!["http://t/a".into()]]).unwrap();
     assert_eq!(again.info, meta.info);
@@ -393,7 +445,16 @@ const HEX: &str = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
     let wrong = InfoHashes::from_v1(InfoHashV1([0; 20]));
     assert!(matches!(Metainfo::from_info_bytes(&raw, wrong, vec![]), Err(MetainfoError::InfoHashMismatch)));
 }
-#[test] fn metainfo_magnet_link() { /* fixture single.torrent: meta.magnet().to_uri() parses back to the same info hash and dn */ }
+#[test] fn from_info_bytes_uses_explicit_limits() {
+    let deep = [b"l".repeat(40), b"e".repeat(40)].concat();
+    assert!(Metainfo::from_info_bytes(&deep, InfoHashes::from_v1(InfoHashV1([0; 20])), vec![]).is_err());   // depth 40 > 32, fails before any hash check
+}
+#[test] fn metainfo_magnet_link() {
+    let meta = Metainfo::from_bytes(&support::single_fixture()).unwrap();
+    let back = Magnet::parse(&meta.magnet().to_uri()).unwrap();
+    assert_eq!(back.info_hashes, meta.info_hashes);
+    assert_eq!(back.display_name.as_deref(), Some(meta.info.name.as_str()));
+}
 ```
 
 Plus a proptest `magnet_parse_never_panics` over arbitrary strings prefixed with `magnet:?`.
@@ -401,7 +462,7 @@ Plus a proptest `magnet_parse_never_panics` over arbitrary strings prefixed with
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-metainfo`
 - [ ] **Step 3: Implement.** Write base32 and percent-decoding by hand in `magnet.rs`; no crate for either.
 - [ ] **Step 4: Run.** PASS.
-- [ ] **Step 5: Commit.** `feat(metainfo): magnet URIs (btih, btmh, so) and metainfo from info bytes`
+- [ ] **Step 5: Commit.** `feat(metainfo): magnet URIs (btih, btmh, so) and metainfo from info bytes` No trailers or attribution of any kind.
 
 ---
 
@@ -409,7 +470,7 @@ Plus a proptest `magnet_parse_never_panics` over arbitrary strings prefixed with
 
 **Files:**
 - Create: `crates/fbt-dht/{Cargo.toml,src/lib.rs,src/id.rs,src/krpc.rs}`. The crate uses the parser-crate clippy deny block; deps are `fbt-core`, `fbt-bencode`, `sha1`, `rand`, `thiserror`, `tracing`, and `tokio` (later tasks).
-- Modify: `CLAUDE.md` (crate list; `fbt-dht` joins the clippy-deny list).
+- (`CLAUDE.md` is edited only in Task 19.)
 
 **Interfaces:**
 - Produces:
@@ -433,7 +494,8 @@ Plus a proptest `magnet_parse_never_panics` over arbitrary strings prefixed with
   - `pub struct Message { pub tid: Vec<u8>, pub body: Body, pub ip: Option<SocketAddr>, pub version: Option<Vec<u8>> }`, with `encode(&self) -> Vec<u8>` (canonical, sorted keys) and `decode(buf: &[u8]) -> Result<Message, KrpcError>`. All of these are `Debug + Clone + PartialEq + Eq`.
   - Constants:
     - `pub const KRPC_LIMITS: Limits = Limits::new(6, 600);`
-    - `MAX_TID_LEN = 16`, `MAX_TOKEN_LEN = 64`, `MAX_VALUES = 200`, `MAX_NODES = 64` (compact entries per field; extra is cut)
+    - `MAX_TID_LEN = 16`, `MAX_TOKEN_LEN = 64`, `MAX_VALUES = 100`, `MAX_NODES = 32` (compact entries per field; extra is cut). Both fit `MAX_DATAGRAM`: 100 IPv4 values are 600 B, 32 IPv6 nodes are 1216 B.
+    - `MAX_VERSION_LEN = 8`, `MAX_METHOD_LEN = 32`
     - `MAX_ERROR_MESSAGE = 256`
     - `MAX_DATAGRAM = 1500`
     - `pub const ERR_GENERIC: i64 = 201`, `ERR_SERVER = 202`, `ERR_PROTOCOL = 203`, `ERR_METHOD_UNKNOWN = 204`
@@ -441,9 +503,9 @@ Plus a proptest `magnet_parse_never_panics` over arbitrary strings prefixed with
 
 Wire rules:
 
-- **Common keys.** `y` is `q`, `r` or `e`. The `ip` key is BEP 42's compact requester address (6 or 18 bytes). `ro: 1` (BEP 43) maps to `read_only`. `v` is kept up to 8 bytes.
-- **Compact entries.** Nodes are 26 bytes (IPv4) or 38 bytes (IPv6). `values` entries are 6 or 18 bytes; others are skipped.
-- **Unknown methods.** An unknown method name decodes to `Query::Unknown` (name cut to 32 bytes), so the server can answer 204 with the right `tid`.
+- **Common keys.** `y` is `q`, `r` or `e`. The `ip` key is BEP 42's compact requester address (6 or 18 bytes). `ro: 1` (BEP 43) maps to `read_only`. `v` is kept up to `MAX_VERSION_LEN` bytes.
+- **Compact entries.** Nodes are 26 bytes (IPv4) or 38 bytes (IPv6): a 20-byte id, then the address through `fbt_core::compact`. `values` entries are 6 or 18 bytes (`fbt_core::compact`); others are skipped.
+- **Unknown methods.** An unknown method name decodes to `Query::Unknown` (name cut to `MAX_METHOD_LEN` bytes), so the server can answer 204 with the right `tid`.
 - **Rejected input.**
   - A missing `t`, `y`, `id` (or `id` not 20 bytes), `info_hash` or `target` gives `Malformed`.
   - A `port` outside `1..=65535` gives `Malformed("port")`, unless `implied_port` is set.
@@ -484,7 +546,12 @@ const BEP5: &[&[u8]] = &[
 ];
 #[test] fn bep5_examples_roundtrip_byte_exact() { for m in BEP5 { assert_eq!(Message::decode(m).unwrap().encode(), *m); } }
 #[test] fn bep32_43_42_fields() {
-    // find_node with want [n4,n6] and ro=1 decodes Want{v4:true,v6:true}, read_only; response with nodes6 (38-byte) and ip (6-byte) roundtrips
+    let q = b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz1234564:wantl2:n42:n6ee1:q9:find_node2:roi1e1:t2:aa1:y1:qe";
+    let Body::Query(qm) = Message::decode(q).unwrap().body else { panic!() };
+    assert_eq!(qm.want, Want { v4: true, v6: true }); assert!(qm.read_only);
+    let resp = Message { tid: b"aa".to_vec(), ip: Some("10.0.0.1:6881".parse().unwrap()), version: None,
+        body: Body::Response(Response { id: NodeId([1; 20]), nodes: vec![], nodes6: vec![NodeInfo { id: NodeId([2; 20]), addr: "[::1]:6881".parse().unwrap() }], values: vec![], token: None }) };
+    assert_eq!(Message::decode(&resp.encode()).unwrap(), resp);
 }
 #[test] fn unknown_method_keeps_tid() {
     let m = Message::decode(b"d1:ad2:id20:abcdefghij0123456789e1:q4:vote1:t2:xy1:y1:qe").unwrap();
@@ -495,7 +562,15 @@ const BEP5: &[&[u8]] = &[
     assert!(matches!(Message::decode(&vec![b'x'; 1501]), Err(KrpcError::TooLarge)));
     assert!(Message::decode(b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234564:porti0e5:token1:xe1:q13:announce_peer1:t2:aa1:y1:qe").is_err());
 }
-#[test] fn caps_values_and_nodes() { /* response with 1000 values → MAX_VALUES kept; 100 compact nodes → MAX_NODES */ }
+#[test] fn caps_values_and_nodes() {
+    // both datagrams stay <= MAX_DATAGRAM: 150 values = 900 B, 50 IPv4 nodes = 1300 B
+    let values: Vec<u8> = (0..150u32).flat_map(|i| [10, 0, (i >> 8) as u8, i as u8, 0x1a, 0xe1]).collect();
+    let r = Message::decode(&response_with_values(&values)).unwrap();
+    let Body::Response(r) = r.body else { panic!() }; assert_eq!(r.values.len(), MAX_VALUES);
+    let nodes = vec![7u8; 26 * 50];
+    let Body::Response(r) = Message::decode(&response_with_nodes(&nodes)).unwrap().body else { panic!() }; assert_eq!(r.nodes.len(), MAX_NODES);
+    assert!(MAX_VALUES * 6 <= MAX_DATAGRAM && MAX_NODES * 38 <= MAX_DATAGRAM);
+}
 ```
 
 Plus a proptest `krpc_decode_never_panics`.
@@ -503,7 +578,7 @@ Plus a proptest `krpc_decode_never_panics`.
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-dht`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test -p fbt-dht && cargo clippy -p fbt-dht --all-targets -- -D warnings`: PASS.
-- [ ] **Step 5: Commit.** `feat(dht): node ids with BEP 42 and KRPC messages`
+- [ ] **Step 5: Commit.** `feat(dht): node ids with BEP 42 and KRPC messages` No trailers or attribution of any kind.
 
 ---
 
@@ -511,6 +586,7 @@ Plus a proptest `krpc_decode_never_panics`.
 
 **Files:**
 - Create: `crates/fbt-dht/src/{table.rs,token.rs,store.rs,rate.rs}`.
+- Modify: `crates/fbt-dht/src/lib.rs` (module declarations).
 
 **Interfaces:**
 - Consumes: `NodeId`, `NodeInfo`, `is_local` (Task 5).
@@ -550,7 +626,7 @@ Table rules:
 - **Ordering.** `closest` orders by XOR distance and skips bad nodes.
 
 - [ ] **Step 1: Write failing tests** (one module per file)
-  - `insert_until_full_then_pending_ping_then_replace_on_failure`: 8 good nodes in bucket 0, a 9th gives `Pending`. Once time moves 16 min ahead and the pinged node gets `failed` twice, the 9th is in the table.
+  - `insert_until_full_then_pending_ping_then_replace_on_failure`: 8 good nodes in bucket 0 (all heard from at `t0`). A 9th inserted at `t0` gives `Rejected` (every node is good). Insert the 9th again at `t0 + 16 min` (all 8 are now questionable): it gives `Pending { ping: oldest questionable }` and waits in the replacement cache. Once the pinged node gets `failed` twice, the 9th is in the table.
   - `bad_node_replaced_immediately`
   - `closest_sorted_by_xor_distance`: 50 random nodes; `closest(t, 8)` equals a brute-force sort.
   - `one_node_per_public_ip_but_local_exempt`: two ids on `8.8.8.8` keep one; two on `127.0.0.1` keep both.
@@ -564,19 +640,23 @@ Table rules:
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-dht`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** PASS.
-- [ ] **Step 5: Commit.** `feat(dht): routing table, tokens, peer store and rate limiter`
+- [ ] **Step 5: Commit.** `feat(dht): routing table, tokens, peer store and rate limiter` No trailers or attribution of any kind.
 
 ---
 
 ### Task 7: DHT node runtime and query server
 
 **Files:**
-- Create: `crates/fbt-dht/src/{node.rs,server.rs}`. Deps `tokio` (`net`, `time`, `sync`, `rt`, `macros`) and `socket2`.
-- Modify: `crates/fbt-dht/src/lib.rs`.
+- Create: `crates/fbt-dht/src/{node.rs,server.rs,state.rs}`. Deps `tokio` (`net`, `time`, `sync`, `rt`, `macros`) and `socket2`; dev-dep `tokio` with `test-util` and `rt-multi-thread`.
+- Modify: `crates/fbt-dht/src/lib.rs`, `crates/fbt-dht/Cargo.toml`, root `Cargo.toml` (`socket2` in `[workspace.dependencies]`).
 
 **Interfaces:**
-- Consumes: Tasks 5 and 6.
+- Consumes: Tasks 5 and 6, and `fbt_core::compact` (Task 2).
 - Produces (public):
+  - `#[derive(Debug, Clone, PartialEq, Eq)] pub struct DhtState { pub id_v4: Option<NodeId>, pub id_v6: Option<NodeId>, pub nodes_v4: Vec<SocketAddr>, pub nodes_v6: Vec<SocketAddr> }` (`state.rs`; Task 8 adds `Dht::state()`), with `to_bytes(&self) -> Vec<u8>` and `from_bytes(b: &[u8]) -> Result<DhtState, DhtError>`.
+    - The format is a bencoded dict: `version` = 1, `id`, `id6`, `nodes` (6-byte compact addresses), `nodes6` (18-byte), through `fbt_core::compact`.
+    - `from_bytes` decodes with `Limits::new(2, 16)`. A missing or different `version`, a wrong id length or a misaligned node string gives `InvalidState`.
+    - At most `pub const MAX_STATE_NODES: usize = 1000` nodes per family on both save and load.
   - `#[derive(Debug, Clone)] #[non_exhaustive] pub struct DhtConfig`. Fields and defaults:
     - `bind_v4: Option<SocketAddr> = Some(0.0.0.0:6881)`
     - `bind_v6: Option<SocketAddr> = Some([::]:6881)`
@@ -589,11 +669,13 @@ Table rules:
     - `max_stored_torrents: usize = 2000`
     - `max_peers_per_torrent: usize = 500`
     - `max_pending_queries: usize = 1024`
+    - hidden: `bootstrap_retry_base: Duration = 30 s` and `bootstrap_retry_max: Duration = 15 min`, so tests can use short real delays
+    - The clock for time-dependent logic (table, tokens, store, rate limiter, backoff) is always passed in as `Instant`; the actor reads `Instant::now()` in one place. Tests use short real delays or direct calls, not `tokio::time::pause()` together with real UDP.
   - `#[derive(Debug, Clone)] pub struct Dht`, with:
     - `pub async fn spawn(cfg: DhtConfig) -> Result<Dht, DhtError>`;
     - `pub fn local_addrs(&self) -> Vec<SocketAddr>`;
     - `pub fn add_node(&self, addr: SocketAddr)`, which pings and inserts on reply;
-    - `pub fn stats(&self) -> DhtStats`, the latest `watch` value, published at most once a second;
+    - `pub fn stats(&self) -> DhtStats`, the latest `watch` value. Stats are published when they change (a node added or removed, `bootstrapped` flips, a store size change), rate-limited to once a second; the 60 s housekeeping tick does not publish;
     - `pub fn subscribe_stats(&self) -> watch::Receiver<DhtStats>`;
     - `pub async fn shutdown(&self)`, which is idempotent.
   - `#[derive(Debug, Clone, Default, PartialEq, Eq)] #[non_exhaustive] pub struct DhtStats { pub nodes_v4: usize, pub nodes_v6: usize, pub stored_info_hashes: usize, pub bootstrapped: bool, pub local_addrs: Vec<SocketAddr> }`.
@@ -607,7 +689,7 @@ Behavior:
 - **Answering queries** (`server.rs`):
   - `ping` returns `id`.
   - `find_node` returns the `K` closest nodes. They come from the asking family's table by default; `want` selects `nodes`/`nodes6` across both tables (BEP 32).
-  - `get_peers` returns a `token` and up to 100 IPv4 or 50 IPv6 `values` when stored, plus `nodes` (or `nodes6`).
+  - `get_peers` returns a `token` and up to `MAX_VALUES_V4 = 100` IPv4 or `MAX_VALUES_V6 = 50` IPv6 `values` when stored (named constants, both within `MAX_VALUES`), plus `nodes` (or `nodes6`).
   - `announce_peer` with a token that fails `verify` gets error 203. Otherwise the peer is stored at `(source ip, implied_port ? source port : port)`.
   - An unknown method gets error 204.
   - Every response carries `ip` = the requester's address (BEP 42) and `v = b"FB" + [major, minor]`.
@@ -616,8 +698,8 @@ Behavior:
 - **Learning nodes.** Any node that answers our query is inserted (`Insert::Pending` triggers the ping).
 - **Node ids.**
   - When `enforce_node_id` is set, a non-local node whose id fails `is_valid_for` is not inserted.
-  - Every response's `ip` field is a vote for our external address. Three distinct reporter IPs agreeing on a non-local address make it our external IP. If our id isn't valid for that IP, it is regenerated with `bep42_id` and the table is rebuilt with `reset_own`. This logic lives in `pub(crate) struct ExternalIp { fn vote(&mut self, reporter: IpAddr, ip: IpAddr) -> Option<IpAddr> }`, which keeps at most 64 votes.
-- **Housekeeping.** Every 60 s: expire the peer store, prune timed-out transactions, publish stats. Every 5 min: rotate the token secret.
+  - Every response's `ip` field is a vote for our external address. Three distinct reporter IPs agreeing on a non-local address make it our external IP. If our id isn't valid for that IP, it is regenerated with `bep42_id` and the table is rebuilt with `reset_own`. This logic lives in `pub(crate) struct ExternalIp { fn vote(&mut self, reporter: IpAddr, ip: IpAddr) -> Option<IpAddr> }`, which keeps at most `MAX_EXTERNAL_VOTES = 64` votes.
+- **Housekeeping.** Every 60 s: expire the peer store and prune timed-out transactions (it does not publish stats; see `stats()`). Every 5 min: rotate the token secret.
 
 - [ ] **Step 1: Write failing tests** in `node.rs`. They drive a spawned `Dht` on `127.0.0.1:0` (`bind_v6: None` unless stated) from a raw `tokio::net::UdpSocket` using `Message::encode/decode`.
   - `answers_ping_with_id_and_requester_ip`: the response `ip == Some(raw socket's local addr)`.
@@ -631,73 +713,21 @@ Behavior:
   - `garbage_and_oversized_datagrams_are_ignored`: after 2000 bytes of junk and an empty datagram, the next ping is still answered.
   - `response_from_wrong_address_is_ignored`: our query to socket A, answered by socket B with the right tid, returns `QueryError::Timeout`.
   - `pending_queries_are_bounded`: `max_pending_queries: 4`, 10 queries to a silent socket, and the 5th onwards return `QueryError::Busy`.
-  - `ipv6_bind_failure_keeps_ipv4_running`: `bind_v6` is an address that cannot bind (`[::1]:<port already bound by a std socket>`); `spawn` succeeds and `local_addrs()` holds only the IPv4 address.
+  - `ipv6_bind_failure_keeps_ipv4_running`: skipped (early return) if `std::net::UdpSocket::bind("[::1]:0")` fails, as in Task 8. `bind_v6` is an address that cannot bind (`[::1]:<port already bound by a std socket>`); `spawn` succeeds and `local_addrs()` holds only the IPv4 address.
   - `external_ip_votes_regenerate_id`: unit test on `ExternalIp`. Two votes give `None`, a third distinct reporter gives `Some(ip)`, and local IPs never win.
-- [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-dht`
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run.** PASS on all three OSes.
-- [ ] **Step 5: Commit.** `feat(dht): node runtime with query server, rate limiting and read-only mode`
-
----
-
-### Task 8: lookups, bootstrap, announce and persistence
-
-**Files:**
-- Create: `crates/fbt-dht/src/{lookup.rs,state.rs}`, `crates/fbt-dht/tests/swarm.rs`.
-- Modify: `crates/fbt-dht/src/{node.rs,lib.rs}`.
-
-**Interfaces:**
-- Consumes: `Dht::query`, `RoutingTable`, `Tokens` (Task 7).
-- Produces:
-  - `pub fn get_peers(&self, info_hash: [u8; 20]) -> PeerLookup` and `pub fn announce(&self, info_hash: [u8; 20], port: Option<u16>) -> PeerLookup`. `port: None` means `implied_port`. Each runs one lookup per bound family and yields peers as they arrive; `announce` then sends `announce_peer` to the `K` closest responders that gave a token.
-  - `#[derive(Debug)] pub struct PeerLookup`, with `pub async fn next(&mut self) -> Option<Vec<SocketAddr>>`. It gives `None` once every family's lookup has finished. Dropping it cancels the lookup. Each batch is deduplicated and holds only dialable addresses.
-  - `pub async fn state(&self) -> Result<DhtState, DhtError>`.
-  - `#[derive(Debug, Clone, PartialEq, Eq)] pub struct DhtState { pub id_v4: Option<NodeId>, pub id_v6: Option<NodeId>, pub nodes_v4: Vec<SocketAddr>, pub nodes_v6: Vec<SocketAddr> }`, with `to_bytes(&self) -> Vec<u8>` and `from_bytes(b: &[u8]) -> Result<DhtState, DhtError>`.
-    - The format is a bencoded dict: `version` = 1, `id`, `id6`, `nodes` (6-byte compact addresses), `nodes6` (18-byte).
-    - `from_bytes` decodes with `Limits::new(2, 16)`. A missing or different `version`, a wrong id length or a misaligned node string gives `InvalidState`.
-    - At most 1000 nodes per family on both save and load.
-  - `pub(crate) struct Lookup` (pure state machine), with:
-    - `new(target: NodeId, seeds: Vec<NodeInfo>) -> Self`;
-    - `next_queries(&mut self) -> Vec<NodeInfo>` (at most `ALPHA = 3` in flight);
-    - `on_response(&mut self, from: &NodeId, nodes: &[NodeInfo], token: Option<Vec<u8>>)`;
-    - `on_failure(&mut self, from: &NodeId)`;
-    - `is_done(&self) -> bool`;
-    - `responders(&self) -> Vec<(NodeInfo, Vec<u8>)>` (the `K` closest with tokens).
-
-    It keeps at most 64 candidates sorted by distance and sends at most 200 queries in all (`MAX_LOOKUP_QUERIES`). It is done when the `K` closest known candidates have all answered or failed and nothing is in flight.
-
-Behavior:
-
-- **Bootstrap.**
-  - Seeds come from restored `state` nodes plus the `bootstrap` entries. Those are resolved with `tokio::net::lookup_host` under a 5 s timeout each; entries that fail to resolve or are malformed are skipped with a debug log.
-  - The bootstrap itself is a `find_node(own id)` lookup per family. `stats().bootstrapped` becomes true once a table has at least `K` nodes.
-  - While the tables are empty, bootstrap is retried after 30 s, doubling up to 15 min.
-  - A restored `id_v4`/`id_v6` replaces the random id.
-- **Refresh.** Every 60 s, each stale bucket (up to the deepest non-empty one plus one) gets a `find_node` for `random_id_in_bucket`.
-- **Lookup seeds.** Lookups start from `table.closest(target, K)`.
-
-- [ ] **Step 1: Write failing tests**
-  - Unit tests in `lookup.rs`:
-    - `queries_alpha_closest_first`
-    - `closer_nodes_from_responses_are_queried_next`
-    - `done_when_k_closest_answered`
-    - `failures_do_not_stall`
-    - `bounded_queries`: a generator answering with 8 fresh, ever-closer nodes each time stops at `MAX_LOOKUP_QUERIES`.
-  - Unit tests in `state.rs`:
-    - `state_roundtrip`
-    - `rejects_future_version_and_garbage`: `version` 2, `b"garbage"` and a 25-byte `nodes` each give `Err(DhtError::InvalidState(_))`.
-    - `caps_nodes_on_load`
+  - `stats_published_on_change_rate_limited`: a `subscribe_stats()` receiver sees `nodes_v4` change within 2 s of a node answering, and across 20 changes in 1 s sees at most 3 published values.
+  - Unit test in `node.rs`: `backoff_doubles_to_the_cap`: with base 30 s and max 15 min, attempts 0..7 give 30, 60, 120, 240, 480, 900, 900, 900 s.
   - Integration tests in `tests/swarm.rs`. Every node binds `127.0.0.1:0` with `query_rate_per_ip: 10_000`, `query_timeout: 500ms` and `bind_v6: None` unless stated.
     - `twenty_nodes_bootstrap_and_fill_tables`: node 0 has no bootstrap; nodes 1..20 bootstrap from node 0. Within 10 s every node's `stats().nodes_v4 >= 8` and `bootstrapped`.
     - `announce_then_get_peers_finds_the_peer`: node 19 runs `announce(ih, Some(4242))` to completion; node 3's `get_peers(ih)` yields `127.0.0.1:4242` within 5 s.
     - `ipv6_swarm_converges_when_available`: skipped (early return) if `std::net::UdpSocket::bind("[::1]:0")` fails. Ten nodes on `[::1]:0` with `bind_v4: None`; get_peers finds the announced peer `[::1]:4242`.
-    - `restored_state_rejoins_without_bootstrap`: `state()` of node 5, then a new node with `state: Some(..)` and an empty `bootstrap` reaches `nodes_v4 >= 8` and keeps node 5's `id_v4`.
-    - `silent_bootstrap_is_retried_with_backoff`: bootstrap points at a raw socket that never answers. Under `tokio::time::pause()`, 10 virtual minutes bring at most 6 `find_node` datagrams to it.
+    - `restored_state_rejoins_without_bootstrap`: `state()` of node 5 (nodes capped at `MAX_STATE_NODES`), then a new node with `state: Some(..)` and an empty `bootstrap` reaches `nodes_v4 >= 8` and keeps node 5's `id_v4`.
+    - `silent_bootstrap_is_retried_with_backoff`: bootstrap points at a raw socket that never answers, with `bootstrap_retry_base` 50 ms and `bootstrap_retry_max` 400 ms (real time, no paused clock). Over 3 s the raw socket receives between 5 and 12 `find_node` datagrams, and the gaps between consecutive datagrams are non-decreasing (within 20 ms of jitter) until they reach 400 ms.
     - `malformed_bootstrap_entries_are_skipped`: `["no-port", "127.0.0.1:notaport"]` gives a running node with `bootstrapped == false` and no panic.
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-dht`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test -p fbt-dht`: PASS on all three OSes, with swarm tests deterministic over 20 local reruns (`for i in $(seq 20); do cargo test -p fbt-dht --test swarm -q || break; done`).
-- [ ] **Step 5: Commit.** `feat(dht): iterative lookups, bootstrap with backoff, announce and state persistence`
+- [ ] **Step 5: Commit.** `feat(dht): iterative lookups, bootstrap with backoff, announce and state persistence` No trailers or attribution of any kind.
 
 ---
 
@@ -711,7 +741,7 @@ Behavior:
 - Produces (crate-internal; no behavior change except the tie-break):
   - `torrent/swarm.rs` takes from `peers.rs`: `Known`, `MAX_KNOWN`, `MAX_NEVER`, `MAX_ATTEMPTS`, `dialable`, `AfterFailure`, `Retries`, `Peer` (with `Peer::new(addr, tx, generation, num_pieces)` unchanged), `new_key`, `queue_addr`, `remember`, `queue_retries`, `try_connect`, `on_incoming`, `send`, `close_peer`, `close_all`, `on_connected` and `on_disconnected`'s bookkeeping half. It also gets their unit tests.
   - `torrent/peers.rs` keeps the piece side: `on_peer_event` dispatch, `on_pieces`, `on_have`, `on_interested`, `set_choke`, `rechoke`, `on_rejected`, `wants_piece`, `update_interest`, `fill`, `top_up_all`, `partial_cap`, `pick_capped`, `evict_orphans`, plus their tests. Neither file exceeds about 700 lines.
-  - `pub(super) struct Loaded { pub meta: Arc<Metainfo>, pub layout: PieceLayout, pub picker: Option<PiecePicker>, pub piece_prio: Vec<u8>, pub total_wanted: u64, pub file_prio: Vec<Priority>, pub bufs: HashMap<u32, Vec<u8>> }`. `Actor` replaces those fields with `pub(super) loaded: Option<Loaded>`, always `Some` in this task (Task 13 adds the `None` phase). Piece-level handlers in `data.rs`, `serve.rs` and `peers.rs` take `&mut Loaded` or return early on `None`.
+  - `pub(super) struct Loaded { pub meta: Arc<Metainfo>, pub layout: PieceLayout, pub picker: Option<PiecePicker>, pub piece_prio: Vec<u8>, pub total_wanted: u64, pub file_prio: Vec<Priority>, pub bufs: HashMap<u32, Vec<u8>> }`. `Actor` replaces those fields with `pub(super) loaded: Option<Loaded>`, always `Some` in this task (Task 13 adds the `None` phase). `Actor.storage` becomes `Option<Arc<dyn Storage>>` (and `sequential` moves into `Loaded` as `pub sequential: bool`), always `Some` in this task; it is `None` before metadata arrives, and `torrent::spawn` takes the storage as an `Option`. Piece-level handlers in `data.rs`, `serve.rs` and `peers.rs` take `&mut Loaded` or return early on `None`.
   - `pub(super) fn keep_new_connection(our_id: &PeerId, their_id: &PeerId, new_outgoing: bool, old_outgoing: bool) -> bool`. When two connections share a peer id and differ in direction, keep the one initiated by the side with the lower peer id (bytewise). The same direction keeps the older connection (M1 behavior). The losing side closes with `DisconnectReason::Duplicate`. Both ends compute the same answer, so exactly one connection survives a simultaneous dial.
 
 - [ ] **Step 1: Write failing tests**
@@ -734,7 +764,7 @@ Behavior:
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session`
 - [ ] **Step 3: Implement.** Move code without changing it first, and commit nothing until `cargo test -p fbt-session` passes again. Then add `Loaded` and the tie-break.
 - [ ] **Step 4: Run.** `cargo test -p fbt-session && cargo clippy -p fbt-session --all-targets -- -D warnings`: PASS, with every M1 test unchanged.
-- [ ] **Step 5: Commit.** `refactor(session): split swarm bookkeeping from piece logic; peer-id tie-break on simultaneous dial`
+- [ ] **Step 5: Commit.** `refactor(session): split swarm bookkeeping from piece logic; peer-id tie-break on simultaneous dial` No trailers or attribution of any kind.
 
 ---
 
@@ -766,7 +796,7 @@ Behavior:
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** PASS.
-- [ ] **Step 5: Commit.** `fix(session): at-most-once completed, last known left on stopped, pure announce planning`
+- [ ] **Step 5: Commit.** `fix(session): at-most-once completed, last known left on stopped, pure announce planning` No trailers or attribution of any kind.
 
 ---
 
@@ -774,7 +804,7 @@ Behavior:
 
 **Files:**
 - Create: `crates/fbt-session/src/peer/ext.rs`.
-- Modify: `crates/fbt-session/src/peer/{conn.rs,messages.rs}`, `crates/fbt-session/src/torrent/{swarm.rs,peers.rs}`, `crates/fbt-session/tests/support/mod.rs`.
+- Modify: `crates/fbt-session/src/peer/{conn.rs,messages.rs}`, `crates/fbt-session/src/peer/mod.rs` (`mod ext;`), `crates/fbt-session/src/torrent/{swarm.rs,peers.rs}`, `crates/fbt-session/tests/support/mod.rs`.
 
 **Interfaces:**
 - Consumes: `fbt_wire::{ExtHandshake, MetadataMsg, PexMsg, Reserved, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, UT_METADATA, UT_PEX}`.
@@ -820,7 +850,7 @@ Behavior:
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session peer`
 - [ ] **Step 3: Implement.** Keep `ext.rs` as the remote-id map, our handshake builder and the decode dispatch, so `conn.rs` only routes. Torrent side: store `ExtHandshake` on `Peer`; ignore `Metadata`/`Pex`/`DhtPort` until Tasks 13 to 15.
 - [ ] **Step 4: Run.** `cargo test -p fbt-session`: PASS.
-- [ ] **Step 5: Commit.** `feat(session): extension handshake, Port and no-metadata mode in peer connections`
+- [ ] **Step 5: Commit.** `feat(session): extension handshake, Port and no-metadata mode in peer connections` No trailers or attribution of any kind.
 
 ---
 
@@ -835,7 +865,7 @@ Behavior:
 - Produces:
   - `#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] #[non_exhaustive] pub enum EncryptionPolicy { Forced, #[default] Preferred, Disabled }`, re-exported from the crate root. `Settings` gains `pub encryption: EncryptionPolicy`.
   - `pub(crate) type PeerStream = MseStream<TcpStream>`. `Cmd::Incoming.stream` and `spawn_incoming` take it.
-  - `PeerEvent::Connected` gains `encrypted: bool`, and `Peer` stores it (for PEX flags).
+  - `PeerEvent::Connected` gains `encrypted: bool`, and `Peer` stores it (for PEX flags). `run_peer` is generic over the stream and cannot read `is_encrypted()` itself, so the caller passes `encrypted: bool` in (a new `PeerCtx.encrypted` field, taken from `MseStream::is_encrypted()` after the handshake), and `run_peer` copies it into `Connected`.
   - `DisconnectReason::Encryption(String)`.
   - `Registry` gains `by_req2: HashMap<[u8; 20], [u8; 20]>`, kept with `by_wire`.
   - `Retries` gains `plaintext_only: HashSet<SocketAddr>` (bounded by `MAX_NEVER`, oldest forgotten) and `fn encryption_failed(&mut self, addr: SocketAddr) -> bool` (true when a plaintext retry is due).
@@ -854,7 +884,7 @@ Behavior:
   - Under `Preferred`, the first `Encryption` failure from an address marks it `plaintext_only` and re-queues it at once without counting an attempt.
   - Under `Forced`, it counts as a normal failed attempt.
 - **Incoming** (listener).
-  1. Read up to 20 bytes within `handshake_timeout`. If `is_plaintext_handshake_prefix`, the connection is plaintext: refused under `Forced`, otherwise `MseStream::plaintext(stream, first)` and the M1 `read_handshake` path.
+  1. `read_exact` 20 bytes within `handshake_timeout` (a short read is a closed or stalled peer, not a classification). If `is_plaintext_handshake_prefix`, the connection is plaintext: refused under `Forced`, otherwise `MseStream::plaintext(stream, first)` and the M1 `read_handshake` path.
   2. Otherwise it is MSE: refused under `Disabled`, otherwise `respond(stream, first, &by_req2 lookup, allowed)`. `allowed` is `RC4` under `Forced` and `RC4 | PLAINTEXT` under `Preferred`.
   3. The BT handshake read from the stream must name the SKEY's torrent; a different info hash is dropped.
 
@@ -864,16 +894,50 @@ Behavior:
 
 ```rust
 async fn pair(seed: EncryptionPolicy, leech: EncryptionPolicy) -> (Session, Session, TorrentHandle) { /* seeder with data, leecher add_peer(seeder) */ }
-#[tokio::test] async fn forced_both_sides_downloads_encrypted() { /* TorrentFinished within 30 s; data identical */ }
-#[tokio::test] async fn preferred_vs_disabled_falls_back_to_plaintext() { /* leecher Preferred, seeder Disabled → finishes; one PeerDisconnected{reason: Encryption(_)} then a plaintext connection */ }
-#[tokio::test] async fn forced_policy_against_plaintext_peer_fails_cleanly() {
-    // leecher Forced dials a seeder with Disabled: PeerDisconnected{reason: Encryption(_)} per attempt,
-    // at most MAX_ATTEMPTS (3) attempts with peer_retry_delay 200 ms, never finishes, num_peers stays 0
+#[tokio::test] async fn forced_both_sides_downloads_encrypted() {
+    let (_s, l, h) = pair(Forced, Forced).await;
+    wait_event(&l, |e| matches!(e, Event::TorrentFinished { .. }), 30).await;
+    assert_eq!(read_payload(&h), expected_payload());
 }
-#[tokio::test] async fn forced_listener_refuses_plaintext_handshake() { /* ScriptedPeer::connect (plaintext) to a Forced session → wait_closed within 2 s, torrent saw no PeerConnected */ }
-#[tokio::test] async fn disabled_listener_refuses_mse() { /* raw fbt_wire::initiate against a Disabled session → Err */ }
-#[tokio::test] async fn stalled_mse_handshake_times_out() { /* raw TCP sends 96 random bytes then nothing; handshake_timeout 500 ms → server closes within 1 s; a second torrent connection still works */ }
-#[tokio::test] async fn incoming_mse_routes_by_skey_among_many_torrents() { /* 3 torrents in the seeder; MSE initiator for torrent #2 gets served torrent #2 */ }
+#[tokio::test] async fn preferred_vs_disabled_falls_back_to_plaintext() {
+    let (_s, l, h) = pair(Disabled, Preferred).await;
+    wait_event(&l, |e| matches!(e, Event::PeerDisconnected { reason: DisconnectReason::Encryption(_), .. }), 30).await;
+    wait_event(&l, |e| matches!(e, Event::TorrentFinished { .. }), 30).await;
+    assert_eq!(read_payload(&h), expected_payload());
+}
+#[tokio::test] async fn forced_policy_against_plaintext_peer_fails_cleanly() {
+    // leecher Forced dials a seeder with Disabled, peer_retry_delay 200 ms
+    let (_s, l, h) = pair(Disabled, Forced).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(count_events(&l, |e| matches!(e, Event::PeerDisconnected { reason: DisconnectReason::Encryption(_), .. })), MAX_ATTEMPTS);
+    assert_eq!(h.status().await.unwrap().num_peers, 0);
+    assert_ne!(h.status().await.unwrap().state, TorrentState::Seeding);
+}
+#[tokio::test] async fn forced_listener_refuses_plaintext_handshake() {
+    let (s, h) = forced_seeder().await;
+    let mut p = ScriptedPeer::connect(s.listen_addr(), h.info_hash()).await;   // plaintext
+    tokio::time::timeout(Duration::from_secs(2), p.wait_closed()).await.unwrap();
+    assert_eq!(count_events(&s, |e| matches!(e, Event::PeerConnected { .. })), 0);
+}
+#[tokio::test] async fn disabled_listener_refuses_mse() {
+    let (s, h) = disabled_seeder().await;
+    let tcp = TcpStream::connect(s.listen_addr()).await.unwrap();
+    assert!(fbt_wire::initiate(tcp, &h.info_hash().v1_bytes(), CryptoMethods::RC4, b"").await.is_err());
+}
+#[tokio::test] async fn stalled_mse_handshake_times_out() {
+    let (s, h) = seeder_with_handshake_timeout(Duration::from_millis(500)).await;
+    let mut raw = TcpStream::connect(s.listen_addr()).await.unwrap();
+    raw.write_all(&[0x55; 96]).await.unwrap();                                   // then nothing
+    let mut b = [0u8; 1]; let n = tokio::time::timeout(Duration::from_secs(1), raw.read(&mut b)).await.unwrap().unwrap();
+    assert_eq!(n, 0);                                                           // server closed within 1 s
+    let mut p = ScriptedPeer::connect(s.listen_addr(), h.info_hash()).await; assert!(p.remote.info_hash == h.info_hash().v1_bytes());   // a second connection still works
+}
+#[tokio::test] async fn incoming_mse_routes_by_skey_among_many_torrents() {
+    let (s, hs) = seeder_with_torrents(3).await;
+    let tcp = TcpStream::connect(s.listen_addr()).await.unwrap();
+    let mut m = fbt_wire::initiate(tcp, &hs[1].info_hash().v1_bytes(), CryptoMethods::RC4, &bt_handshake(&hs[1])).await.unwrap();
+    let hs_back = read_bt_handshake(&mut m).await; assert_eq!(hs_back.info_hash, hs[1].info_hash().v1_bytes());
+}
 ```
 
   Plus incoming-handshake tests in `tests/lifecycle.rs`, covering M1 debt:
@@ -884,7 +948,7 @@ async fn pair(seed: EncryptionPolicy, leech: EncryptionPolicy) -> (Session, Sess
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session --test encryption --test lifecycle`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test -p fbt-session`: PASS, with every M1 swarm test passing under the default `Preferred`, so sessions talk to each other encrypted.
-- [ ] **Step 5: Commit.** `feat(session): MSE/PE for outgoing and incoming connections with forced, preferred and disabled policies`
+- [ ] **Step 5: Commit.** `feat(session): MSE/PE for outgoing and incoming connections with forced, preferred and disabled policies` No trailers or attribution of any kind.
 
 ---
 
@@ -931,7 +995,8 @@ Actor behavior:
   - Non-empty `file_priorities` gives `InvalidPriorities { expected: 0, got }`.
   - The registry key is the magnet's `InfoHashes`, which stays the torrent's identity after metadata.
 - **Start.** The actor starts in `DownloadingMetadata` with `loaded: None`. Magnet `tr`s feed the announcer, as one tier each. `x.pe` peers are queued like `add_peer` (Task 14 adds the `PeersFound { source: Magnet }` event for them).
-- **Announcing without metadata.** Announces report `left = 16_384`, so trackers treat us as a leecher.
+- **Announcing without metadata.** While `!has_metadata`, announces report `left = 16_384`, so trackers treat us as a leecher. This explicitly overrides Task 10's `last_left` (a `DownloadingMetadata` status computes `total_wanted - wanted_done = 0`), and `stopped` during that phase also reports 16_384. Once metadata is in, the normal `left` resumes.
+- **Privacy before metadata.** Privacy is unknown until `Done`, so the global magnet exception applies: before metadata we advertise the DHT bit and `ut_pex` as for any public torrent. After `Done`, if `meta.private` is set, the actor sets `ExtConfig.pex = false`, stops PEX sends and ignores later `Pex` and `DhtPort` events for the torrent (Tasks 14 and 15 stop the DHT announcer and the PEX tick on `MetadataReceived`).
 - **On `Done`.**
   1. `Metainfo::from_info_bytes(bytes, ih, magnet trackers)`. A parse failure puts the torrent in `TorrentState::Error` with the message.
   2. Build `Loaded`, applying `so=` as `Priority::Skip` for unselected files.
@@ -945,7 +1010,7 @@ Actor behavior:
   - `set_file_priorities` and `force_recheck` give `NoMetadata`.
   - `pieces()` gives an empty bitfield.
   - `remove(DeleteData)` deletes nothing, since no storage exists yet.
-- **Storage.** For a magnet, storage is created only after metadata, as `FsStorage::new(save_path, &meta)` or the custom `storage`.
+- **Storage.** For a magnet, `Actor.storage` (an `Option` since Task 9) is `None` until metadata arrives, then set to `FsStorage::new(save_path, &meta)` or the custom `storage` in the `Done` step, before `start_check`.
 
 - [ ] **Step 1: Write failing tests**
   - Unit tests in `metadata.rs`:
@@ -966,12 +1031,13 @@ Actor behavior:
     - `so_selection_skips_unselected_files`: three files with `so=0,2`; the middle file's non-boundary bytes are absent.
     - `remove_before_metadata_creates_no_files` (Review Focus 4): a magnet pointing at a silent scripted peer; `remove(DeleteData)` returns within 1 s and the save dir is still empty. The same goes for `pause` then `resume` and for `shutdown`.
     - `seeder_serves_metadata_and_rejects_out_of_range`
+    - `magnet_announces_left_16384_until_metadata`: the fake HTTP tracker records `left=16384` on every announce before `MetadataReceived`, including `stopped` when the torrent is removed first, and the true `left` after metadata.
     - `magnet_v2_only_rejected`
     - `magnet_priorities_rejected_until_metadata`: `InvalidPriorities { expected: 0, .. }` at add, `NoMetadata` from `set_file_priorities` before metadata.
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test --workspace`: PASS.
-- [ ] **Step 5: Commit.** `feat(session): magnet torrents with BEP 9 metadata exchange`
+- [ ] **Step 5: Commit.** `feat(session): magnet torrents with BEP 9 metadata exchange` No trailers or attribution of any kind.
 
 ---
 
@@ -992,6 +1058,7 @@ Actor behavior:
     - `dht_state: Option<Vec<u8>> = None`
     - `dht_announce_interval: Duration = 15 min` (non-zero)
     - hidden: `dht_query_timeout: Duration = 3 s` and `dht_query_rate_per_ip: u32 = 5`
+    - Validation: `Settings::validate` is `pub(crate)` and runs inside `Session::new().await`, so entry errors surface there as `InvalidSettings`.
   - `Session::dht_stats(&self) -> Option<DhtStats>` (sync) and `async fn dht_state(&self) -> Result<Option<Vec<u8>>, SessionError>`, which returns `DhtState::to_bytes()`.
   - `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum PeerSource { Tracker, Dht, Pex, Magnet }`.
   - Two new events:
@@ -1010,7 +1077,7 @@ Behavior:
 - **Private torrents.**
   - No DHT announcer runs.
   - The `dht` reserved bit and the `Port` message are suppressed (`ExtConfig.dht_port: None`), and incoming `DhtPort` is ignored.
-  - A magnet whose metadata turns out private stops its DHT announcer at `MetadataReceived`.
+  - A magnet's privacy is unknown until metadata arrives (see Global Constraints): before that it announces to the DHT and sends `Port` like a public torrent. At `MetadataReceived`, a private torrent stops its DHT announcer immediately and ignores later `DhtPort`.
 - **`Port` messages.** `PeerEvent::DhtPort` on a public torrent calls `dht.add_node((peer ip, port))`.
 - **Shutdown.** `Session::shutdown` shuts the DHT down after the torrents.
 
@@ -1030,15 +1097,27 @@ Behavior:
 #[tokio::test] async fn corrupt_dht_state_is_ignored() { /* dht_state Some(b"garbage") → Session::new Ok, dht_stats() Some */ }
 #[tokio::test] async fn dht_port_taken_falls_back() { /* hold UdpSocket on 127.0.0.1:P, TcpListener free on P; Session listen P → Ok, dht local addr port != P */ }
 #[tokio::test] async fn dht_disabled_means_none() { /* dht_enabled false → dht_stats() None, dht_state() Ok(None) */ }
-#[tokio::test] async fn dht_bootstrapped_event_once() {}
-#[test] fn bootstrap_entries_validated() { /* "nohost" → InvalidSettings naming dht_bootstrap_nodes */ }
+#[tokio::test] async fn dht_bootstrapped_event_once() {
+    // subscribe with EventMask::DHT, bootstrap from a loopback Dht that already knows >= 8 nodes
+    let mut rx = session.subscribe(EventMask::DHT);
+    assert!(matches!(next_event(&mut rx, 10).await, Some(Event::DhtBootstrapped { nodes }) if nodes >= 1));
+    assert!(tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.is_err());   // exactly one: nothing more in 3 s
+}
+#[tokio::test] async fn bootstrap_entries_validated() {
+    let mut s = test_settings(); s.dht_enabled = true; s.dht_bootstrap_nodes = vec!["nohost".into()];
+    assert!(matches!(Session::new(s).await, Err(SessionError::InvalidSettings(m)) if m.contains("dht_bootstrap_nodes")));
+}
+#[tokio::test] async fn private_magnet_stops_dht_announcer_at_metadata() {
+    // magnet of a private torrent, peer hint from x.pe; before MetadataReceived the announcer may run, after it
+    // bootstrap.stats().stored_info_hashes stays unchanged for 5 s (dht_announce_interval 1 s) and no Port is sent on new connections
+}
 ```
 
   Plus `defaults_ship_public_bootstrap_nodes`: `Settings::default().dht_bootstrap_nodes` equals the three names, and `fbt_dht::DhtConfig::default().bootstrap.is_empty()`.
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session --test dht`
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run.** `cargo test --workspace`: PASS. Then confirm no test touches a public node: `grep -rn "router.bittorrent\|transmissionbt\|utorrent" crates/*/tests crates/*/src` shows only `settings.rs` and the `defaults_ship_public_bootstrap_nodes` test.
-- [ ] **Step 5: Commit.** `feat(session): DHT peer discovery, Port messages and DHT state save/restore`
+- [ ] **Step 4: Run.** `cargo test --workspace && bash dev/check-pure-rust.sh && cargo deny --all-features check` (this task wires `fbt-dht` and `socket2` into `fbt`'s tree): PASS. Then confirm no test touches a public node: `grep -rn "router.bittorrent\|transmissionbt\|utorrent" crates/*/tests crates/*/src` shows only `settings.rs` and the `defaults_ship_public_bootstrap_nodes` test.
+- [ ] **Step 5: Commit.** `feat(session): DHT peer discovery, Port messages and DHT state save/restore` No trailers or attribution of any kind.
 
 ---
 
@@ -1046,10 +1125,10 @@ Behavior:
 
 **Files:**
 - Create: `crates/fbt-session/src/torrent/pex.rs`, `crates/fbt-session/tests/pex.rs`.
-- Modify: `crates/fbt-session/src/{settings.rs}`, `crates/fbt-session/src/torrent/{actor.rs,swarm.rs,peers.rs}`.
+- Modify: `crates/fbt-session/src/settings.rs`, `crates/fbt-session/src/torrent/{mod.rs,actor.rs,swarm.rs,peers.rs}` (`mod pex;` in `mod.rs`).
 
 **Interfaces:**
-- Consumes: `PexMsg`, `PexFlags` (Task 2); `PeerEvent::Pex`, `PeerCommand::SendPex` (Task 11); `PeerSource::Pex`, `Event::PeersFound` (Task 14).
+- Consumes: `PexMsg`, `PexFlags` and `fbt_core::compact` (Task 2; no new address codec here: `connectable_addr` and the added/dropped lists are `SocketAddr`s that `PexMsg` already (de)serializes through `fbt_core::compact`); `PeerEvent::Pex`, `PeerCommand::SendPex` (Task 11); `PeerSource::Pex`, `Event::PeersFound` (Task 14).
 - Produces:
   - `Settings` gains `pub pex_enabled: bool = true` and a hidden `pub pex_interval: Duration = 60 s` (non-zero).
   - `pub(super) const MAX_PEX_ADDED: usize = 50; const MAX_PEX_DROPPED: usize = 50;`. The receive gap is `pex_interval * 3 / 4` (45 s by default).
@@ -1064,6 +1143,7 @@ Behavior:
 - **Sending.** Every `pex_interval` tick, each such peer gets `build(...)` over the connected peers' connectable addresses. Flags: `ENCRYPTION` if that connection is encrypted, `SEED` if it is a seed, `CONNECTABLE` always (only connectable addresses are listed).
 - **Receiving.** A message failing `accept` is dropped. Otherwise the first `MAX_PEX_ADDED` dialable added addresses go to the candidate queue through `Known`, and `PeersFound { source: Pex, count }` is emitted. `dropped` is ignored, since peers we know stay known until connections fail.
 - **Private torrents.** A private torrent ignores incoming `ut_pex`, and its extension handshake omits `ut_pex` (`ExtConfig.pex = false`).
+- **Magnets.** A magnet's privacy is unknown until metadata arrives (Global Constraints), so before that PEX behaves as for a public torrent. At `MetadataReceived`, a private torrent stops the PEX tick at once, drops every `PexPeer`, and ignores later `Pex` events.
 
 - [ ] **Step 1: Write failing tests**
   - Unit tests in `pex.rs`:
@@ -1078,11 +1158,12 @@ Behavior:
     - `third_peer_learned_through_pex`: A seeds; B leeches with `add_peer(A)`; C leeches with only `add_peer(B)`. C gets `PeersFound { source: Pex }` containing A's listen address, then `num_peers == 2`, and finishes.
     - `private_torrent_sends_and_accepts_no_pex`: same topology with a private torrent. Within 5 s, C sees no `PeersFound { source: Pex }`, and a scripted peer advertising `ut_pex` sees no `ut_pex` in our handshake and gets no PEX message.
     - `pex_disabled_setting_disables_both_directions`
+    - `private_magnet_stops_pex_at_metadata`: a magnet of a private torrent (peer hint `x.pe`) exchanges PEX with a scripted peer before metadata; after `MetadataReceived` no more `ut_pex` is sent and an incoming one emits no `PeersFound { source: Pex }`.
     - `pex_flood_is_bounded`: a scripted peer sends 20 `ut_pex` messages of 200 added addresses each, back to back. At most `MAX_PEX_ADDED` addresses are taken per accepted message, and only one message is accepted per gap.
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session pex`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test --workspace`: PASS.
-- [ ] **Step 5: Commit.** `feat(session): peer exchange (BEP 11), off for private torrents`
+- [ ] **Step 5: Commit.** `feat(session): peer exchange (BEP 11), off for private torrents` No trailers or attribution of any kind.
 
 ---
 
@@ -1112,14 +1193,14 @@ Behavior:
 
 - [ ] **Step 1: Write failing tests** in `tests/cli.rs`:
   - `info_prints_magnet_link`
-  - `download_magnet_from_seed_process`: `seed --no-dht --port 0` (port read from a new first output line `listening on <addr>`), then `download "magnet:?xt=urn:btih:<hash>&x.pe=127.0.0.1:<port>" --no-dht --out <tmp>`. Exit 0 within 60 s, files identical, stdout contains `metadata received:`.
+  - `download_magnet_from_seed_process`: `seed --no-dht --port 0` (port read from the existing `listening on <addr>` line, `main.rs:180`), then `download "magnet:?xt=urn:btih:<hash>&x.pe=127.0.0.1:<port>" --no-dht --out <tmp>`. Exit 0 within 60 s, files identical, stdout contains `metadata received:`.
   - `encryption_forced_download_from_seed_process`
   - `dht_node_starts_and_stops`: `dht-node --port 0 --run-for 1` exits 0 and printed `dht node listening on`.
   - `bad_magnet_is_a_clean_error`: exit 1 and stderr starting with `error:`.
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-example`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test -p fbt-example -p fbt && RUSTDOCFLAGS="-D warnings" cargo doc -p fbt --no-deps`: PASS.
-- [ ] **Step 5: Commit.** `feat(fbt): magnet, encryption and DHT in the facade and example CLI`
+- [ ] **Step 5: Commit.** `feat(fbt): magnet, encryption and DHT in the facade and example CLI` No trailers or attribution of any kind.
 
 ---
 
@@ -1127,7 +1208,7 @@ Behavior:
 
 **Files:**
 - Create: `fuzz/fuzz_targets/{krpc.rs,extension.rs,mse.rs,magnet.rs}`, `fuzz/seeds/{krpc,extension,mse,magnet}/`.
-- Modify: `fuzz/Cargo.toml` (deps `fbt-dht`, `tokio` with `rt` and `io-util`; four `[[bin]]`s), `.github/workflows/fuzz.yml`, `CLAUDE.md` (fuzz target list).
+- Modify: `fuzz/Cargo.toml` (deps `fbt-dht`, `tokio` with `rt` and `io-util`; four `[[bin]]`s), `.github/workflows/fuzz.yml`, `crates/fbt-dht/src/lib.rs` (`#[doc(hidden)] pub mod krpc;`). (`CLAUDE.md` is edited only in Task 19.)
 
 **Interfaces:**
 - Consumes:
@@ -1151,7 +1232,7 @@ Behavior:
   - Add the four targets to the matrix, and `crates/fbt-dht/**` to the PR paths.
   - Add `workflow_dispatch` with input `seconds` (default `600`); the run time is the input, else 1200 on schedule, else 60.
   - Persist the corpus with `actions/cache@v4`: path `fuzz/corpus/${{ matrix.target }}`, key `fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}`, `restore-keys: fuzz-corpus-${{ matrix.target }}-`. Add a `cargo fuzz cmin` step on schedule runs before the cache saves.
-- [ ] **Step 4: Commit.** `test(fuzz): KRPC, extension, MSE and magnet targets; persisted corpus and manual runs`
+- [ ] **Step 4: Commit.** `test(fuzz): KRPC, extension, MSE and magnet targets; persisted corpus and manual runs` No trailers or attribution of any kind.
 
 ---
 
@@ -1198,7 +1279,7 @@ New `run.sh` scenarios, after the M1 ones:
 - [ ] **Step 1: Write the files.** Run `bash dev/interop/run.sh` locally (Docker Desktop on macOS works with the bridge network, as in M1).
 - [ ] **Step 2: Verify.** Output ends with the M1 lines plus `interop: encryption OK (qbittorrent, transmission)`, `interop: magnet via DHT OK` and `interop: PEX OK`, and the script exits 0. Run `docker network inspect fbt-interop_swarm --format '{{.Internal}}'` while it runs; it should print `true`.
 - [ ] **Step 3: Raise the CI `interop` timeout** to 40 minutes in `.github/workflows/ci.yml`, and add `target/interop/logs/` artifacts for the new logs.
-- [ ] **Step 4: Commit.** `ci: interop for magnet via DHT, forced encryption and PEX on an isolated network`
+- [ ] **Step 4: Commit.** `ci: interop for magnet via DHT, forced encryption and PEX on an isolated network` No trailers or attribution of any kind.
 
 ---
 
@@ -1211,22 +1292,22 @@ New `run.sh` scenarios, after the M1 ones:
   - `README.md`: feature list (DHT, magnets, MSE, PEX), a magnet usage example matching the `fbt` doctest, and the DHT defaults with how to override them.
   - `CHANGELOG.md` `## [Unreleased]`:
     - `### Added` per crate (`fbt-dht` new; wire extension messages and MSE; magnets; session magnet, DHT, PEX, encryption; example `dht-node`; fuzz targets; interop scenarios).
-    - `### Changed`: `AddTorrent.metainfo` becomes `source: TorrentSource`, `Limits` gains `max_items`, new `TorrentState` and `Event` variants, `PeerEvent::Connected` gains `encrypted` (internal), and simultaneous dials keep the lower-peer-id initiator's connection.
+    - `### Changed`: `AddTorrent.metainfo` becomes `source: TorrentSource`, `Limits` gains `max_items`, new `TorrentState` and `Event` variants, and simultaneous dials keep the lower-peer-id initiator's connection.
     - `### Fixed`: duplicate `completed`, and `left` on a recheck `stopped`.
-  - `CLAUDE.md`:
+  - `CLAUDE.md` (the only task that edits it):
     - crate list with `fbt-dht`;
     - the clippy deny list naming `fbt-dht`;
     - the rule "tests never contact public DHT nodes; `test_settings()` disables the DHT";
     - the fuzz targets list;
     - the interop scenarios line.
 - [ ] **Step 2: Run the full gate.** `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace && cargo deny --all-features check && bash dev/check-pure-rust.sh && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps && bash dev/sast.sh`: all pass.
-- [ ] **Step 3: Commit.** `docs: milestone 2 changelog, README and CLAUDE.md`
+- [ ] **Step 3: Commit.** `docs: milestone 2 changelog, README and CLAUDE.md` No trailers or attribution of any kind.
 
 ---
 
 ## After the plan: shipping v0.2.0
 
-PR `feature/m2-must-haves` → `develop`. Every CI job must be green, including `interop` and the fuzz runs the PR triggers. The PR body lists the decisions made on the owner's behalf (the "Decision" list of this plan's review) and a "Deferred to later milestones" section. Then follow the Gitflow release:
+PR `feature/m2-must-haves` → `develop`. Every CI job must be green, including `interop` and the fuzz runs the PR triggers. The PR body lists the decisions made on the owner's behalf and a "Deferred to later milestones" section. Then follow the Gitflow release:
 
 1. `release/0.2.0` off `develop`: bump the workspace version to `0.2.0` (the peer-id prefix becomes `-FB0200-` and the KRPC `v` becomes `FB\x00\x02` automatically). Move `Unreleased` to `## [0.2.0] - <date>`, and check `bash dev/test-release-version.sh`.
 2. PR into `main`, then the annotated tag `v0.2.0`, then merge `main` back into `develop`.
