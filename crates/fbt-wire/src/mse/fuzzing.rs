@@ -22,14 +22,12 @@ pub async fn initiate_fixed<S: AsyncRead + AsyncWrite + Unpin>(
     private: [u8; 20],
     pad_len: usize,
 ) -> Result<MseStream<S>, MseError> {
-    initiate_with(
-        stream,
-        info_hash,
-        provide,
-        ia,
-        KeyPair::from_private(&private),
-        vec![0; pad_len.min(MSE_MAX_PAD)],
-    )
+    initiate_with(stream, info_hash, provide, ia, || {
+        (
+            KeyPair::from_private(&private),
+            vec![0; pad_len.min(MSE_MAX_PAD)],
+        )
+    })
     .await
 }
 
@@ -43,13 +41,11 @@ pub async fn respond_fixed<S: AsyncRead + AsyncWrite + Unpin>(
     private: [u8; 20],
     pad_len: usize,
 ) -> Result<(MseStream<S>, [u8; 20]), MseError> {
-    respond_with(
-        stream,
-        prefix,
-        lookup,
-        allowed,
-        KeyPair::from_private(&private),
-        vec![0; pad_len.min(MSE_MAX_PAD)],
-    )
+    respond_with(stream, prefix, lookup, allowed, || {
+        (
+            KeyPair::from_private(&private),
+            vec![0; pad_len.min(MSE_MAX_PAD)],
+        )
+    })
     .await
 }
