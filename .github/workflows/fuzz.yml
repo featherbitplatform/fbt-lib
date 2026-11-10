@@ -1,0 +1,58 @@
+name: Fuzz
+
+# Fuzzes every parser of remote input. Short run on pull requests that touch a
+# parser; long run weekly (Mondays 05:30, as in security.yml).
+
+on:
+  pull_request:
+    paths:
+      - "crates/fbt-bencode/**"
+      - "crates/fbt-metainfo/**"
+      - "crates/fbt-wire/**"
+      - "crates/fbt-tracker/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "30 5 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - bencode
+          - metainfo
+          - wire_codec
+          - handshake
+          - http_announce
+          - udp_announce
+          - path
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
+      - name: Fuzz
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
+            -- -max_total_time=${{ github.event_name == 'schedule' && 1200 || 60 }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/

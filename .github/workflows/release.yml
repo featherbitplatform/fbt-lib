@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - dev/release-version.sh
+      - dev/test-release-version.sh
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+# Read-only by default; only the release job (tag pushes) gets write access.
+permissions:
+  contents: read
+
+jobs:
+  # A tag must be v<workspace version>; the resolver and the changelog extraction are tested
+  # with fake refs and files (pull requests cannot try a real tag).
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolver tests
+        run: bash dev/test-release-version.sh
+      - name: Resolve version
+        id: version
+        run: bash dev/release-version.sh
+
+  # CycloneDX SBOM of the workspace's crates (Cargo.lock). Same generator, name and syft
+  # version as `bash dev/sast.sh sbom`.
+  sbom:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned, so a release SBOM never changes format with an unreviewed syft release.
+      - name: Install syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.54.1
+      - name: Generate the SBOM
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/dist
+          "$SYFT" scan file:Cargo.lock \
+            --source-name fbt-lib --source-version "$VERSION" \
+            -o "cyclonedx-json=target/dist/fbt-lib-$VERSION.cdx.json"
+          # An SBOM without components means syft read nothing from the lockfile.
+          jq -e '.components | length > 0' "target/dist/fbt-lib-$VERSION.cdx.json" > /dev/null \
+            || { echo "::error::no components in the SBOM"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fbt-lib-sbom
+          if-no-files-found: error
+          path: target/dist/fbt-lib-${{ needs.verify.outputs.version }}.cdx.json
+
+  # The GitHub release: the tag's CHANGELOG.md section as the body, the SBOM attached. Only a
+  # tag push publishes. Nothing is published to crates.io.
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: fbt-lib-sbom
+          path: dist
+      - name: Release notes from the changelog
+        run: bash dev/release-version.sh --notes > "$RUNNER_TEMP/notes.md"
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" --verify-tag --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${prerelease[@]}" \
+            "dist/fbt-lib-$VERSION.cdx.json"
