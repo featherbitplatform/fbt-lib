@@ -542,6 +542,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-dht"
+version = "0.1.0"
+dependencies = [
+ "fbt-bencode",
+ "fbt-core",
+ "proptest",
+ "rand",
+ "sha1",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-example"
 version = "0.1.0"
 dependencies = [

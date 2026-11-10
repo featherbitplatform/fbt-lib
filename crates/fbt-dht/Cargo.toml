@@ -1,0 +1,23 @@
+[package]
+name = "fbt-dht"
+description = "Mainline DHT (BEP 5) node: node ids, KRPC messages, routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fbt-core = { path = "../fbt-core" }
+fbt-bencode = { path = "../fbt-bencode" }
+sha1.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
