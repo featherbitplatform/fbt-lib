@@ -18,6 +18,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::warn;
 
+use super::announcer::{self, Announcer, STOPPED_TIMEOUT, Signals};
 use super::data::Job;
 use super::peers::{Peer, Retries, remember};
 use super::{Cmd, piece_priorities, same_state};
@@ -101,6 +102,10 @@ pub(crate) struct Actor {
     /// `TorrentFinished` was emitted for the current set of wanted pieces.
     pub(super) finished_emitted: bool,
     pub(super) rng: StdRng,
+    /// The announcer task; `None` without trackers.
+    pub(super) announcer: Option<Announcer>,
+    /// Peers from tracker replies; `None` once the announcer is gone.
+    pub(super) tracker_rx: Option<mpsc::Receiver<Vec<SocketAddr>>>,
 }
 
 impl Actor {
@@ -117,6 +122,13 @@ impl Actor {
         let total_wanted = wanted_bytes(&meta.piece_layout(), &piece_prio);
         let choker = Choker::new(shared.settings.unchoke_slots);
         let retries = Retries::new(shared.settings.peer_retry_delay);
+        let (announcer, tracker_rx) = announcer::spawn(announcer::Params {
+            ih: meta.info_hashes,
+            trackers: meta.trackers.clone(),
+            shared: Arc::clone(&shared),
+            status: status_tx.subscribe(),
+        })
+        .unzip();
         Actor {
             ih: meta.info_hashes,
             layout: meta.piece_layout(),
@@ -149,6 +161,8 @@ impl Actor {
             last_state: TorrentState::CheckingFiles { progress: 0.0 },
             finished_emitted: false,
             rng: rand::make_rng(),
+            announcer,
+            tracker_rx,
         }
     }
 
@@ -175,6 +189,10 @@ impl Actor {
                     }
                 }
                 Some(ev) = self.peer_rx.recv() => self.on_peer_event(ev),
+                peers = recv_opt(&mut self.tracker_rx) => match peers {
+                    Some(peers) => self.on_tracker_peers(peers),
+                    None => self.tracker_rx = None,
+                },
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
                     self.queue_retries();
@@ -287,7 +305,39 @@ impl Actor {
                 torrent: self.ih,
                 state,
             });
+            let running = self.active();
+            self.signal(|s| {
+                if s.running == running {
+                    return false;
+                }
+                s.running = running;
+                if running {
+                    s.starts = s.starts.wrapping_add(1);
+                }
+                true
+            });
         }
+    }
+
+    // ----- announcing ---------------------------------------------------------
+
+    /// Updates the announcer's signals; `f` returns whether it changed them.
+    /// Never waits.
+    pub(super) fn signal(&self, f: impl FnOnce(&mut Signals) -> bool) {
+        if let Some(a) = &self.announcer {
+            a.signals.send_if_modified(f);
+        }
+    }
+
+    /// Peers from a tracker reply join the known addresses, as `add_peer`
+    /// does.
+    fn on_tracker_peers(&mut self, peers: Vec<SocketAddr>) {
+        for addr in peers {
+            if !self.retries.is_never(&addr) && remember(&mut self.known, addr) && self.active() {
+                self.queue_addr(addr);
+            }
+        }
+        self.try_connect();
     }
 
     // ----- checking -----------------------------------------------------------
@@ -378,8 +428,11 @@ impl Actor {
                 self.recheck();
                 let _ = tx.send(());
             }
-            // Task 15: announcing.
             Cmd::Reannounce(tx) => {
+                self.signal(|s| {
+                    s.reannounces = s.reannounces.wrapping_add(1);
+                    true
+                });
                 let _ = tx.send(());
             }
             Cmd::SetPriorities(p, tx) => {
@@ -471,7 +524,15 @@ impl Actor {
 
     /// Closes every peer, waits for running jobs, flushes and optionally
     /// deletes the data. The actor exits afterwards.
+    /// On shutdown (`remove` is `None`) it also waits up to
+    /// [`STOPPED_TIMEOUT`] for the `stopped` announce; on remove that
+    /// announce finishes on its own.
     pub(super) async fn stop(&mut self, remove: Option<RemoveMode>) -> Result<(), SessionError> {
+        let announce_deadline = Instant::now() + STOPPED_TIMEOUT;
+        self.signal(|s| {
+            s.exit = true;
+            true
+        });
         self.close_all();
         let deadline = Instant::now() + PEER_DRAIN_TIMEOUT;
         while !self.peers.is_empty() {
@@ -501,6 +562,17 @@ impl Actor {
         })
         .await
         .unwrap_or_else(|e| Err(io::Error::other(e)));
+        if let Some(a) = self.announcer.take()
+            && remove.is_none()
+        {
+            let mut task = a.task;
+            if tokio::time::timeout_at(announce_deadline, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
         match r {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -512,6 +584,14 @@ impl Actor {
                 }
             }
         }
+    }
+}
+
+/// The next message of `rx`; pending forever without one.
+async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use fbt_core::{InfoHashes, PeerId};
 use fbt_metainfo::Metainfo;
+use fbt_tracker::TrackerClient;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -94,6 +95,10 @@ impl AddTorrent {
 pub(crate) struct Shared {
     pub settings: Arc<Settings>,
     pub peer_id: PeerId,
+    /// Port of the peer listener, as announced to trackers.
+    pub listen_port: u16,
+    /// Shared by every torrent's announcer.
+    pub tracker: TrackerClient,
     pub events: broadcast::Sender<Event>,
     pub shutdown: AtomicBool,
     /// Peer tasks alive across the session (connecting or connected).
@@ -196,10 +201,14 @@ impl Session {
             .await
             .map_err(SessionError::Bind)?;
         let local_addr = listener.local_addr().map_err(SessionError::Bind)?;
+        let tracker =
+            TrackerClient::new(settings.tracker.clone()).map_err(SessionError::Tracker)?;
         let (events, _) = broadcast::channel(settings.event_queue.max(1));
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
+            listen_port: local_addr.port(),
+            tracker,
             events,
             shutdown: AtomicBool::new(false),
             global_peers: AtomicUsize::new(0),
@@ -294,7 +303,8 @@ impl Session {
         EventStream::new(self.inner.shared.events.subscribe(), mask)
     }
 
-    /// Stops the listener and every torrent, waiting for pending writes.
+    /// Stops the listener and every torrent, waiting for pending writes and
+    /// for up to 5 s for the `stopped` announces (sent in parallel).
     /// Idempotent; afterwards every command returns
     /// [`SessionError::Shutdown`].
     pub async fn shutdown(&self) {

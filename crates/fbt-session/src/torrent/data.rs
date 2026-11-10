@@ -205,7 +205,8 @@ impl Actor {
                 self.update_interest(key);
             }
         }
-        if finished && !self.finished_emitted {
+        let just_finished = finished && !self.finished_emitted;
+        if just_finished {
             self.finished_emitted = true;
             self.emit(Event::TorrentFinished { torrent: self.ih });
             let storage = Arc::clone(&self.storage);
@@ -215,5 +216,9 @@ impl Actor {
                 .spawn_blocking(move || Job::Flushed(storage.flush()));
         }
         self.refresh_state();
+        if just_finished {
+            // After `refresh_state`, so the announce reads `left` = 0.
+            self.signal(|s| !std::mem::replace(&mut s.completed, true));
+        }
     }
 }

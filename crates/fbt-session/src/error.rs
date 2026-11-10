@@ -27,6 +27,9 @@ pub enum SessionError {
     /// The session was shut down.
     #[error("session shut down")]
     Shutdown,
+    /// The tracker client could not be built.
+    #[error("cannot build the tracker client: {0}")]
+    Tracker(#[source] fbt_tracker::TrackerError),
     /// A storage operation failed.
     #[error("storage error: {0}")]
     Storage(#[source] io::Error),

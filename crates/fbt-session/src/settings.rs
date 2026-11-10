@@ -49,6 +49,11 @@ pub struct Settings {
     pub num_want: u32,
     /// Tracker client settings.
     pub tracker: TrackerConfig,
+    /// First wait after every tracker failed; doubles with each further
+    /// failed round, up to 30 minutes. Internal tunable (tests shorten it);
+    /// not part of the stable API.
+    #[doc(hidden)]
+    pub tracker_retry_base: Duration,
 }
 
 impl Default for Settings {
@@ -72,6 +77,7 @@ impl Default for Settings {
             event_queue: 4096,
             num_want: 50,
             tracker: TrackerConfig::default(),
+            tracker_retry_base: Duration::from_secs(60),
         }
     }
 }

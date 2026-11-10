@@ -5,11 +5,14 @@
 //!   block requests.
 //! - `data`: block buffering, piece verification and writes.
 //! - `serve`: answering block requests from peers.
+//! - `announcer`, `tiers`: announcing to the trackers (BEP 12 tiers).
 
 mod actor;
+mod announcer;
 mod data;
 mod peers;
 mod serve;
+mod tiers;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
