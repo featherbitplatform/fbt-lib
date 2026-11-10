@@ -14,8 +14,12 @@
     )
 )]
 
+#[allow(dead_code)] // used by conn.rs from Task 7 on
+mod ledbat;
 #[doc(hidden)]
 pub mod packet;
+#[allow(dead_code)] // used by conn.rs from Task 7 on
+mod rtt;
 
 pub use packet::{
     HEADER_LEN, MAX_EXTENSIONS, MAX_SACK_LEN, Packet, PacketError, PacketType, sack_acks, seq_le,
