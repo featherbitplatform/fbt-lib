@@ -582,6 +582,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-net"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "fbt-core",
+ "proptest",
+ "rand",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-session"
 version = "0.2.0"
 dependencies = [
