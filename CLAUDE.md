@@ -38,6 +38,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo deny --all-features check
+bash dev/check-pure-rust.sh   # pure-rust build has no ring or cc
+
+# Release plumbing: tag check + changelog extraction (tested with fake refs)
+bash dev/test-release-version.sh
+bash dev/release-version.sh --notes   # the current version's CHANGELOG section
 
 # Local security scans via Docker (semgrep, deny, grype, gitleaks, sbom)
 bash dev/sast.sh              # everything
