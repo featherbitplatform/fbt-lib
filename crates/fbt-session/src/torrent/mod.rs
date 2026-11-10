@@ -14,8 +14,11 @@
 
 mod actor;
 mod announcer;
+mod check;
+mod commands;
 mod data;
 mod dht;
+mod magnet;
 mod metadata;
 mod peers;
 mod pex;

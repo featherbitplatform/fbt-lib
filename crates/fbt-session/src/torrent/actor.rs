@@ -6,42 +6,38 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::ops::ControlFlow;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use fbt_core::{Bitfield, InfoHashes, PieceLayout};
-use fbt_metainfo::{Magnet, Metainfo, MetainfoError};
+use fbt_core::{InfoHashes, PieceLayout};
+use fbt_metainfo::Metainfo;
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::warn;
 
-use super::announcer::{self, Announcer, STOPPED_TIMEOUT, Signals};
+use super::announcer::{self, Announcer, Signals};
 use super::data::Job;
 use super::dht::{self, DhtAnnouncer, DhtParams};
+use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
-use super::swarm::{BanTarget, Known, Peer, Retries, dialable};
+use super::swarm::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
-use crate::error::SessionError;
 use crate::event::{Event, PeerSource};
-use crate::peer::messages::{PeerCommand, PeerEvent};
+use crate::peer::messages::PeerEvent;
 use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
-use crate::session::{
-    AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource, release,
-};
+use crate::session::{AddTorrent, Priority, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
-use crate::storage::{FsStorage, Storage, check_pieces};
+use crate::storage::Storage;
 
 /// Capacity of the channel carrying every peer's events into the actor.
 const PEER_EVENT_QUEUE: usize = 1024;
 /// How long remove and shutdown wait for peer tasks to report back.
-const PEER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const PEER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 thread_local! {
@@ -80,7 +76,7 @@ pub(super) struct Counters {
 }
 
 /// What the main loop does after a command.
-enum Flow {
+pub(super) enum Flow {
     Continue,
     Exit,
 }
@@ -102,7 +98,7 @@ pub(super) struct Loaded {
 }
 
 impl Loaded {
-    fn new(meta: Arc<Metainfo>, file_prio: Vec<Priority>, sequential: bool) -> Self {
+    pub(super) fn new(meta: Arc<Metainfo>, file_prio: Vec<Priority>, sequential: bool) -> Self {
         let layout = meta.piece_layout();
         let piece_prio = piece_priorities(&meta, &file_prio);
         let total_wanted = wanted_bytes(&layout, &piece_prio);
@@ -116,24 +112,6 @@ impl Loaded {
             sequential,
             bufs: HashMap::new(),
         }
-    }
-}
-
-/// A magnet torrent until its metadata arrives.
-#[derive(Debug)]
-pub(super) struct MagnetState {
-    pub fetch: MetadataFetch,
-    pub magnet: Magnet,
-    pub save_path: PathBuf,
-    /// The custom storage from `AddTorrent`, used once the metadata is in.
-    pub storage: Option<Arc<dyn Storage>>,
-    pub sequential: bool,
-}
-
-impl MagnetState {
-    /// A fresh fetch; completed buffers are verified in `spawn_blocking`.
-    pub(super) fn new_fetch(&self, max_size: usize) -> MetadataFetch {
-        MetadataFetch::new(self.magnet.info_hashes, max_size).deferred()
     }
 }
 
@@ -587,73 +565,6 @@ impl Actor {
 
     // ----- checking -----------------------------------------------------------
 
-    pub(super) fn start_check(&mut self) {
-        // A check still running belongs to an older generation: stop it
-        // instead of letting checks pile up.
-        self.cancel_check();
-        let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_mut()) else {
-            return;
-        };
-        let storage = Arc::clone(storage);
-        l.picker = None;
-        let meta = Arc::clone(&l.meta);
-        let layout = l.layout;
-        let done = Arc::new(AtomicU32::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.phase = Phase::Checking {
-            done: Arc::clone(&done),
-            cancel: Arc::clone(&cancel),
-        };
-        let generation = self.generation;
-        self.jobs.spawn_blocking(move || {
-            let result = check_pieces(&*storage, &layout, &meta.info.pieces, |i| {
-                done.store(i.saturating_add(1), Ordering::Relaxed);
-                if cancel.load(Ordering::Relaxed) {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            });
-            Job::Checked { generation, result }
-        });
-    }
-
-    /// Stops the running check, if any, at its next piece.
-    fn cancel_check(&self) {
-        if let Phase::Checking { cancel, .. } = &self.phase {
-            cancel.store(true, Ordering::Relaxed);
-        }
-    }
-
-    pub(super) fn on_checked(&mut self, generation: u64, result: io::Result<Bitfield>) {
-        if generation != self.generation {
-            return;
-        }
-        match result {
-            Ok(have) => {
-                let Some(l) = self.loaded.as_mut() else {
-                    return;
-                };
-                let mut picker = PiecePicker::new(l.layout, &have);
-                picker.set_piece_priorities(&l.piece_prio);
-                picker.set_sequential(l.sequential);
-                // Peers still connected (a magnet keeps those it fetched
-                // the metadata through) count toward availability.
-                add_availability(&mut picker, &self.peers, self.generation);
-                // Finishing during this session is what `TorrentFinished` reports.
-                self.finished_emitted = picker.is_finished();
-                l.picker = Some(picker);
-                self.phase = Phase::Ready;
-                self.metadata_check = false;
-                self.refresh_state();
-                self.catch_up_peers();
-                self.requeue_known();
-                self.try_connect();
-            }
-            Err(e) => self.fail(&e, "checking files"),
-        }
-    }
-
     // ----- errors -------------------------------------------------------------
 
     /// A storage error: the torrent stops with `TorrentState::Error`.
@@ -696,332 +607,7 @@ impl Actor {
 
     // ----- metadata -------------------------------------------------------------
 
-    /// A complete metadata buffer was hashed and parsed off the actor.
-    pub(super) fn on_metadata_job(
-        &mut self,
-        key: PeerKey,
-        ban: Option<BanTarget>,
-        result: Result<Box<Metainfo>, MetainfoError>,
-    ) {
-        if self.loaded.is_some() || !matches!(self.phase, Phase::Metadata) {
-            return;
-        }
-        match result {
-            Ok(meta) => self.install_metadata(*meta),
-            Err(MetainfoError::InfoHashMismatch) => {
-                let sends = self
-                    .magnet
-                    .as_mut()
-                    .map(|m| m.fetch.on_verify_failed(key))
-                    .unwrap_or_default();
-                if self.peers.contains_key(&key) {
-                    self.ban(key);
-                } else if let Some(t) = ban {
-                    self.apply_ban(t);
-                }
-                self.send_metadata(sends);
-            }
-            Err(e) => self.metadata_failed(format!("invalid metadata: {e}")),
-        }
-    }
-
-    /// The verified metadata: build `Loaded` and the storage, tell the
-    /// handle and every peer, then check the existing data as for a
-    /// `.torrent`.
-    fn install_metadata(&mut self, meta: Metainfo) {
-        let Some(m) = self.magnet.take() else {
-            return;
-        };
-        let m = *m;
-        let file_prio = selected_priorities(meta.info.files.len(), m.magnet.select_only.as_deref());
-        let storage: Arc<dyn Storage> = match m.storage {
-            Some(s) => s,
-            None => Arc::new(FsStorage::new(m.save_path, &meta)),
-        };
-        let meta = Arc::new(meta);
-        let loaded = Loaded::new(Arc::clone(&meta), file_prio, m.sequential);
-        let layout = loaded.layout;
-        let total_wanted = loaded.total_wanted;
-        self.install(loaded, storage);
-        let _ = self.metainfo_cell.set(meta);
-        // Whoever reacts to the event sees `has_metadata` already.
-        self.publish();
-        self.emit(Event::MetadataReceived { torrent: self.ih });
-        // Peers were set up with no pieces; they get the layout now.
-        let n = layout.num_pieces();
-        if self.is_private() {
-            // The magnet exception ends here: off the DHT and PEX at once.
-            self.dht_announcer = None;
-            self.dht_rx = None;
-            self.drop_pex_peers();
-        }
-        let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
-        for key in keys {
-            let Some(addr) = self.peers.get(&key).map(|p| p.addr) else {
-                continue;
-            };
-            let ext = self.ext_config(&addr);
-            if let Some(p) = self.peers.get_mut(&key) {
-                p.bits = Bitfield::new(n);
-                p.fast_has = None;
-                if p.have_sent.is_some() {
-                    p.have_sent = Some(Bitfield::new(n));
-                }
-            }
-            self.send(key, PeerCommand::MetadataReady { layout, ext });
-        }
-        // Until the check is done, `stopped` (if any) reports everything
-        // as left.
-        self.signal(|s| {
-            s.left = total_wanted;
-            true
-        });
-        self.metadata_check = true;
-        self.start_check();
-        self.refresh_state();
-    }
-
-    /// Advances the metadata fetch's timers.
-    fn metadata_tick(&mut self) {
-        let now = Instant::now();
-        let sends = match self.magnet.as_mut() {
-            Some(m) if matches!(self.phase, Phase::Metadata) => m.fetch.on_tick(now),
-            _ => return,
-        };
-        self.send_metadata(sends);
-        self.close_useless_metadata_peer(now);
-    }
-
     // ----- commands -----------------------------------------------------------
-
-    async fn on_cmd(&mut self, cmd: Cmd) -> Flow {
-        match cmd {
-            Cmd::Pause(tx) => {
-                if !self.paused {
-                    self.paused = true;
-                    self.metadata_check = false;
-                    self.close_all();
-                    self.refresh_state();
-                }
-                let _ = tx.send(());
-            }
-            Cmd::Resume(tx) => {
-                self.resume();
-                let _ = tx.send(());
-            }
-            Cmd::Recheck(tx) => {
-                self.recheck();
-                let _ = tx.send(());
-            }
-            Cmd::Reannounce(tx) => {
-                self.signal(|s| {
-                    s.reannounces = s.reannounces.wrapping_add(1);
-                    true
-                });
-                let _ = tx.send(());
-            }
-            Cmd::SetPriorities(p, tx) => {
-                self.set_priorities(p);
-                let _ = tx.send(());
-            }
-            Cmd::AddPeer(addr, tx) => {
-                if !self.retries.is_never(&addr) && self.remember(addr) {
-                    self.queue_addr(addr);
-                    self.try_connect();
-                }
-                let _ = tx.send(());
-            }
-            Cmd::Pieces(tx) => {
-                let bf = self.loaded.as_ref().map_or_else(
-                    || Bitfield::new(0),
-                    |l| {
-                        l.picker.as_ref().map_or_else(
-                            || Bitfield::new(l.layout.num_pieces()),
-                            |p| p.have().clone(),
-                        )
-                    },
-                );
-                let _ = tx.send(bf);
-            }
-            Cmd::Incoming {
-                stream,
-                handshake,
-                addr,
-            } => self.on_incoming(*stream, handshake, addr),
-            Cmd::Remove(mode, tx) => {
-                let r = self.stop(Some(mode)).await;
-                // Done here rather than by the caller, whose future may be
-                // dropped before this point.
-                if let Some(session) = self.session.upgrade()
-                    && session.unregister(&self.ih)
-                {
-                    self.emit(Event::TorrentRemoved { torrent: self.ih });
-                }
-                let _ = tx.send(r);
-                return Flow::Exit;
-            }
-            Cmd::Shutdown(tx) => {
-                let _ = self.stop(None).await;
-                let _ = tx.send(());
-                return Flow::Exit;
-            }
-        }
-        Flow::Continue
-    }
-
-    pub(super) fn resume(&mut self) {
-        let was_error = matches!(self.phase, Phase::Error(_));
-        self.paused = false;
-        if was_error && self.loaded.is_none() {
-            // Bad metadata: fetch it again from scratch.
-            let max = self.shared.settings.max_metadata_size;
-            if let Some(m) = self.magnet.as_mut() {
-                m.fetch = m.new_fetch(max);
-            }
-            self.phase = Phase::Metadata;
-        } else if was_error {
-            // Whatever was in flight when the error hit is unknown: forget
-            // the picker and partial pieces and trust only the disk. Peers
-            // of the old generation go too.
-            self.remember_left();
-            self.generation = self.generation.wrapping_add(1);
-            self.close_all();
-            self.clear_bufs();
-            self.start_check();
-        }
-        self.refresh_state();
-        self.requeue_known();
-        self.try_connect();
-    }
-
-    /// Tells the announcer how much is left, before a check drops the
-    /// picker: it reports this on `stopped`. Without a picker the figure is
-    /// meaningless and the earlier one stays.
-    fn remember_left(&self) {
-        if self.loaded.as_ref().is_none_or(|l| l.picker.is_none()) {
-            return;
-        }
-        let st = self.snapshot();
-        let left = st.total_wanted.saturating_sub(st.wanted_done);
-        self.signal(|s| {
-            s.left = left;
-            true
-        });
-    }
-
-    pub(super) fn recheck(&mut self) {
-        if self.loaded.is_none() {
-            return;
-        }
-        self.remember_left();
-        self.generation = self.generation.wrapping_add(1);
-        self.close_all();
-        self.clear_bufs();
-        self.start_check();
-        self.refresh_state();
-    }
-
-    pub(super) fn set_priorities(&mut self, p: Vec<Priority>) {
-        let Some(l) = self.loaded.as_mut() else {
-            return;
-        };
-        l.file_prio = p;
-        l.piece_prio = piece_priorities(&l.meta, &l.file_prio);
-        l.total_wanted = wanted_bytes(&l.layout, &l.piece_prio);
-        if let Some(picker) = l.picker.as_mut() {
-            picker.set_piece_priorities(&l.piece_prio);
-            // Partial pieces no longer wanted give back their buffers.
-            let skipped: Vec<u32> = picker
-                .partial_pieces()
-                .filter(|&i| l.piece_prio.get(i as usize).is_some_and(|&p| p == 0))
-                .collect();
-            for piece in skipped {
-                picker.piece_failed(piece);
-                l.bufs.remove(&piece);
-            }
-            if !picker.is_finished() {
-                self.finished_emitted = false;
-            }
-        }
-        let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
-        for key in keys {
-            self.update_interest(key);
-        }
-        self.top_up_all(None);
-        self.refresh_state();
-    }
-
-    /// Closes every peer, waits for running jobs, flushes and optionally
-    /// deletes the data. The actor exits afterwards.
-    /// On shutdown (`remove` is `None`) it also waits up to
-    /// [`STOPPED_TIMEOUT`] for the `stopped` announce; on remove that
-    /// announce finishes on its own.
-    pub(super) async fn stop(&mut self, remove: Option<RemoveMode>) -> Result<(), SessionError> {
-        let announce_deadline = Instant::now() + STOPPED_TIMEOUT;
-        self.signal(|s| {
-            s.exit = true;
-            true
-        });
-        self.dht_announcer = None;
-        self.dht_rx = None;
-        self.close_all();
-        // Its result would be thrown away; do not wait for a whole check.
-        self.cancel_check();
-        let deadline = Instant::now() + PEER_DRAIN_TIMEOUT;
-        // Only connected peers read their commands; one still connecting
-        // or handshaking ends on its own timeout, its slots released below.
-        while self.peers.values().any(|p| p.connected) {
-            match tokio::time::timeout_at(deadline, self.peer_rx.recv()).await {
-                Ok(Some(ev @ PeerEvent::Disconnected { .. })) => self.on_peer_event(ev),
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
-        // Peers that did not report back still hold session slots.
-        for (_, p) in self.peers.drain() {
-            if p.connecting {
-                release(&self.shared.half_open);
-            }
-            release(&self.shared.global_peers);
-        }
-        // Pending writes finish before files are flushed or deleted.
-        while self.jobs.join_next().await.is_some() {}
-        let delete = remove == Some(RemoveMode::DeleteData);
-        let r = match self.storage.clone() {
-            Some(storage) => tokio::task::spawn_blocking(move || {
-                if delete {
-                    storage.delete_files()
-                } else {
-                    storage.flush()
-                }
-            })
-            .await
-            .unwrap_or_else(|e| Err(io::Error::other(e))),
-            None => Ok(()),
-        };
-        if let Some(a) = self.announcer.take()
-            && remove.is_none()
-        {
-            let mut task = a.task;
-            if tokio::time::timeout_at(announce_deadline, &mut task)
-                .await
-                .is_err()
-            {
-                task.abort();
-            }
-        }
-        match r {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                warn!(torrent = %self.name(), error = %e, "flush or delete failed");
-                if delete {
-                    Err(SessionError::Storage(e))
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
 }
 
 /// The next message of `rx`; pending forever without one.
@@ -1032,49 +618,8 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
     }
 }
 
-/// Adds the pieces of every peer of `generation` to `picker`'s
-/// availability: the same peers whose pieces `Disconnected` removes again
-/// (closing ones included), so the counts never drift.
-fn add_availability(picker: &mut PiecePicker, peers: &HashMap<PeerKey, Peer>, generation: u64) {
-    for p in peers.values().filter(|p| p.generation == generation) {
-        picker.add_peer_pieces(p.pieces());
-    }
-}
-
-/// File priorities for `files` files from a magnet's `so` selection:
-/// unselected files are skipped; no selection means every file at `Normal`.
-/// The ranges are sorted first, so this is O(files + ranges log ranges).
-fn selected_priorities(
-    files: usize,
-    select: Option<&[std::ops::RangeInclusive<usize>]>,
-) -> Vec<Priority> {
-    let Some(select) = select else {
-        return Vec::new();
-    };
-    let mut ranges: Vec<(usize, usize)> = select.iter().map(|r| (*r.start(), *r.end())).collect();
-    ranges.sort_unstable();
-    let mut out = vec![Priority::Skip; files];
-    // Every file below `next` is already settled.
-    let mut next = 0usize;
-    for (start, end) in ranges {
-        let start = start.max(next);
-        let end = end.min(files.saturating_sub(1));
-        if start >= files {
-            break;
-        }
-        if start > end {
-            continue;
-        }
-        if let Some(slice) = out.get_mut(start..=end) {
-            slice.fill(Priority::Normal);
-        }
-        next = end.saturating_add(1);
-    }
-    out
-}
-
 /// Bytes of the pieces with a non-zero priority.
-fn wanted_bytes(layout: &PieceLayout, prio: &[u8]) -> u64 {
+pub(super) fn wanted_bytes(layout: &PieceLayout, prio: &[u8]) -> u64 {
     (0..layout.num_pieces())
         .filter(|&i| prio.get(i as usize).is_some_and(|&p| p > 0))
         .map(|i| u64::from(layout.piece_size(i)))
@@ -1083,6 +628,10 @@ fn wanted_bytes(layout: &PieceLayout, prio: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use fbt_core::Bitfield;
+
+    use super::super::check::add_availability;
+    use super::super::commands::selected_priorities;
     use super::*;
 
     /// A peer closed while the check ran (no command sender, still waiting
