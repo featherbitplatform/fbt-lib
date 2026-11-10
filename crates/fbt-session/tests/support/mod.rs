@@ -335,6 +335,8 @@ pub struct Announce {
     pub port: u16,
     /// `started`, `completed`, `stopped` or `none`.
     pub event: String,
+    /// The `left` the announcer reported.
+    pub left: u64,
 }
 
 /// How a fake tracker answers.
@@ -346,6 +348,9 @@ pub enum Reply {
     Failure(String),
     /// HTTP 500 (HTTP only).
     ServerError,
+    /// Peers, but a `completed` announce is answered only after the delay
+    /// (HTTP only). The announce is recorded at once.
+    PeersDelayCompleted(Duration),
 }
 
 #[derive(Debug, Default)]
@@ -486,12 +491,14 @@ async fn http_conn(
     let mut info_hash = [0u8; 20];
     let mut port = 0u16;
     let mut event = "none".to_owned();
+    let mut left = 0u64;
     for pair in query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
             "info_hash" => info_hash.copy_from_slice(&percent_decode(v)),
             "port" => port = v.parse().unwrap(),
             "event" => event = v.to_owned(),
+            "left" => left = v.parse().unwrap(),
             _ => {}
         }
     }
@@ -501,10 +508,16 @@ async fn http_conn(
         .announce(Announce {
             info_hash,
             port,
-            event,
+            event: event.clone(),
+            left,
         });
+    if let Reply::PeersDelayCompleted(d) = &reply
+        && event == "completed"
+    {
+        tokio::time::sleep(*d).await;
+    }
     let (status, body) = match reply {
-        Reply::Peers => {
+        Reply::Peers | Reply::PeersDelayCompleted(_) => {
             let c = compact(&peers);
             let mut body = format!("d8:intervali1800e5:peers{}:", c.len()).into_bytes();
             body.extend_from_slice(&c);
@@ -564,6 +577,7 @@ async fn udp_loop(
                     info_hash: b[16..36].try_into().unwrap(),
                     port: u16::from_be_bytes([b[96], b[97]]),
                     event: event.to_owned(),
+                    left: u64::from_be_bytes(b[64..72].try_into().unwrap()),
                 });
             match &reply {
                 Reply::Failure(msg) => {

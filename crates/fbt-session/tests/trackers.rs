@@ -251,3 +251,78 @@ async fn pause_announces_stopped_and_resume_started() {
         ["started", "stopped", "started", "none", "stopped"]
     );
 }
+
+/// Pausing while the `completed` reply is pending abandons that walk; after
+/// the resume `completed` is not sent a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupted_completed_walk_is_not_repeated() {
+    let tracker = FakeTracker::http(Reply::PeersDelayCompleted(Duration::from_secs(2))).await;
+    let (m, payload) = torrent(vec![vec![tracker.url.clone()]]);
+    let (seed, _sh) = seeder(&m, &payload, &tracker.url).await;
+    let (leech, lh, _storage, mut ev) = leecher(&m, payload.len()).await;
+    let port = leech.local_addr().port();
+    finished(&mut ev).await;
+    let completed = |t: &FakeTracker| {
+        t.events_of(port)
+            .iter()
+            .filter(|e| *e == "completed")
+            .count()
+    };
+    assert!(wait_until(|| completed(&tracker) == 1, T).await);
+    // The reply is still 2 s away.
+    lh.pause().await.unwrap();
+    assert!(wait_until(|| tracker.events_of(port).iter().any(|e| e == "stopped"), T).await);
+    lh.resume().await.unwrap();
+    assert!(
+        wait_until(
+            || tracker
+                .events_of(port)
+                .iter()
+                .filter(|e| *e == "started")
+                .count()
+                == 2,
+            T
+        )
+        .await
+    );
+    // Long enough for a repeated `completed` walk to show up.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(completed(&tracker), 1, "{:?}", tracker.events_of(port));
+    leech.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// A recheck stops the torrent for the files check; the `stopped` announce
+/// reports the `left` from before it, not the transient figure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recheck_stopped_reports_previous_left() {
+    let tracker = FakeTracker::http(Reply::Peers).await;
+    let (m, payload) = torrent(vec![vec![tracker.url.clone()]]);
+    // The first half of the pieces is on disk already.
+    let mut have = vec![0u8; payload.len()];
+    let half = 6 * 32_768;
+    have[..half].copy_from_slice(&payload[..half]);
+    let s = Session::new(settings()).await.unwrap();
+    let port = s.local_addr().port();
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(Arc::new(MemStorage::from_bytes(have)));
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+    let st = h.status();
+    let left = st.total_wanted - st.wanted_done;
+    assert!(left > 0 && left < st.total_wanted, "half done: {left}");
+    assert!(wait_until(|| !tracker.events_of(port).is_empty(), T).await);
+    h.force_recheck().await.unwrap();
+    assert!(
+        wait_until(|| tracker.events_of(port).iter().any(|e| e == "stopped"), T).await,
+        "{:?}",
+        tracker.events_of(port)
+    );
+    let stopped = tracker
+        .announces()
+        .into_iter()
+        .find(|a| a.event == "stopped")
+        .unwrap();
+    assert_eq!(stopped.left, left);
+    s.shutdown().await;
+}

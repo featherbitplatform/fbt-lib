@@ -583,6 +583,13 @@ impl Actor {
     }
 
     pub(super) fn recheck(&mut self) {
+        // The announcer reports this on `stopped`, while the picker is gone.
+        let st = self.snapshot();
+        let left = st.total_wanted.saturating_sub(st.wanted_done);
+        self.signal(|s| {
+            s.left = left;
+            true
+        });
         self.generation = self.generation.wrapping_add(1);
         self.close_all();
         self.clear_bufs();
