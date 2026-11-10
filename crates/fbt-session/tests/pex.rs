@@ -247,6 +247,19 @@ async fn private_magnet_stops_pex_at_metadata() {
     theirs.m.insert(UT_METADATA.to_owned(), THEIR_UT_METADATA);
     theirs.metadata_size = Some(raw.len() as u32);
     source.send_ext_handshake(&theirs).await;
+    // The session has registered the source as connected (its handshake
+    // alone does not say so) before another peer dials in, so the two
+    // connections never race in the torrent's bookkeeping.
+    assert!(
+        next_matching(
+            &mut ev,
+            |e| matches!(e, Event::PeerConnected { addr, .. } if *addr == source_addr),
+            T
+        )
+        .await
+        .is_some(),
+        "the session registers the metadata source"
+    );
 
     let mut other = ScriptedPeer::connect_with(
         leech.local_addr(),
