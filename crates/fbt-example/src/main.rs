@@ -7,9 +7,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
-use fbt::{AddTorrent, Metainfo, Session, Settings, TorrentHandle, TorrentState, TorrentStatus};
-use tokio::time::{Instant, MissedTickBehavior, interval};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use fbt::{
+    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, Magnet, Metainfo, PeerSource,
+    Session, Settings, TorrentHandle, TorrentState, TorrentStatus,
+};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
 #[derive(Parser)]
 #[command(version, about = "Example BitTorrent client built on fbt")]
@@ -18,12 +21,60 @@ struct Cli {
     command: Command,
 }
 
+/// Connection policy shared by `download` and `seed`.
+#[derive(Args)]
+struct NetArgs {
+    /// Peer connection encryption.
+    #[arg(long, value_enum)]
+    encryption: Option<Encryption>,
+    /// DHT bootstrap node; may be repeated and replaces the public defaults.
+    #[arg(long, value_name = "HOST:PORT", value_parser = host_port)]
+    dht_bootstrap: Vec<String>,
+    /// Do not run the DHT (no public DHT node is contacted).
+    #[arg(long)]
+    no_dht: bool,
+    /// Do not exchange peers with other peers (PEX).
+    #[arg(long)]
+    no_pex: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Encryption {
+    Forced,
+    Preferred,
+    Disabled,
+}
+
+fn host_port(s: &str) -> Result<String, String> {
+    match s.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => Ok(s.to_string()),
+        _ => Err("expected HOST:PORT".to_string()),
+    }
+}
+
+impl NetArgs {
+    fn apply(&self, settings: &mut Settings) {
+        settings.dht_enabled = !self.no_dht;
+        settings.pex_enabled = !self.no_pex;
+        if let Some(e) = self.encryption {
+            settings.encryption = match e {
+                Encryption::Forced => EncryptionPolicy::Forced,
+                Encryption::Preferred => EncryptionPolicy::Preferred,
+                Encryption::Disabled => EncryptionPolicy::Disabled,
+            };
+        }
+        if !self.dht_bootstrap.is_empty() {
+            settings.dht_bootstrap_nodes = self.dht_bootstrap.clone();
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Download a torrent.
     Download {
-        /// The .torrent file.
-        torrent: PathBuf,
+        /// A .torrent file, or a `magnet:` link.
+        torrent: String,
         /// Directory to download into.
         #[arg(long)]
         out: PathBuf,
@@ -36,9 +87,8 @@ enum Command {
         /// Extra peer to connect to; may be repeated.
         #[arg(long, value_name = "ADDR")]
         peer: Vec<SocketAddr>,
-        /// Do not run the DHT (no public DHT node is contacted).
-        #[arg(long)]
-        no_dht: bool,
+        #[command(flatten)]
+        net: NetArgs,
     },
     /// Seed a torrent whose data is already on disk.
     Seed {
@@ -53,9 +103,20 @@ enum Command {
         /// Stop after this many seconds (default: until Ctrl-C).
         #[arg(long, value_name = "SECS")]
         seed_for: Option<u64>,
-        /// Do not run the DHT (no public DHT node is contacted).
+        #[command(flatten)]
+        net: NetArgs,
+    },
+    /// Run a bare DHT node: no torrents, no default bootstrap nodes.
+    DhtNode {
+        /// UDP and TCP port to listen on (0 picks a free one).
         #[arg(long)]
-        no_dht: bool,
+        port: Option<u16>,
+        /// Node to bootstrap from; may be repeated.
+        #[arg(long, value_name = "HOST:PORT", value_parser = host_port)]
+        dht_bootstrap: Vec<String>,
+        /// Stop after this many seconds (default: until Ctrl-C).
+        #[arg(long, value_name = "SECS")]
+        run_for: Option<u64>,
     },
     /// Print what a .torrent file contains.
     Info {
@@ -94,15 +155,33 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             port,
             seed_for,
             peer,
-            no_dht,
-        } => transfer(&torrent, out, port, seed_for, &peer, true, no_dht).await,
+            net,
+        } => {
+            let source = if torrent
+                .get(..7)
+                .is_some_and(|h| h.eq_ignore_ascii_case("magnet:"))
+            {
+                Source::Magnet(Magnet::parse(&torrent)?)
+            } else {
+                Source::File(load(std::path::Path::new(&torrent))?)
+            };
+            transfer(source, out, port, seed_for, &peer, true, &net).await
+        }
         Command::Seed {
             torrent,
             data,
             port,
             seed_for,
-            no_dht,
-        } => transfer(&torrent, data, port, seed_for, &[], false, no_dht).await,
+            net,
+        } => {
+            let source = Source::File(load(&torrent)?);
+            transfer(source, data, port, seed_for, &[], false, &net).await
+        }
+        Command::DhtNode {
+            port,
+            dht_bootstrap,
+            run_for,
+        } => dht_node(port, dht_bootstrap, run_for).await,
     }
 }
 
@@ -131,6 +210,10 @@ fn info(path: &std::path::Path) -> Result<(), Error> {
             println!("  [{tier}] {url}");
         }
     }
+    let mut magnet = Magnet::from_info_hashes(m.info_hashes);
+    magnet.display_name = Some(m.info.name.clone());
+    magnet.trackers = m.trackers.iter().flatten().cloned().collect();
+    println!("magnet: {}", magnet.to_uri());
     Ok(())
 }
 
@@ -150,6 +233,7 @@ fn human_bytes(n: u64) -> String {
 
 fn state_name(state: TorrentState) -> &'static str {
     match state {
+        TorrentState::DownloadingMetadata => "metadata",
         TorrentState::CheckingFiles { .. } => "checking",
         TorrentState::Downloading => "downloading",
         TorrentState::Seeding => "seeding",
@@ -170,34 +254,118 @@ fn progress_line(s: &TorrentStatus) -> String {
     )
 }
 
+/// What `transfer` adds.
+enum Source {
+    File(Metainfo),
+    Magnet(Magnet),
+}
+
 /// Runs one torrent until it finishes (plus `seed_for`), errors, or Ctrl-C.
 async fn transfer(
-    torrent: &std::path::Path,
+    source: Source,
     dir: PathBuf,
     port: Option<u16>,
     seed_for: Option<u64>,
     peers: &[SocketAddr],
     download: bool,
-    no_dht: bool,
+    net: &NetArgs,
 ) -> Result<ExitCode, Error> {
-    let metainfo = load(torrent)?;
     let mut settings = Settings::default();
-    settings.dht_enabled = !no_dht;
+    net.apply(&mut settings);
     if let Some(port) = port {
         settings.listen_addr.set_port(port);
     }
     let session = Session::new(settings).await?;
     println!("listening on {}", session.local_addr());
-    let handle = session.add_torrent(AddTorrent::new(metainfo, dir)).await?;
+    let mut events = session.subscribe(EventMask::STATUS | EventMask::PEER);
+    let params = match source {
+        Source::File(m) => AddTorrent::new(m, dir),
+        Source::Magnet(m) => AddTorrent::magnet(m, dir),
+    };
+    let handle = session.add_torrent(params).await?;
     for peer in peers {
         handle.add_peer(*peer).await?;
     }
-    let code = watch(&handle, seed_for.map(Duration::from_secs), download).await;
+    let code = watch(
+        &handle,
+        &mut events,
+        seed_for.map(Duration::from_secs),
+        download,
+    )
+    .await;
     session.shutdown().await;
     Ok(code)
 }
 
-async fn watch(handle: &TorrentHandle, seed_for: Option<Duration>, download: bool) -> ExitCode {
+/// Runs a session with only the DHT until `run_for` elapses or Ctrl-C.
+async fn dht_node(
+    port: Option<u16>,
+    bootstrap: Vec<String>,
+    run_for: Option<u64>,
+) -> Result<ExitCode, Error> {
+    let mut settings = Settings::default();
+    settings.dht_enabled = true;
+    settings.dht_bootstrap_nodes = bootstrap;
+    if let Some(port) = port {
+        settings.listen_addr.set_port(port);
+    }
+    let session = Session::new(settings).await?;
+    println!("dht node listening on {}", session.local_addr());
+    let period = Duration::from_secs(10);
+    let mut tick = interval_at(Instant::now() + period, period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let deadline = run_for.map(|s| Instant::now() + Duration::from_secs(s));
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            Ok(()) = &mut ctrl_c => break,
+            _ = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            } => break,
+            _ = tick.tick() => {
+                if let Some(s) = session.dht_stats() {
+                    println!(
+                        "dht nodes: v4={} v6={} torrents={}",
+                        s.nodes_v4, s.nodes_v6, s.stored_info_hashes
+                    );
+                }
+            }
+        }
+    }
+    session.shutdown().await;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn source_name(source: PeerSource) -> &'static str {
+    match source {
+        PeerSource::Tracker => "tracker",
+        PeerSource::Dht => "dht",
+        PeerSource::Pex => "pex",
+        PeerSource::Magnet => "magnet",
+        _ => "other",
+    }
+}
+
+fn print_event(handle: &TorrentHandle, event: &Event) {
+    match event {
+        Event::MetadataReceived { .. } => println!("metadata received: {}", handle.status().name),
+        Event::PeersFound { source, count, .. } => {
+            println!("found {count} peers via {}", source_name(*source));
+        }
+        Event::PeerConnected { addr, .. } => println!("peer connected {addr}"),
+        _ => {}
+    }
+}
+
+async fn watch(
+    handle: &TorrentHandle,
+    events: &mut EventStream,
+    seed_for: Option<Duration>,
+    download: bool,
+) -> ExitCode {
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut seeding_since: Option<Instant> = None;
@@ -210,6 +378,10 @@ async fn watch(handle: &TorrentHandle, seed_for: Option<Duration>, download: boo
                 // Graceful stop; an unfinished download is a failure.
                 let done = matches!(handle.status().state, TorrentState::Seeding);
                 return if download && !done { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+            }
+            Some(ev) = events.recv() => {
+                print_event(handle, &ev);
+                continue;
             }
             _ = tick.tick() => {}
         }
