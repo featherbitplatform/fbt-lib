@@ -75,9 +75,10 @@ impl Actor {
             }
             PeerEvent::ExtHandshake { key, hs } => self.on_ext_handshake(key, hs),
             PeerEvent::Metadata { key, msg } => self.on_metadata_msg(key, msg),
-            // PEX and the DHT come with Tasks 14 and 15 (a private torrent,
-            // magnets included once their metadata says so, ignores both).
-            PeerEvent::Pex { .. } | PeerEvent::DhtPort { .. } => {}
+            // PEX comes with Task 15 (a private torrent, magnets included
+            // once their metadata says so, ignores it).
+            PeerEvent::Pex { .. } => {}
+            PeerEvent::DhtPort { key, port } => self.on_dht_port(key, port),
             PeerEvent::Disconnected {
                 key,
                 reason,
@@ -283,6 +284,18 @@ impl Actor {
     }
 
     // ----- metadata exchange (BEP 9) ------------------------------------------
+
+    /// A peer's `Port`: its DHT node joins ours (pinged first), unless the
+    /// torrent is private. Never waits.
+    fn on_dht_port(&mut self, key: PeerKey, port: u16) {
+        if self.is_private() {
+            return;
+        }
+        let (Some(dht), Some(p)) = (self.shared.dht.as_ref(), self.peers.get(&key)) else {
+            return;
+        };
+        dht.add_node(SocketAddr::new(p.addr.ip(), port));
+    }
 
     fn on_ext_handshake(&mut self, key: PeerKey, hs: Box<ExtHandshake>) {
         let size = hs.metadata_size;

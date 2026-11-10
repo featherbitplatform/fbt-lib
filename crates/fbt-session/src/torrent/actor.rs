@@ -22,12 +22,13 @@ use tracing::warn;
 
 use super::announcer::{self, Announcer, STOPPED_TIMEOUT, Signals};
 use super::data::Job;
+use super::dht::{self, DhtAnnouncer, DhtParams};
 use super::metadata::MetadataFetch;
 use super::swarm::{BanTarget, Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
 use crate::error::SessionError;
-use crate::event::Event;
+use crate::event::{Event, PeerSource};
 use crate::peer::messages::{PeerCommand, PeerEvent};
 use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
@@ -170,10 +171,17 @@ pub(crate) struct Actor {
     /// `TorrentFinished` was emitted for the current set of wanted pieces.
     pub(super) finished_emitted: bool,
     pub(super) rng: StdRng,
+    /// What the tracker and DHT announcers are told.
+    pub(super) signals: watch::Sender<Signals>,
     /// The announcer task; `None` without trackers.
     pub(super) announcer: Option<Announcer>,
     /// Peers from tracker replies; `None` once the announcer is gone.
     pub(super) tracker_rx: Option<mpsc::Receiver<Vec<SocketAddr>>>,
+    /// The DHT announcer; `None` without a session DHT, for a private
+    /// torrent, and once a magnet's metadata says private.
+    pub(super) dht_announcer: Option<DhtAnnouncer>,
+    /// Peers from DHT lookups; `None` with no DHT announcer.
+    pub(super) dht_rx: Option<mpsc::Receiver<Vec<SocketAddr>>>,
 }
 
 impl Actor {
@@ -222,13 +230,32 @@ impl Actor {
         let (peer_tx, peer_rx) = mpsc::channel(PEER_EVENT_QUEUE);
         let choker = Choker::new(shared.settings.unchoke_slots);
         let retries = Retries::new(shared.settings.peer_retry_delay);
+        let (signals, _) = watch::channel(Signals::default());
         let (announcer, tracker_rx) = announcer::spawn(announcer::Params {
             ih,
             trackers,
             shared: Arc::clone(&shared),
             status: status_tx.subscribe(),
+            signals: signals.subscribe(),
         })
         .unzip();
+        // A magnet's privacy is unknown yet: it runs one until it is known.
+        let private = loaded.as_ref().is_some_and(|l| l.meta.info.private);
+        let (dht_announcer, dht_rx) = shared
+            .dht
+            .clone()
+            .filter(|_| !private)
+            .map(|dht| {
+                dht::spawn(DhtParams {
+                    dht,
+                    info_hash: ih.wire_hash(),
+                    port: shared.listen_port,
+                    interval: shared.settings.dht_announce_interval,
+                    signals: signals.subscribe(),
+                    status: status_tx.subscribe(),
+                })
+            })
+            .unzip();
         let mut actor = Actor {
             ih,
             loaded,
@@ -256,8 +283,11 @@ impl Actor {
             last_state: TorrentState::CheckingFiles { progress: 0.0 },
             finished_emitted: false,
             rng: rand::make_rng(),
+            signals,
             announcer,
             tracker_rx,
+            dht_announcer,
+            dht_rx,
         };
         if actor.magnet.is_some() {
             actor.last_state = actor.state();
@@ -277,11 +307,16 @@ impl Actor {
             .as_ref()
             .map(|m| m.magnet.peers.clone())
             .unwrap_or_default();
+        let mut count = 0usize;
         for addr in hints {
-            if dialable(&addr) && self.remember(addr) {
-                self.queue_addr(addr);
+            if dialable(&addr) {
+                count = count.saturating_add(1);
+                if self.remember(addr) {
+                    self.queue_addr(addr);
+                }
             }
         }
+        self.peers_found(PeerSource::Magnet, count);
         self.sync_running();
         self.try_connect();
         let mut tick = tokio::time::interval(self.shared.settings.status_interval);
@@ -302,8 +337,12 @@ impl Actor {
                 }
                 Some(ev) = self.peer_rx.recv() => self.on_peer_event(ev),
                 peers = recv_opt(&mut self.tracker_rx) => match peers {
-                    Some(peers) => self.on_tracker_peers(peers),
+                    Some(peers) => self.on_found_peers(PeerSource::Tracker, peers),
                     None => self.tracker_rx = None,
+                },
+                peers = recv_opt(&mut self.dht_rx) => match peers {
+                    Some(peers) => self.on_found_peers(PeerSource::Dht, peers),
+                    None => self.dht_rx = None,
                 },
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
@@ -489,28 +528,45 @@ impl Actor {
 
     // ----- announcing ---------------------------------------------------------
 
-    /// Updates the announcer's signals; `f` returns whether it changed them.
-    /// Never waits.
+    /// Updates the announcers' signals; `f` returns whether it changed
+    /// them. Never waits.
     pub(super) fn signal(&self, f: impl FnOnce(&mut Signals) -> bool) {
-        if let Some(a) = &self.announcer {
-            a.signals.send_if_modified(f);
-        }
+        self.signals.send_if_modified(f);
     }
 
-    /// Peers from a tracker reply join the known addresses, as `add_peer`
-    /// does; addresses nobody can dial (port 0, unspecified, multicast) are
-    /// dropped.
-    fn on_tracker_peers(&mut self, peers: Vec<SocketAddr>) {
+    /// Peers from a tracker reply or a DHT lookup join the known addresses,
+    /// as `add_peer` does (bounded, oldest unused evicted); addresses nobody
+    /// can dial (port 0, unspecified, multicast) are dropped.
+    fn on_found_peers(&mut self, source: PeerSource, peers: Vec<SocketAddr>) {
+        let mut count = 0usize;
         for addr in peers {
-            if dialable(&addr)
-                && !self.retries.is_never(&addr)
-                && self.remember(addr)
-                && self.connectable()
-            {
+            if !dialable(&addr) {
+                continue;
+            }
+            count = count.saturating_add(1);
+            if !self.retries.is_never(&addr) && self.remember(addr) && self.connectable() {
                 self.queue_addr(addr);
             }
         }
+        self.peers_found(source, count);
         self.try_connect();
+    }
+
+    /// `PeersFound` for a non-empty batch.
+    fn peers_found(&self, source: PeerSource, count: usize) {
+        if count > 0 {
+            self.emit(Event::PeersFound {
+                torrent: self.ih,
+                source,
+                count,
+            });
+        }
+    }
+
+    /// The torrent is known to be private (BEP 27): no DHT, PEX or `Port`.
+    /// A magnet is not, until its metadata arrives.
+    pub(super) fn is_private(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|l| l.meta.info.private)
     }
 
     // ----- checking -----------------------------------------------------------
@@ -679,6 +735,11 @@ impl Actor {
         self.emit(Event::MetadataReceived { torrent: self.ih });
         // Peers were set up with no pieces; they get the layout now.
         let n = layout.num_pieces();
+        if self.is_private() {
+            // The magnet exception ends here: off the DHT at once.
+            self.dht_announcer = None;
+            self.dht_rx = None;
+        }
         let ext = self.ext_config();
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
@@ -881,6 +942,8 @@ impl Actor {
             s.exit = true;
             true
         });
+        self.dht_announcer = None;
+        self.dht_rx = None;
         self.close_all();
         // Its result would be thrown away; do not wait for a whole check.
         self.cancel_check();

@@ -19,8 +19,8 @@
 //! walks), capped at 30 minutes. Trackers whose URL cannot work (unsupported
 //! scheme, invalid URL, HTTPS without TLS) are reported once and dropped.
 //!
-//! Private torrents (BEP 27) need nothing special here: milestone 1 has no
-//! DHT, PEX or LSD, so trackers are already the only peer source.
+//! Private torrents (BEP 27) announce to their trackers as any other; the
+//! actor keeps them off the DHT (see `dht`).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -75,7 +75,6 @@ pub(super) struct Signals {
 /// The actor's side of a running announcer.
 #[derive(Debug)]
 pub(super) struct Announcer {
-    pub signals: watch::Sender<Signals>,
     pub task: JoinHandle<()>,
 }
 
@@ -86,6 +85,8 @@ pub(super) struct Params {
     pub trackers: Vec<Vec<String>>,
     pub shared: Arc<Shared>,
     pub status: watch::Receiver<TorrentStatus>,
+    /// The actor's signals, shared with the DHT announcer.
+    pub signals: watch::Receiver<Signals>,
 }
 
 /// Starts the announcer for a torrent; `None` if it has no tracker. Peers
@@ -97,7 +98,6 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
     if tiers.is_empty() {
         return None;
     }
-    let (signals, signals_rx) = watch::channel(Signals::default());
     let (peers_tx, peers_rx) = mpsc::channel(PEER_QUEUE);
     let task = Task {
         ih: p.ih,
@@ -107,14 +107,14 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
         tiers,
         shared: p.shared,
         status: p.status,
-        signals: signals_rx,
+        signals: p.signals,
         peers: peers_tx,
         tracker_ids: HashMap::new(),
         last_ok: None,
         failed_walks: 0,
     };
     let task = tokio::spawn(task.run());
-    Some((Announcer { signals, task }, peers_rx))
+    Some((Announcer { task }, peers_rx))
 }
 
 /// How a walk through the tiers ended.

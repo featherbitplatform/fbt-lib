@@ -9,10 +9,12 @@
 //! - `metadata`: fetching a magnet's metadata from peers and serving ours
 //!   (BEP 9).
 //! - `announcer`, `tiers`: announcing to the trackers (BEP 12 tiers).
+//! - `dht`: looking up and announcing on the session's DHT.
 
 mod actor;
 mod announcer;
 mod data;
+mod dht;
 mod metadata;
 mod peers;
 mod serve;

@@ -456,8 +456,9 @@ impl Actor {
             listen_port: self.shared.listen_port,
             metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),
             pex: !meta.is_some_and(|m| m.info.private),
-            // Set once the session runs a DHT.
-            dht_port: None,
+            // No DHT bit or `Port` for a private torrent (a magnet's
+            // privacy is unknown until its metadata: it advertises both).
+            dht_port: self.shared.dht_port.filter(|_| !self.is_private()),
             reqq: u32::try_from(self.shared.settings.max_incoming_requests).unwrap_or(u32::MAX),
         }
     }

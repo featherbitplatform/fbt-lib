@@ -12,6 +12,20 @@ use tokio_util::sync::ReusableBoxFuture;
 use crate::peer::DisconnectReason;
 use crate::status::TorrentState;
 
+/// Where a batch of peer addresses came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerSource {
+    /// A tracker reply.
+    Tracker,
+    /// A DHT lookup.
+    Dht,
+    /// Peer exchange (BEP 11).
+    Pex,
+    /// A magnet link's `x.pe` hints.
+    Magnet,
+}
+
 /// Something that happened in the session.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -75,6 +89,21 @@ pub enum Event {
         /// What went wrong.
         message: String,
     },
+    /// A batch of peer addresses arrived for a torrent.
+    PeersFound {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// Where they came from.
+        source: PeerSource,
+        /// Dialable addresses in the batch.
+        count: usize,
+    },
+    /// The session's DHT node filled its routing table for the first time.
+    /// Emitted at most once per session.
+    DhtBootstrapped {
+        /// Nodes in the routing tables at that moment.
+        nodes: usize,
+    },
     /// A peer completed the handshake.
     PeerConnected {
         /// The torrent.
@@ -118,16 +147,19 @@ bitflags::bitflags! {
         const PIECE = 1 << 1;
         /// Tracker replies and errors.
         const TRACKER = 1 << 2;
-        /// Peer connects and disconnects.
+        /// Peer connects and disconnects, peers found.
         const PEER = 1 << 3;
         /// Storage errors.
         const STORAGE = 1 << 4;
+        /// The session's DHT node.
+        const DHT = 1 << 5;
         /// Every category.
         const ALL = Self::STATUS.bits()
             | Self::PIECE.bits()
             | Self::TRACKER.bits()
             | Self::PEER.bits()
-            | Self::STORAGE.bits();
+            | Self::STORAGE.bits()
+            | Self::DHT.bits();
     }
 }
 
@@ -142,7 +174,10 @@ impl Event {
             | Event::TorrentFinished { .. } => EventMask::STATUS,
             Event::PieceFinished { .. } | Event::HashFailed { .. } => EventMask::PIECE,
             Event::TrackerReply { .. } | Event::TrackerError { .. } => EventMask::TRACKER,
-            Event::PeerConnected { .. } | Event::PeerDisconnected { .. } => EventMask::PEER,
+            Event::PeerConnected { .. }
+            | Event::PeerDisconnected { .. }
+            | Event::PeersFound { .. } => EventMask::PEER,
+            Event::DhtBootstrapped { .. } => EventMask::DHT,
             Event::FileError { .. } => EventMask::STORAGE,
             Event::Lagged { .. } => EventMask::ALL,
         }

@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fbt_core::{InfoHashes, PeerId};
+use fbt_dht::{Dht, DhtConfig, DhtError, DhtState, DhtStats};
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_tracker::TrackerClient;
 use fbt_wire::req2_hash;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::error::SessionError;
 use crate::event::{Event, EventMask, EventStream};
@@ -138,6 +140,10 @@ pub(crate) struct Shared {
     pub global_peers: AtomicUsize,
     /// Outgoing connections still connecting or handshaking.
     pub half_open: AtomicUsize,
+    /// The session-wide DHT node; `None` with `dht_enabled` off.
+    pub dht: Option<Dht>,
+    /// The DHT's UDP port, sent in `Port` messages.
+    pub dht_port: Option<u16>,
 }
 
 impl Shared {
@@ -245,6 +251,14 @@ impl Session {
         let tracker =
             TrackerClient::new(settings.tracker.clone()).map_err(SessionError::Tracker)?;
         let (events, _) = broadcast::channel(settings.event_queue);
+        let dht = if settings.dht_enabled {
+            start_dht(&settings, local_addr).await
+        } else {
+            None
+        };
+        let dht_port = dht
+            .as_ref()
+            .and_then(|d| d.local_addrs().first().map(SocketAddr::port));
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -254,7 +268,12 @@ impl Session {
             shutdown: AtomicBool::new(false),
             global_peers: AtomicUsize::new(0),
             half_open: AtomicUsize::new(0),
+            dht,
+            dht_port,
         });
+        if let Some(dht) = &shared.dht {
+            watch_bootstrap(dht, Arc::downgrade(&shared));
+        }
         let inner = Arc::new(SessionInner {
             shared: Arc::clone(&shared),
             local_addr,
@@ -264,6 +283,26 @@ impl Session {
         let task = crate::listener::spawn(listener, Arc::downgrade(&inner), shared);
         *inner.listener.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
         Ok(Session { inner })
+    }
+
+    /// The session's DHT node, `None` with [`Settings::dht_enabled`] off.
+    pub fn dht_stats(&self) -> Option<DhtStats> {
+        self.inner.shared.dht.as_ref().map(Dht::stats)
+    }
+
+    /// The DHT's state (node ids and known nodes) for
+    /// [`Settings::dht_state`] in a later session, `None` with the DHT off.
+    /// The library never writes it anywhere: storing it is the caller's
+    /// job, typically just before [`shutdown`](Self::shutdown).
+    ///
+    /// Fails with [`SessionError::Shutdown`] once the session (and its
+    /// DHT) has shut down.
+    pub async fn dht_state(&self) -> Result<Option<Vec<u8>>, SessionError> {
+        let Some(dht) = &self.inner.shared.dht else {
+            return Ok(None);
+        };
+        let state = dht.state().await.map_err(|_| SessionError::Shutdown)?;
+        Ok(Some(state.to_bytes()))
     }
 
     /// The address the peer listener is bound to.
@@ -397,5 +436,76 @@ impl Session {
         for rx in waits {
             let _ = rx.await;
         }
+        if let Some(dht) = &self.inner.shared.dht {
+            dht.shutdown().await;
+        }
     }
+}
+
+/// Starts the session's DHT on the listener's IP and port (plus `[::]` on
+/// that port with `dht_ipv6`), on port 0 when that UDP port is taken. A
+/// DHT that cannot start at all is logged and left out.
+async fn start_dht(settings: &Settings, listener: SocketAddr) -> Option<Dht> {
+    let state = settings
+        .dht_state
+        .as_deref()
+        .and_then(|b| match DhtState::from_bytes(b) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(error = %e, "ignoring the saved DHT state; starting fresh");
+                None
+            }
+        });
+    let config = |port: u16| {
+        let mut c = DhtConfig::default();
+        if listener.is_ipv4() {
+            c.bind_v4 = Some(SocketAddr::new(listener.ip(), port));
+            c.bind_v6 = settings
+                .dht_ipv6
+                .then(|| SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)));
+        } else {
+            c.bind_v4 = None;
+            c.bind_v6 = Some(SocketAddr::new(listener.ip(), port));
+        }
+        c.bootstrap = settings.dht_bootstrap_nodes.clone();
+        c.read_only = settings.dht_read_only;
+        c.state = state.clone();
+        c.query_timeout = settings.dht_query_timeout;
+        c.query_rate_per_ip = settings.dht_query_rate_per_ip;
+        c
+    };
+    let first = Dht::spawn(config(listener.port())).await;
+    let r = match first {
+        Err(DhtError::Bind(_) | DhtError::NoSocket) if listener.port() != 0 => {
+            warn!(
+                port = listener.port(),
+                "DHT port taken; binding the DHT to a free port"
+            );
+            Dht::spawn(config(0)).await
+        }
+        r => r,
+    };
+    match r {
+        Ok(d) => Some(d),
+        Err(e) => {
+            warn!(error = %e, "cannot start the DHT; running without it");
+            None
+        }
+    }
+}
+
+/// Emits [`Event::DhtBootstrapped`] the first time the DHT's routing table
+/// fills, then ends; also ends with the DHT or the session.
+fn watch_bootstrap(dht: &Dht, shared: std::sync::Weak<Shared>) {
+    let mut stats = dht.subscribe_stats();
+    tokio::spawn(async move {
+        let Ok(s) = stats.wait_for(|s| s.bootstrapped).await else {
+            return;
+        };
+        let nodes = s.nodes_v4.saturating_add(s.nodes_v6);
+        drop(s);
+        if let Some(shared) = shared.upgrade() {
+            shared.emit(Event::DhtBootstrapped { nodes });
+        }
+    });
 }

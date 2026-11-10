@@ -36,6 +36,9 @@ enum Command {
         /// Extra peer to connect to; may be repeated.
         #[arg(long, value_name = "ADDR")]
         peer: Vec<SocketAddr>,
+        /// Do not run the DHT (no public DHT node is contacted).
+        #[arg(long)]
+        no_dht: bool,
     },
     /// Seed a torrent whose data is already on disk.
     Seed {
@@ -50,6 +53,9 @@ enum Command {
         /// Stop after this many seconds (default: until Ctrl-C).
         #[arg(long, value_name = "SECS")]
         seed_for: Option<u64>,
+        /// Do not run the DHT (no public DHT node is contacted).
+        #[arg(long)]
+        no_dht: bool,
     },
     /// Print what a .torrent file contains.
     Info {
@@ -88,13 +94,15 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             port,
             seed_for,
             peer,
-        } => transfer(&torrent, out, port, seed_for, &peer, true).await,
+            no_dht,
+        } => transfer(&torrent, out, port, seed_for, &peer, true, no_dht).await,
         Command::Seed {
             torrent,
             data,
             port,
             seed_for,
-        } => transfer(&torrent, data, port, seed_for, &[], false).await,
+            no_dht,
+        } => transfer(&torrent, data, port, seed_for, &[], false, no_dht).await,
     }
 }
 
@@ -170,9 +178,11 @@ async fn transfer(
     seed_for: Option<u64>,
     peers: &[SocketAddr],
     download: bool,
+    no_dht: bool,
 ) -> Result<ExitCode, Error> {
     let metainfo = load(torrent)?;
     let mut settings = Settings::default();
+    settings.dht_enabled = !no_dht;
     if let Some(port) = port {
         settings.listen_addr.set_port(port);
     }

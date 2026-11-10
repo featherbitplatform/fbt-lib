@@ -56,8 +56,9 @@ pub use fbt_core::{
 pub use fbt_metainfo::{FileEntry, Info, Metainfo, MetainfoError, RelPath};
 pub use fbt_session::storage::{FsStorage, MemStorage, Storage};
 pub use fbt_session::{
-    AddTorrent, DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, Priority,
-    RemoveMode, Session, SessionError, Settings, TorrentHandle, TorrentState, TorrentStatus,
+    AddTorrent, DEFAULT_DHT_BOOTSTRAP, DhtStats, DisconnectReason, EncryptionPolicy, Event,
+    EventMask, EventStream, PeerSource, Priority, RemoveMode, Session, SessionError, Settings,
+    TorrentHandle, TorrentState, TorrentStatus,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

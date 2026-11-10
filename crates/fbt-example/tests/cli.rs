@@ -118,7 +118,7 @@ fn download_from_seed_process() {
             .arg(&torrent_path)
             .arg("--data")
             .arg(&seed_dir)
-            .args(["--port", "0"])
+            .args(["--port", "0", "--no-dht"])
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn seed"),
@@ -152,7 +152,7 @@ fn download_from_seed_process() {
             .arg(&torrent_path)
             .arg("--out")
             .arg(&out_dir)
-            .args(["--port", "0", "--peer"])
+            .args(["--port", "0", "--no-dht", "--peer"])
             .arg(format!("127.0.0.1:{port}"))
             .stdout(Stdio::null())
             .spawn()

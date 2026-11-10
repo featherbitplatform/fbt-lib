@@ -1,7 +1,8 @@
 //! Magnet torrents: metadata fetched from peers (BEP 9) and verified,
 //! hostile metadata refused, our metadata served, and what a magnet without
-//! metadata does with commands and announces. The session has no DHT yet:
-//! peers come from `x.pe` hints, `add_peer`, trackers or connect to us.
+//! metadata does with commands and announces. These sessions run no DHT
+//! (see `dht.rs`): peers come from `x.pe` hints, `add_peer`, trackers or
+//! connect to us.
 
 mod support;
 

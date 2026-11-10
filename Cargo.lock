@@ -589,6 +589,7 @@ dependencies = [
  "bytes",
  "fbt-bencode",
  "fbt-core",
+ "fbt-dht",
  "fbt-metainfo",
  "fbt-tracker",
  "fbt-wire",

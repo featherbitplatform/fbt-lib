@@ -5,6 +5,17 @@
 //! snapshots ([`TorrentStatus`]); everything else that happens is reported
 //! as [`Event`]s through [`Session::subscribe`].
 //!
+//! # DHT
+//!
+//! With [`Settings::dht_enabled`] (the default) the session runs one Mainline
+//! DHT node (BEP 5) on the listener's IP and UDP port, bootstrapping from
+//! [`Settings::dht_bootstrap_nodes`] (the public routers in
+//! [`DEFAULT_DHT_BOOTSTRAP`] by default). Every running public torrent looks
+//! up and announces itself every [`Settings::dht_announce_interval`];
+//! peers' `Port` messages add their nodes. [`Session::dht_state`] returns the
+//! node's state to pass back as [`Settings::dht_state`] next time; the
+//! library never writes files. Private torrents never touch the DHT.
+//!
 //! # Magnet links
 //!
 //! [`AddTorrent::magnet`] adds a torrent by its info hash: the info
@@ -39,11 +50,12 @@ pub mod storage;
 mod torrent;
 
 pub use error::SessionError;
-pub use event::{Event, EventMask, EventStream};
+pub use event::{Event, EventMask, EventStream, PeerSource};
+pub use fbt_dht::DhtStats;
 pub use peer::DisconnectReason;
 pub use rate::RateMeter;
 pub use session::{AddTorrent, Priority, RemoveMode, Session, TorrentSource};
-pub use settings::{EncryptionPolicy, MAX_METADATA_SIZE, Settings};
+pub use settings::{DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_METADATA_SIZE, Settings};
 pub use status::{TorrentState, TorrentStatus};
 pub use torrent::TorrentHandle;
 

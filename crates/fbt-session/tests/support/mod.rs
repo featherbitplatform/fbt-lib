@@ -24,17 +24,30 @@ use rand::RngExt;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
-/// Settings for tests: loopback listener on a free port, fast status updates.
+/// Settings for tests: loopback listener on a free port, fast status
+/// updates, and no DHT (so no test ever contacts a public DHT node; the DHT
+/// tests bootstrap from a loopback node).
 pub fn test_settings() -> Settings {
     let mut s = Settings::default();
     s.listen_addr = SocketAddr::from(([127, 0, 0, 1], 0));
     s.status_interval = Duration::from_millis(50);
+    s.dht_enabled = false;
+    s.dht_bootstrap_nodes = Vec::new();
     s
 }
 
 /// A multi-file torrent named `torrent` over random data. Returns the
 /// metainfo and the concatenated payload.
 pub fn make_torrent(files: &[(&str, usize)], piece_len: u32) -> (Metainfo, Vec<u8>) {
+    build_torrent(files, piece_len, false)
+}
+
+/// [`make_torrent`] with the BEP 27 private flag set.
+pub fn make_private_torrent(files: &[(&str, usize)], piece_len: u32) -> (Metainfo, Vec<u8>) {
+    build_torrent(files, piece_len, true)
+}
+
+fn build_torrent(files: &[(&str, usize)], piece_len: u32, private: bool) -> (Metainfo, Vec<u8>) {
     let total: usize = files.iter().map(|f| f.1).sum();
     let mut payload = vec![0u8; total];
     rand::rng().fill(payload.as_mut_slice());
@@ -59,6 +72,9 @@ pub fn make_torrent(files: &[(&str, usize)], piece_len: u32) -> (Metainfo, Vec<u
     info.insert(b"name", "torrent");
     info.insert(b"piece length", i64::from(piece_len));
     info.insert(b"pieces", pieces);
+    if private {
+        info.insert(b"private", 1i64);
+    }
     let mut root = DictBuilder::new();
     root.insert(b"info", info.build());
     let bytes = encode(&root.build());
