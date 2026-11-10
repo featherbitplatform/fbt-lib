@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use fbt_core::{InfoHashes, PieceLayout};
 use fbt_metainfo::Metainfo;
+use fbt_wire::PexFlags;
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -168,6 +169,19 @@ pub(crate) struct Actor {
     pub(super) dht_announcer: Option<DhtAnnouncer>,
     /// Peers from DHT lookups; `None` with no DHT announcer.
     pub(super) dht_rx: Option<mpsc::Receiver<Vec<SocketAddr>>>,
+    /// The connectable peers PEX lists, built for the `peers_epoch` it is
+    /// keyed by; rebuilt by the first tick with a due peer after the epoch
+    /// moved.
+    pub(super) pex_live: Option<(u64, Vec<(SocketAddr, PexFlags)>)>,
+    /// Bumped whenever the set of connections or their PEX addresses
+    /// changes (see [`Actor::on_peer_set_changed`]).
+    pub(super) peers_epoch: u64,
+    /// The earliest `last_sent + pex_interval` of the PEX peers; `None`
+    /// when a peer was never sent to or the peer set changed (scan).
+    pub(super) next_pex_due: Option<Instant>,
+    /// Unit tests: how often the live list was built.
+    #[cfg(test)]
+    pub(super) pex_live_builds: u32,
 }
 
 impl Actor {
@@ -274,6 +288,11 @@ impl Actor {
             tracker_rx,
             dht_announcer,
             dht_rx,
+            pex_live: None,
+            peers_epoch: 0,
+            next_pex_due: None,
+            #[cfg(test)]
+            pex_live_builds: 0,
         };
         if actor.magnet.is_some() {
             actor.last_state = actor.state();

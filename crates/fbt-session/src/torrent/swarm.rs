@@ -807,6 +807,7 @@ impl Actor {
     /// Closes a peer: it stays until its `Disconnected` event, but its
     /// requests return to the picker now.
     pub(super) fn close_peer(&mut self, key: PeerKey) {
+        self.on_peer_set_changed();
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
@@ -849,6 +850,7 @@ impl Actor {
                 **k != key && o.connected && o.tx.is_some() && o.peer_id == Some(peer_id)
             })
             .map(|(k, o)| (*k, o.outgoing));
+        self.on_peer_set_changed();
         let Some(p) = self.peers.get_mut(&key) else {
             return false;
         };
@@ -894,6 +896,7 @@ impl Actor {
         connect_failed: Option<Transport>,
     ) -> Option<(Peer, DisconnectReason)> {
         let mut p = self.peers.remove(&key)?;
+        self.on_peer_set_changed();
         let reason = match p.close_reason.take() {
             Some(ours) if reason == DisconnectReason::Shutdown => ours,
             _ => reason,
@@ -946,7 +949,7 @@ impl Actor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -1118,7 +1121,7 @@ mod tests {
     }
 
     /// An actor for a one-piece torrent, with nothing connected.
-    fn actor() -> Actor {
+    pub(in crate::torrent) fn actor() -> Actor {
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicBool, AtomicUsize};
         use std::sync::{OnceLock, Weak};

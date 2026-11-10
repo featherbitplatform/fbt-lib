@@ -307,6 +307,8 @@ impl Actor {
         let size = hs.metadata_size;
         let supports = hs.id_of(UT_METADATA).is_some();
         let pex = self.pex_active() && hs.id_of(UT_PEX).is_some();
+        // Its PEX address (or its PEX state) may change.
+        self.on_peer_set_changed();
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };

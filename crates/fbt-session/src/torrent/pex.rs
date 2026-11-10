@@ -45,6 +45,11 @@ impl PexPeer {
             .is_none_or(|t| now.saturating_duration_since(t) >= interval)
     }
 
+    /// When the next message is due; `None` if none went out yet.
+    fn due_at(&self, interval: Duration) -> Option<Instant> {
+        self.last_sent.map(|t| t + interval)
+    }
+
     /// The next message for this peer from the `live` connectable
     /// addresses, never listing `exclude` (the recipient). `None` before
     /// `interval` has passed since the last one or when nothing changed.
@@ -137,12 +142,27 @@ impl Actor {
         self.shared.settings.pex_interval * 3 / 4
     }
 
-    /// Sends each due PEX peer what changed since its last message.
+    /// The set of connections, or what PEX would list for one, changed: the
+    /// cached live list is stale and the due scan must run again.
+    pub(super) fn on_peer_set_changed(&mut self) {
+        self.peers_epoch = self.peers_epoch.wrapping_add(1);
+        self.next_pex_due = None;
+    }
+
+    /// Sends each due PEX peer what changed since its last message. Cheap
+    /// when nothing is due: it returns before the earliest due time, and
+    /// the connectable list is built at most once per tick, only when a
+    /// peer is due, and reused while the connections stay the same. (Flags
+    /// that change without a connection change, such as a peer becoming a
+    /// seed, show in the next rebuild.)
     pub(super) fn pex_tick(&mut self) {
         if !self.pex_active() {
             return;
         }
         let now = Instant::now();
+        if self.next_pex_due.is_some_and(|t| now < t) {
+            return;
+        }
         let interval = self.shared.settings.pex_interval;
         let live_peer = |p: &Peer| p.connected && p.tx.is_some();
         let due: Vec<PeerKey> = self
@@ -152,18 +172,28 @@ impl Actor {
             .map(|(k, _)| *k)
             .collect();
         if due.is_empty() {
+            self.next_pex_due = self.earliest_pex_due(interval);
             return;
         }
-        let live: Vec<(SocketAddr, PexFlags)> = self
-            .peers
-            .values()
-            .filter(|p| live_peer(p))
-            .filter_map(|p| {
-                connectable_addr(p)
-                    .filter(dialable)
-                    .map(|a| (a, flags_of(p)))
-            })
-            .collect();
+        let epoch = self.peers_epoch;
+        let live = match self.pex_live.take() {
+            Some((e, live)) if e == epoch => live,
+            _ => {
+                #[cfg(test)]
+                {
+                    self.pex_live_builds += 1;
+                }
+                self.peers
+                    .values()
+                    .filter(|p| live_peer(p))
+                    .filter_map(|p| {
+                        connectable_addr(p)
+                            .filter(dialable)
+                            .map(|a| (a, flags_of(p)))
+                    })
+                    .collect()
+            }
+        };
         for key in due {
             let Some(p) = self.peers.get_mut(&key) else {
                 continue;
@@ -178,6 +208,26 @@ impl Actor {
             };
             self.send(key, PeerCommand::SendPex(msg));
         }
+        // Keyed by the epoch it was built for: a peer closed meanwhile (a
+        // full queue) leaves it stale, so the next tick rebuilds.
+        self.pex_live = Some((epoch, live));
+        self.next_pex_due = self.earliest_pex_due(interval);
+    }
+
+    /// The earliest time a live PEX peer is due; `None` if one was never
+    /// sent to (due now) or none speaks PEX.
+    fn earliest_pex_due(&self, interval: Duration) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        for x in self
+            .peers
+            .values()
+            .filter(|p| p.connected && p.tx.is_some())
+            .filter_map(|p| p.pex.as_ref())
+        {
+            let at = x.due_at(interval)?;
+            earliest = Some(earliest.map_or(at, |e| e.min(at)));
+        }
+        earliest
     }
 
     /// A `ut_pex` message from a peer: dropped unless PEX runs with it and
@@ -376,5 +426,80 @@ mod tests {
         );
         p.outgoing = true;
         assert_eq!(connectable_addr(&p), Some(addr(1)));
+    }
+
+    /// An actor with `n` connected PEX peers, none of which was sent to yet.
+    fn actor_with_peers(n: u32) -> (Actor, Vec<mpsc::Receiver<PeerCommand>>) {
+        let mut a = super::super::swarm::tests::actor();
+        let mut rxs = Vec::new();
+        for i in 0..n {
+            let (tx, rx) = mpsc::channel(8);
+            let mut p = Peer::new(addr(i), tx, a.generation, 1, Transport::Tcp);
+            p.outgoing = true;
+            p.connected = true;
+            p.pex = Some(PexPeer::default());
+            let key = a.new_key();
+            a.peers.insert(key, p);
+            rxs.push(rx);
+        }
+        a.peers_epoch += 1;
+        (a, rxs)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tick_builds_once_for_many_due_peers() {
+        let (mut a, mut rxs) = actor_with_peers(30);
+        a.pex_tick();
+        assert_eq!(a.pex_live_builds, 1);
+        for rx in &mut rxs {
+            assert!(matches!(rx.try_recv(), Ok(PeerCommand::SendPex(_))));
+        }
+        // Peers due again with nothing changed: the cached list is reused.
+        for _ in 0..5 {
+            tokio::time::advance(INTERVAL).await;
+            a.pex_tick();
+        }
+        assert_eq!(a.pex_live_builds, 1);
+        // A connection change invalidates it: one rebuild for all.
+        a.peers_epoch += 1;
+        tokio::time::advance(INTERVAL).await;
+        a.pex_tick();
+        assert_eq!(a.pex_live_builds, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tick_rebuilds_nothing_when_nobody_is_due() {
+        let (mut a, _rxs) = actor_with_peers(30);
+        a.pex_tick();
+        a.pex_live_builds = 0;
+        for _ in 0..100 {
+            a.peers_epoch += 1;
+            tokio::time::advance(Duration::from_millis(100)).await;
+            a.pex_tick();
+        }
+        assert_eq!(a.pex_live_builds, 0);
+        assert!(a.next_pex_due.is_some());
+        // Due again after the interval (10 s of ticks so far).
+        tokio::time::advance(INTERVAL).await;
+        a.pex_tick();
+        assert_eq!(a.pex_live_builds, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_pex_peer_is_served_before_the_next_due_time() {
+        let (mut a, _rxs) = actor_with_peers(3);
+        a.pex_tick();
+        assert!(a.next_pex_due.is_some());
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut p = Peer::new(addr(50), tx, a.generation, 1, Transport::Tcp);
+        p.outgoing = true;
+        p.connected = true;
+        p.pex = Some(PexPeer::default());
+        let key = a.new_key();
+        a.peers.insert(key, p);
+        a.on_peer_set_changed();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        a.pex_tick();
+        assert!(matches!(rx.try_recv(), Ok(PeerCommand::SendPex(_))));
     }
 }

@@ -3,8 +3,9 @@
 //! handshake from MSE; MSE connections are answered as responder and
 //! matched to a torrent by `HASH('req2', SKEY)`.
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use fbt_utp::UtpSocket;
@@ -14,7 +15,7 @@ use fbt_wire::{
 };
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 use tracing::debug;
@@ -27,13 +28,22 @@ use crate::settings::EncryptionPolicy;
 /// Pause after a failed `accept` (for example out of file descriptors).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// Handshakes in progress per source IP, over every accept loop and both
+/// transports; further connections from that IP are dropped unread.
+const MAX_PENDING_PER_IP: usize = 8;
+
 /// Accept-side state shared by every accept loop of the session, so the
-/// limits hold across all listen addresses together.
+/// limits hold across all listen addresses and both transports together.
 #[derive(Debug)]
 pub(crate) struct ListenerState {
     /// Connections still sending their handshake, on every accept loop
-    /// together (`max_peers_global` permits); more are dropped at once.
+    /// together (`max_peers_global` permits); more are dropped at once. Go
+    /// through [`ListenerState::admit`], which also counts per source IP.
     pub pending: Arc<Semaphore>,
+    /// Handshakes in progress per source IP (at most [`MAX_PENDING_PER_IP`]
+    /// each). One entry per pending handshake at most, so the map is
+    /// bounded by `pending`'s permits.
+    per_ip: Mutex<HashMap<IpAddr, usize>>,
 }
 
 impl ListenerState {
@@ -41,6 +51,54 @@ impl ListenerState {
         let permits = max_peers_global.clamp(1, Semaphore::MAX_PERMITS);
         ListenerState {
             pending: Arc::new(Semaphore::new(permits)),
+            per_ip: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Admits a connection from `addr` into the pending-handshake phase:
+    /// `None` when the session-wide permits or the source IP's share are
+    /// used up. The returned guard gives both back when dropped, on every
+    /// exit path of the handshake.
+    fn admit(self: &Arc<Self>, addr: SocketAddr) -> Option<PendingHandshake> {
+        let permit = Arc::clone(&self.pending).try_acquire_owned().ok()?;
+        // `::ffff:a.b.c.d` and `a.b.c.d` are one source.
+        let ip = addr.ip().to_canonical();
+        {
+            let mut map = self.per_ip.lock().unwrap_or_else(PoisonError::into_inner);
+            let n = map.entry(ip).or_insert(0);
+            if *n >= MAX_PENDING_PER_IP {
+                return None;
+            }
+            *n += 1;
+        }
+        Some(PendingHandshake {
+            state: Arc::clone(self),
+            ip,
+            _permit: permit,
+        })
+    }
+}
+
+/// A connection in its handshake phase: holds a session-wide permit and
+/// one of its source IP's slots until dropped.
+struct PendingHandshake {
+    state: Arc<ListenerState>,
+    ip: IpAddr,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for PendingHandshake {
+    fn drop(&mut self) {
+        let mut map = self
+            .state
+            .per_ip
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = map.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.ip);
+            }
         }
     }
 }
@@ -66,7 +124,7 @@ pub(crate) fn spawn(
             if session.strong_count() == 0 || shared.is_shutdown() {
                 return;
             }
-            let Ok(permit) = Arc::clone(&state.pending).try_acquire_owned() else {
+            let Some(permit) = state.admit(addr) else {
                 debug!(%addr, "too many pending handshakes; dropping connection");
                 continue;
             };
@@ -98,7 +156,7 @@ pub(crate) fn spawn_utp(
             if session.strong_count() == 0 || shared.is_shutdown() {
                 return;
             }
-            let Ok(permit) = Arc::clone(&state.pending).try_acquire_owned() else {
+            let Some(permit) = state.admit(addr) else {
                 debug!(%addr, "too many pending handshakes; dropping uTP connection");
                 continue;
             };
@@ -211,4 +269,44 @@ async fn accept(
         return Err("handshake names another torrent than the MSE SKEY".into());
     }
     Ok((stream, hs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().expect("address")
+    }
+
+    #[test]
+    fn admit_caps_per_ip_and_gives_slots_back() {
+        let state = Arc::new(ListenerState::new(100));
+        let held: Vec<_> = (0..MAX_PENDING_PER_IP)
+            .map(|i| {
+                state
+                    .admit(sa(&format!("10.0.0.1:{}", 1000 + i)))
+                    .expect("admitted")
+            })
+            .collect();
+        assert!(state.admit(sa("10.0.0.1:2000")).is_none());
+        // The same source written as an IPv4-mapped address counts too.
+        assert!(state.admit(sa("[::ffff:10.0.0.1]:2000")).is_none());
+        // Another IP is unaffected.
+        assert!(state.admit(sa("10.0.0.2:1000")).is_some());
+        drop(held);
+        assert!(state.admit(sa("10.0.0.1:2000")).is_some());
+        // Nothing is left behind once everything is dropped.
+        assert!(state.per_ip.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn session_wide_permits_still_apply() {
+        let state = Arc::new(ListenerState::new(2));
+        let _a = state.admit(sa("10.0.0.1:1")).expect("first");
+        let _b = state.admit(sa("10.0.0.2:1")).expect("second");
+        assert!(state.admit(sa("10.0.0.3:1")).is_none());
+        // A refused connection leaves no per-IP entry.
+        assert_eq!(state.per_ip.lock().expect("lock").len(), 2);
+    }
 }

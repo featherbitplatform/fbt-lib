@@ -48,17 +48,20 @@ impl Actor {
         match result {
             Ok(meta) => self.install_metadata(*meta),
             Err(MetainfoError::InfoHashMismatch) => {
-                let sends = self
+                let verdict = self
                     .magnet
                     .as_mut()
                     .map(|m| m.fetch.on_verify_failed(key))
                     .unwrap_or_default();
-                if self.peers.contains_key(&key) {
-                    self.ban(key);
-                } else if let Some(t) = ban {
-                    self.apply_ban(t);
+                // A buffer mixed from several sources bans nobody.
+                if verdict.ban {
+                    if self.peers.contains_key(&key) {
+                        self.ban(key);
+                    } else if let Some(t) = ban {
+                        self.apply_ban(t);
+                    }
                 }
-                self.send_metadata(sends);
+                self.send_metadata(verdict.sends);
             }
             Err(e) => self.metadata_failed(format!("invalid metadata: {e}")),
         }
