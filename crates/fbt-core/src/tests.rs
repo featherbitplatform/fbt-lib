@@ -38,9 +38,25 @@ fn wire_hash_prefers_v1_else_truncates_v2() {
 
 #[test]
 fn peer_id_prefix() {
+    // The prefix tracks the crate version: -FB<major><minor><patch>0-.
+    let digit = |v: &str| {
+        v.parse::<u8>().map_or(b'?', |n| {
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[usize::from(n.min(35))]
+        })
+    };
+    let expected = [
+        b'-',
+        b'F',
+        b'B',
+        digit(env!("CARGO_PKG_VERSION_MAJOR")),
+        digit(env!("CARGO_PKG_VERSION_MINOR")),
+        digit(env!("CARGO_PKG_VERSION_PATCH")),
+        b'0',
+        b'-',
+    ];
     let id = PeerId::generate();
-    assert_eq!(&id.0[..8], b"-FB0000-");
-    assert_eq!(id.client_prefix(), *b"-FB0000-");
+    assert_eq!(&id.0[..8], &expected);
+    assert_eq!(id.client_prefix(), expected);
     assert!(id.0[8..].iter().all(u8::is_ascii_alphanumeric));
 }
 
