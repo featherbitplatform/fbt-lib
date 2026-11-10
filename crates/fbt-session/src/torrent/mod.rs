@@ -24,7 +24,6 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::SessionError;
-use crate::event::Event;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::Storage;
@@ -59,7 +58,6 @@ struct HandleInner {
     cmds: mpsc::Sender<Cmd>,
     status: watch::Receiver<TorrentStatus>,
     shared: Arc<Shared>,
-    session: Weak<SessionInner>,
 }
 
 /// A torrent in a [`Session`](crate::Session).
@@ -90,10 +88,9 @@ pub(crate) fn spawn(
             cmds: cmd_tx,
             status: status_rx,
             shared: Arc::clone(&shared),
-            session,
         }),
     };
-    let actor = actor::Actor::new(params, storage, shared, cmd_rx, status_tx);
+    let actor = actor::Actor::new(params, storage, shared, session, cmd_rx, status_tx);
     tokio::spawn(actor.run());
     handle
 }
@@ -147,16 +144,11 @@ impl TorrentHandle {
     }
 
     /// Removes the torrent from the session, optionally deleting its files.
+    ///
+    /// Once the command is sent the removal completes even if this future
+    /// is dropped: the torrent's task unregisters itself when it is done.
     pub async fn remove(&self, mode: RemoveMode) -> Result<(), SessionError> {
-        let r = self.call(|tx| Cmd::Remove(mode, tx)).await?;
-        if let Some(session) = self.inner.session.upgrade()
-            && session.unregister(&self.inner.info_hashes)
-        {
-            self.inner.shared.emit(Event::TorrentRemoved {
-                torrent: self.inner.info_hashes,
-            });
-        }
-        r
+        self.call(|tx| Cmd::Remove(mode, tx)).await?
     }
 
     /// Disconnects every peer and checks the data again.

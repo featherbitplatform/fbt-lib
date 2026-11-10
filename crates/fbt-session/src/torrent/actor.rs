@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use fbt_core::{Bitfield, InfoHashes, PieceLayout};
@@ -29,7 +29,7 @@ use crate::event::Event;
 use crate::peer::messages::PeerEvent;
 use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
-use crate::session::{AddTorrent, Priority, RemoveMode, Shared, release};
+use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, release};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::{Storage, check_pieces};
 
@@ -76,6 +76,8 @@ pub(crate) struct Actor {
     pub(super) layout: PieceLayout,
     pub(super) storage: Arc<dyn Storage>,
     pub(super) shared: Arc<Shared>,
+    /// The session's registry, which the actor leaves when removed.
+    pub(super) session: Weak<SessionInner>,
     pub(super) cmds: mpsc::Receiver<Cmd>,
     pub(super) peer_tx: mpsc::Sender<PeerEvent>,
     pub(super) peer_rx: mpsc::Receiver<PeerEvent>,
@@ -118,6 +120,7 @@ impl Actor {
         params: AddTorrent,
         storage: Arc<dyn Storage>,
         shared: Arc<Shared>,
+        session: Weak<SessionInner>,
         cmds: mpsc::Receiver<Cmd>,
         status_tx: watch::Sender<TorrentStatus>,
     ) -> Self {
@@ -140,6 +143,7 @@ impl Actor {
             meta,
             storage,
             shared,
+            session,
             cmds,
             peer_tx,
             peer_rx,
@@ -483,6 +487,13 @@ impl Actor {
             } => self.on_incoming(stream, handshake, addr),
             Cmd::Remove(mode, tx) => {
                 let r = self.stop(Some(mode)).await;
+                // Done here rather than by the caller, whose future may be
+                // dropped before this point.
+                if let Some(session) = self.session.upgrade()
+                    && session.unregister(&self.ih)
+                {
+                    self.emit(Event::TorrentRemoved { torrent: self.ih });
+                }
                 let _ = tx.send(r);
                 return Flow::Exit;
             }

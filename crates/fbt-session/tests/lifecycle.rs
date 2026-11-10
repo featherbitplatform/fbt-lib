@@ -569,3 +569,29 @@ async fn stop_during_check_is_prompt() {
     assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     s.shutdown().await;
 }
+
+/// Dropping a `remove` future after the command went out still removes the
+/// torrent from the session: it can be added again afterwards.
+#[tokio::test]
+async fn dropped_remove_future_still_unregisters() {
+    use futures_util::FutureExt;
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 1000)], 16_384);
+    let mut ev = s.subscribe(EventMask::STATUS);
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+    // Polled once: the command is queued, then the future is dropped.
+    assert!(h.remove(RemoveMode::KeepData).now_or_never().is_none());
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentRemoved { .. }), T)
+        .await
+        .expect("TorrentRemoved");
+    assert!(s.torrent(&m.info_hashes).is_none());
+    s.add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .expect("re-added");
+    s.shutdown().await;
+}
