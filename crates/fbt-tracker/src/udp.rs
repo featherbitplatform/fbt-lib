@@ -14,7 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::types::MIN_INTERVAL;
+use crate::types::{MIN_INTERVAL, bounded_text};
 use crate::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerConfig, TrackerError};
 
 const PROTOCOL_ID: u64 = 0x0417_2710_1980;
@@ -24,6 +24,8 @@ const ACTION_ERROR: u32 = 3;
 const CONNECTION_TTL: Duration = Duration::from_secs(60);
 /// Largest backoff exponent, so `base * 2^n` cannot overflow.
 const MAX_BACKOFF_SHIFT: u32 = 16;
+/// Resolved addresses considered per tracker host.
+const MAX_RESOLVED: usize = 16;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -54,9 +56,7 @@ pub fn parse_udp_announce(
     }
     if action == ACTION_ERROR {
         let msg = buf.get(8..).unwrap_or_default();
-        return Err(TrackerError::Failure(
-            String::from_utf8_lossy(msg).into_owned(),
-        ));
+        return Err(TrackerError::Failure(bounded_text(msg)));
     }
     if action != ACTION_ANNOUNCE {
         return Err(TrackerError::InvalidResponse("unexpected action"));
@@ -203,6 +203,8 @@ impl Drop for Waiter<'_> {
 }
 
 pub(crate) struct UdpClient {
+    /// Bound on the DNS lookup of the tracker host.
+    dns_timeout: Duration,
     base_timeout: Duration,
     max_retries: u32,
     v4: OnceCell<Sock>,
@@ -293,9 +295,7 @@ fn parse_connect(buf: &[u8], tid: u32) -> Result<u64, TrackerError> {
     }
     if action == ACTION_ERROR {
         let msg = buf.get(8..).unwrap_or_default();
-        return Err(TrackerError::Failure(
-            String::from_utf8_lossy(msg).into_owned(),
-        ));
+        return Err(TrackerError::Failure(bounded_text(msg)));
     }
     if action != ACTION_CONNECT {
         return Err(TrackerError::InvalidResponse("unexpected action"));
@@ -306,6 +306,7 @@ fn parse_connect(buf: &[u8], tid: u32) -> Result<u64, TrackerError> {
 impl UdpClient {
     pub(crate) fn new(cfg: &TrackerConfig) -> UdpClient {
         UdpClient {
+            dns_timeout: cfg.http_timeout,
             base_timeout: cfg.udp_base_timeout,
             max_retries: cfg.udp_max_retries,
             v4: OnceCell::new(),
@@ -320,10 +321,36 @@ impl UdpClient {
         req: &AnnounceRequest,
     ) -> Result<AnnounceResponse, TrackerError> {
         let (host, port) = parse_udp_url(url)?;
-        let addr = tokio::net::lookup_host((host.as_str(), port))
-            .await?
-            .next()
+        // The host comes from a hostile torrent: bound the lookup.
+        let addrs: Vec<SocketAddr> = match tokio::time::timeout(
+            self.dns_timeout,
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await
+        {
+            Ok(found) => found?.take(MAX_RESOLVED).collect(),
+            Err(_) => return Err(TrackerError::Timeout),
+        };
+        let first = *addrs
+            .first()
             .ok_or_else(|| TrackerError::InvalidUrl("host did not resolve".to_owned()))?;
+        match self.announce_to(first, req).await {
+            // Unreachable over the first family (no IPv6 route, say): one
+            // address of the other family gets a chance.
+            Err(e) if unreachable(&e) => match other_family(&addrs, first) {
+                Some(second) => self.announce_to(second, req).await,
+                None => Err(e),
+            },
+            r => r,
+        }
+    }
+
+    /// Announces to one resolved tracker address.
+    async fn announce_to(
+        &self,
+        addr: SocketAddr,
+        req: &AnnounceRequest,
+    ) -> Result<AnnounceResponse, TrackerError> {
         let ipv6 = addr.is_ipv6();
         let sock = if ipv6 {
             self.v6
@@ -389,6 +416,20 @@ impl UdpClient {
         }
         Err(TrackerError::Timeout)
     }
+}
+
+/// The tracker did not answer at this address (as opposed to answering with
+/// an error).
+fn unreachable(e: &TrackerError) -> bool {
+    matches!(e, TrackerError::Timeout | TrackerError::Io(_))
+}
+
+/// The first address in `addrs` of the other family than `first`.
+fn other_family(addrs: &[SocketAddr], first: SocketAddr) -> Option<SocketAddr> {
+    addrs
+        .iter()
+        .copied()
+        .find(|a| a.is_ipv6() != first.is_ipv6())
 }
 
 /// A transaction id not currently in flight.
@@ -652,6 +693,56 @@ mod tests {
         let r = client().announce(&url, &request()).await.unwrap();
         assert_eq!(r.peers.len(), 2);
         assert_eq!(r.peers[0], "1.2.3.4:6881".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn fallback_picks_the_other_family() {
+        let v4: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let v4b: SocketAddr = "127.0.0.2:1".parse().unwrap();
+        let v6: SocketAddr = "[::1]:1".parse().unwrap();
+        assert_eq!(other_family(&[v6, v4, v4b], v6), Some(v4));
+        assert_eq!(other_family(&[v4, v4b, v6], v4), Some(v6));
+        assert_eq!(other_family(&[v4, v4b], v4), None);
+        assert!(unreachable(&TrackerError::Timeout));
+        assert!(!unreachable(&TrackerError::Failure(String::new())));
+    }
+
+    /// A host resolving to both families, with the tracker listening only
+    /// on the second one: the announce falls back after the first times
+    /// out. Skipped where `localhost` does not resolve to both families.
+    #[tokio::test]
+    async fn udp_falls_back_to_the_other_family() {
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", 0))
+            .await
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        let Some(first) = addrs.first().copied() else {
+            return;
+        };
+        let Some(second) = other_family(&addrs, first) else {
+            return;
+        };
+        let Ok(sock) = UdpSocket::bind(SocketAddr::new(second.ip(), 0)).await else {
+            return;
+        };
+        let port = sock.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                let b = &buf[..n];
+                let reply = if is_connect(b) {
+                    connect_reply(&b[12..16], CID)
+                } else if second.is_ipv6() {
+                    announce_reply(&b[12..16], &[0u8; 18])
+                } else {
+                    announce_reply(&b[12..16], &PEERS)
+                };
+                let _ = sock.send_to(&reply, from).await;
+            }
+        });
+        let url = format!("udp://localhost:{port}/announce");
+        let r = client().announce(&url, &request()).await.unwrap();
+        assert!(!r.peers.is_empty());
     }
 
     #[test]

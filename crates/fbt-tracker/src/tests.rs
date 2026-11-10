@@ -246,3 +246,46 @@ async fn https_without_tls_feature() {
         .unwrap_err();
     assert!(matches!(err, TrackerError::TlsDisabled), "{err:?}");
 }
+
+#[test]
+fn tracker_strings_are_bounded() {
+    // Failure reasons are cut to 1 KiB on a character boundary.
+    let long = "é".repeat(5000);
+    let body = dict(|b| {
+        b.insert(b"failure reason", long.as_str());
+    });
+    match parse_http_announce(&body) {
+        Err(TrackerError::Failure(m)) => {
+            assert!(m.len() <= 1024 && m.len() >= 1020, "{}", m.len());
+            assert!(m.chars().all(|c| c == 'é'));
+        }
+        other => panic!("{other:?}"),
+    }
+    // Warnings too; tracker ids above 256 bytes are dropped, shorter kept.
+    let body = dict(|b| {
+        b.insert(b"interval", 900);
+        b.insert(b"warning message", "w".repeat(10_000).as_str());
+        b.insert(b"tracker id", vec![b'i'; 257]);
+    });
+    let r = parse_http_announce(&body).unwrap();
+    assert_eq!(r.warning.map(|w| w.len()), Some(1024));
+    assert_eq!(r.tracker_id, None);
+    let body = dict(|b| {
+        b.insert(b"interval", 900);
+        b.insert(b"tracker id", vec![b'i'; 256]);
+    });
+    assert_eq!(
+        parse_http_announce(&body)
+            .unwrap()
+            .tracker_id
+            .map(|t| t.len()),
+        Some(256)
+    );
+    // A UDP error action's text as well.
+    let mut dgram = vec![0, 0, 0, 3, 0, 0, 0, 7];
+    dgram.extend(std::iter::repeat_n(b'x', 60_000));
+    match parse_udp_announce(&dgram, 7, false) {
+        Err(TrackerError::Failure(m)) => assert_eq!(m.len(), 1024),
+        other => panic!("{other:?}"),
+    }
+}

@@ -7,6 +7,27 @@ use fbt_core::PeerId;
 
 /// Floor applied to every tracker-supplied announce interval.
 pub(crate) const MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// Longest tracker-supplied text kept (failure reasons, warnings, UDP error
+/// messages), in bytes.
+pub(crate) const MAX_TEXT_BYTES: usize = 1024;
+/// Longest `tracker id` kept; longer ones are dropped.
+pub(crate) const MAX_TRACKER_ID_BYTES: usize = 256;
+
+/// Tracker-supplied text as a string of at most [`MAX_TEXT_BYTES`] bytes,
+/// cut on a character boundary.
+pub(crate) fn bounded_text(raw: &[u8]) -> String {
+    let head = raw.get(..MAX_TEXT_BYTES).unwrap_or(raw);
+    let mut s = String::from_utf8_lossy(head).into_owned();
+    if s.len() > MAX_TEXT_BYTES {
+        // Replacement characters can make the lossy text longer.
+        let mut end = MAX_TEXT_BYTES;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
 
 /// The `event` of an announce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +68,8 @@ pub struct AnnounceRequest {
     pub tracker_id: Option<Vec<u8>>,
 }
 
-/// What the tracker tells us.
+/// What the tracker tells us. Tracker-supplied text is cut to 1 KiB and a
+/// tracker id longer than 256 bytes is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnounceResponse {
     /// Seconds until the next announce (at least 60 s).
@@ -81,7 +103,7 @@ pub enum TrackerError {
     /// An `https` URL was used but no TLS feature is enabled.
     #[error("https tracker but no TLS feature enabled")]
     TlsDisabled,
-    /// The tracker answered with a `failure reason`.
+    /// The tracker answered with a `failure reason` (cut to 1 KiB).
     #[error("tracker failure: {0}")]
     Failure(String),
     /// A non-success HTTP status.
@@ -105,11 +127,15 @@ pub enum TrackerError {
 }
 
 /// Tracker client configuration.
+///
+/// Build with [`TrackerConfig::default`] and assign the fields to change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TrackerConfig {
     /// `User-Agent` header value.
     pub user_agent: String,
-    /// Overall timeout of one HTTP announce.
+    /// Overall timeout of one HTTP announce; also bounds the DNS lookup of a
+    /// UDP tracker.
     pub http_timeout: Duration,
     /// Initial UDP retransmission timeout.
     pub udp_base_timeout: Duration,

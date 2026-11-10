@@ -12,7 +12,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 use crate::tls::{self, Connector};
-use crate::types::MIN_INTERVAL;
+use crate::types::{MAX_TRACKER_ID_BYTES, MIN_INTERVAL, bounded_text};
 use crate::urlencode::url_encode_bytes;
 use crate::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerConfig, TrackerError};
 
@@ -216,9 +216,7 @@ pub fn parse_http_announce(body: &[u8]) -> Result<AnnounceResponse, TrackerError
     ))?;
     if let Some(reason) = dict.get(b"failure reason") {
         let text = reason.as_bytes().unwrap_or_default();
-        return Err(TrackerError::Failure(
-            String::from_utf8_lossy(text).into_owned(),
-        ));
+        return Err(TrackerError::Failure(bounded_text(text)));
     }
     let interval = dict
         .get(b"interval")
@@ -279,11 +277,12 @@ pub fn parse_http_announce(body: &[u8]) -> Result<AnnounceResponse, TrackerError
         tracker_id: dict
             .get(b"tracker id")
             .and_then(Value::as_bytes)
+            .filter(|b| b.len() <= MAX_TRACKER_ID_BYTES)
             .map(<[u8]>::to_vec),
         warning: dict
             .get(b"warning message")
             .and_then(Value::as_bytes)
-            .map(|b| String::from_utf8_lossy(b).into_owned()),
+            .map(bounded_text),
         external_ip,
     })
 }
