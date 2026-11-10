@@ -15,4 +15,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl jq \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/fbt-example /usr/local/bin/fbt-example
+# Non-root by default; compose overrides the uid/gid with the caller's.
+RUN useradd --system --uid 10001 --no-create-home fbt
+USER fbt
 CMD ["sleep", "infinity"]

@@ -48,7 +48,7 @@ wait_for() {
     local what=$1 timeout=$2
     shift 2
     local deadline=$((SECONDS + timeout))
-    until "$@" >/dev/null 2>&1; do
+    until "$@" >/dev/null; do
         if [ "$SECONDS" -ge "$deadline" ]; then
             fail "timed out after ${timeout}s waiting for $what"
         fi
@@ -79,21 +79,21 @@ info_hash() {
     fbt fbt-example info "$1" | sed -n 's/^info hash: //p'
 }
 
-qbt_api() { fbt curl -fsS "http://qbittorrent:8080/api/v2/$1" "${@:2}"; }
+qbt_api() { fbt curl -fsS --max-time 10 "http://qbittorrent:8080/api/v2/$1" "${@:2}"; }
 
 qbt_field() { # qbt_field <hash> <jq expr>
     qbt_api "torrents/info?hashes=$1" | fbt jq -r ".[0] | $2"
 }
 
 qbt_seeding() {
-    [ "$(qbt_field "$1" '(.progress == 1) and (.state | test("UP$"))')" = true ]
+    [ "$(qbt_field "$1" '(.progress == 1) and (.state | test("^(uploading|stalledUP|forcedUP)$"))')" = true ]
 }
 
 qbt_uploaded() {
     [ "$(qbt_field "$1" '.uploaded')" -gt 0 ]
 }
 
-tr_info() { trc transmission-remote -t "$1" -i; }
+tr_info() { trc timeout 15 transmission-remote -t "$1" -i; }
 
 tr_field() { # tr_field <hash> <label>
     tr_info "$1" | sed -n "s/^ *$2: *//p" | head -n 1
@@ -124,7 +124,7 @@ dc build --quiet
 dc up -d --quiet-pull
 wait_for "opentracker" 60 fbt curl -fsS http://tracker:6969/stats
 wait_for "qBittorrent WebUI" 120 qbt_api app/version
-wait_for "Transmission RPC" 120 trc transmission-remote -l
+wait_for "Transmission RPC" 120 trc timeout 15 transmission-remote -l
 
 # ---------------------------------------------------------------- download --
 echo "interop: creating payload and fixture.torrent"
@@ -165,9 +165,9 @@ make_torrent /interop/payload2/fixture2 /interop/fixture2.torrent
 hash2=$(info_hash /interop/fixture2.torrent)
 [ -n "$hash2" ] || fail "could not read the info hash of fixture2.torrent"
 
-echo "interop: fbt-example seed (300s)"
+echo "interop: fbt-example seed (420s)"
 fbt fbt-example seed /interop/fixture2.torrent --data /interop/payload2 --port 6891 \
-    --seed-for 300 >"$logs/fbt-seed.log" 2>&1 &
+    --seed-for 420 >"$logs/fbt-seed.log" 2>&1 &
 seed_pid=$!
 seed_ready() {
     kill -0 "$seed_pid" 2>/dev/null || fail "fbt-example seed exited early (see $logs/fbt-seed.log)"
