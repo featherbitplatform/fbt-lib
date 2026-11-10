@@ -199,8 +199,9 @@ fn reset_packet(conn_id: u16, seq_nr: u16, ack_nr: u16) -> Vec<u8> {
 #[derive(Debug, Default)]
 struct Table {
     slots: HashMap<Key, Slot>,
-    /// The keys of the slots we dialled (`connect`), a subset of `slots`.
-    outgoing: HashSet<Key>,
+    /// The slots we dialled (`connect`), a subset of `slots`, with the
+    /// sequence number of their SYN.
+    outgoing: HashMap<Key, u16>,
     half_open: HashSet<Key>,
     half_open_per_ip: HashMap<IpAddr, usize>,
 }
@@ -495,14 +496,15 @@ impl Shared {
         self.finish(key, slot, peer, st);
     }
 
-    /// Room for one more half-open connection at `key`: under the limits,
-    /// and no neighbouring id in use by that peer (as `connect` keeps them
-    /// free), so a reset by send id matches one connection only.
-    fn has_room(&self, table: &Table, pending: usize, key: Key) -> bool {
+    /// Room for one more half-open connection at `key` for `syn`: under
+    /// the limits, and no neighbouring id in use by that peer (as `connect`
+    /// keeps them free), so a reset by send id matches one connection only;
+    /// see [`syn_neighbours_free`] for the one exception.
+    fn has_room(&self, table: &Table, pending: usize, key: Key, syn: &Packet) -> bool {
         table.slots.len() < self.cfg.max_connections
             && pending < self.cfg.max_pending_accept
             && table.half_open_from(key.0.ip()) < MAX_PENDING_PER_IP
-            && syn_neighbours_free(table, key)
+            && syn_neighbours_free(table, key, syn)
     }
 
     fn incoming_syn(&self, key: Key, syn: &Packet, now: Instant) {
@@ -510,7 +512,7 @@ impl Shared {
         {
             let table = lock(&self.table);
             let pending = lock(&self.pending).len();
-            if !self.has_room(&table, pending, key) {
+            if !self.has_room(&table, pending, key, syn) {
                 return;
             }
         }
@@ -526,7 +528,7 @@ impl Shared {
         {
             let mut table = lock(&self.table);
             let mut pending = lock(&self.pending);
-            if table.slots.contains_key(&key) || !self.has_room(&table, pending.len(), key) {
+            if table.slots.contains_key(&key) || !self.has_room(&table, pending.len(), key, syn) {
                 return;
             }
             table.slots.insert(key, Arc::clone(&slot));
@@ -648,22 +650,29 @@ fn neighbours_free(table: &Table, key: Key) -> bool {
         .all(|id| !table.slots.contains_key(&(key.0, id)))
 }
 
-/// [`neighbours_free`] for an incoming SYN at `key`, except that the id
-/// just below may be a connection we dialled to the same address. That is
-/// the SYN of our own dial when a socket connects to itself (the dialler's
-/// receive id is the SYN's id, ours is one more), or a peer that picked the
-/// id we did. Both connections stay apart: packets to the dialler carry its
-/// receive id, packets to the acceptor carry the dialler's send id, and a
-/// reset by send id still matches one of them only (their send ids differ,
-/// and the ids around the pair stay free).
-fn syn_neighbours_free(table: &Table, key: Key) -> bool {
+/// [`neighbours_free`] for an incoming `syn` at `key`, with one exception:
+/// the id just below may be a connection we dialled to the same address
+/// whose own SYN this looks like (same id, same sequence number). That is
+/// our own SYN coming back when a socket connects to itself: the dialler's
+/// receive id is the SYN's id, the acceptor's one more.
+///
+/// The pair is not fully separable. Data packets are (to the dialler they
+/// carry its receive id, to the acceptor the dialler's send id, both
+/// distinct keys), but a reset that echoes the acceptor's send id (as
+/// libutp answers an unknown packet) carries the dialler's receive id and
+/// lands on the dialler. Every dialler starts at the same sequence number
+/// (as libutp does), so a remote peer that drew our id by chance (1 in
+/// 65536 per concurrent dial) qualifies too and shares that caveat; before
+/// this exception its connect simply timed out.
+fn syn_neighbours_free(table: &Table, key: Key, syn: &Packet) -> bool {
     let below = (key.0, key.1.wrapping_sub(1));
+    let own_syn = table.outgoing.get(&below) == Some(&syn.seq_nr);
     [1u16, 2]
         .into_iter()
         .flat_map(|d| [key.1.wrapping_add(d), key.1.wrapping_sub(d)])
         .all(|id| {
             let k = (key.0, id);
-            !table.slots.contains_key(&k) || (k == below && table.outgoing.contains(&k))
+            !table.slots.contains_key(&k) || (k == below && own_syn)
         })
 }
 
@@ -801,9 +810,10 @@ impl UtpSocket {
                 return Err(UtpError::TooManyConnections);
             };
             let conn = Connection::connect(&sh.cfg, to, id, now);
+            let isn = conn.isn();
             let slot = Arc::new(Mutex::new(ConnSlot::new(conn, (to, id), false)));
             table.slots.insert((to, id), Arc::clone(&slot));
-            table.outgoing.insert((to, id));
+            table.outgoing.insert((to, id), isn);
             ((to, id), slot)
         };
         let st = sh.settle(&mut lock(&slot), now, None);
@@ -887,6 +897,12 @@ impl UtpSocket {
     /// Resets every connection and stops the socket's tasks; idempotent.
     /// Streams and pending `accept`/`connect` calls wake with an error.
     pub async fn shutdown(&self) {
+        self.shutdown_now();
+    }
+
+    /// [`UtpSocket::shutdown`] without awaiting: usable from `Drop` and
+    /// other synchronous code. Idempotent.
+    pub fn shutdown_now(&self) {
         self.inner.shutdown();
     }
 }
@@ -961,5 +977,71 @@ async fn receive_loop(socket: UdpSocket, shared: Weak<Shared>, stop: Arc<Notify>
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn syn(conn_id: u16, seq_nr: u16) -> Packet {
+        Packet {
+            ty: PacketType::Syn,
+            conn_id,
+            timestamp_us: 0,
+            timestamp_diff_us: 0,
+            wnd_size: 1 << 20,
+            seq_nr,
+            ack_nr: 0,
+            sack: None,
+            payload: Bytes::new(),
+        }
+    }
+
+    /// A table holding one connection dialled to `peer` with receive id `id`.
+    fn dialled(peer: SocketAddr, id: u16) -> (Table, u16) {
+        let conn = Connection::connect(&UtpConfig::default(), peer, id, Instant::now());
+        let isn = conn.isn();
+        let mut table = Table::default();
+        let slot = Arc::new(Mutex::new(ConnSlot::new(conn, (peer, id), false)));
+        table.slots.insert((peer, id), slot);
+        table.outgoing.insert((peer, id), isn);
+        (table, isn)
+    }
+
+    #[test]
+    fn only_our_own_syn_may_sit_next_to_our_dial() {
+        let peer: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let id = 1000u16;
+        let (table, isn) = dialled(peer, id);
+        // Our own SYN coming back: its id is the dialler's, the acceptor's
+        // key one more.
+        let key = (peer, id.wrapping_add(1));
+        assert!(syn_neighbours_free(&table, key, &syn(id, isn)));
+        // Another sequence number is not our SYN.
+        assert!(!syn_neighbours_free(
+            &table,
+            key,
+            &syn(id, isn.wrapping_add(7))
+        ));
+        // Two above, or below the dial: the ordinary neighbour rule.
+        let two_above = (peer, id.wrapping_add(2));
+        assert!(!syn_neighbours_free(
+            &table,
+            two_above,
+            &syn(id.wrapping_add(1), isn)
+        ));
+        let below = (peer, id.wrapping_sub(1));
+        assert!(!syn_neighbours_free(
+            &table,
+            below,
+            &syn(id.wrapping_sub(2), isn)
+        ));
+        // An accepted connection (not dialled) never qualifies.
+        let mut accepted = Table::default();
+        let conn = Connection::accept(&UtpConfig::default(), peer, &syn(id, 1), 5, Instant::now());
+        let slot = Arc::new(Mutex::new(ConnSlot::new(conn, (peer, id), true)));
+        accepted.slots.insert((peer, id), slot);
+        assert!(!syn_neighbours_free(&accepted, key, &syn(id, isn)));
     }
 }

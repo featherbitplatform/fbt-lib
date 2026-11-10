@@ -298,6 +298,11 @@ impl Connection {
         self.send_id
     }
 
+    /// Our initial sequence number (that of the SYN, for a dialler).
+    pub fn isn(&self) -> u16 {
+        self.isn
+    }
+
     pub fn state(&self) -> ConnState {
         self.state
     }
