@@ -626,12 +626,7 @@ impl Actor {
                 picker.set_sequential(l.sequential);
                 // Peers still connected (a magnet keeps those it fetched
                 // the metadata through) count toward availability.
-                let generation = self.generation;
-                for p in self.peers.values() {
-                    if p.tx.is_some() && p.generation == generation {
-                        picker.add_peer_pieces(p.pieces());
-                    }
-                }
+                add_availability(&mut picker, &self.peers, self.generation);
                 // Finishing during this session is what `TorrentFinished` reports.
                 self.finished_emitted = picker.is_finished();
                 l.picker = Some(picker);
@@ -725,7 +720,7 @@ impl Actor {
             return;
         };
         let m = *m;
-        let file_prio = selected_priorities(&meta, m.magnet.select_only.as_deref());
+        let file_prio = selected_priorities(meta.info.files.len(), m.magnet.select_only.as_deref());
         let storage: Arc<dyn Storage> = match m.storage {
             Some(s) => s,
             None => Arc::new(FsStorage::new(m.save_path, &meta)),
@@ -747,9 +742,12 @@ impl Actor {
             self.dht_rx = None;
             self.drop_pex_peers();
         }
-        let ext = self.ext_config();
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
+            let Some(addr) = self.peers.get(&key).map(|p| p.addr) else {
+                continue;
+            };
+            let ext = self.ext_config(&addr);
             if let Some(p) = self.peers.get_mut(&key) {
                 p.bits = Bitfield::new(n);
                 p.fast_has = None;
@@ -1021,24 +1019,45 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
     }
 }
 
-/// File priorities from a magnet's `so` selection: unselected files are
-/// skipped; no selection means every file at `Normal`.
+/// Adds the pieces of every peer of `generation` to `picker`'s
+/// availability: the same peers whose pieces `Disconnected` removes again
+/// (closing ones included), so the counts never drift.
+fn add_availability(picker: &mut PiecePicker, peers: &HashMap<PeerKey, Peer>, generation: u64) {
+    for p in peers.values().filter(|p| p.generation == generation) {
+        picker.add_peer_pieces(p.pieces());
+    }
+}
+
+/// File priorities for `files` files from a magnet's `so` selection:
+/// unselected files are skipped; no selection means every file at `Normal`.
+/// The ranges are sorted first, so this is O(files + ranges log ranges).
 fn selected_priorities(
-    meta: &Metainfo,
+    files: usize,
     select: Option<&[std::ops::RangeInclusive<usize>]>,
 ) -> Vec<Priority> {
     let Some(select) = select else {
         return Vec::new();
     };
-    (0..meta.info.files.len())
-        .map(|i| {
-            if select.iter().any(|r| r.contains(&i)) {
-                Priority::Normal
-            } else {
-                Priority::Skip
-            }
-        })
-        .collect()
+    let mut ranges: Vec<(usize, usize)> = select.iter().map(|r| (*r.start(), *r.end())).collect();
+    ranges.sort_unstable();
+    let mut out = vec![Priority::Skip; files];
+    // Every file below `next` is already settled.
+    let mut next = 0usize;
+    for (start, end) in ranges {
+        let start = start.max(next);
+        let end = end.min(files.saturating_sub(1));
+        if start >= files {
+            break;
+        }
+        if start > end {
+            continue;
+        }
+        if let Some(slice) = out.get_mut(start..=end) {
+            slice.fill(Priority::Normal);
+        }
+        next = end.saturating_add(1);
+    }
+    out
 }
 
 /// Bytes of the pieces with a non-zero priority.
@@ -1047,4 +1066,53 @@ fn wanted_bytes(layout: &PieceLayout, prio: &[u8]) -> u64 {
         .filter(|&i| prio.get(i as usize).is_some_and(|&p| p > 0))
         .map(|i| u64::from(layout.piece_size(i)))
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer closed while the check ran (no command sender, still waiting
+    /// for its `Disconnected`) counts toward availability, since its
+    /// disconnect takes its pieces off again; older generations do not.
+    #[test]
+    fn availability_counts_closing_peers_of_the_generation() {
+        let layout = PieceLayout::new(4 * 16_384, 16_384).expect("layout");
+        let mut picker = PiecePicker::new(layout, &Bitfield::new(4));
+        let (tx, _rx) = mpsc::channel(1);
+        let addr = SocketAddr::from(([10, 0, 0, 1], 6881));
+        let mut closing = Peer::new(addr, tx.clone(), 3, 4);
+        closing.bits.set(0);
+        closing.tx = None;
+        let mut stale = Peer::new(addr, tx, 2, 4);
+        stale.bits.set(1);
+        let peers = HashMap::from([(PeerKey(1), closing), (PeerKey(2), stale)]);
+        add_availability(&mut picker, &peers, 3);
+        assert_eq!(picker.availability(0), 1);
+        assert_eq!(picker.availability(1), 0);
+        // The disconnect removes exactly what was added.
+        picker.remove_peer_pieces(peers[&PeerKey(1)].pieces());
+        assert_eq!(picker.availability(0), 0);
+    }
+
+    #[test]
+    fn so_selection_is_merged_in_one_pass() {
+        use Priority::{Normal as N, Skip as S};
+        assert!(selected_priorities(3, None).is_empty());
+        // Unsorted, overlapping, nested, empty and out-of-range ranges.
+        #[allow(
+            clippy::reversed_empty_ranges,
+            reason = "an empty range is valid input"
+        )]
+        let sel = [7..=20, 0..=0, 2..=4, 3..=3, 5..=4, 3..=5, 100..=200];
+        assert_eq!(
+            selected_priorities(10, Some(&sel)),
+            [N, S, N, N, N, N, S, N, N, N]
+        );
+        assert_eq!(selected_priorities(0, Some(&sel)), []);
+        // The worst case the magnet parser allows stays cheap.
+        let many: Vec<_> = (0..1000).rev().map(|i| i * 1000..=i * 1000 + 999).collect();
+        let all = selected_priorities(1_000_000, Some(&many));
+        assert!(all.iter().all(|p| *p == N));
+    }
 }

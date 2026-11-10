@@ -21,7 +21,7 @@ use crate::peer::ext::ExtConfig;
 use crate::peer::messages::PeerCommand;
 use crate::picker::{PeerKey, PeerPieces};
 use crate::rate::RateMeter;
-use crate::session::{release, try_reserve};
+use crate::session::{dht_port_for, release, try_reserve};
 use crate::settings::EncryptionPolicy;
 
 /// Connection attempts per address before it is given up.
@@ -429,7 +429,7 @@ impl Actor {
 
     /// The context of a new peer task. Without metadata the task runs in
     /// no-metadata mode (no layout, an empty `have`).
-    pub(super) fn ctx(&self, key: PeerKey) -> PeerCtx {
+    pub(super) fn ctx(&self, key: PeerKey, addr: &SocketAddr) -> PeerCtx {
         let l = self.loaded.as_ref();
         let have = l.map_or_else(
             || Bitfield::new(0),
@@ -446,17 +446,17 @@ impl Actor {
             our_id: self.shared.peer_id,
             layout: l.map(|l| l.layout),
             have,
-            ext: self.ext_config(),
+            ext: self.ext_config(addr),
             settings: Arc::clone(&self.shared.settings),
             events: self.peer_tx.clone(),
             encrypted: false,
         }
     }
 
-    /// What new connections advertise. A torrent without metadata may be
-    /// private; until it is known, PEX is advertised (the magnet exception)
-    /// when `pex_enabled`.
-    pub(super) fn ext_config(&self) -> ExtConfig {
+    /// What a connection to `addr` advertises. A torrent without metadata
+    /// may be private; until it is known, PEX is advertised (the magnet
+    /// exception) when `pex_enabled`.
+    pub(super) fn ext_config(&self, addr: &SocketAddr) -> ExtConfig {
         let meta = self.loaded.as_ref().map(|l| &l.meta);
         ExtConfig {
             listen_port: self.shared.listen_port,
@@ -464,7 +464,7 @@ impl Actor {
             pex: self.shared.settings.pex_enabled && !meta.is_some_and(|m| m.info.private),
             // No DHT bit or `Port` for a private torrent (a magnet's
             // privacy is unknown until its metadata: it advertises both).
-            dht_port: self.shared.dht_port.filter(|_| !self.is_private()),
+            dht_port: dht_port_for(&self.shared.dht_addrs, addr).filter(|_| !self.is_private()),
             reqq: u32::try_from(self.shared.settings.max_incoming_requests).unwrap_or(u32::MAX),
         }
     }
@@ -554,7 +554,7 @@ impl Actor {
                 continue;
             }
             let key = self.new_key();
-            let ctx = self.ctx(key);
+            let ctx = self.ctx(key, &addr);
             let have = ctx.have.clone();
             let num_pieces = ctx.have.len();
             let tx = spawn_outgoing(addr, ctx, self.mse_provide(&addr));
@@ -605,7 +605,7 @@ impl Actor {
             return;
         }
         let key = self.new_key();
-        let mut ctx = self.ctx(key);
+        let mut ctx = self.ctx(key, &addr);
         ctx.encrypted = stream.is_encrypted();
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();

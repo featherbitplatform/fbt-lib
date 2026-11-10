@@ -142,8 +142,20 @@ pub(crate) struct Shared {
     pub half_open: AtomicUsize,
     /// The session-wide DHT node; `None` with `dht_enabled` off.
     pub dht: Option<Dht>,
-    /// The DHT's UDP port, sent in `Port` messages.
-    pub dht_port: Option<u16>,
+    /// The DHT's UDP sockets; `Port` messages carry the port of the one
+    /// matching the peer's address family ([`dht_port_for`]).
+    pub dht_addrs: Vec<SocketAddr>,
+}
+
+/// The DHT port to send a peer at `peer` in `Port`: that of our DHT socket
+/// of the same address family (an IPv4-mapped IPv6 peer counts as IPv4),
+/// `None` without one, since the peer could not reach the other socket.
+pub(crate) fn dht_port_for(dht_addrs: &[SocketAddr], peer: &SocketAddr) -> Option<u16> {
+    let v4 = peer.ip().to_canonical().is_ipv4();
+    dht_addrs
+        .iter()
+        .find(|a| a.is_ipv4() == v4)
+        .map(SocketAddr::port)
 }
 
 impl Shared {
@@ -256,9 +268,7 @@ impl Session {
         } else {
             None
         };
-        let dht_port = dht
-            .as_ref()
-            .and_then(|d| d.local_addrs().first().map(SocketAddr::port));
+        let dht_addrs = dht.as_ref().map(Dht::local_addrs).unwrap_or_default();
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -269,7 +279,7 @@ impl Session {
             global_peers: AtomicUsize::new(0),
             half_open: AtomicUsize::new(0),
             dht,
-            dht_port,
+            dht_addrs,
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -508,4 +518,26 @@ fn watch_bootstrap(dht: &Dht, shared: std::sync::Weak<Shared>) {
             shared.emit(Event::DhtBootstrapped { nodes });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_message_carries_the_dht_port_of_the_peers_family() {
+        let v4: SocketAddr = "0.0.0.0:7001".parse().unwrap();
+        let v6: SocketAddr = "[::]:7002".parse().unwrap();
+        let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
+        let peer6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();
+        let both = [v4, v6];
+        assert_eq!(dht_port_for(&both, &peer4), Some(7001));
+        assert_eq!(dht_port_for(&both, &peer6), Some(7002));
+        assert_eq!(dht_port_for(&both, &mapped), Some(7001));
+        // Only one family bound: the other gets no `Port`.
+        assert_eq!(dht_port_for(&[v6], &peer4), None);
+        assert_eq!(dht_port_for(&[v4], &peer6), None);
+        assert_eq!(dht_port_for(&[], &peer4), None);
+    }
 }

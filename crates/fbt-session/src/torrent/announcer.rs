@@ -57,9 +57,11 @@ pub(super) const NO_METADATA_LEFT: u64 = 16_384;
 /// What the actor wants from the announcer.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Signals {
-    /// The torrent is active (checked, not paused, no error).
+    /// The torrent is announced: not paused and not in error, and either
+    /// ready, fetching a magnet's metadata, or checking the files right
+    /// after that metadata arrived (`Actor::running`).
     pub running: bool,
-    /// Bumped each time the torrent becomes active: a new `started`.
+    /// Bumped each time `running` turns on: a new `started`.
     pub starts: u64,
     /// The torrent finished during this session.
     pub completed: bool,
