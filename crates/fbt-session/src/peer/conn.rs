@@ -563,6 +563,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 }
             }
             PeerCommand::Have(piece) => self.send(Message::Have(piece)).await?,
+            PeerCommand::Haves(pieces) => {
+                if !pieces.is_empty() {
+                    for piece in pieces {
+                        self.feed(Message::Have(piece)).await?;
+                    }
+                    self.flush().await?;
+                }
+            }
             PeerCommand::SendBlock { block, data } => {
                 // Only answer requests still queued (not cancelled or choked away).
                 if self.incoming.remove(&block) {

@@ -467,3 +467,64 @@ async fn allowed_fast_flood_keeps_the_actor_responsive() {
     assert_eq!(b.piece, 3);
     s.shutdown().await;
 }
+
+/// A piece that finishes after an outgoing connection was started but
+/// before its handshake completed is announced to that peer with `Have`
+/// (its initial bitfield predates the piece).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn piece_finished_while_a_peer_connects_is_announced() {
+    use fbt_wire::{Handshake, MessageCodec, Reserved, read_handshake, write_handshake};
+    use futures_util::StreamExt;
+
+    let (m, payload) = make_torrent(&[("a", 4 * 16_384)], 16_384);
+    let ih = m.info_hashes.wire_hash();
+    let (s, h, _) = mem_leecher(&m, payload.len()).await;
+    let mut ev = s.subscribe(EventMask::PIECE);
+
+    // A remote that accepts our connection but holds back its handshake.
+    let slow = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    h.add_peer(slow.local_addr().unwrap()).await.unwrap();
+    let (mut stream, _) = tokio::time::timeout(T, slow.accept())
+        .await
+        .expect("dialled in time")
+        .unwrap();
+    read_handshake(&mut stream).await.unwrap();
+
+    // Meanwhile another peer delivers piece 0.
+    let mut seed = ScriptedPeer::connect(s.local_addr(), ih).await;
+    seed.send(Message::Bitfield(bytes::Bytes::from_static(&[0x80])))
+        .await;
+    seed.send(Message::Unchoke).await;
+    let data = payload.clone();
+    tokio::spawn(async move { seed.serve(&data, 16_384).await });
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PieceFinished { piece: 0, .. }),
+        T,
+    )
+    .await
+    .expect("piece 0 finished");
+
+    // Now the slow remote answers: it learns about piece 0.
+    let theirs = Handshake {
+        reserved: Reserved::default(),
+        info_hash: ih,
+        peer_id: fbt_core::PeerId([0x77; 20]),
+    };
+    write_handshake(&mut stream, &theirs).await.unwrap();
+    let mut wire = tokio_util::codec::Framed::new(stream, MessageCodec::new(1 << 20));
+    let got_have = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(msg)) = wire.next().await {
+            match msg {
+                Message::Have(0) => return true,
+                Message::Bitfield(b) if b[0] & 0x80 != 0 => return true,
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(got_have, "piece 0 never announced to the slow peer");
+    s.shutdown().await;
+}

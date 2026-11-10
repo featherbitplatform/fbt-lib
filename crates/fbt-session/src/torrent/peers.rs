@@ -152,6 +152,10 @@ pub(super) struct Peer {
     /// Outgoing and still holding a half-open slot.
     pub connecting: bool,
     pub connected: bool,
+    /// Our pieces as the peer task will announce them (its initial
+    /// bitfield), until `Connected`; pieces finished since then are
+    /// announced on connect, since `Have`s go to connected peers only.
+    pub have_sent: Option<Bitfield>,
     pub peer_id: Option<PeerId>,
     /// `HaveAll` or a full bitfield.
     pub seed: bool,
@@ -191,6 +195,7 @@ impl Peer {
             outgoing: false,
             connecting: false,
             connected: false,
+            have_sent: None,
             peer_id: None,
             seed: false,
             bits: Bitfield::new(num_pieces),
@@ -334,10 +339,13 @@ impl Actor {
                 break;
             };
             let key = self.new_key();
-            let tx = spawn_outgoing(addr, self.ctx(key));
+            let ctx = self.ctx(key);
+            let have = ctx.have.clone();
+            let tx = spawn_outgoing(addr, ctx);
             let mut peer = Peer::new(addr, tx, self.generation, self.layout.num_pieces());
             peer.outgoing = true;
             peer.connecting = true;
+            peer.have_sent = Some(have);
             self.peers.insert(key, peer);
         }
     }
@@ -358,8 +366,11 @@ impl Actor {
             return;
         }
         let key = self.new_key();
-        let tx = spawn_incoming(stream, hs, addr, self.ctx(key));
-        let peer = Peer::new(addr, tx, self.generation, self.layout.num_pieces());
+        let ctx = self.ctx(key);
+        let have = ctx.have.clone();
+        let tx = spawn_incoming(stream, hs, addr, ctx);
+        let mut peer = Peer::new(addr, tx, self.generation, self.layout.num_pieces());
+        peer.have_sent = Some(have);
         self.peers.insert(key, peer);
     }
 
@@ -480,6 +491,18 @@ impl Actor {
         p.peer_id = Some(peer_id);
         if p.outgoing {
             self.retries.connected(&p.addr);
+        }
+        // Pieces finished while it connected were skipped by `on_written`.
+        let snapshot = p.have_sent.take();
+        if let (Some(sent), Some(picker)) = (snapshot, self.picker.as_ref()) {
+            let missed: Vec<u32> = picker
+                .have()
+                .iter_ones()
+                .filter(|&i| !sent.get(i))
+                .collect();
+            if !missed.is_empty() {
+                self.send(key, PeerCommand::Haves(missed));
+            }
         }
         debug!(%addr, "peer connected");
         self.emit(Event::PeerConnected {

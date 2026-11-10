@@ -107,6 +107,9 @@ pub(crate) enum PeerCommand {
     Interested(bool),
     /// Announce a piece we completed.
     Have(u32),
+    /// Announce several pieces at once: those completed while the
+    /// connection was being set up, after its initial bitfield was taken.
+    Haves(Vec<u32>),
     /// Answer a queued request.
     SendBlock { block: BlockRef, data: Bytes },
     /// Refuse a queued request.
