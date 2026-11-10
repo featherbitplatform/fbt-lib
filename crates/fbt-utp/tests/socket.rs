@@ -121,6 +121,23 @@ async fn connect_accept_echo() {
     assert_eq!(server.num_connections(), 1);
 }
 
+/// Regression: a socket dialling its own address. Its SYN lands next to its
+/// own outgoing connection (the acceptor's id is the dialler's plus one) and
+/// was dropped by the free-neighbour rule, so the connect timed out. A
+/// BitTorrent session dialling itself must reach the handshake to see its
+/// own peer id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socket_connects_to_itself() {
+    let s = bind(short_timeouts()).await;
+    let (mut c, mut a) = pair(&s, &s).await;
+    echo_roundtrip(&mut c, &mut a, b"talking to myself").await;
+    assert_eq!(s.num_connections(), 2);
+    // Each end closes on its own.
+    drop(c);
+    let mut b = [0u8; 1];
+    assert_eq!(step(a.read(&mut b)).await.unwrap(), 0, "EOF after the FIN");
+}
+
 #[derive(Debug, Default)]
 struct CountingHandler {
     seen: Mutex<Vec<Vec<u8>>>,

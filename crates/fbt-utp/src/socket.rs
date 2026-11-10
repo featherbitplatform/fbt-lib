@@ -199,6 +199,8 @@ fn reset_packet(conn_id: u16, seq_nr: u16, ack_nr: u16) -> Vec<u8> {
 #[derive(Debug, Default)]
 struct Table {
     slots: HashMap<Key, Slot>,
+    /// The keys of the slots we dialled (`connect`), a subset of `slots`.
+    outgoing: HashSet<Key>,
     half_open: HashSet<Key>,
     half_open_per_ip: HashMap<IpAddr, usize>,
 }
@@ -422,6 +424,7 @@ impl Shared {
             let mut table = lock(&self.table);
             if table.holds(key, slot) {
                 table.slots.remove(&key);
+                table.outgoing.remove(&key);
                 table.drop_half_open(key);
             }
         }
@@ -499,7 +502,7 @@ impl Shared {
         table.slots.len() < self.cfg.max_connections
             && pending < self.cfg.max_pending_accept
             && table.half_open_from(key.0.ip()) < MAX_PENDING_PER_IP
-            && neighbours_free(table, key)
+            && syn_neighbours_free(table, key)
     }
 
     fn incoming_syn(&self, key: Key, syn: &Packet, now: Instant) {
@@ -607,6 +610,7 @@ impl Shared {
             let mut table = lock(&self.table);
             table.half_open.clear();
             table.half_open_per_ip.clear();
+            table.outgoing.clear();
             table.slots.drain().collect()
         };
         lock(&self.pending).clear();
@@ -642,6 +646,25 @@ fn neighbours_free(table: &Table, key: Key) -> bool {
         .into_iter()
         .flat_map(|d| [key.1.wrapping_add(d), key.1.wrapping_sub(d)])
         .all(|id| !table.slots.contains_key(&(key.0, id)))
+}
+
+/// [`neighbours_free`] for an incoming SYN at `key`, except that the id
+/// just below may be a connection we dialled to the same address. That is
+/// the SYN of our own dial when a socket connects to itself (the dialler's
+/// receive id is the SYN's id, ours is one more), or a peer that picked the
+/// id we did. Both connections stay apart: packets to the dialler carry its
+/// receive id, packets to the acceptor carry the dialler's send id, and a
+/// reset by send id still matches one of them only (their send ids differ,
+/// and the ids around the pair stay free).
+fn syn_neighbours_free(table: &Table, key: Key) -> bool {
+    let below = (key.0, key.1.wrapping_sub(1));
+    [1u16, 2]
+        .into_iter()
+        .flat_map(|d| [key.1.wrapping_add(d), key.1.wrapping_sub(d)])
+        .all(|id| {
+            let k = (key.0, id);
+            !table.slots.contains_key(&k) || (k == below && table.outgoing.contains(&k))
+        })
 }
 
 /// Feeds datagrams to the socket. Holds it weakly: the socket ends with its
@@ -780,6 +803,7 @@ impl UtpSocket {
             let conn = Connection::connect(&sh.cfg, to, id, now);
             let slot = Arc::new(Mutex::new(ConnSlot::new(conn, (to, id), false)));
             table.slots.insert((to, id), Arc::clone(&slot));
+            table.outgoing.insert((to, id));
             ((to, id), slot)
         };
         let st = sh.settle(&mut lock(&slot), now, None);
