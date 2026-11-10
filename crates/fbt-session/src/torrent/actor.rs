@@ -399,9 +399,11 @@ impl Actor {
     }
 
     /// What the announcer is told: announcing while peers may connect, and
-    /// through the check that follows a magnet's metadata.
+    /// through the check that follows a magnet's metadata (only while that
+    /// check is still running).
     pub(super) fn running(&self) -> bool {
-        self.connectable() || (self.metadata_check && !self.paused)
+        self.connectable()
+            || (self.metadata_check && matches!(self.phase, Phase::Checking { .. }) && !self.paused)
     }
 
     pub(super) fn state(&self) -> TorrentState {
@@ -654,6 +656,8 @@ impl Actor {
         warn!(torrent = %self.name(), error = %e, "storage error while {during}");
         let message = format!("{during}: {e}");
         self.phase = Phase::Error(message.clone());
+        // A failed metadata check ends the announce like any other error.
+        self.metadata_check = false;
         self.emit(Event::FileError {
             path: None,
             torrent: self.ih,
@@ -670,6 +674,7 @@ impl Actor {
     pub(super) fn metadata_failed(&mut self, message: String) {
         warn!(torrent = %self.name(), %message, "metadata failed");
         self.phase = Phase::Error(message);
+        self.metadata_check = false;
         self.close_all();
         self.refresh_state();
     }
@@ -865,9 +870,11 @@ impl Actor {
             self.phase = Phase::Metadata;
         } else if was_error {
             // Whatever was in flight when the error hit is unknown: forget
-            // the picker and partial pieces and trust only the disk.
+            // the picker and partial pieces and trust only the disk. Peers
+            // of the old generation go too.
             self.remember_left();
             self.generation = self.generation.wrapping_add(1);
+            self.close_all();
             self.clear_bufs();
             self.start_check();
         }

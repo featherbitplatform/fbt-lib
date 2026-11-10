@@ -661,3 +661,98 @@ async fn magnet_priorities_rejected_until_metadata() {
     assert_eq!(st.state, TorrentState::DownloadingMetadata);
     session.shutdown().await;
 }
+
+/// Memory storage whose reads fail while `fail` is set.
+#[derive(Debug)]
+struct FailingReads {
+    inner: MemStorage,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl fbt_session::storage::Storage for FailingReads {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected read failure"));
+        }
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> std::io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// A check after the metadata that fails puts the torrent in `Error` like
+/// any storage error: `stopped` is announced, incoming peers are dropped,
+/// and a resume starts over cleanly and finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_metadata_check_stops_the_torrent_until_resumed() {
+    let tracker = FakeTracker::http(Reply::Peers).await;
+    let (mut m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    m.trackers = vec![vec![tracker.url.clone()]];
+    let (seed, _sh) = seeder(&m, &payload).await;
+    let seed_port = seed.local_addr().port();
+    assert!(wait_until(|| tracker.events_of(seed_port) == ["started"], T).await);
+
+    // The seeder is found through the tracker, so `started` is answered
+    // before the metadata arrives.
+    let leech = Session::new(settings()).await.unwrap();
+    let port = leech.local_addr().port();
+    let mut mg = magnet_of(m.info_hashes, vec![]);
+    mg.trackers = vec![tracker.url.clone()];
+    let storage = Arc::new(FailingReads {
+        inner: MemStorage::new(payload.len() as u64),
+        fail: std::sync::atomic::AtomicBool::new(true),
+    });
+    let mut p = AddTorrent::magnet(mg, PathBuf::from("unused"));
+    p.storage = Some(storage.clone());
+    let h = leech.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Error, T).await);
+    assert!(h.status().has_metadata);
+    assert!(
+        wait_until(|| tracker.events_of(port) == ["started", "stopped"], T).await,
+        "{:?}",
+        tracker.events_of(port)
+    );
+
+    // An incoming peer is dropped before any handshake.
+    let mut s = tokio::net::TcpStream::connect(leech.local_addr())
+        .await
+        .unwrap();
+    fbt_wire::write_handshake(
+        &mut s,
+        &fbt_wire::Handshake {
+            reserved: fast_ext(),
+            info_hash: m.info_hashes.wire_hash(),
+            peer_id: fbt_core::PeerId([6; 20]),
+        },
+    )
+    .await
+    .unwrap();
+    let mut buf = [0u8; 68];
+    let n = tokio::time::timeout(T, tokio::io::AsyncReadExt::read(&mut s, &mut buf))
+        .await
+        .expect("closed in time")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "no handshake while in Error");
+    assert_eq!(h.status().num_peers, 0);
+
+    // Resume: a fresh check, a new `started`, and the download finishes.
+    storage
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.resume().await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    let events = tracker.events_of(port);
+    assert_eq!(events[..3], ["started", "stopped", "started"], "{events:?}");
+    let mut got = vec![0u8; payload.len()];
+    fbt_session::storage::Storage::read(&storage.inner, 0, &mut got).unwrap();
+    assert!(got == payload, "downloaded bytes differ");
+    leech.shutdown().await;
+    seed.shutdown().await;
+}
