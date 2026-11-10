@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `fbt-session`: the first retry of a failed outgoing connection now comes after 5 s (a twelfth of the retry delay) instead of a full minute, so a peer that was not ready yet (starting, checking its files, briefly full) no longer stalls a download that has no other peer
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

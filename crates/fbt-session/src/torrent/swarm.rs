@@ -26,6 +26,12 @@ use crate::settings::EncryptionPolicy;
 
 /// Connection attempts per address before it is given up.
 const MAX_ATTEMPTS: u32 = 3;
+/// The first retry after a fresh failure waits `peer_retry_delay` divided by
+/// this (5 s of the default 60 s); later ones wait the full delay. A peer
+/// that was merely not ready (starting, checking its files, briefly full)
+/// usually accepts a few seconds later, and a lone explicit peer must not
+/// stall a download for a minute. Transmission's first retry is 5 s too.
+const FIRST_RETRY_DIVISOR: u32 = 12;
 /// Most addresses a torrent remembers for connecting; beyond it the oldest
 /// address not in use is forgotten.
 const MAX_KNOWN: usize = 1000;
@@ -135,7 +141,8 @@ pub(super) enum AfterFailure {
 }
 
 /// Outgoing connection retries: failed addresses come back after `delay`
-/// (`Settings::peer_retry_delay`), at most [`MAX_ATTEMPTS`] attempts in all;
+/// (`Settings::peer_retry_delay`; the first retry of a series sooner, see
+/// [`FIRST_RETRY_DIVISOR`]), at most [`MAX_ATTEMPTS`] attempts in all;
 /// an address that turned out to be ourselves is never tried again (the
 /// last [`MAX_NEVER`] such addresses are kept).
 #[derive(Debug)]
@@ -246,9 +253,14 @@ impl Retries {
         let n = self.attempts.entry(addr).or_insert(0);
         *n = n.saturating_add(1);
         if *n < MAX_ATTEMPTS {
+            let wait = if *n == 1 {
+                self.delay / FIRST_RETRY_DIVISOR
+            } else {
+                self.delay
+            };
             // A huge delay means "not in this process's lifetime".
             let at = now
-                .checked_add(self.delay)
+                .checked_add(wait)
                 .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
             self.pending.insert(addr, at);
             AfterFailure::Retry
@@ -791,7 +803,14 @@ mod tests {
         let mut attempts = 1;
         while r.failed(a, Instant::now()) == AfterFailure::Retry {
             assert!(r.is_pending(&a));
-            tokio::time::advance(DELAY - Duration::from_secs(1)).await;
+            // The first retry comes after 5 s of the 60 s, the next after
+            // all of it.
+            let wait = if attempts == 1 {
+                Duration::from_secs(5)
+            } else {
+                DELAY
+            };
+            tokio::time::advance(wait - Duration::from_secs(1)).await;
             assert!(r.due(Instant::now()).is_empty(), "not before the delay");
             tokio::time::advance(Duration::from_secs(1)).await;
             assert_eq!(r.due(Instant::now()), vec![a]);
