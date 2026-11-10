@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 fbt-core = { path = "../fbt-core" }
+fbt-bencode = { path = "../fbt-bencode" }
+bitflags.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tokio-util.workspace = true

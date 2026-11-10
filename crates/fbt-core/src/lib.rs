@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod bitfield;
+pub mod compact;
 mod info_hash;
 mod layout;
 mod peer_id;
