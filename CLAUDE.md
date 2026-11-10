@@ -25,7 +25,7 @@ Binding design: `docs/superpowers/specs/2026-11-10-fbt-lib-design.md`. Read it b
 - **Gitflow:** `main` holds tagged releases (`vX.Y.Z`) only; `develop` is the integration branch; work on `feature/<name>` off `develop`; `release/X.Y.Z` and `hotfix/<name>` as in the other featherbit repos.
 - **Conventional Commits** with the crate as scope (`feat(bencode): ...`, `ci: ...`, `chore: ...`).
 - **No attribution of any kind:** no `Co-Authored-By` trailer, no `Claude-Session` line or session link in commits, no "Generated with" footer or session link in PR bodies.
-- **Semantic versioning.** The workspace version stays `0.0.0` until the `release/0.1.0` branch bumps it.
+- **Semantic versioning.** The workspace version is bumped on the `release/X.Y.Z` branch of each release (it is `0.1.0` since that release).
 - **Changelog:** `CHANGELOG.md` at the root (Keep a Changelog); user-visible changes go under `## [Unreleased]`.
 - **CI gates:** `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`, an MSRV check, `cargo doc` with warnings denied, plus the security scans in `.github/workflows/security.yml` (semgrep, cargo-deny, grype, gitleaks over the full history; also weekly on `main`). Their configs live at the repo root (`.semgrepignore`, `.gitleaks.toml`, `.grype.yaml`, `deny.toml`); every ignore carries a one-line reason.
 

@@ -11,11 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `fbt-dht`: new crate with the Mainline DHT (BEP 5): node ids with BEP 42 restrictions, KRPC messages, routing table, announce tokens, a bounded peer store, rate limiting, iterative lookups, bootstrap with backoff, announce, external-IP votes and a persistable state blob; it bootstraps from nothing unless told to ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-bencode`: `Limits::new(depth, items)`, the `MAX_DEPTH_CAP` hard depth cap and `DecodeError::TooManyItems` ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
-- `fbt-wire`: the extension protocol (BEP 10) with `ut_metadata` (BEP 9) and `ut_pex` (BEP 11) messages, the DHT `Port` message, and MSE/PE (message stream encryption) handshake and encrypted stream ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
-- `fbt-metainfo`: magnet URIs (`btih`, `btmh`, `so`) and building a `Metainfo` from verified info bytes ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-wire`: the extension protocol (BEP 10) with `ut_metadata` (BEP 9) and `ut_pex` (BEP 11) messages, `Reserved::set_dht` and `Reserved::set_extended`, and MSE/PE (message stream encryption) handshake and encrypted stream ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-metainfo`: magnet URIs (`btih`, `btmh`, `so`), `Metainfo::from_info_bytes` to build a `Metainfo` from verified info bytes, and `Metainfo::magnet()` ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-session`: magnet links with metadata exchange: `TorrentSource`, `AddTorrent::magnet`, `Settings::max_metadata_size`, `Event::MetadataReceived`, `TorrentState::DownloadingMetadata` and `DisconnectReason::BadMetadata` (peers that send bad metadata are banned for that torrent) ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-session`: a session DHT with `Settings::dht_enabled` and `Settings::dht_bootstrap_nodes` (public routers by default, `DEFAULT_DHT_BOOTSTRAP`), `Settings::dht_state` and `Session::dht_state()` to persist the routing table across runs, `Event::DhtBootstrapped`, and `EventMask::DHT`, which is now part of `EventMask::ALL`; private torrents never use the DHT ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
-- `fbt-session`: `Settings::encryption` (`EncryptionPolicy`: `Forced`, `Preferred`, `Disabled`) for MSE/PE on outgoing and incoming connections ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: `Settings::encryption` (`EncryptionPolicy`: `Forced`, `Preferred`, `Disabled`) for MSE/PE on outgoing and incoming connections, and `DisconnectReason::Encryption` for a failed MSE handshake ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: `Session::dht_stats()` returning `DhtStats`, and `Settings::dht_ipv6`, `Settings::dht_read_only` and `Settings::dht_announce_interval` ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: `Event::PeersFound` (with its `PeerSource`), `TorrentStatus::has_metadata` and `TorrentHandle::metainfo()` ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: `SessionError::NoMetadata` (a command that needs the metadata of a magnet still fetching it) and `SessionError::V2OnlyUnsupported` ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-session`: peer exchange with `Settings::pex_enabled` and `PeerSource` on discovered peers; off for private torrents ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt`: facade re-exports for magnets, encryption and the DHT, with a magnet doctest ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-example`: magnet download (`fbt-example download <magnet:...>`), `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht`, `--no-pex`, and a `dht-node` subcommand that runs a bare DHT node ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
@@ -29,11 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Settings::default()` now has encryption `Preferred`: outgoing connections open with an MSE handshake and fall back to plain text only where the policy allows it ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `TorrentState` and `Event` gained variants (`DownloadingMetadata`, `MetadataReceived`, `DhtBootstrapped`); match with a wildcard arm ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - When two peers dial each other at once, the connection initiated by the lower peer id is kept ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `Settings::default()` now starts a DHT node and contacts the public routers (`DEFAULT_DHT_BOOTSTRAP`); set `dht_enabled = false` to stay off the DHT ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `TorrentHandle::force_recheck` and `TorrentHandle::set_file_priorities` can return `SessionError::NoMetadata` for a magnet without its metadata ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `EventMask::PEER` also carries `Event::PeersFound` ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 
 ### Fixed
 
 - `fbt-session`: the `completed` tracker announce is sent at most once, and is retried after a failed attempt ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-session`: the `left` value of a `stopped` announce after a recheck is the last known one ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: a magnet answers incoming peers during the check that follows its metadata instead of dropping them ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: a torrent whose check after the metadata fails stops like any errored torrent: it announces `stopped`, refuses incoming peers, and a resume starts over cleanly ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: a slow metadata source can no longer stall a magnet: each request times out on its own, and a source that has not delivered the whole metadata within its deadline gives its slot to the next one ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-dht`: a node that queries us enters the routing table only after answering our ping, so spoofed sources cannot fill it ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 
 ## [0.1.0] - 2026-11-10
 
