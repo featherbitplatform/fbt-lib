@@ -36,7 +36,9 @@ impl Tokens {
 
     /// Whether `token` was issued to `ip` under the current or previous secret.
     pub(crate) fn verify(&self, ip: IpAddr, token: &[u8]) -> bool {
-        token == self::token(&self.current, ip) || token == self::token(&self.previous, ip)
+        let cur = ct_eq(token, &self::token(&self.current, ip));
+        let prev = ct_eq(token, &self::token(&self.previous, ip));
+        cur | prev
     }
 
     /// Starts a new secret; the current one becomes the previous one.
@@ -44,6 +46,18 @@ impl Tokens {
         self.previous = self.current;
         self.current = secret(rng);
     }
+}
+
+/// Constant-time comparison of a candidate token against an issued one.
+fn ct_eq(candidate: &[u8], issued: &[u8; TOKEN_LEN]) -> bool {
+    if candidate.len() != TOKEN_LEN {
+        return false;
+    }
+    candidate
+        .iter()
+        .zip(issued)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 fn secret(rng: &mut impl Rng) -> [u8; SECRET_LEN] {

@@ -6,10 +6,13 @@ use std::time::{Duration, Instant};
 
 use rand::{Rng, RngExt};
 
+use crate::id::is_local;
 use crate::table::Family;
 
 /// Announced peers older than this are dropped by [`PeerStore::expire`].
 const PEER_TTL: Duration = Duration::from_secs(30 * 60);
+/// Most endpoints one non-local IP may hold per info hash.
+const MAX_PEERS_PER_IP: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
@@ -17,8 +20,11 @@ struct Entry {
     seen: Instant,
 }
 
-/// Info hash -> announced peers, bounded on both axes. One entry per IP: a
-/// re-announce from the same IP updates its port and time.
+/// Info hash -> announced peers, bounded on both axes. Peers are endpoints
+/// (IP and port): a re-announce of the same endpoint refreshes its time. A
+/// non-local IP holds at most [`MAX_PEERS_PER_IP`] endpoints per info hash;
+/// beyond that its oldest endpoint is replaced. Local IPs are exempt, as in
+/// the routing table.
 #[derive(Debug)]
 pub(crate) struct PeerStore {
     max_torrents: usize,
@@ -36,7 +42,8 @@ impl PeerStore {
     }
 
     /// Records `peer` for `ih`. At capacity, a new info hash evicts the one
-    /// with the fewest peers and a new peer replaces a random one.
+    /// with the fewest peers and a new endpoint replaces a random one (or,
+    /// past the per-IP cap, the oldest endpoint of the same IP).
     pub(crate) fn announce(&mut self, ih: [u8; 20], peer: SocketAddr, now: Instant) {
         if self.max_torrents == 0 || self.max_peers == 0 {
             return;
@@ -56,8 +63,19 @@ impl PeerStore {
             addr: peer,
             seen: now,
         };
-        if let Some(e) = peers.iter_mut().find(|e| e.addr.ip() == peer.ip()) {
+        if let Some(e) = peers.iter_mut().find(|e| e.addr == peer) {
             *e = entry;
+            return;
+        }
+        let ip = peer.ip();
+        if !is_local(ip) && peers.iter().filter(|e| e.addr.ip() == ip).count() >= MAX_PEERS_PER_IP {
+            if let Some(oldest) = peers
+                .iter_mut()
+                .filter(|e| e.addr.ip() == ip)
+                .min_by_key(|e| e.seen)
+            {
+                *oldest = entry;
+            }
         } else if peers.len() < self.max_peers {
             peers.push(entry);
         } else {
@@ -136,11 +154,11 @@ mod tests {
         let got = s.peers(&a, Family::V4, 100, &mut r);
         assert_eq!(got.len(), 3);
         assert!(got.contains(&peer("1.0.0.4:6881")));
-        // one entry per IP: a re-announce on a new port updates it
-        s.announce(b, peer("2.0.0.1:7000"), t0);
+        // a re-announce of the same endpoint refreshes it, no duplicate
+        s.announce(b, peer("2.0.0.1:6881"), t0 + MIN);
         assert_eq!(
             s.peers(&b, Family::V4, 100, &mut r),
-            vec![peer("2.0.0.1:7000")]
+            vec![peer("2.0.0.1:6881")]
         );
         // a third torrent evicts the one with the fewest peers (b)
         s.announce(c, peer("3.0.0.1:6881"), t0);
@@ -150,6 +168,54 @@ mod tests {
         assert_eq!(s.peers(&c, Family::V4, 100, &mut r).len(), 1);
         // sampling honours max
         assert_eq!(s.peers(&a, Family::V4, 2, &mut r).len(), 2);
+    }
+
+    #[test]
+    fn store_keeps_every_loopback_port() {
+        let t0 = Instant::now();
+        let mut r = StdRng::seed_from_u64(6);
+        let mut s = PeerStore::new(10, 100);
+        let ih = [4u8; 20];
+        for port in 1..=(MAX_PEERS_PER_IP as u16 + 2) {
+            s.announce(ih, SocketAddr::new("127.0.0.1".parse().unwrap(), port), t0);
+        }
+        // local IPs are exempt from the per-IP cap: every port survives
+        assert_eq!(
+            s.peers(&ih, Family::V4, 100, &mut r).len(),
+            MAX_PEERS_PER_IP + 2
+        );
+        let mut two = PeerStore::new(10, 100);
+        two.announce(ih, peer("127.0.0.1:7001"), t0);
+        two.announce(ih, peer("127.0.0.1:7002"), t0);
+        let mut got = two.peers(&ih, Family::V4, 100, &mut r);
+        got.sort();
+        assert_eq!(got, vec![peer("127.0.0.1:7001"), peer("127.0.0.1:7002")]);
+    }
+
+    #[test]
+    fn store_per_ip_cap_replaces_that_ips_oldest() {
+        let t0 = Instant::now();
+        let mut r = StdRng::seed_from_u64(8);
+        let mut s = PeerStore::new(10, 100);
+        let ih = [5u8; 20];
+        s.announce(ih, peer("9.9.9.9:1"), t0);
+        for k in 0..MAX_PEERS_PER_IP as u64 {
+            let port = 1000 + k as u16;
+            s.announce(
+                ih,
+                SocketAddr::new("8.8.8.8".parse().unwrap(), port),
+                t0 + Duration::from_secs(k),
+            );
+        }
+        assert_eq!(s.peers(&ih, Family::V4, 100, &mut r).len(), 9);
+        // a 9th port from 8.8.8.8 replaces its oldest (port 1000)
+        s.announce(ih, peer("8.8.8.8:2000"), t0 + MIN);
+        let got = s.peers(&ih, Family::V4, 100, &mut r);
+        assert_eq!(got.len(), 9);
+        assert!(got.contains(&peer("8.8.8.8:2000")));
+        assert!(!got.contains(&peer("8.8.8.8:1000")));
+        assert!(got.contains(&peer("8.8.8.8:1001")));
+        assert!(got.contains(&peer("9.9.9.9:1")), "other IPs untouched");
     }
 
     #[test]

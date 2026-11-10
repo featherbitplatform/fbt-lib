@@ -178,6 +178,12 @@ impl RoutingTable {
     }
 
     /// Adds `n`, heard from at `now`, following the bucket rules.
+    ///
+    /// Contract: inserting marks the node good (`last_seen = now`, failures
+    /// reset), so call this only for a node that contacted us directly (a
+    /// query from it, or a reply from it at that address). Nodes learned from
+    /// a third party's `nodes` list must be pinged first and inserted only
+    /// when they answer.
     pub(crate) fn insert(&mut self, n: NodeInfo, now: Instant) -> Insert {
         if n.id == self.own || Family::of(&n.addr) != self.family || !dialable(&n.addr) {
             return Insert::Rejected;
@@ -371,6 +377,16 @@ impl RoutingTable {
         );
         self.own = own;
         self.ips.clear();
+        // old cache entries go first, so that former table nodes overflowing
+        // into a cache are the newest there and are not evicted by them
+        for c in old.iter().flat_map(|b| &b.cache) {
+            if let Some(nb) = own
+                .bucket_index(&c.info.id)
+                .and_then(|b| self.buckets.get_mut(b))
+            {
+                nb.push_cache(*c);
+            }
+        }
         for bucket in &old {
             for e in &bucket.nodes {
                 let Some(b) = own.bucket_index(&e.info.id) else {
@@ -385,14 +401,6 @@ impl RoutingTable {
                 } else {
                     nb.push_cache(*e);
                 }
-            }
-        }
-        for c in old.iter().flat_map(|b| &b.cache) {
-            if let Some(nb) = own
-                .bucket_index(&c.info.id)
-                .and_then(|b| self.buckets.get_mut(b))
-            {
-                nb.push_cache(*c);
             }
         }
     }
@@ -628,6 +636,40 @@ mod tests {
             }
         }
         assert_eq!(t.ips.len(), before);
+    }
+
+    #[test]
+    fn reset_own_overflow_goes_to_cache_ahead_of_old_cache() {
+        let t0 = Instant::now();
+        // own 0x00..: nodes 0x40.. (bucket 1) and 0x20.. (bucket 2)
+        let mut t = zero_table();
+        let id = |hi: u8, k: u8| {
+            let mut id = [0u8; 20];
+            id[0] = hi;
+            id[19] = k;
+            id
+        };
+        for k in 0..8u8 {
+            let a = node(id(0x40, k), &format!("1.0.0.{k}:6881"));
+            let b = node(id(0x20, k), &format!("2.0.0.{k}:6881"));
+            assert_eq!(t.insert(a, t0), Insert::Added);
+            assert_eq!(t.insert(b, t0), Insert::Added);
+        }
+        // fill bucket 1's replacement cache (its nodes are questionable by then)
+        for k in 0..8u8 {
+            let c = node(id(0x60, k), &format!("3.0.0.{k}:6881"));
+            assert!(matches!(t.insert(c, t0 + 16 * MIN), Insert::Pending { .. }));
+        }
+        assert_eq!(t.len(), 16);
+        // new own 0xff..: all 16 table nodes and the 8 cached land in bucket 0
+        t.reset_own(NodeId([0xff; 20]));
+        assert_eq!(t.len(), 8);
+        let b0 = &t.buckets[0];
+        assert_eq!(b0.nodes.len(), 8);
+        assert_eq!(b0.cache.len(), REPLACEMENTS);
+        // the cache holds the 8 former table nodes that overflowed, not the
+        // old cache entries
+        assert!(b0.cache.iter().all(|c| c.info.id.0[0] != 0x60));
     }
 
     #[test]
