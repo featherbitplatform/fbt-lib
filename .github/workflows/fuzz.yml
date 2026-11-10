@@ -1,7 +1,8 @@
 name: Fuzz
 
 # Fuzzes every parser of remote input. Short run on pull requests that touch a
-# parser; long run weekly (Mondays 05:30, as in security.yml).
+# parser; long run weekly (Mondays 05:30, as in security.yml); manual runs take
+# a duration. The corpus is cached between runs.
 
 on:
   pull_request:
@@ -10,10 +11,16 @@ on:
       - "crates/fbt-metainfo/**"
       - "crates/fbt-wire/**"
       - "crates/fbt-tracker/**"
+      - "crates/fbt-dht/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
     - cron: "30 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target"
+        default: "600"
 
 permissions:
   contents: read
@@ -36,6 +43,10 @@ jobs:
           - http_announce
           - udp_announce
           - path
+          - krpc
+          - extension
+          - mse
+          - magnet
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -44,12 +55,22 @@ jobs:
           workspaces: fuzz
       - name: Install cargo-fuzz
         run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
       - name: Fuzz
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
           cargo +nightly fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
-            -- -max_total_time=${{ github.event_name == 'schedule' && 1200 || 60 }}
+            -- -max_total_time=${{ github.event_name == 'workflow_dispatch' && inputs.seconds || (github.event_name == 'schedule' && 1200 || 60) }}
+      - name: Minimize corpus
+        if: github.event_name == 'schedule'
+        run: |
+          cargo +nightly fuzz cmin ${{ matrix.target }} fuzz/corpus/${{ matrix.target }}
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4

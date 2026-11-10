@@ -16,6 +16,8 @@ fbt-bencode = { path = "../crates/fbt-bencode" }
 fbt-metainfo = { path = "../crates/fbt-metainfo" }
 fbt-wire = { path = "../crates/fbt-wire" }
 fbt-tracker = { path = "../crates/fbt-tracker" }
+fbt-dht = { path = "../crates/fbt-dht" }
+tokio = { version = "1", default-features = false, features = ["rt", "io-util"] }
 
 [workspace]
 members = ["."]
@@ -69,6 +71,34 @@ bench = false
 [[bin]]
 name = "path"
 path = "fuzz_targets/path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "krpc"
+path = "fuzz_targets/krpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extension"
+path = "fuzz_targets/extension.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mse"
+path = "fuzz_targets/mse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "magnet"
+path = "fuzz_targets/magnet.rs"
 test = false
 doc = false
 bench = false
