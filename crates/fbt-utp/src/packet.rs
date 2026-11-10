@@ -154,7 +154,8 @@ impl Packet {
 }
 
 /// Sequence numbers acknowledged by a SACK mask. Bit `j` (LSB first) of byte
-/// `k` acknowledges `ack_nr + 2 + 8k + j`, wrapping.
+/// `k` acknowledges `ack_nr + 2 + 8k + j`, wrapping. Callers pass a decoded
+/// mask of at most [`MAX_SACK_LEN`] bytes.
 pub fn sack_acks(sack: &[u8], ack_nr: u16) -> impl Iterator<Item = u16> + '_ {
     sack.iter().enumerate().flat_map(move |(k, byte)| {
         (0..8usize)
@@ -163,7 +164,8 @@ pub fn sack_acks(sack: &[u8], ack_nr: u16) -> impl Iterator<Item = u16> + '_ {
     })
 }
 
-/// `a` is strictly before `b` in wrapping sequence space.
+/// `a` is strictly before `b` in wrapping sequence space. Exactly half the
+/// window apart (`b - a == 0x8000`) is a tie: neither is before the other.
 pub fn seq_lt(a: u16, b: u16) -> bool {
     (1..0x8000).contains(&b.wrapping_sub(a))
 }
@@ -284,6 +286,37 @@ mod tests {
     }
 
     #[test]
+    fn half_window_boundaries() {
+        assert!(seq_lt(0, 0x7fff));
+        assert!(!seq_lt(0, 0x8000));
+        assert!(!seq_lt(0x8000, 0));
+        assert!(!seq_le(0, 0x8000));
+    }
+
+    #[test]
+    fn short_sack_is_padded_on_encode() {
+        let p = Packet {
+            sack: Some(vec![1, 2, 3]),
+            ..state(0)
+        };
+        let mut out = Vec::new();
+        p.encode(&mut out);
+        assert_eq!(&out[20..], &[0, 4, 1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn long_sack_is_cut_on_encode() {
+        let p = Packet {
+            sack: Some(vec![0xff; 40]),
+            ..state(0)
+        };
+        let mut out = Vec::new();
+        p.encode(&mut out);
+        assert_eq!(out[21], 32);
+        assert_eq!(out.len(), 20 + 2 + 32);
+    }
+
+    #[test]
     fn long_sack_is_cut_not_rejected() {
         let mut v = syn_bytes();
         v[1] = 1;
@@ -297,12 +330,55 @@ mod tests {
 
     proptest! {
         #[test]
-        fn decode_never_panics_and_roundtrips(bytes in proptest::collection::vec(any::<u8>(), 0..200)) {
+        fn decode_never_panics_and_roundtrips(
+            mut bytes in proptest::collection::vec(any::<u8>(), 0..200),
+            biased in any::<bool>(),
+            ty in 1u8..=0x41,
+            ext in prop::sample::select(vec![0u8, 1, 9]),
+        ) {
+            if biased && bytes.len() >= 2 {
+                bytes[0] = (ty & 0xf0) | 1;
+                bytes[0] = bytes[0].clamp(0x01, 0x41);
+                bytes[1] = ext;
+            }
             if let Ok(p) = Packet::decode(&Bytes::from(bytes)) {
                 let mut out = Vec::new();
                 p.encode(&mut out);
                 prop_assert_eq!(Packet::decode(&Bytes::from(out)).unwrap(), p);
             }
+        }
+
+        #[test]
+        fn structured_packets_roundtrip(
+            ty in prop::sample::select(vec![
+                PacketType::Data, PacketType::Fin, PacketType::State,
+                PacketType::Reset, PacketType::Syn,
+            ]),
+            conn_id in any::<u16>(),
+            timestamp_us in any::<u32>(),
+            timestamp_diff_us in any::<u32>(),
+            wnd_size in any::<u32>(),
+            seq_nr in any::<u16>(),
+            ack_nr in any::<u16>(),
+            sack in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..=64)),
+            payload in proptest::collection::vec(any::<u8>(), 0..=64),
+        ) {
+            let p = Packet {
+                ty, conn_id, timestamp_us, timestamp_diff_us, wnd_size, seq_nr, ack_nr,
+                sack: sack.clone(),
+                payload: Bytes::from(payload),
+            };
+            let mut out = Vec::new();
+            p.encode(&mut out);
+            let expected_sack = sack.filter(|s| !s.is_empty()).map(|mut s| {
+                s.truncate(MAX_SACK_LEN);
+                while s.len() % 4 != 0 {
+                    s.push(0);
+                }
+                s
+            });
+            let back = Packet::decode(&Bytes::from(out)).unwrap();
+            prop_assert_eq!(back, Packet { sack: expected_sack, ..p });
         }
     }
 }
