@@ -25,7 +25,7 @@ mod socket;
 mod stream;
 
 pub use conn::UtpConfig;
-pub use socket::UtpSocket;
+pub use socket::{MAX_PENDING_PER_IP, UtpSocket};
 pub use stream::UtpStream;
 
 pub use packet::{

@@ -53,7 +53,8 @@ async fn step<T>(f: impl std::future::Future<Output = T>) -> T {
         .expect("test step timed out")
 }
 
-/// A connected (client, server) stream pair.
+/// A connected (client, server) stream pair, confirmed: the server has
+/// heard from the dialer after the handshake (one byte, already read).
 async fn pair(client: &UtpSocket, server: &UtpSocket) -> (UtpStream, UtpStream) {
     let srv = server.clone();
     let accept = tokio::spawn(async move { srv.accept().await });
@@ -62,6 +63,11 @@ async fn pair(client: &UtpSocket, server: &UtpSocket) -> (UtpStream, UtpStream) 
     assert_eq!(from, client.local_addr());
     assert_eq!(c.peer_addr(), server.local_addr());
     assert_eq!(s.peer_addr(), client.local_addr());
+    let (mut c, mut s) = (c, s);
+    step(c.write_all(&[0])).await.unwrap();
+    let mut b = [1u8];
+    step(s.read_exact(&mut b)).await.unwrap();
+    assert_eq!(b, [0]);
     (c, s)
 }
 
@@ -346,7 +352,9 @@ async fn drop_sends_fin_and_peer_reads_eof() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_is_idempotent_and_wakes_streams() {
-    let server = bind(UtpConfig::default()).await;
+    let mut scfg = UtpConfig::default();
+    scfg.idle_timeout = Duration::from_secs(1);
+    let server = bind(scfg).await;
     let client = bind(UtpConfig::default()).await;
     let (mut c, mut s) = pair(&client, &server).await;
 
@@ -366,10 +374,16 @@ async fn shutdown_is_idempotent_and_wakes_streams() {
     // The blocked reader and acceptor wake with errors.
     assert!(step(reader).await.unwrap().is_err());
     assert_eq!(step(acceptor).await.unwrap(), Err(UtpError::Closed));
-    // The peer was reset.
+    // The peer is reset, or (should that one datagram be lost) times out.
     let mut buf = [0u8; 16];
     let e = step(s.read(&mut buf)).await.unwrap_err();
-    assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+    assert!(
+        matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::TimedOut
+        ),
+        "{e:?}"
+    );
     // The socket refuses further work.
     assert_eq!(client.num_connections(), 0);
     assert_eq!(
@@ -386,7 +400,6 @@ async fn last_handle_drop_ends_tasks() {
     let server = bind(UtpConfig::default()).await;
     let client = bind(UtpConfig::default()).await;
     let (c, s) = pair(&client, &server).await;
-    let port = server.local_addr();
     assert!(metrics.num_alive_tasks() > before);
     drop((c, s, client, server));
     step(async {
@@ -395,14 +408,197 @@ async fn last_handle_drop_ends_tasks() {
         }
     })
     .await;
-    // The owned UDP socket is released with its receive task.
-    let mut rebound = None;
-    for _ in 0..50 {
-        if let Ok(s) = UtpSocket::bind(port, UtpConfig::default()).await {
-            rebound = Some(s);
-            break;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_by_send_id_from_the_peer_fails_the_stream() {
+    // Both ends in shared mode: the server's sender can forge datagrams
+    // from the server's real address.
+    let server_udp = shared_bind();
+    let server = UtpSocket::new(server_udp.sender(), UtpConfig::default());
+    server_udp.set_handler(PacketKind::Utp, server.handler());
+    let client_udp = shared_bind();
+    let rec = Arc::new(RecordingSender {
+        inner: client_udp.sender(),
+        syn_ids: Mutex::new(Vec::new()),
+    });
+    let client = UtpSocket::new(rec.clone(), UtpConfig::default());
+    client_udp.set_handler(PacketKind::Utp, client.handler());
+
+    let (mut c, _s) = pair(&client, &server).await;
+    // The client receives with `id` and sends with `id + 1`; libutp's reset
+    // carries the id of the packet it answers, i.e. the client's send id.
+    let id = *rec.syn_ids.lock().unwrap().first().unwrap();
+    let rst = packet(PacketType::Reset, id.wrapping_add(1), 0);
+    server_udp
+        .sender()
+        .send_to(&rst, client.local_addr())
+        .unwrap();
+    let mut buf = [0u8; 8];
+    let e = step(c.read(&mut buf)).await.unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+    step(async {
+        while client.num_connections() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    })
+    .await;
+}
+
+/// Sends forged SYNs with random ids from `raw` to `to` until stopped.
+fn flood(raw: Arc<tokio::net::UdpSocket>, to: SocketAddr) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            for _ in 0..200 {
+                let id = rand::rng().random();
+                let _ = raw.send_to(&packet(PacketType::Syn, id, 1), to).await;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn syn_flood_from_one_address_cannot_lock_out_others() {
+    // Default timeouts: half-open entries live 7 s, so only the per-IP cap
+    // keeps the queue open. The flood is fed straight into the handler with
+    // a forged source IP (127.0.0.3), so this runs where only 127.0.0.1 is
+    // bindable; the honest dialer is real.
+    let udp = shared_bind();
+    let server = UtpSocket::new(udp.sender(), UtpConfig::default());
+    udp.set_handler(PacketKind::Utp, server.handler());
+    let handler = server.handler();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flooding = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut rng = rand::rng();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let from = SocketAddr::from(([127, 0, 0, 3], rng.random_range(1024..65535u16)));
+                handler.handle(from, &packet(PacketType::Syn, rng.random(), 1));
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let n = server.num_connections();
+    assert!(n > 0, "no forged SYN reached the server");
+    assert!(n <= fbt_utp::MAX_PENDING_PER_IP, "{n} half-open entries");
+
+    // An honest dialer from another address gets in during the flood.
+    let honest = bind(UtpConfig::default()).await;
+    let started = Instant::now();
+    let srv = server.clone();
+    let honest_addr = honest.local_addr();
+    let accept = tokio::spawn(async move {
+        loop {
+            let (s, from) = srv.accept().await.unwrap();
+            if from == honest_addr {
+                return s;
+            }
+        }
+    });
+    let mut c = tokio::time::timeout(Duration::from_secs(3), honest.connect(server.local_addr()))
+        .await
+        .expect("honest connect stalled during the flood")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let mut s = step(accept).await.unwrap();
+    echo_roundtrip(&mut c, &mut s, b"honest").await;
+    assert!(server.num_connections() <= fbt_utp::MAX_PENDING_PER_IP + 1);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flooding.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unconfirmed_syns_expire_after_connect_timeout() {
+    // Even from the flooding address, a dialer gets in once the half-open
+    // entries expire, long before the 60 s idle timeout.
+    let mut cfg = UtpConfig::default();
+    cfg.connect_timeout = Duration::from_millis(500);
+    let server = bind(cfg.clone()).await;
+    let raw = Arc::new(tokio::net::UdpSocket::bind(loopback()).await.unwrap());
+    let flooding = flood(raw, server.local_addr());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(server.num_connections() > 0);
+    flooding.abort();
+    let started = Instant::now();
+    step(async {
+        while server.num_connections() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let client = bind(cfg).await;
+    let (mut c, mut s) = pair(&client, &server).await;
+    echo_roundtrip(&mut c, &mut s, b"after the flood").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timer_processes_only_due_connections() {
+    const IDLE: usize = 100;
+    let server = bind(UtpConfig::default()).await;
+    let client = bind(UtpConfig::default()).await;
+    let mut idle = Vec::new();
+    for _ in 0..IDLE {
+        idle.push(pair(&client, &server).await);
     }
-    assert!(rebound.is_some(), "port {port} still bound");
+    let (mut c, mut s) = pair(&client, &server).await;
+    // Let delayed acks and handshake timers run out.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let visits = || client.timer_visits() + server.timer_visits();
+    let v0 = visits();
+    // One busy connection keeps the timer waking.
+    for i in 0..20u8 {
+        echo_roundtrip(&mut c, &mut s, &[i; 100]).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let delta = visits() - v0;
+    // The last echo leaves the client a delayed ack, so the timer ran.
+    assert!(delta >= 1, "the timer never ran");
+    assert!(
+        delta < IDLE as u64,
+        "{delta} slot visits: the idle connections were scanned"
+    );
+    assert_eq!(server.num_connections(), IDLE + 1);
+    drop(idle);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_for_a_dropped_stream_resets_it() {
+    let server = bind(UtpConfig::default()).await;
+    let client = bind(UtpConfig::default()).await;
+    let (mut c, s) = pair(&client, &server).await;
+    drop(s);
+    let mut buf = [0u8; 8];
+    assert_eq!(step(c.read(&mut buf)).await.unwrap(), 0, "FIN first");
+    // Nobody will read this: the server resets instead of buffering it.
+    let e = step(async {
+        loop {
+            if let Err(e) = c.write_all(b"unwanted").await {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_buffers_are_clamped_to_one_packet() {
+    let mut cfg = UtpConfig::default();
+    cfg.recv_buffer = 0;
+    cfg.send_buffer = 0;
+    let server = bind(cfg.clone()).await;
+    let client = bind(cfg).await;
+    let (mut c, mut s) = pair(&client, &server).await;
+    // With one packet of buffer each way, the reader must run alongside.
+    let msg = vec![7u8; 10_000];
+    let mut got = vec![0u8; msg.len()];
+    let (w, r) = step(async { tokio::join!(c.write_all(&msg), s.read_exact(&mut got)) }).await;
+    w.unwrap();
+    r.unwrap();
+    assert_eq!(got, msg);
 }

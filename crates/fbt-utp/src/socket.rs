@@ -2,17 +2,19 @@
 //! a shared datagram sender (or a UDP socket it owns), drives their timers
 //! and hands established ones out as [`UtpStream`]s.
 //!
-//! Locking: the connection table, the accept queue and each connection slot
-//! have their own mutex. No two slot locks are ever held together, no slot
-//! lock is taken while the table or queue lock is held, no lock is held
-//! across an await, and datagrams are sent after every lock is released.
+//! Locking: the connection table, the accept queue, the deadline index and
+//! each connection slot have their own mutex. A slot lock may be followed by
+//! the deadline-index lock, never the reverse; no slot lock is taken while
+//! the table or queue lock is held; no two slot locks are held together; no
+//! lock is held across an await; datagrams are sent with every lock
+//! released.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
@@ -25,7 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 
 use crate::UtpError;
-use crate::conn::{ConnState, Connection, UtpConfig};
+use crate::conn::{ConnState, Connection, HOLE_RESERVE, UtpConfig};
 use crate::packet::{Packet, PacketType};
 use crate::stream::UtpStream;
 
@@ -36,6 +38,9 @@ pub const RESETS_PER_SECOND: u32 = 10;
 /// How long a cleanly closed connection stays in the table, so it can still
 /// ack a retransmitted FIN.
 pub const CLOSE_LINGER: Duration = Duration::from_secs(5);
+/// Half-open incoming connections (SYN acked, nothing else heard yet) kept
+/// per source IP, so one host cannot fill the accept queue.
+pub const MAX_PENDING_PER_IP: usize = 8;
 /// Random connection ids tried before `connect` gives up on a peer.
 const ID_ATTEMPTS: usize = 64;
 /// The timer's sleep when no connection has a deadline.
@@ -45,8 +50,6 @@ const MIN_TIMER_SLEEP: Duration = Duration::from_millis(1);
 /// Consecutive `recv_from` errors after which the loop sleeps [`ERROR_PAUSE`].
 const ERROR_BURST: u32 = 16;
 const ERROR_PAUSE: Duration = Duration::from_millis(50);
-/// Chunk used to discard data that arrives for a dropped stream.
-const DISCARD_CHUNK: usize = 4096;
 
 /// A connection key: the peer and the id it puts in packets to us.
 pub(crate) type Key = (SocketAddr, u16);
@@ -58,32 +61,66 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// One connection and the tasks waiting on it.
-#[derive(Debug)]
 pub(crate) struct ConnSlot {
     pub(crate) conn: Connection,
     pub(crate) peer: SocketAddr,
+    key: Key,
+    /// Created by an incoming SYN (as opposed to `connect`).
+    acceptor: bool,
     pub(crate) read_waker: Option<Waker>,
     /// Also used by `connect` and `poll_shutdown`, which never run
     /// alongside a write on the same stream.
     pub(crate) write_waker: Option<Waker>,
     /// Set when the socket ended the connection itself (shutdown or reap).
     pub(crate) local_error: Option<UtpError>,
-    /// No stream owns this connection any more: incoming data is discarded.
+    /// No stream owns this connection any more.
     pub(crate) stream_dropped: bool,
     /// When the slot leaves the table regardless of the connection's state.
     pub(crate) reap_at: Option<Instant>,
+    /// Acceptor not yet confirmed by a non-SYN packet: reaped at this time.
+    unconfirmed_until: Option<Instant>,
+    /// This slot's entry in the deadline index.
+    scheduled: Option<Instant>,
+}
+
+impl std::fmt::Debug for ConnSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnSlot")
+            .field("peer", &self.peer)
+            .field("recv_id", &self.conn.recv_id())
+            .field("send_id", &self.conn.send_id())
+            .field("state", &self.conn.state())
+            .field("error", &self.error())
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a waiting reader or writer may care about, compared before and
+/// after a change to wake only the side whose condition moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Readiness {
+    readable: usize,
+    eof: bool,
+    failed: bool,
+    state: ConnState,
+    fin_acked: bool,
+    room: usize,
 }
 
 impl ConnSlot {
-    fn new(conn: Connection, peer: SocketAddr) -> ConnSlot {
+    fn new(conn: Connection, key: Key, acceptor: bool) -> ConnSlot {
         ConnSlot {
             conn,
-            peer,
+            peer: key.0,
+            key,
+            acceptor,
             read_waker: None,
             write_waker: None,
             local_error: None,
             stream_dropped: false,
             reap_at: None,
+            unconfirmed_until: None,
+            scheduled: None,
         }
     }
 
@@ -91,20 +128,41 @@ impl ConnSlot {
         self.local_error.clone().or_else(|| self.conn.error())
     }
 
+    pub(crate) fn readiness(&self) -> Readiness {
+        Readiness {
+            readable: self.conn.readable_bytes(),
+            eof: self.conn.is_eof(),
+            failed: self.error().is_some(),
+            state: self.conn.state(),
+            fin_acked: self.conn.is_fin_acked(),
+            room: self.conn.send_room(),
+        }
+    }
+
     fn deadline(&self) -> Option<Instant> {
         if self.local_error.is_some() {
             return None;
         }
-        [self.conn.next_deadline(), self.reap_at]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.conn.next_deadline(),
+            self.reap_at,
+            self.unconfirmed_until,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub(crate) fn reap_by(&mut self, t: Option<Instant>) {
         if let Some(t) = t {
             self.reap_at = Some(self.reap_at.map_or(t, |r| r.min(t)));
         }
+    }
+
+    fn take_wakers(&mut self, read: bool, write: bool) -> Vec<Waker> {
+        let r = if read { self.read_waker.take() } else { None };
+        let w = if write { self.write_waker.take() } else { None };
+        [r, w].into_iter().flatten().collect()
     }
 }
 
@@ -114,6 +172,8 @@ pub(crate) struct Settled {
     out: Vec<Vec<u8>>,
     wakers: Vec<Waker>,
     remove: bool,
+    /// The slot just left the half-open state.
+    confirmed: bool,
     deadline: Option<Instant>,
 }
 
@@ -135,19 +195,60 @@ fn reset_packet(conn_id: u16, seq_nr: u16, ack_nr: u16) -> Vec<u8> {
     out
 }
 
+/// The connections, and the half-open ones counted per source IP.
+#[derive(Debug, Default)]
+struct Table {
+    slots: HashMap<Key, Slot>,
+    half_open: HashSet<Key>,
+    half_open_per_ip: HashMap<IpAddr, usize>,
+}
+
+impl Table {
+    fn half_open_from(&self, ip: IpAddr) -> usize {
+        self.half_open_per_ip.get(&ip).copied().unwrap_or(0)
+    }
+
+    fn add_half_open(&mut self, key: Key) {
+        if self.half_open.insert(key) {
+            *self.half_open_per_ip.entry(key.0.ip()).or_insert(0) += 1;
+        }
+    }
+
+    /// Idempotent: only the first call for a key counts.
+    fn drop_half_open(&mut self, key: Key) {
+        if self.half_open.remove(&key) {
+            let ip = key.0.ip();
+            if let Some(n) = self.half_open_per_ip.get_mut(&ip) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.half_open_per_ip.remove(&ip);
+                }
+            }
+        }
+    }
+
+    fn holds(&self, key: Key, slot: &Slot) -> bool {
+        self.slots.get(&key).is_some_and(|s| Arc::ptr_eq(s, slot))
+    }
+}
+
 /// State shared by the socket handles, its streams, its handler and tasks.
 pub(crate) struct Shared {
     sender: Arc<dyn DatagramSender>,
     pub(crate) cfg: UtpConfig,
-    table: Mutex<HashMap<Key, Slot>>,
+    table: Mutex<Table>,
     /// Accepted connections not yet handed out by `accept`.
     pending: Mutex<VecDeque<(Key, Slot)>>,
     accept_ready: Notify,
     filter: Mutex<Option<AcceptFilter>>,
+    /// Every slot's next deadline, earliest first.
+    deadlines: Mutex<BTreeSet<(Instant, Key)>>,
     /// Wakes the timer task: a deadline moved earlier, or shutdown.
     timer: Arc<Notify>,
-    /// The time the timer task sleeps until; `None` while it scans.
+    /// The time the timer task sleeps until; `None` while it runs.
     armed: Mutex<Option<Instant>>,
+    /// Slots the timer task has processed (for tests).
+    timer_visits: AtomicU64,
     closed: AtomicBool,
     /// Start of the current reset window and resets sent in it.
     resets: Mutex<(Instant, u32)>,
@@ -159,7 +260,7 @@ impl std::fmt::Debug for Shared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Shared")
             .field("local", &self.sender.local_addr())
-            .field("connections", &lock(&self.table).len())
+            .field("connections", &lock(&self.table).slots.len())
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -203,73 +304,132 @@ impl Shared {
         }
     }
 
-    /// Collects what a slot has to send and decides its fate. Runs under
-    /// the slot lock; `wake` hands its wakers out (its state changed).
-    pub(crate) fn settle(&self, s: &mut ConnSlot, now: Instant, wake: bool) -> Settled {
+    /// Moves the slot's deadline-index entry to `d`. Slot lock held.
+    fn index(&self, s: &mut ConnSlot, d: Option<Instant>) {
+        if s.scheduled == d {
+            return;
+        }
+        let mut idx = lock(&self.deadlines);
+        if let Some(old) = s.scheduled.take() {
+            idx.remove(&(old, s.key));
+        }
+        if let Some(d) = d {
+            idx.insert((d, s.key));
+        }
+        s.scheduled = d;
+    }
+
+    /// Collects what a slot has to send and decides its fate; runs under
+    /// the slot lock. `before` is the readiness before the change being
+    /// settled: the reader and writer are woken if theirs moved (`None`
+    /// wakes nobody, for changes the stream made itself).
+    pub(crate) fn settle(
+        &self,
+        s: &mut ConnSlot,
+        now: Instant,
+        before: Option<Readiness>,
+    ) -> Settled {
         if s.local_error.is_some() {
+            self.index(s, None);
             return Settled {
-                wakers: take_wakers(s),
+                wakers: s.take_wakers(true, true),
                 remove: true,
                 ..Settled::default()
             };
-        }
-        if s.stream_dropped {
-            let mut sink = [0u8; DISCARD_CHUNK];
-            while s.conn.read(&mut sink) > 0 {}
         }
         let mut out = Vec::new();
         while let Some(d) = s.conn.poll_transmit(now) {
             out.push(d);
         }
+        let open = s.conn.state() != ConnState::Closed;
         let mut remove = false;
-        if s.conn.state() == ConnState::Closed {
+        if !open {
             if s.conn.error().is_some() {
                 remove = true;
             } else {
                 s.reap_by(now.checked_add(CLOSE_LINGER));
             }
         }
-        if s.reap_at.is_some_and(|r| now >= r) {
+        if s.unconfirmed_until.is_some_and(|t| now >= t) {
+            // Never confirmed: most likely a forged SYN, so no reset either.
             remove = true;
-            if s.conn.state() != ConnState::Closed {
+            s.local_error = Some(UtpError::TimedOut);
+        } else if s.reap_at.is_some_and(|r| now >= r)
+            || (s.stream_dropped && s.conn.readable_bytes() > 0)
+        {
+            // Lingered too long, or data arrived nobody will read.
+            remove = true;
+            if open {
                 out.push(reset_packet(s.conn.send_id(), 0, 0));
                 s.local_error = Some(UtpError::Closed);
             }
         }
+        let wakers = match (remove, before) {
+            (true, _) => s.take_wakers(true, true),
+            (false, None) => Vec::new(),
+            (false, Some(b)) => {
+                let a = s.readiness();
+                let changed = a.failed != b.failed || a.state != b.state;
+                let read = changed || a.readable > b.readable || a.eof != b.eof;
+                let write = changed || a.room > b.room || a.fin_acked != b.fin_acked;
+                s.take_wakers(read, write)
+            }
+        };
+        let deadline = if remove { None } else { s.deadline() };
+        self.index(s, deadline);
         Settled {
             out,
-            wakers: if wake || remove {
-                take_wakers(s)
-            } else {
-                Vec::new()
-            },
+            wakers,
             remove,
-            deadline: s.deadline(),
+            confirmed: false,
+            deadline,
         }
     }
 
     /// Acts on a settled slot after its lock is released.
     pub(crate) fn finish(&self, key: Key, slot: &Slot, peer: SocketAddr, st: Settled) {
+        let deadline = st.deadline;
+        let remove = st.remove;
+        self.finish_quiet(key, slot, peer, st);
+        if !remove {
+            self.reschedule(deadline);
+        }
+    }
+
+    /// `finish` without waking the timer (the timer itself calls this).
+    fn finish_quiet(&self, key: Key, slot: &Slot, peer: SocketAddr, st: Settled) {
         self.send_all(peer, &st.out);
         for w in st.wakers {
             w.wake();
         }
         if st.remove {
             self.remove(key, slot);
-        } else {
-            self.reschedule(st.deadline);
+        } else if st.confirmed {
+            let mut table = lock(&self.table);
+            if table.holds(key, slot) {
+                table.drop_half_open(key);
+            }
         }
     }
 
-    /// Removes `slot` from the table and the accept queue.
+    /// Removes `slot` from the table, the accept queue and the index.
     pub(crate) fn remove(&self, key: Key, slot: &Slot) {
         {
+            let mut s = lock(slot);
+            self.index(&mut s, None);
+        }
+        {
             let mut table = lock(&self.table);
-            if table.get(&key).is_some_and(|s| Arc::ptr_eq(s, slot)) {
-                table.remove(&key);
+            if table.holds(key, slot) {
+                table.slots.remove(&key);
+                table.drop_half_open(key);
             }
         }
         lock(&self.pending).retain(|(_, s)| !Arc::ptr_eq(s, slot));
+    }
+
+    fn get(&self, key: Key) -> Option<Slot> {
+        lock(&self.table).slots.get(&key).cloned()
     }
 
     fn handle(&self, from: SocketAddr, data: &[u8]) {
@@ -287,13 +447,26 @@ impl Shared {
             p.conn_id
         };
         let key = (from, id);
-        let slot = lock(&self.table).get(&key).cloned();
-        match (slot, p.ty) {
+        match (self.get(key), p.ty) {
             (Some(slot), _) => self.deliver(key, &slot, &p, now),
             (None, PacketType::Syn) => self.incoming_syn(key, &p, now),
-            // Never answer a reset: two sockets would bounce them forever.
-            (None, PacketType::Reset) => {}
+            (None, PacketType::Reset) => self.reset_by_send_id(from, &p, now),
             (None, _) => self.unknown(from, &p, now),
+        }
+    }
+
+    /// A reset carrying a connection's send id (libutp answers with the id
+    /// of the packet it got). That connection's receive id is one off.
+    /// Never answered: two sockets would bounce resets forever.
+    fn reset_by_send_id(&self, from: SocketAddr, p: &Packet, now: Instant) {
+        for id in [p.conn_id.wrapping_add(1), p.conn_id.wrapping_sub(1)] {
+            let key = (from, id);
+            if let Some(slot) = self.get(key)
+                && lock(&slot).conn.send_id() == p.conn_id
+            {
+                self.deliver(key, &slot, p, now);
+                return;
+            }
         }
     }
 
@@ -303,55 +476,62 @@ impl Shared {
             if s.local_error.is_some() {
                 return;
             }
+            if p.ty == PacketType::Syn && !s.acceptor {
+                tracing::debug!(peer = %s.peer, "utp SYN collides with an outgoing connection");
+                return;
+            }
+            let before = s.readiness();
             s.conn.on_packet(p, now);
-            let st = self.settle(&mut s, now, true);
+            let confirmed = p.ty != PacketType::Syn && s.unconfirmed_until.take().is_some();
+            let mut st = self.settle(&mut s, now, Some(before));
+            st.confirmed = confirmed;
             (s.peer, st)
         };
         self.finish(key, slot, peer, st);
     }
 
-    /// Room for one more pending connection.
-    fn has_room(&self) -> bool {
-        let table = lock(&self.table);
-        table.len() < self.cfg.max_connections
-            && lock(&self.pending).len() < self.cfg.max_pending_accept
+    /// Room for one more half-open connection from `ip`.
+    fn has_room(&self, table: &Table, pending: usize, ip: IpAddr) -> bool {
+        table.slots.len() < self.cfg.max_connections
+            && pending < self.cfg.max_pending_accept
+            && table.half_open_from(ip) < MAX_PENDING_PER_IP
     }
 
     fn incoming_syn(&self, key: Key, syn: &Packet, now: Instant) {
         // Checked before any allocation, so a flood costs a lookup each.
-        if !self.has_room() {
-            return;
+        {
+            let table = lock(&self.table);
+            let pending = lock(&self.pending).len();
+            if !self.has_room(&table, pending, key.0.ip()) {
+                return;
+            }
         }
         let filter = lock(&self.filter).clone();
         if filter.is_some_and(|f| !f(key.0)) {
             return;
         }
         let isn: u16 = rand::rng().random();
-        let mut conn = Connection::accept(&self.cfg, key.0, syn, isn, now);
-        let mut out = Vec::new();
-        while let Some(d) = conn.poll_transmit(now) {
-            out.push(d);
-        }
-        let deadline = conn.next_deadline();
-        let slot = Arc::new(Mutex::new(ConnSlot::new(conn, key.0)));
+        let conn = Connection::accept(&self.cfg, key.0, syn, isn, now);
+        let mut slot = ConnSlot::new(conn, key, true);
+        slot.unconfirmed_until = now.checked_add(self.cfg.connect_timeout);
+        let slot = Arc::new(Mutex::new(slot));
         {
             let mut table = lock(&self.table);
             let mut pending = lock(&self.pending);
-            if table.contains_key(&key)
-                || table.len() >= self.cfg.max_connections
-                || pending.len() >= self.cfg.max_pending_accept
-            {
+            if table.slots.contains_key(&key) || !self.has_room(&table, pending.len(), key.0.ip()) {
                 return;
             }
-            table.insert(key, Arc::clone(&slot));
-            pending.push_back((key, slot));
+            table.slots.insert(key, Arc::clone(&slot));
+            table.add_half_open(key);
+            pending.push_back((key, Arc::clone(&slot)));
         }
-        self.send_all(key.0, &out);
+        let st = self.settle(&mut lock(&slot), now, None);
+        self.finish(key, &slot, key.0, st);
         self.accept_ready.notify_one();
-        self.reschedule(deadline);
     }
 
-    /// A packet for no connection we know: one rate-limited reset.
+    /// A packet for no connection we know: one rate-limited reset, echoing
+    /// the packet's id (as libutp does).
     fn unknown(&self, from: SocketAddr, p: &Packet, now: Instant) {
         {
             let mut r = lock(&self.resets);
@@ -367,44 +547,49 @@ impl Shared {
         self.send_all(from, &[reset_packet(p.conn_id, seq, p.seq_nr)]);
     }
 
-    /// Runs every due timer; returns when the timer should next wake.
+    /// Runs the due timers (from the index, not a scan); returns when the
+    /// timer should next wake.
     fn run_timers(&self) -> Instant {
         *lock(&self.armed) = None;
         let now = Instant::now();
-        let slots: Vec<(Key, Slot)> = lock(&self.table)
-            .iter()
-            .map(|(k, v)| (*k, Arc::clone(v)))
-            .collect();
-        let mut next: Option<Instant> = None;
-        for (key, slot) in slots {
+        let due: Vec<(Instant, Key)> = {
+            let mut idx = lock(&self.deadlines);
+            let mut due = Vec::new();
+            while let Some(&first) = idx.first() {
+                if first.0 > now {
+                    break;
+                }
+                idx.pop_first();
+                due.push(first);
+            }
+            due
+        };
+        for (t, key) in due {
+            let Some(slot) = self.get(key) else { continue };
             let (peer, st) = {
                 let mut s = lock(&slot);
-                let due =
-                    s.local_error.is_none() && s.conn.next_deadline().is_some_and(|d| now >= d);
-                if due {
+                if s.scheduled != Some(t) {
+                    continue; // stale: the entry belonged to an older slot
+                }
+                s.scheduled = None;
+                self.timer_visits.fetch_add(1, Ordering::Relaxed);
+                let before = s.readiness();
+                if s.local_error.is_none() && s.conn.next_deadline().is_some_and(|d| now >= d) {
                     s.conn.on_timer(now);
                 }
-                let st = self.settle(&mut s, now, due);
+                let st = self.settle(&mut s, now, Some(before));
                 (s.peer, st)
             };
-            if !st.remove {
-                next = [next, st.deadline].into_iter().flatten().min();
-            }
-            self.send_all(peer, &st.out);
-            for w in st.wakers {
-                w.wake();
-            }
-            if st.remove {
-                self.remove(key, &slot);
-            }
+            self.finish_quiet(key, &slot, peer, st);
         }
+        let next = lock(&self.deadlines).first().map(|e| e.0);
         let floor = now.checked_add(MIN_TIMER_SLEEP).unwrap_or(now);
         let until = next
             .or_else(|| now.checked_add(IDLE_SLEEP))
             .unwrap_or(floor)
             .max(floor);
-        // A deadline set during the scan left a permit: the next wait
-        // returns at once and scans again.
+        // A deadline set while this ran left a permit: the next wait
+        // returns at once and runs again.
         *lock(&self.armed) = Some(until);
         until
     }
@@ -413,7 +598,12 @@ impl Shared {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let slots: Vec<(Key, Slot)> = lock(&self.table).drain().collect();
+        let slots: Vec<(Key, Slot)> = {
+            let mut table = lock(&self.table);
+            table.half_open.clear();
+            table.half_open_per_ip.clear();
+            table.slots.drain().collect()
+        };
         lock(&self.pending).clear();
         for (_, slot) in slots {
             let (peer, out, wakers) = {
@@ -423,26 +613,21 @@ impl Shared {
                     out.push(reset_packet(s.conn.send_id(), 0, 0));
                     s.local_error = Some(UtpError::Closed);
                 }
-                (s.peer, out, take_wakers(&mut s))
+                self.index(&mut s, None);
+                (s.peer, out, s.take_wakers(true, true))
             };
             self.send_all(peer, &out);
             for w in wakers {
                 w.wake();
             }
         }
+        lock(&self.deadlines).clear();
         self.accept_ready.notify_waiters();
         self.timer.notify_one();
         if let Some(s) = &self.recv_stop {
             s.notify_one();
         }
     }
-}
-
-fn take_wakers(s: &mut ConnSlot) -> Vec<Waker> {
-    [s.read_waker.take(), s.write_waker.take()]
-        .into_iter()
-        .flatten()
-        .collect()
 }
 
 /// Feeds datagrams to the socket. Holds it weakly: the socket ends with its
@@ -485,25 +670,34 @@ pub struct UtpSocket {
 impl UtpSocket {
     /// Shared mode: sends through `sender`, receives what is fed to
     /// [`UtpSocket::handler`]. Must run inside a tokio runtime.
+    ///
+    /// `recv_buffer` and `send_buffer` are raised to at least one packet
+    /// (the larger payload size, and never below 1472 bytes), so a
+    /// connection can always make progress.
     pub fn new(sender: Arc<dyn DatagramSender>, cfg: UtpConfig) -> UtpSocket {
         UtpSocket::build(sender, cfg, None)
     }
 
     fn build(
         sender: Arc<dyn DatagramSender>,
-        cfg: UtpConfig,
+        mut cfg: UtpConfig,
         recv_stop: Option<Arc<Notify>>,
     ) -> UtpSocket {
+        let floor = cfg.max_payload_v4.max(cfg.max_payload_v6).max(HOLE_RESERVE);
+        cfg.recv_buffer = cfg.recv_buffer.max(floor);
+        cfg.send_buffer = cfg.send_buffer.max(floor);
         let timer = Arc::new(Notify::new());
         let inner = Arc::new(Shared {
             sender,
             cfg,
-            table: Mutex::new(HashMap::new()),
+            table: Mutex::new(Table::default()),
             pending: Mutex::new(VecDeque::new()),
             accept_ready: Notify::new(),
             filter: Mutex::new(None),
+            deadlines: Mutex::new(BTreeSet::new()),
             timer: Arc::clone(&timer),
             armed: Mutex::new(None),
+            timer_visits: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             resets: Mutex::new((Instant::now(), 0)),
             recv_stop,
@@ -514,6 +708,7 @@ impl UtpSocket {
 
     /// Standalone mode: binds and owns a UDP socket and its receive task,
     /// which ends on [`UtpSocket::shutdown`] or when the last handle drops.
+    /// Buffers are clamped as in [`UtpSocket::new`].
     pub async fn bind(addr: SocketAddr, cfg: UtpConfig) -> io::Result<UtpSocket> {
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
@@ -551,30 +746,35 @@ impl UtpSocket {
             return Err(UtpError::Closed);
         }
         let now = Instant::now();
-        let (key, slot, out, deadline) = {
+        let (key, slot) = {
             let mut table = lock(&sh.table);
-            if table.len() >= sh.cfg.max_connections {
+            if table.slots.len() >= sh.cfg.max_connections {
                 return Err(UtpError::TooManyConnections);
             }
+            // Keep the neighbouring ids free too: an incoming SYN from the
+            // same peer must not land on this connection, and a reset by
+            // send id must match one connection only.
+            let free = |id: u16| {
+                (0..=4u16).all(|d| {
+                    !table
+                        .slots
+                        .contains_key(&(to, id.wrapping_add(d).wrapping_sub(2)))
+                })
+            };
             let mut rng = rand::rng();
             let Some(id) = (0..ID_ATTEMPTS)
                 .map(|_| rng.random::<u16>())
-                .find(|id| !table.contains_key(&(to, *id)))
+                .find(|id| free(*id))
             else {
                 return Err(UtpError::TooManyConnections);
             };
-            let mut conn = Connection::connect(&sh.cfg, to, id, now);
-            let mut out = Vec::new();
-            while let Some(d) = conn.poll_transmit(now) {
-                out.push(d);
-            }
-            let deadline = conn.next_deadline();
-            let slot = Arc::new(Mutex::new(ConnSlot::new(conn, to)));
-            table.insert((to, id), Arc::clone(&slot));
-            ((to, id), slot, out, deadline)
+            let conn = Connection::connect(&sh.cfg, to, id, now);
+            let slot = Arc::new(Mutex::new(ConnSlot::new(conn, (to, id), false)));
+            table.slots.insert((to, id), Arc::clone(&slot));
+            ((to, id), slot)
         };
-        sh.send_all(to, &out);
-        sh.reschedule(deadline);
+        let st = sh.settle(&mut lock(&slot), now, None);
+        sh.finish(key, &slot, to, st);
 
         // Removes the attempt if this future is dropped or fails.
         let mut guard = ConnectGuard {
@@ -637,7 +837,13 @@ impl UtpSocket {
 
     /// Connections in the table: pending, established and closing.
     pub fn num_connections(&self) -> usize {
-        lock(&self.inner.table).len()
+        lock(&self.inner.table).slots.len()
+    }
+
+    /// Slots the timer task has processed so far (for tests).
+    #[doc(hidden)]
+    pub fn timer_visits(&self) -> u64 {
+        self.inner.timer_visits.load(Ordering::Relaxed)
     }
 
     /// Resets every connection and stops the socket's tasks; idempotent.

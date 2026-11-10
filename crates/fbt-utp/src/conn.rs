@@ -313,6 +313,23 @@ impl Connection {
         self.fin_acked
     }
 
+    /// In-order bytes waiting for `read`.
+    #[doc(hidden)]
+    pub fn readable_bytes(&self) -> usize {
+        self.inbox.len()
+    }
+
+    /// Bytes `write` would accept now.
+    #[doc(hidden)]
+    pub fn send_room(&self) -> usize {
+        if self.closing || matches!(self.state, ConnState::Closed | ConnState::FinSent) {
+            return 0;
+        }
+        self.cfg
+            .send_buffer
+            .saturating_sub(self.unsent.len() + self.unacked_bytes)
+    }
+
     /// Out-of-order plus unread in-order receive bytes.
     #[doc(hidden)]
     pub fn buffered_bytes(&self) -> usize {
@@ -479,7 +496,10 @@ impl Connection {
     /// Handles one packet from the peer.
     pub fn on_packet(&mut self, p: &Packet, now: Instant) {
         let acceptor_syn = self.is_acceptor && p.ty == PacketType::Syn && p.conn_id == self.send_id;
-        if p.conn_id != self.recv_id && !acceptor_syn {
+        // libutp sends a reset with the id of the packet it answers, which
+        // is our send id; libtorrent accepts both.
+        let reset_by_send_id = p.ty == PacketType::Reset && p.conn_id == self.send_id;
+        if p.conn_id != self.recv_id && !acceptor_syn && !reset_by_send_id {
             return;
         }
         if self.state == ConnState::Closed {

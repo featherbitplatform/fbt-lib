@@ -32,8 +32,9 @@ fn store(slot: &mut Option<Waker>, w: &Waker) {
 }
 
 /// A reliable, ordered uTP byte stream. Dropping it sends FIN if the
-/// connection is still up; `poll_shutdown` sends FIN and waits for its ack.
-#[derive(Debug)]
+/// connection is still up (and resets it if unread data is left or arrives
+/// later). `poll_shutdown` sends FIN after the queued data and waits for
+/// its ack; the whole wait, draining included, is bounded by `idle_timeout`.
 pub struct UtpStream {
     shared: Arc<Shared>,
     key: Key,
@@ -41,6 +42,20 @@ pub struct UtpStream {
     peer: SocketAddr,
     /// Set once `poll_shutdown` queued the FIN: bounds the wait for its ack.
     shutdown_deadline: Option<Pin<Box<Sleep>>>,
+}
+
+impl std::fmt::Debug for UtpStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("UtpStream");
+        d.field("peer", &self.peer).field("recv_id", &self.key.1);
+        // try_lock: formatting must never block or deadlock.
+        if let Ok(s) = self.slot.try_lock() {
+            d.field("send_id", &s.conn.send_id())
+                .field("state", &s.conn.state())
+                .field("error", &s.error());
+        }
+        d.finish_non_exhaustive()
+    }
 }
 
 impl UtpStream {
@@ -66,7 +81,7 @@ impl UtpStream {
 
     /// Settles the slot under `s` and sends after releasing it.
     fn flush_slot(&self, mut s: std::sync::MutexGuard<'_, ConnSlot>, now: Instant) {
-        let st = self.shared.settle(&mut s, now, false);
+        let st = self.shared.settle(&mut s, now, None);
         let peer = s.peer;
         drop(s);
         self.shared.finish(self.key, &self.slot, peer, st);
@@ -171,8 +186,13 @@ impl Drop for UtpStream {
         s.read_waker = None;
         s.write_waker = None;
         s.stream_dropped = true;
-        if s.error().is_none() && s.conn.state() != ConnState::Closed {
+        if s.error().is_none()
+            && s.conn.state() != ConnState::Closed
+            && s.conn.readable_bytes() == 0
+        {
             // FIN after the queued data; the slot lingers to deliver it.
+            // Unread data left behind resets the connection instead
+            // (`settle`).
             s.conn.close();
             s.reap_by(now.checked_add(self.shared.cfg.idle_timeout));
         }
