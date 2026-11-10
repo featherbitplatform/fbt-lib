@@ -72,4 +72,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bash dev/check-pure-rust.sh
 
+  # Live interop against qBittorrent-nox and Transmission (dev/interop/).
+  interop:
+    name: interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash dev/interop/run.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs
+          path: |
+            target/interop/logs/
+            target/interop/qbt-config/qBittorrent/data/logs/
+          if-no-files-found: ignore
+
   # cargo-deny runs in security.yml (job cargo-deny), which also re-scans weekly.

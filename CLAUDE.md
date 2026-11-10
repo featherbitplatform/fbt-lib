@@ -43,6 +43,9 @@ cargo deny --all-features check
 bash dev/sast.sh              # everything
 bash dev/sast.sh semgrep      # one tool
 
+# Live interop vs qBittorrent-nox and Transmission via opentracker (Docker; see dev/interop/README.md)
+bash dev/interop/run.sh
+
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec
 # handshake http_announce udp_announce path. Seeds live in fuzz/seeds/<target>/.
 mkdir -p fuzz/corpus/<target>

@@ -1,0 +1,56 @@
+# Live interop harness: fbt-example against qBittorrent-nox (libtorrent) and
+# Transmission, with opentracker as the tracker. Driven by run.sh, which
+# exports INTEROP_DIR (target/interop, shared by every container as /interop)
+# and HOST_UID/HOST_GID (so files written there stay owned by the caller).
+# All services share one bridge network and reach each other by service name.
+
+name: fbt-interop
+
+services:
+  tracker:
+    build:
+      context: tracker
+    networks: [swarm]
+
+  qbittorrent:
+    # qBittorrent 5.3.0 on libtorrent 2.x; multi-arch index digest.
+    image: qbittorrentofficial/qbittorrent-nox:5.3.0-2@sha256:43b2d352cf76330a7ca34c7320b9b74227d6f31e662e0e123d0457206b09a7ea
+    environment:
+      QBT_LEGAL_NOTICE: confirm
+      QBT_WEBUI_PORT: "8080"
+      QBT_TORRENTING_PORT: "6882"
+      PUID: ${HOST_UID:?run via run.sh}
+      PGID: ${HOST_GID:?run via run.sh}
+    volumes:
+      - ${INTEROP_DIR:?run via run.sh}/qbt-config:/config
+      - ${INTEROP_DIR}:/interop
+    networks: [swarm]
+
+  transmission:
+    # Transmission 4.1.4 (LinuxServer.io build); multi-arch index digest.
+    image: lscr.io/linuxserver/transmission:4.1.4-r0-ls368@sha256:fb8fe625941cf15eb69aba4e5c0a678e035ddb11605fd85af4516a4e641f2687
+    environment:
+      PUID: ${HOST_UID}
+      PGID: ${HOST_GID}
+      TZ: Etc/UTC
+    volumes:
+      - ${INTEROP_DIR}/tr-config:/config
+      - ${INTEROP_DIR}:/interop
+    networks: [swarm]
+
+  fbt:
+    build:
+      context: ../..
+      dockerfile: dev/interop/Dockerfile
+    image: fbt-interop-fbt:local
+    init: true
+    user: "${HOST_UID}:${HOST_GID}"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ${INTEROP_DIR}:/interop
+    networks: [swarm]
+
+networks:
+  swarm:
+    driver: bridge
