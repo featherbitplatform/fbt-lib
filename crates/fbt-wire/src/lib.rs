@@ -19,6 +19,7 @@ mod ext;
 mod fast;
 mod handshake;
 mod message;
+mod mse;
 
 pub use codec::{MessageCodec, WireError};
 pub use ext::{
@@ -31,3 +32,7 @@ pub use handshake::{
     HANDSHAKE_LEN, Handshake, HandshakeError, Reserved, read_handshake, write_handshake,
 };
 pub use message::Message;
+pub use mse::{
+    CryptoMethods, MSE_MAX_IA, MSE_MAX_PAD, MseError, MseStream, initiate,
+    is_plaintext_handshake_prefix, req2_hash, respond,
+};
