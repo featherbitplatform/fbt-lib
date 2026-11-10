@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -20,6 +21,8 @@ pub(crate) const MAX_CANDIDATES: usize = 64;
 pub(crate) const MAX_LOOKUP_QUERIES: usize = 200;
 /// Peers one lookup yields in all (de-duplication memory).
 const MAX_LOOKUP_PEERS: usize = 4096;
+/// How long a query refused with `Busy` waits before its node is retried.
+const BUSY_RETRY: Duration = Duration::from_millis(100);
 /// Peer batches buffered for a slow [`PeerLookup`] reader.
 const PEER_BATCHES: usize = 16;
 
@@ -154,6 +157,13 @@ impl Lookup {
         self.settle(from, State::Failed);
     }
 
+    /// The query to `from` was never sent (our node was busy): `from` is
+    /// queried again later. The attempt still counts towards
+    /// [`MAX_LOOKUP_QUERIES`], so a node that stays busy cannot loop forever.
+    pub(crate) fn on_busy(&mut self, from: &NodeId) {
+        self.settle(from, State::Fresh);
+    }
+
     pub(crate) fn is_done(&self) -> bool {
         self.in_flight == 0
             && (self.sent >= MAX_LOOKUP_QUERIES
@@ -240,7 +250,14 @@ pub(crate) async fn run(
         for n in lookup.next_queries() {
             let link = link.clone();
             let q = query.clone();
-            set.spawn(async move { (n, link.query(n.addr, q).await) });
+            set.spawn(async move {
+                let res = link.query(n.addr, q).await;
+                if res == Err(QueryError::Busy) {
+                    // keep the slot while the node's queue drains
+                    tokio::time::sleep(BUSY_RETRY).await;
+                }
+                (n, res)
+            });
         }
         if lookup.is_done() {
             break;
@@ -268,6 +285,7 @@ pub(crate) async fn run(
                 lookup.on_response(&n.id, &usable(n.addr, family, own, nodes), r.token);
             }
             Err(QueryError::Shutdown) => return,
+            Err(QueryError::Busy) => lookup.on_busy(&n.id),
             Err(_) => lookup.on_failure(&n.id),
         }
     }
@@ -404,6 +422,29 @@ mod tests {
         }
         assert!(l.is_done());
         assert_eq!(l.responders(), vec![(at(2), b"tok".to_vec())]);
+    }
+
+    #[test]
+    fn busy_nodes_are_retried_not_failed() {
+        let mut l = Lookup::new(TARGET, [1, 2].map(at).to_vec());
+        assert_eq!(l.next_queries(), vec![at(1), at(2)]);
+        l.on_busy(&at(1).id);
+        assert!(!l.is_done());
+        assert_eq!(l.next_queries(), vec![at(1)], "queried again");
+        l.on_response(&at(1).id, &[], Some(b"t".to_vec()));
+        l.on_response(&at(2).id, &[], None);
+        assert!(l.is_done());
+        assert_eq!(l.responders(), vec![(at(1), b"t".to_vec())]);
+        // always busy: the query budget still ends the lookup
+        let mut l = Lookup::new(TARGET, vec![at(1)]);
+        let mut rounds = 0;
+        while !l.is_done() {
+            for n in l.next_queries() {
+                l.on_busy(&n.id);
+            }
+            rounds += 1;
+            assert!(rounds <= MAX_LOOKUP_QUERIES);
+        }
     }
 
     #[test]

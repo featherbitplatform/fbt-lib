@@ -248,8 +248,11 @@ pub(crate) struct ExternalIp {
 }
 
 impl ExternalIp {
-    /// Records `reporter`'s view of our address. Returns the address once
-    /// [`EXTERNAL_IP_QUORUM`] distinct reporters agree on a new, non-local one.
+    /// Records `reporter`'s view of our address. Returns a new, non-local
+    /// address once it leads the held votes: at least
+    /// [`EXTERNAL_IP_QUORUM`] distinct reporters agree on it and strictly
+    /// more than on any other address. A minority, however many Sybils it
+    /// has, never overrides the majority; a tie keeps the current address.
     pub(crate) fn vote(&mut self, reporter: IpAddr, ip: IpAddr) -> Option<IpAddr> {
         let ip = canonical(ip);
         let reporter = canonical(reporter);
@@ -264,12 +267,29 @@ impl ExternalIp {
             }
             self.votes.push_back((reporter, ip));
         }
-        let agree = self.votes.iter().filter(|(_, v)| *v == ip).count();
-        if agree >= EXTERNAL_IP_QUORUM && self.current != Some(ip) {
-            self.current = Some(ip);
-            return Some(ip);
+        let leader = self.leader()?;
+        if self.current == Some(leader) {
+            return None;
         }
-        None
+        self.current = Some(leader);
+        Some(leader)
+    }
+
+    /// The address with at least [`EXTERNAL_IP_QUORUM`] votes and strictly
+    /// more than the runner-up.
+    fn leader(&self) -> Option<IpAddr> {
+        let mut counts: HashMap<IpAddr, usize> = HashMap::new();
+        for (_, v) in &self.votes {
+            *counts.entry(*v).or_default() += 1;
+        }
+        let (best, n) = counts.iter().max_by_key(|(_, n)| **n)?;
+        let runner_up = counts
+            .iter()
+            .filter(|(ip, _)| *ip != best)
+            .map(|(_, n)| *n)
+            .max()
+            .unwrap_or(0);
+        (*n >= EXTERNAL_IP_QUORUM && *n > runner_up).then_some(*best)
     }
 
     #[cfg(test)]
@@ -331,6 +351,9 @@ fn bind_v6(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
 /// on write readiness; a full send buffer drops the datagram, as UDP may.
 fn split(s: std::net::UdpSocket) -> io::Result<(UdpSocket, std::net::UdpSocket)> {
     let send = s.try_clone()?;
+    // the clone shares the file status on Unix but not necessarily on
+    // Windows: never let a send block the actor
+    send.set_nonblocking(true)?;
     Ok((UdpSocket::from_std(s)?, send))
 }
 
@@ -565,6 +588,8 @@ impl Actor {
         if sock_v6.is_some() {
             restored.extend(state.nodes_v6.iter().take(MAX_STATE_NODES).copied());
         }
+        let mut tid_seed = [0u8; 2];
+        rng.fill_bytes(&mut tid_seed);
         let has_seeds = !cfg.bootstrap.is_empty() || !restored.is_empty();
         let local = stats_tx.borrow().local_addrs.clone();
         Actor {
@@ -589,7 +614,8 @@ impl Actor {
             rng,
             pending: HashMap::new(),
             timeouts: VecDeque::new(),
-            next_tid: 0,
+            // a counter from a random start: tids are not guessable off-path
+            next_tid: u16::from_be_bytes(tid_seed),
             pinging: HashSet::new(),
             refreshed: HashMap::new(),
             link,
@@ -694,16 +720,22 @@ impl Actor {
         self.table_v4.iter().chain(self.table_v6.iter())
     }
 
-    fn send(&self, to: SocketAddr, bytes: &[u8]) {
+    /// Sends one datagram; `false` when it did not leave this host.
+    fn send(&self, to: SocketAddr, bytes: &[u8]) -> bool {
         let sock = if to.is_ipv4() {
             &self.sock_v4
         } else {
             &self.sock_v6
         };
-        if let Some(s) = sock
-            && let Err(e) = s.send_to(bytes, to)
-        {
-            debug!(error = %e, %to, "DHT: send failed");
+        let Some(s) = sock else {
+            return false;
+        };
+        match s.send_to(bytes, to) {
+            Ok(_) => true,
+            Err(e) => {
+                debug!(error = %e, %to, "DHT: send failed");
+                false
+            }
         }
     }
 
@@ -781,7 +813,7 @@ impl Actor {
         let Some(out) = server.answer(from, tid, q, now, &mut self.rng) else {
             return;
         };
-        self.send(raw_from, &out);
+        let _ = self.send(raw_from, &out);
         // BEP 43: read-only nodes are answered but never stored
         if !q.read_only {
             self.learn(
@@ -814,6 +846,10 @@ impl Actor {
 
     fn vote(&mut self, reporter: IpAddr, ip: IpAddr) {
         let ip = canonical(ip);
+        // an IPv4 reporter can only see our IPv4 address, and vice versa
+        if ip.is_ipv4() != canonical(reporter).is_ipv4() {
+            return;
+        }
         let family = if ip.is_ipv4() { Family::V4 } else { Family::V6 };
         let ext = match family {
             Family::V4 => &mut self.ext_v4,
@@ -831,6 +867,9 @@ impl Actor {
         {
             info!(%id, "DHT: new node id for the external address (BEP 42)");
             t.reset_own(id);
+            // bucket indices are relative to our id: the pacing restarts
+            let key = family_key(family);
+            self.refreshed.retain(|(f, _), _| *f != key);
         }
     }
 
@@ -846,7 +885,8 @@ impl Actor {
         Ok(())
     }
 
-    /// Sends a query; on `Err` nothing was sent.
+    /// Sends a query; on `Err` nothing is pending (and `reply`, if any, has
+    /// been answered for a local send failure).
     fn send_query(
         &mut self,
         addr: SocketAddr,
@@ -876,7 +916,14 @@ impl Actor {
                 read_only: self.read_only,
             }),
         };
-        self.send(addr, &msg.encode());
+        if !self.send(addr, &msg.encode()) {
+            // a local failure says nothing about the node: no pending
+            // entry, so its timeout cannot mark a healthy node failed
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(QueryError::Timeout));
+            }
+            return Err(QueryError::Timeout);
+        }
         let deadline = after(now, self.query_timeout);
         self.pending.insert(
             tid,
@@ -1579,6 +1626,67 @@ mod tests {
     }
 
     #[test]
+    fn external_ip_minority_never_overrides_the_majority() {
+        let a: IpAddr = "203.0.113.7".parse().unwrap();
+        let b: IpAddr = "198.18.0.1".parse().unwrap();
+        let c: IpAddr = "198.18.0.2".parse().unwrap();
+        let r = |k: u32| IpAddr::V4((0x0500_0000 + k).into());
+        let mut e = ExternalIp::default();
+        let mut switches = Vec::new();
+        for k in 0..20 {
+            switches.extend(e.vote(r(k), a));
+        }
+        assert_eq!(switches, [a]);
+        // 3 Sybil reporters dissent: no switch
+        for k in 100..103 {
+            assert_eq!(e.vote(r(k), b), None);
+        }
+        // alternating minorities, each far below the majority, do not flap
+        for k in 200..230 {
+            let ip = if k % 2 == 0 { b } else { c };
+            assert_eq!(e.vote(r(k), ip), None, "vote {k}");
+        }
+        // a tie keeps the current address
+        let mut t = ExternalIp::default();
+        for k in 0..3 {
+            t.vote(r(k), a);
+        }
+        for k in 10..13 {
+            assert_eq!(t.vote(r(k), b), None);
+        }
+    }
+
+    #[test]
+    fn external_ip_genuine_move_switches() {
+        let old: IpAddr = "203.0.113.7".parse().unwrap();
+        let new: IpAddr = "198.51.100.200".parse().unwrap();
+        let r = |k: u32| IpAddr::V4((0x0500_0000 + k).into());
+        let mut e = ExternalIp::default();
+        for k in 0..10 {
+            e.vote(r(k), old);
+        }
+        // the same reporters see us move, one by one
+        let mut switched_at = None;
+        for k in 0..10 {
+            if e.vote(r(k), new) == Some(new) {
+                switched_at = Some(k);
+            }
+        }
+        assert_eq!(switched_at, Some(5), "once new holds 6 of 10");
+        // and old votes ageing out of the window move us back
+        let mut e = ExternalIp::default();
+        for k in 0..MAX_EXTERNAL_VOTES as u32 {
+            e.vote(r(k), old);
+        }
+        let mut switched = false;
+        for k in 1000..1000 + MAX_EXTERNAL_VOTES as u32 {
+            switched |= e.vote(r(k), new) == Some(new);
+        }
+        assert!(switched);
+        assert_eq!(e.len(), MAX_EXTERNAL_VOTES);
+    }
+
+    #[test]
     fn external_ip_changes_the_id_when_invalid() {
         let mut rng = StdRng::seed_from_u64(1);
         let ext: IpAddr = "203.0.113.7".parse().unwrap();
@@ -1646,15 +1754,121 @@ mod tests {
         (a, tx)
     }
 
-    /// A node in bucket 0 of the all-zero id, on public IP `1.0.0.k`.
+    /// A node in bucket 0 of the all-zero id, on loopback port `20000 + k`
+    /// (so pings to it leave this host's stack without error).
     fn far(k: u8) -> NodeInfo {
         let mut i = [0u8; 20];
         i[0] = 0x80;
         i[19] = k;
         NodeInfo {
             id: NodeId(i),
-            addr: SocketAddr::from(([1, 0, 0, k], 6881)),
+            addr: SocketAddr::from(([127, 0, 0, 1], 20000 + u16::from(k))),
         }
+    }
+
+    #[tokio::test]
+    async fn enforce_node_id_keeps_invalid_ids_out() {
+        let (mut a, _tx) = actor(DhtConfig {
+            enforce_node_id: true,
+            ..cfg()
+        });
+        let now = Instant::now();
+        let public: SocketAddr = "203.0.113.9:6881".parse().unwrap();
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut bad = bep42_id(public.ip(), 1, &mut rng);
+        bad.0[0] ^= 0xff;
+        a.learn(
+            NodeInfo {
+                id: bad,
+                addr: public,
+            },
+            now,
+        );
+        assert_eq!(a.table_v4.as_ref().unwrap().len(), 0, "invalid id refused");
+        let good = bep42_id(public.ip(), 2, &mut rng);
+        a.learn(
+            NodeInfo {
+                id: good,
+                addr: public,
+            },
+            now,
+        );
+        assert_eq!(a.table_v4.as_ref().unwrap().id_at(&public), Some(good));
+        // local addresses are exempt
+        let mut l = far(3);
+        l.id = bad;
+        a.learn(l, now);
+        assert_eq!(a.table_v4.as_ref().unwrap().id_at(&l.addr), Some(bad));
+        // without enforcement any id goes in
+        let (mut a, _tx) = actor(cfg());
+        a.learn(
+            NodeInfo {
+                id: bad,
+                addr: public,
+            },
+            now,
+        );
+        assert_eq!(a.table_v4.as_ref().unwrap().id_at(&public), Some(bad));
+    }
+
+    #[tokio::test]
+    async fn local_send_failure_registers_no_pending_query() {
+        let (mut a, _tx) = actor(cfg());
+        let now = Instant::now();
+        // broadcast without SO_BROADCAST is refused by the local stack
+        let nowhere: SocketAddr = "255.255.255.255:6881".parse().unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        assert_eq!(
+            a.send_query(nowhere, Query::Ping, Some(tx), None, now),
+            Err(QueryError::Timeout)
+        );
+        assert_eq!(rx.try_recv(), Ok(Err(QueryError::Timeout)));
+        assert!(a.pending.is_empty() && a.timeouts.is_empty());
+        // a reachable address is registered
+        let ok = far(1).addr;
+        assert_eq!(a.send_query(ok, Query::Ping, None, None, now), Ok(()));
+        assert_eq!(a.pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tid_counter_starts_at_random() {
+        let starts: HashSet<u16> = (0..8).map(|_| actor(cfg()).0.next_tid).collect();
+        assert!(starts.len() > 1, "{starts:?}");
+    }
+
+    #[tokio::test]
+    async fn votes_from_the_other_family_are_ignored() {
+        let (mut a, _tx) = actor(cfg());
+        let ext: IpAddr = "203.0.113.7".parse().unwrap();
+        for k in 1..=5u16 {
+            let v6_reporter = IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, k]);
+            a.vote(v6_reporter, ext);
+        }
+        assert_eq!(a.ext_v4.len(), 0);
+        let own = a.table_v4.as_ref().unwrap().own_id();
+        for k in 1..=3 {
+            a.vote(IpAddr::from([198, 51, 100, k]), ext);
+        }
+        let new = a.table_v4.as_ref().unwrap().own_id();
+        assert_ne!(new, own, "same-family quorum regenerates the id");
+        assert!(new.is_valid_for(ext));
+    }
+
+    #[tokio::test]
+    async fn id_change_restarts_refresh_pacing() {
+        let (mut a, _tx) = actor(cfg());
+        a.table_v4 = Some(RoutingTable::new(NodeId([0; 20]), Family::V4));
+        let t0 = Instant::now();
+        a.learn(far(1), t0);
+        a.refresh(t0 + Duration::from_secs(16 * 60));
+        assert!(!a.refreshed.is_empty());
+        for k in 1..=3 {
+            a.vote(
+                IpAddr::from([198, 51, 100, k]),
+                "203.0.113.7".parse().unwrap(),
+            );
+        }
+        assert!(a.refreshed.is_empty());
     }
 
     #[tokio::test]
