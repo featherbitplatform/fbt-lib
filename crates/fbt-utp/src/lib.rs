@@ -1,4 +1,5 @@
-//! fbt-utp: the uTP transport (BEP 29).
+//! fbt-utp: the uTP transport (BEP 29): a sans-IO connection core and a
+//! tokio runtime ([`UtpSocket`], [`UtpStream`]) on top of it.
 //!
 //! Everything here receives datagrams from untrusted hosts: no panics, no
 //! unbounded allocation.
@@ -20,8 +21,12 @@ mod ledbat;
 #[doc(hidden)]
 pub mod packet;
 mod rtt;
+mod socket;
+mod stream;
 
 pub use conn::UtpConfig;
+pub use socket::UtpSocket;
+pub use stream::UtpStream;
 
 pub use packet::{
     HEADER_LEN, MAX_EXTENSIONS, MAX_SACK_LEN, Packet, PacketError, PacketType, sack_acks, seq_le,

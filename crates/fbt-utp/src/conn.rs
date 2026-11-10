@@ -308,6 +308,11 @@ impl Connection {
         self.eof && self.inbox.is_empty()
     }
 
+    /// Our FIN was sent and the peer acknowledged it.
+    pub fn is_fin_acked(&self) -> bool {
+        self.fin_acked
+    }
+
     /// Out-of-order plus unread in-order receive bytes.
     #[doc(hidden)]
     pub fn buffered_bytes(&self) -> usize {

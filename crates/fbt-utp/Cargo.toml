@@ -16,9 +16,11 @@ fbt-core = { path = "../fbt-core" }
 bytes.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time", "sync", "io-util"] }
+rand.workspace = true
 
 [dev-dependencies]
+fbt-net = { path = "../fbt-net" }
 proptest.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
-rand.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "macros", "time", "sync", "io-util", "test-util"] }
 sha1.workspace = true
