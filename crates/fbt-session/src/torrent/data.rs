@@ -114,6 +114,9 @@ impl Actor {
         dst.copy_from_slice(&data);
         self.counters.downloaded = self.counters.downloaded.saturating_add(len);
         self.counters.dl.record(len);
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.from_rate.record(len);
+        }
         // End-game: the other holders of this block no longer need it.
         for owner in res.cancel {
             if let Some(o) = self.peers.get_mut(&owner) {

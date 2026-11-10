@@ -67,9 +67,16 @@ impl Actor {
             Ok(buf) => {
                 let len = buf.len() as u64;
                 let data = Bytes::from(buf);
+                // Choked since the request: the peer task dropped it already.
+                if self.peers.get(&key).is_none_or(|p| p.am_choking) {
+                    return;
+                }
                 if self.send(key, PeerCommand::SendBlock { block, data }) {
                     self.counters.uploaded = self.counters.uploaded.saturating_add(len);
                     self.counters.ul.record(len);
+                    if let Some(p) = self.peers.get_mut(&key) {
+                        p.to_rate.record(len);
+                    }
                 }
             }
             Err(e) => self.fail(&e, "reading a block"),

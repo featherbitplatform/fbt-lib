@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use fbt_wire::read_handshake;
+use fbt_wire::{read_handshake, write_handshake};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -75,7 +75,15 @@ async fn route(
         }
     };
     if hs.peer_id == shared.peer_id {
+        // Our own handshake goes back, so the outgoing side sees its own id
+        // and reports `SelfConnection` (never retried) instead of an I/O
+        // error; this side is dropped without reaching the torrent.
         debug!(%addr, "dropping incoming connection from ourselves");
+        let _ = timeout(
+            shared.settings.handshake_timeout,
+            write_handshake(&mut stream, &hs),
+        )
+        .await;
         return;
     }
     let Some(session) = session.upgrade() else {

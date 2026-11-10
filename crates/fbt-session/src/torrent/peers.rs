@@ -4,19 +4,90 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::time::Instant;
 use tracing::debug;
 
 use super::actor::Actor;
+use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
 use crate::peer::conn::{PeerCtx, spawn_incoming, spawn_outgoing};
 use crate::peer::messages::{PeerCommand, PeerEvent, PeerPiecesOwned};
 use crate::picker::{PeerKey, PeerPieces, PiecePicker};
+use crate::rate::RateMeter;
 use crate::session::{release, try_reserve};
+
+/// A failed outgoing connection is retried after this long.
+const RETRY_DELAY: Duration = Duration::from_secs(60);
+/// Connection attempts per address before it is given up.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Outgoing connection retries: failed addresses come back after
+/// [`RETRY_DELAY`], at most [`MAX_ATTEMPTS`] attempts in all; an address
+/// that turned out to be ourselves is never tried again.
+#[derive(Debug, Default)]
+pub(super) struct Retries {
+    /// Failed attempts since the last successful connection.
+    attempts: HashMap<SocketAddr, u32>,
+    /// Addresses waiting for their retry time.
+    pending: HashMap<SocketAddr, Instant>,
+    never: HashSet<SocketAddr>,
+}
+
+impl Retries {
+    /// Never connect to `addr` again.
+    pub(super) fn never(&mut self, addr: SocketAddr) {
+        self.never.insert(addr);
+        self.pending.remove(&addr);
+        self.attempts.remove(&addr);
+    }
+
+    pub(super) fn is_never(&self, addr: &SocketAddr) -> bool {
+        self.never.contains(addr)
+    }
+
+    /// Waiting for a retry: neither queued again nor connected early.
+    pub(super) fn is_pending(&self, addr: &SocketAddr) -> bool {
+        self.pending.contains_key(addr)
+    }
+
+    /// An attempt failed; schedules a retry unless attempts are used up.
+    pub(super) fn failed(&mut self, addr: SocketAddr, now: Instant) {
+        if self.never.contains(&addr) {
+            return;
+        }
+        let n = self.attempts.entry(addr).or_insert(0);
+        *n = n.saturating_add(1);
+        if *n < MAX_ATTEMPTS {
+            self.pending.insert(addr, now + RETRY_DELAY);
+        }
+    }
+
+    /// The handshake succeeded: the attempts start over.
+    pub(super) fn connected(&mut self, addr: &SocketAddr) {
+        self.attempts.remove(addr);
+        self.pending.remove(addr);
+    }
+
+    /// Removes and returns the addresses whose retry time has come.
+    pub(super) fn due(&mut self, now: Instant) -> Vec<SocketAddr> {
+        let due: Vec<SocketAddr> = self
+            .pending
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(a, _)| *a)
+            .collect();
+        for a in &due {
+            self.pending.remove(a);
+        }
+        due
+    }
+}
 
 /// One peer connection, from spawn until its `Disconnected` event.
 #[derive(Debug)]
@@ -26,6 +97,8 @@ pub(super) struct Peer {
     pub tx: Option<mpsc::Sender<PeerCommand>>,
     /// Picker generation the peer belongs to.
     pub generation: u64,
+    /// We dialled it.
+    pub outgoing: bool,
     /// Outgoing and still holding a half-open slot.
     pub connecting: bool,
     pub connected: bool,
@@ -42,6 +115,10 @@ pub(super) struct Peer {
     pub requested: HashSet<BlockRef>,
     /// Blocks the peer asked for (`WantBlocks`) and we have not handed out.
     pub demand: usize,
+    /// Payload the peer uploads to us.
+    pub from_rate: RateMeter,
+    /// Payload we upload to the peer.
+    pub to_rate: RateMeter,
 }
 
 impl Peer {
@@ -55,6 +132,7 @@ impl Peer {
             addr,
             tx: Some(tx),
             generation,
+            outgoing: false,
             connecting: false,
             connected: false,
             peer_id: None,
@@ -67,6 +145,8 @@ impl Peer {
             allowed_fast: HashSet::new(),
             requested: HashSet::new(),
             demand: 0,
+            from_rate: RateMeter::new(),
+            to_rate: RateMeter::new(),
         }
     }
 
@@ -84,6 +164,11 @@ impl Peer {
 
     pub(super) fn is_seed(&self) -> bool {
         self.seed || self.bits.is_full()
+    }
+
+    /// Connected, not closed, and we do not choke it.
+    pub(super) fn unchoked(&self) -> bool {
+        self.connected && self.tx.is_some() && !self.am_choking
     }
 }
 
@@ -116,18 +201,36 @@ impl Actor {
         }
         let known: Vec<SocketAddr> = self.known.iter().copied().collect();
         for addr in known {
-            let busy = self
-                .peers
-                .values()
-                .any(|p| p.addr == addr && p.tx.is_some());
-            if !busy && !self.candidates.contains(&addr) {
-                self.candidates.push_back(addr);
-            }
+            self.queue_addr(addr);
+        }
+    }
+
+    /// Queues `addr` for connecting unless it is ourselves, waiting for a
+    /// retry, already connected or already queued.
+    pub(super) fn queue_addr(&mut self, addr: SocketAddr) {
+        if self.retries.is_never(&addr) || self.retries.is_pending(&addr) {
+            return;
+        }
+        let busy = self
+            .peers
+            .values()
+            .any(|p| p.addr == addr && p.tx.is_some());
+        if !busy && !self.candidates.contains(&addr) {
+            self.candidates.push_back(addr);
+        }
+    }
+
+    /// Queues the addresses whose retry time has come.
+    pub(super) fn queue_retries(&mut self) {
+        if !self.active() {
+            return;
+        }
+        for addr in self.retries.due(Instant::now()) {
+            self.queue_addr(addr);
         }
     }
 
     /// Starts outgoing connections while every limit allows.
-    // Task 14: retry with backoff and a never-retry set.
     pub(super) fn try_connect(&mut self) {
         let s = Arc::clone(&self.shared.settings);
         while self.active() && !self.candidates.is_empty() {
@@ -149,6 +252,7 @@ impl Actor {
             let key = self.new_key();
             let tx = spawn_outgoing(addr, self.ctx(key));
             let mut peer = Peer::new(addr, tx, self.generation, self.layout.num_pieces());
+            peer.outgoing = true;
             peer.connecting = true;
             self.peers.insert(key, peer);
         }
@@ -285,6 +389,9 @@ impl Actor {
         }
         p.connected = true;
         p.peer_id = Some(peer_id);
+        if p.outgoing {
+            self.retries.connected(&p.addr);
+        }
         debug!(%addr, "peer connected");
         self.emit(Event::PeerConnected {
             torrent: self.ih,
@@ -338,17 +445,61 @@ impl Actor {
             return;
         };
         p.peer_interested = on;
-        // Task 14: the choker decides; until then every interested peer is
-        // unchoked and an uninterested one choked.
         if !active {
             return;
         }
-        if on && p.am_choking {
-            p.am_choking = false;
-            self.send(key, PeerCommand::Unchoke);
-        } else if !on && !p.am_choking {
-            p.am_choking = true;
-            self.send(key, PeerCommand::Choke);
+        // The choker runs every `rechoke_interval`; in between a newly
+        // interested peer takes a free slot at once and a peer losing
+        // interest gives its slot back.
+        if on {
+            let unchoked = self.peers.values().filter(|p| p.unchoked()).count();
+            if unchoked < self.shared.settings.unchoke_slots {
+                self.set_choke(key, false);
+            }
+        } else {
+            self.set_choke(key, true);
+        }
+    }
+
+    /// Chokes or unchokes a peer, sending only on change.
+    pub(super) fn set_choke(&mut self, key: PeerKey, choke: bool) {
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        if p.tx.is_none() || p.am_choking == choke {
+            return;
+        }
+        p.am_choking = choke;
+        let cmd = if choke {
+            PeerCommand::Choke
+        } else {
+            PeerCommand::Unchoke
+        };
+        self.send(key, cmd);
+    }
+
+    /// Runs the choker over the connected peers: rate from each peer while
+    /// downloading, rate to it while seeding.
+    pub(super) fn rechoke(&mut self) {
+        if !self.active() {
+            return;
+        }
+        let now = Instant::now();
+        let infos: Vec<PeerChokeInfo> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.connected && p.tx.is_some())
+            .map(|(&key, p)| PeerChokeInfo {
+                key,
+                interested: p.peer_interested,
+                rate_from_peer: p.from_rate.rate(now),
+                rate_to_peer: p.to_rate.rate(now),
+            })
+            .collect();
+        let seeding = self.picker.as_ref().is_some_and(PiecePicker::is_finished);
+        let unchoke = self.choker.rechoke(&infos, seeding, &mut self.rng);
+        for info in infos {
+            self.set_choke(info.key, !unchoke.contains(&info.key));
         }
     }
 
@@ -380,6 +531,14 @@ impl Actor {
             release(&self.shared.half_open);
         }
         release(&self.shared.global_peers);
+        if reason == DisconnectReason::SelfConnection {
+            self.retries.never(p.addr);
+            self.known.remove(&p.addr);
+            self.candidates.retain(|a| *a != p.addr);
+        } else if p.outgoing && !p.connected && reason != DisconnectReason::Shutdown {
+            // The connection or handshake failed (we did not close it).
+            self.retries.failed(p.addr, Instant::now());
+        }
         match &reason {
             DisconnectReason::Protocol(msg) => {
                 debug!(addr = %p.addr, %msg, "peer broke the protocol");
@@ -645,6 +804,51 @@ mod tests {
         assert!(blocks.iter().all(|blk| blk.piece >= 10));
         // Below the cap nothing is evicted.
         assert_eq!(evict_orphans(&mut p, 3, &mut bufs), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_connects_retry_after_a_minute_three_attempts_in_all() {
+        let addr: SocketAddr = "10.0.0.1:6881".parse().expect("addr");
+        let mut r = Retries::default();
+        let mut attempts = 1;
+        loop {
+            r.failed(addr, Instant::now());
+            if !r.is_pending(&addr) {
+                break;
+            }
+            tokio::time::advance(RETRY_DELAY - Duration::from_secs(1)).await;
+            assert!(r.due(Instant::now()).is_empty(), "not before 60 s");
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(r.due(Instant::now()), vec![addr]);
+            assert!(!r.is_pending(&addr));
+            attempts += 1;
+        }
+        assert_eq!(attempts, MAX_ATTEMPTS);
+        tokio::time::advance(RETRY_DELAY * 10).await;
+        assert!(r.due(Instant::now()).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_resets_attempts_and_self_is_never_retried() {
+        let a: SocketAddr = "10.0.0.1:6881".parse().expect("addr");
+        let me: SocketAddr = "10.0.0.2:6881".parse().expect("addr");
+        let mut r = Retries::default();
+        r.failed(a, Instant::now());
+        r.failed(a, Instant::now());
+        r.connected(&a);
+        assert!(!r.is_pending(&a));
+        // A fresh series: two more failures still schedule retries.
+        r.failed(a, Instant::now());
+        assert!(r.is_pending(&a));
+        r.failed(a, Instant::now());
+        assert!(r.is_pending(&a));
+        r.failed(me, Instant::now());
+        r.never(me);
+        assert!(r.is_never(&me) && !r.is_pending(&me));
+        r.failed(me, Instant::now());
+        assert!(!r.is_pending(&me));
+        tokio::time::advance(RETRY_DELAY).await;
+        assert_eq!(r.due(Instant::now()), vec![a]);
     }
 
     #[test]

@@ -2,15 +2,19 @@
 
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
+use std::io;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use fbt_bencode::{DictBuilder, OwnedValue, encode};
 use fbt_core::PeerId;
 use fbt_metainfo::Metainfo;
-use fbt_session::storage::sha1_piece;
+use fbt_session::storage::{MemStorage, Storage, sha1_piece};
 use fbt_session::{Event, EventStream, Settings, TorrentHandle, TorrentState};
 use fbt_wire::{Handshake, Message, MessageCodec, Reserved, read_handshake, write_handshake};
 use futures_util::{SinkExt, StreamExt};
@@ -120,9 +124,24 @@ impl ScriptedPeer {
     /// Connects to `addr` and exchanges handshakes for `info_hash` (no fast
     /// extension).
     pub async fn connect(addr: SocketAddr, info_hash: [u8; 20]) -> ScriptedPeer {
+        Self::connect_with(addr, info_hash, Reserved::default()).await
+    }
+
+    /// Like [`connect`](Self::connect), advertising the fast extension.
+    pub async fn connect_fast(addr: SocketAddr, info_hash: [u8; 20]) -> ScriptedPeer {
+        let mut reserved = Reserved::default();
+        reserved.set_fast();
+        Self::connect_with(addr, info_hash, reserved).await
+    }
+
+    async fn connect_with(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        reserved: Reserved,
+    ) -> ScriptedPeer {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let ours = Handshake {
-            reserved: Reserved::default(),
+            reserved,
             info_hash,
             peer_id: PeerId([0x5a; 20]),
         };
@@ -201,4 +220,97 @@ pub enum PeerEnd {
     Closed,
     /// Still open when the wait ran out.
     TimedOut,
+}
+
+/// Polls `cond` every 10 ms until it holds or `timeout` passes.
+pub async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let end = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Memory storage that serves reads one at a time, each after `delay`: a
+/// rate-throttled seeder (about `16 KiB / delay` per second).
+#[derive(Debug)]
+pub struct SlowStorage {
+    pub inner: MemStorage,
+    pub delay: Duration,
+    gate: Mutex<()>,
+}
+
+impl SlowStorage {
+    pub fn new(data: Vec<u8>, delay: Duration) -> Self {
+        SlowStorage {
+            inner: MemStorage::from_bytes(data),
+            delay,
+            gate: Mutex::new(()),
+        }
+    }
+}
+
+impl Storage for SlowStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::sleep(self.delay);
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// Memory storage that, once `armed`, returns flipped bytes for reads
+/// overlapping `bad`. Armed after the initial check, it passes the check and
+/// then serves corrupt data.
+#[derive(Debug)]
+pub struct CorruptStorage {
+    pub inner: MemStorage,
+    pub bad: Range<u64>,
+    pub armed: AtomicBool,
+}
+
+impl CorruptStorage {
+    pub fn new(data: Vec<u8>, bad: Range<u64>) -> Self {
+        CorruptStorage {
+            inner: MemStorage::from_bytes(data),
+            bad,
+            armed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Storage for CorruptStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, buf)?;
+        if self.armed.load(Ordering::SeqCst) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                if self.bad.contains(&(offset + i as u64)) {
+                    *b ^= 0xff;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
 }

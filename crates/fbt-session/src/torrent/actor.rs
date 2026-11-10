@@ -19,8 +19,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::warn;
 
 use super::data::Job;
-use super::peers::Peer;
+use super::peers::{Peer, Retries};
 use super::{Cmd, piece_priorities, same_state};
+use crate::choker::Choker;
 use crate::error::SessionError;
 use crate::event::Event;
 use crate::peer::messages::PeerEvent;
@@ -90,6 +91,9 @@ pub(crate) struct Actor {
     pub(super) candidates: VecDeque<SocketAddr>,
     /// Every address given to `add_peer`, reconnected on resume.
     pub(super) known: HashSet<SocketAddr>,
+    /// Retry schedule and never-retry set of outgoing connections.
+    pub(super) retries: Retries,
+    pub(super) choker: Choker,
     /// Partially downloaded pieces, by index.
     pub(super) bufs: HashMap<u32, Vec<u8>>,
     pub(super) counters: Counters,
@@ -111,6 +115,7 @@ impl Actor {
         let (peer_tx, peer_rx) = mpsc::channel(PEER_EVENT_QUEUE);
         let piece_prio = piece_priorities(&meta, &params.file_priorities);
         let total_wanted = wanted_bytes(&meta.piece_layout(), &piece_prio);
+        let choker = Choker::new(shared.settings.unchoke_slots);
         Actor {
             ih: meta.info_hashes,
             layout: meta.piece_layout(),
@@ -136,6 +141,8 @@ impl Actor {
             next_key: 0,
             candidates: VecDeque::new(),
             known: HashSet::new(),
+            retries: Retries::default(),
+            choker,
             bufs: HashMap::new(),
             counters: Counters::default(),
             last_state: TorrentState::CheckingFiles { progress: 0.0 },
@@ -152,6 +159,8 @@ impl Actor {
         });
         let mut tick = tokio::time::interval(self.shared.settings.status_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut rechoke = tokio::time::interval(self.shared.settings.rechoke_interval);
+        rechoke.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 cmd = self.cmds.recv() => {
@@ -167,9 +176,11 @@ impl Actor {
                 Some(ev) = self.peer_rx.recv() => self.on_peer_event(ev),
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
+                    self.queue_retries();
                     self.try_connect();
                     self.publish();
                 }
+                _ = rechoke.tick() => self.rechoke(),
             }
         }
     }
@@ -375,15 +386,11 @@ impl Actor {
                 let _ = tx.send(());
             }
             Cmd::AddPeer(addr, tx) => {
-                self.known.insert(addr);
-                let busy = self
-                    .peers
-                    .values()
-                    .any(|p| p.addr == addr && p.tx.is_some());
-                if !busy && !self.candidates.contains(&addr) {
-                    self.candidates.push_back(addr);
+                if !self.retries.is_never(&addr) {
+                    self.known.insert(addr);
+                    self.queue_addr(addr);
+                    self.try_connect();
                 }
-                self.try_connect();
                 let _ = tx.send(());
             }
             Cmd::Pieces(tx) => {
