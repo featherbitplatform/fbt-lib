@@ -10,6 +10,8 @@ use crate::path::{RelPath, sanitize_component, sanitize_path};
 /// Deepest accepted file path, in components (including the root name).
 const MAX_PATH_DEPTH: usize = 256;
 const MAX_PIECE_LEN: i64 = 268_435_456;
+/// Most tracker URLs kept across all tiers; later ones are ignored.
+const MAX_TRACKERS: usize = 64;
 
 /// Errors from [`Metainfo::from_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -77,7 +79,8 @@ pub struct Metainfo {
     pub info_hashes: InfoHashes,
     /// The validated info dictionary.
     pub info: Info,
-    /// Announce tiers (de-duplicated, no empty tiers).
+    /// Announce tiers (de-duplicated, no empty tiers, at most 64 URLs in
+    /// all: the first ones in tier order).
     pub trackers: Vec<Vec<String>>,
     /// Free-form comment.
     pub comment: Option<String>,
@@ -315,12 +318,14 @@ fn parse_trackers(root: &Dict<'_>) -> Vec<Vec<String>> {
     let mut tiers = Vec::new();
     if let Some(list) = root.get(b"announce-list").and_then(Value::as_list) {
         for tier in list {
+            let room = MAX_TRACKERS.saturating_sub(seen.len());
             let urls: Vec<String> = tier
                 .as_list()
                 .unwrap_or(&[])
                 .iter()
                 .filter_map(Value::as_str)
                 .filter(|u| !u.is_empty() && seen.insert(u.to_string()))
+                .take(room)
                 .map(str::to_string)
                 .collect();
             if !urls.is_empty() {

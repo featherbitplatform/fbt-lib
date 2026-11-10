@@ -366,3 +366,20 @@ fn regenerate_fixtures() {
         std::fs::write(format!("{dir}/{name}.torrent"), bytes).unwrap();
     }
 }
+
+#[test]
+fn trackers_capped_at_64_urls() {
+    let content = data(1, 100);
+    let urls: Vec<String> = (0..100).map(|i| format!("http://t{i}.example/")).collect();
+    // Tiers of 30, 30 and 40 URLs: 64 in all survive, in order.
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let tiers: [&[&str]; 3] = [&refs[..30], &refs[30..60], &refs[60..]];
+    let t = torrent(
+        single_info("a", &content, 16_384),
+        &[("announce-list", announce_list(&tiers))],
+    );
+    let m = Metainfo::from_bytes(&t).unwrap();
+    let sizes: Vec<usize> = m.trackers.iter().map(Vec::len).collect();
+    assert_eq!(sizes, vec![30, 30, 4]);
+    assert_eq!(m.trackers.concat(), urls[..64].to_vec());
+}
