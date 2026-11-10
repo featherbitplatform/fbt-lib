@@ -10,3 +10,36 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = []
+tls-ring = [
+    "dep:rustls",
+    "rustls/ring",
+    "dep:hyper-rustls",
+    "hyper-rustls/ring",
+    "dep:webpki-roots",
+]
+tls-rustcrypto = [
+    "dep:rustls",
+    "dep:hyper-rustls",
+    "dep:webpki-roots",
+    "dep:rustls-rustcrypto",
+]
+
+[dependencies]
+fbt-bencode = { path = "../fbt-bencode" }
+fbt-core = { path = "../fbt-core" }
+thiserror.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["time"] }
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+hyper-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-rustcrypto = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }

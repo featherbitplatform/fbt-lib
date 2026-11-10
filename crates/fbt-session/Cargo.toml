@@ -10,3 +10,11 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = []
+tls-ring = ["fbt-tracker/tls-ring"]
+tls-rustcrypto = ["fbt-tracker/tls-rustcrypto"]
+
+[dependencies]
+fbt-tracker = { path = "../fbt-tracker" }

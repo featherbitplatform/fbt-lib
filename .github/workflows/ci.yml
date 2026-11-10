@@ -51,4 +51,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
 
+  # Feature plumbing: no TLS at all, and the pure-Rust TLS provider.
+  features:
+    name: features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p fbt --no-default-features
+      - run: cargo check -p fbt --no-default-features --features pure-rust
+
+  # The pure-rust build must not pull in ring or cc.
+  pure-rust:
+    name: pure-rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash dev/check-pure-rust.sh
+
   # cargo-deny runs in security.yml (job cargo-deny), which also re-scans weekly.

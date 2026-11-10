@@ -10,3 +10,13 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = ["tls"]
+# HTTPS trackers over rustls with the `ring` provider (needs a C toolchain).
+tls = ["fbt-session/tls-ring"]
+# HTTPS trackers over rustls with the pure-Rust RustCrypto provider.
+pure-rust = ["fbt-session/tls-rustcrypto"]
+
+[dependencies]
+fbt-session = { path = "../fbt-session" }
