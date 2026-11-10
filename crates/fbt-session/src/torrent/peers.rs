@@ -5,10 +5,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
+use fbt_metainfo::Metainfo;
+use fbt_wire::{ExtHandshake, MetadataMsg, UT_METADATA};
 use tokio::time::Instant;
 use tracing::debug;
 
 use super::actor::Actor;
+use super::data::Job;
+use super::metadata::{FetchStep, MAX_METADATA_REQUESTS_PER_PEER, serve_metadata};
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
@@ -68,14 +72,11 @@ impl Actor {
             PeerEvent::Wasted { bytes, .. } => {
                 self.counters.wasted = self.counters.wasted.saturating_add(bytes);
             }
-            PeerEvent::ExtHandshake { key, hs } => {
-                if let Some(p) = self.peers.get_mut(&key) {
-                    p.listen_port = hs.listen_port;
-                    p.ext = Some(hs);
-                }
-            }
-            // Metadata exchange, PEX and the DHT come with later tasks.
-            PeerEvent::Metadata { .. } | PeerEvent::Pex { .. } | PeerEvent::DhtPort { .. } => {}
+            PeerEvent::ExtHandshake { key, hs } => self.on_ext_handshake(key, hs),
+            PeerEvent::Metadata { key, msg } => self.on_metadata_msg(key, msg),
+            // PEX and the DHT come with Tasks 14 and 15 (a private torrent,
+            // magnets included once their metadata says so, ignores both).
+            PeerEvent::Pex { .. } | PeerEvent::DhtPort { .. } => {}
             PeerEvent::Disconnected {
                 key,
                 reason,
@@ -258,6 +259,10 @@ impl Actor {
         let Some((p, reason)) = self.on_disconnected(key, reason) else {
             return;
         };
+        if let Some(m) = self.magnet.as_mut() {
+            let sends = m.fetch.on_peer_gone(key);
+            self.send_metadata(sends);
+        }
         if p.generation == self.generation
             && let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut())
         {
@@ -274,6 +279,120 @@ impl Actor {
         });
         self.top_up_all(None);
         self.try_connect();
+    }
+
+    // ----- metadata exchange (BEP 9) ------------------------------------------
+
+    fn on_ext_handshake(&mut self, key: PeerKey, hs: Box<ExtHandshake>) {
+        let size = hs.metadata_size;
+        let supports = hs.id_of(UT_METADATA).is_some();
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        p.listen_port = hs.listen_port;
+        p.ext = Some(hs);
+        let Some(m) = self.magnet.as_mut() else {
+            return;
+        };
+        if size.is_some_and(|s| !m.fetch.acceptable_size(s)) {
+            debug!(key = key.0, ?size, "unacceptable metadata_size");
+            self.ban(key);
+            return;
+        }
+        let sends = m
+            .fetch
+            .on_ext_handshake(key, size, supports, Instant::now());
+        self.send_metadata(sends);
+    }
+
+    fn on_metadata_msg(&mut self, key: PeerKey, msg: MetadataMsg) {
+        if let MetadataMsg::Request { piece } = msg {
+            self.serve_metadata_request(key, piece);
+            return;
+        }
+        let Some(m) = self.magnet.as_mut() else {
+            return;
+        };
+        match m.fetch.on_message(key, msg, Instant::now()) {
+            FetchStep::Nothing => {}
+            FetchStep::Send(sends) => self.send_metadata(sends),
+            FetchStep::Bad(key) => self.ban(key),
+            // Only from a fetch that hashes inline, which the actor does not
+            // use: verify it the same way.
+            FetchStep::Done(bytes) | FetchStep::Verify(_, bytes) => {
+                let expected = m.magnet.info_hashes;
+                let trackers = m.magnet.trackers.iter().map(|t| vec![t.clone()]).collect();
+                // Hashing up to `max_metadata_size` bytes and parsing stay off
+                // the actor.
+                self.jobs.spawn_blocking(move || Job::Metadata {
+                    key,
+                    result: Metainfo::from_info_bytes(&bytes, expected, trackers).map(Box::new),
+                });
+            }
+        }
+    }
+
+    /// Answers a `ut_metadata` request from our metadata; beyond
+    /// [`MAX_METADATA_REQUESTS_PER_PEER`] per connection, with `Reject`.
+    fn serve_metadata_request(&mut self, key: PeerKey, piece: u32) {
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        p.metadata_requests = p.metadata_requests.saturating_add(1);
+        let msg = if p.metadata_requests > MAX_METADATA_REQUESTS_PER_PEER {
+            MetadataMsg::Reject { piece }
+        } else {
+            serve_metadata(self.loaded.as_ref().map(|l| l.meta.raw_info()), piece)
+        };
+        self.send(key, PeerCommand::SendMetadata(msg));
+    }
+
+    pub(super) fn send_metadata(&mut self, sends: Vec<(PeerKey, MetadataMsg)>) {
+        for (key, msg) in sends {
+            self.send(key, PeerCommand::SendMetadata(msg));
+        }
+    }
+
+    /// Closes a peer that sent bad metadata; its address is never dialled
+    /// again.
+    pub(super) fn ban(&mut self, key: PeerKey) {
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        p.close_reason = Some(DisconnectReason::BadMetadata);
+        let addr = p.addr;
+        self.retries.never(addr);
+        self.known.remove(&addr);
+        self.candidates.retain(|a| *a != addr);
+        self.close_peer(key);
+    }
+
+    /// After the first check of a magnet: the peers connected meanwhile
+    /// were told no pieces; they learn ours, and interest and requests
+    /// start.
+    pub(super) fn catch_up_peers(&mut self) {
+        let generation = self.generation;
+        let Some(have) = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.picker.as_ref())
+            .map(|pk| pk.have().iter_ones().collect::<Vec<u32>>())
+        else {
+            return;
+        };
+        let keys: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.connected && p.tx.is_some() && p.generation == generation)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in keys {
+            if !have.is_empty() {
+                self.send(key, PeerCommand::Haves(have.clone()));
+            }
+            self.update_interest(key);
+        }
+        self.top_up_all(None);
     }
 
     // ----- interest and requests ----------------------------------------------

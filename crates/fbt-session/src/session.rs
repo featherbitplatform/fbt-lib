@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fbt_core::{InfoHashes, PeerId};
-use fbt_metainfo::Metainfo;
+use fbt_metainfo::{Magnet, Metainfo};
 use fbt_tracker::TrackerClient;
 use fbt_wire::req2_hash;
 use tokio::net::TcpListener;
@@ -58,19 +58,41 @@ pub enum RemoveMode {
     DeleteData,
 }
 
+/// What a torrent is added from.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum TorrentSource {
+    /// A parsed `.torrent`.
+    Metainfo(Box<Metainfo>),
+    /// A magnet link: the metadata is fetched from peers (BEP 9) and
+    /// verified against its info hash.
+    Magnet(Magnet),
+}
+
+impl TorrentSource {
+    /// The info hashes the torrent is known by.
+    pub(crate) fn info_hashes(&self) -> InfoHashes {
+        match self {
+            TorrentSource::Metainfo(m) => m.info_hashes,
+            TorrentSource::Magnet(m) => m.info_hashes,
+        }
+    }
+}
+
 /// Parameters for [`Session::add_torrent`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct AddTorrent {
     /// The torrent.
-    pub metainfo: Metainfo,
+    pub source: TorrentSource,
     /// Directory the torrent's files live below.
     pub save_path: PathBuf,
     /// Start paused (the existing data is still checked).
     pub paused: bool,
     /// Download pieces in index order instead of rarest first.
     pub sequential: bool,
-    /// One per file (pad files included); empty means all `Normal`.
+    /// One per file (pad files included); empty means all `Normal`. Must be
+    /// empty for a magnet (its `so` selection applies instead).
     pub file_priorities: Vec<Priority>,
     /// Custom storage; `None` uses the filesystem below `save_path`.
     pub storage: Option<Arc<dyn Storage>>,
@@ -80,8 +102,18 @@ impl AddTorrent {
     /// Adds `metainfo` with its files below `save_path`, every other field
     /// at its default.
     pub fn new(metainfo: Metainfo, save_path: PathBuf) -> Self {
+        Self::from_source(TorrentSource::Metainfo(Box::new(metainfo)), save_path)
+    }
+
+    /// Adds a magnet link with its files below `save_path`, every other
+    /// field at its default.
+    pub fn magnet(magnet: Magnet, save_path: PathBuf) -> Self {
+        Self::from_source(TorrentSource::Magnet(magnet), save_path)
+    }
+
+    fn from_source(source: TorrentSource, save_path: PathBuf) -> Self {
         AddTorrent {
-            metainfo,
+            source,
             save_path,
             paused: false,
             sequential: false,
@@ -239,20 +271,36 @@ impl Session {
         self.inner.local_addr
     }
 
-    /// Adds a torrent and starts checking its existing data.
+    /// Adds a torrent and starts checking its existing data. A magnet
+    /// starts in [`TorrentState::DownloadingMetadata`](crate::TorrentState)
+    /// and is registered under its own info hashes, which stay its identity
+    /// after the metadata arrives.
+    ///
+    /// Fails with [`SessionError::V2OnlyUnsupported`] for a magnet without a
+    /// v1 info hash and with [`SessionError::InvalidPriorities`] (expecting
+    /// 0) for a magnet with file priorities.
     pub async fn add_torrent(&self, params: AddTorrent) -> Result<TorrentHandle, SessionError> {
         let shared = &self.inner.shared;
         if shared.is_shutdown() {
             return Err(SessionError::Shutdown);
         }
-        let num_files = params.metainfo.info.files.len();
+        let num_files = match &params.source {
+            TorrentSource::Metainfo(m) => m.info.files.len(),
+            TorrentSource::Magnet(m) => {
+                if m.info_hashes.v1.is_none() {
+                    return Err(SessionError::V2OnlyUnsupported);
+                }
+                // Unknown until the metadata arrives.
+                0
+            }
+        };
         if !params.file_priorities.is_empty() && params.file_priorities.len() != num_files {
             return Err(SessionError::InvalidPriorities {
                 expected: num_files,
                 got: params.file_priorities.len(),
             });
         }
-        let ih = params.metainfo.info_hashes;
+        let ih = params.source.info_hashes();
         let wire_hash = ih.wire_hash();
         let mut reg = self.inner.registry();
         if shared.is_shutdown() {
@@ -261,14 +309,18 @@ impl Session {
         if reg.torrents.contains_key(&ih) || reg.by_wire.contains_key(&wire_hash) {
             return Err(SessionError::DuplicateTorrent);
         }
-        let storage: Arc<dyn Storage> = match params.storage.clone() {
-            Some(s) => s,
-            None => Arc::new(FsStorage::new(params.save_path.clone(), &params.metainfo)),
+        // A magnet's storage is built once its metadata is known.
+        let storage: Option<Arc<dyn Storage>> = match (&params.source, params.storage.clone()) {
+            (TorrentSource::Magnet(_), _) => None,
+            (TorrentSource::Metainfo(_), Some(s)) => Some(s),
+            (TorrentSource::Metainfo(m), None) => {
+                Some(Arc::new(FsStorage::new(params.save_path.clone(), m)))
+            }
         };
         shared.emit(Event::TorrentAdded { torrent: ih });
         let handle = torrent::spawn(
             params,
-            Some(storage),
+            storage,
             Arc::clone(shared),
             Arc::downgrade(&self.inner),
         );

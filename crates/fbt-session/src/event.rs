@@ -47,6 +47,11 @@ pub enum Event {
         /// Piece index.
         piece: u32,
     },
+    /// A magnet torrent received and verified its metadata.
+    MetadataReceived {
+        /// The torrent.
+        torrent: InfoHashes,
+    },
     /// Every wanted piece was downloaded.
     TorrentFinished {
         /// The torrent.
@@ -106,7 +111,8 @@ bitflags::bitflags! {
     /// Event categories a subscriber receives.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct EventMask: u32 {
-        /// Torrent added/removed, state changes, torrent finished.
+        /// Torrent added/removed, state changes, metadata received, torrent
+        /// finished.
         const STATUS = 1;
         /// Piece finished, hash failed.
         const PIECE = 1 << 1;
@@ -132,6 +138,7 @@ impl Event {
             Event::TorrentAdded { .. }
             | Event::TorrentRemoved { .. }
             | Event::StateChanged { .. }
+            | Event::MetadataReceived { .. }
             | Event::TorrentFinished { .. } => EventMask::STATUS,
             Event::PieceFinished { .. } | Event::HashFailed { .. } => EventMask::PIECE,
             Event::TrackerReply { .. } | Event::TrackerError { .. } => EventMask::TRACKER,

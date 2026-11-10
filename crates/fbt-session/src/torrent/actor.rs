@@ -7,12 +7,13 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use fbt_core::{Bitfield, InfoHashes, PieceLayout};
-use fbt_metainfo::Metainfo;
+use fbt_metainfo::{Magnet, Metainfo, MetainfoError};
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -21,17 +22,20 @@ use tracing::warn;
 
 use super::announcer::{self, Announcer, STOPPED_TIMEOUT, Signals};
 use super::data::Job;
+use super::metadata::MetadataFetch;
 use super::swarm::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
 use crate::error::SessionError;
 use crate::event::Event;
-use crate::peer::messages::PeerEvent;
+use crate::peer::messages::{PeerCommand, PeerEvent};
 use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
-use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, release};
+use crate::session::{
+    AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource, release,
+};
 use crate::status::{TorrentState, TorrentStatus};
-use crate::storage::{Storage, check_pieces};
+use crate::storage::{FsStorage, Storage, check_pieces};
 
 /// Capacity of the channel carrying every peer's events into the actor.
 const PEER_EVENT_QUEUE: usize = 1024;
@@ -41,6 +45,9 @@ const PEER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Where the torrent is in its life.
 #[derive(Debug)]
 pub(super) enum Phase {
+    /// A magnet without metadata: peers connect and the metadata is
+    /// fetched from them.
+    Metadata,
     /// `check_pieces` is running; it counts checked pieces into `done` and
     /// stops at the next piece once `cancel` is set.
     Checking {
@@ -49,7 +56,7 @@ pub(super) enum Phase {
     },
     /// Checked; downloading or seeding (unless paused).
     Ready,
-    /// Stopped by a storage error.
+    /// Stopped by a storage error or invalid metadata.
     Error(String),
 }
 
@@ -86,8 +93,7 @@ pub(super) struct Loaded {
 }
 
 impl Loaded {
-    fn new(meta: Metainfo, file_prio: Vec<Priority>, sequential: bool) -> Self {
-        let meta = Arc::new(meta);
+    fn new(meta: Arc<Metainfo>, file_prio: Vec<Priority>, sequential: bool) -> Self {
         let layout = meta.piece_layout();
         let piece_prio = piece_priorities(&meta, &file_prio);
         let total_wanted = wanted_bytes(&layout, &piece_prio);
@@ -104,13 +110,40 @@ impl Loaded {
     }
 }
 
+/// A magnet torrent until its metadata arrives.
+#[derive(Debug)]
+pub(super) struct MagnetState {
+    pub fetch: MetadataFetch,
+    pub magnet: Magnet,
+    pub save_path: PathBuf,
+    /// The custom storage from `AddTorrent`, used once the metadata is in.
+    pub storage: Option<Arc<dyn Storage>>,
+    pub sequential: bool,
+}
+
+impl MagnetState {
+    /// A fresh fetch; completed buffers are verified in `spawn_blocking`.
+    pub(super) fn new_fetch(&self, max_size: usize) -> MetadataFetch {
+        MetadataFetch::new(self.magnet.info_hashes, max_size).deferred()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Actor {
     pub(super) ih: InfoHashes,
-    /// The metadata and everything built from it; always `Some` for now.
+    /// The metadata and everything built from it; `None` for a magnet
+    /// until its metadata arrives. Set only by [`Actor::install`], together
+    /// with `storage`.
     pub(super) loaded: Option<Loaded>,
     /// `None` until the metadata is known.
     pub(super) storage: Option<Arc<dyn Storage>>,
+    /// `Some` while a magnet waits for its metadata.
+    pub(super) magnet: Option<Box<MagnetState>>,
+    /// The handle's view of the metadata, filled once it is known.
+    pub(super) metainfo_cell: Arc<OnceLock<Arc<Metainfo>>>,
+    /// The check that follows a magnet's metadata is running: the announcer
+    /// keeps running through it (no `stopped`/`started` pair).
+    pub(super) metadata_check: bool,
     pub(super) shared: Arc<Shared>,
     /// The session's registry, which the actor leaves when removed.
     pub(super) session: Weak<SessionInner>,
@@ -147,14 +180,45 @@ impl Actor {
     pub(super) fn new(
         params: AddTorrent,
         storage: Option<Arc<dyn Storage>>,
+        metainfo_cell: Arc<OnceLock<Arc<Metainfo>>>,
         shared: Arc<Shared>,
         session: Weak<SessionInner>,
         cmds: mpsc::Receiver<Cmd>,
         status_tx: watch::Sender<TorrentStatus>,
     ) -> Self {
-        let ih = params.metainfo.info_hashes;
-        let trackers = params.metainfo.trackers.clone();
-        let loaded = Loaded::new(params.metainfo, params.file_priorities, params.sequential);
+        let ih = params.source.info_hashes();
+        let (loaded, magnet, trackers) = match params.source {
+            TorrentSource::Metainfo(m) => {
+                let trackers = m.trackers.clone();
+                let meta = Arc::new(*m);
+                let _ = metainfo_cell.set(Arc::clone(&meta));
+                let loaded = Loaded::new(meta, params.file_priorities, params.sequential);
+                (Some(loaded), None, trackers)
+            }
+            TorrentSource::Magnet(magnet) => {
+                // One tier per `tr`, in order.
+                let trackers = magnet.trackers.iter().map(|t| vec![t.clone()]).collect();
+                let fetch =
+                    MetadataFetch::new(magnet.info_hashes, shared.settings.max_metadata_size)
+                        .deferred();
+                let state = MagnetState {
+                    fetch,
+                    magnet,
+                    save_path: params.save_path,
+                    storage: params.storage,
+                    sequential: params.sequential,
+                };
+                (None, Some(Box::new(state)), trackers)
+            }
+        };
+        let phase = if loaded.is_some() {
+            Phase::Checking {
+                done: Arc::new(AtomicU32::new(0)),
+                cancel: Arc::new(AtomicBool::new(false)),
+            }
+        } else {
+            Phase::Metadata
+        };
         let (peer_tx, peer_rx) = mpsc::channel(PEER_EVENT_QUEUE);
         let choker = Choker::new(shared.settings.unchoke_slots);
         let retries = Retries::new(shared.settings.peer_retry_delay);
@@ -165,10 +229,13 @@ impl Actor {
             status: status_tx.subscribe(),
         })
         .unzip();
-        Actor {
+        let mut actor = Actor {
             ih,
-            loaded: Some(loaded),
+            loaded,
             storage,
+            magnet,
+            metainfo_cell,
+            metadata_check: false,
             shared,
             session,
             cmds,
@@ -177,10 +244,7 @@ impl Actor {
             status_tx,
             jobs: JoinSet::new(),
             generation: 0,
-            phase: Phase::Checking {
-                done: Arc::new(AtomicU32::new(0)),
-                cancel: Arc::new(AtomicBool::new(false)),
-            },
+            phase,
             paused: params.paused,
             peers: HashMap::new(),
             next_key: 0,
@@ -194,7 +258,11 @@ impl Actor {
             rng: rand::make_rng(),
             announcer,
             tracker_rx,
+        };
+        if actor.magnet.is_some() {
+            actor.last_state = actor.state();
         }
+        actor
     }
 
     pub(super) async fn run(mut self) {
@@ -203,6 +271,19 @@ impl Actor {
             torrent: self.ih,
             state: self.last_state,
         });
+        // A magnet connects to its `x.pe` peers and announces right away.
+        let hints = self
+            .magnet
+            .as_ref()
+            .map(|m| m.magnet.peers.clone())
+            .unwrap_or_default();
+        for addr in hints {
+            if dialable(&addr) && self.remember(addr) {
+                self.queue_addr(addr);
+            }
+        }
+        self.sync_running();
+        self.try_connect();
         let mut tick = tokio::time::interval(self.shared.settings.status_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut rechoke = tokio::time::interval(self.shared.settings.rechoke_interval);
@@ -226,6 +307,7 @@ impl Actor {
                 },
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
+                    self.metadata_tick();
                     self.queue_retries();
                     self.try_connect();
                     self.publish();
@@ -237,11 +319,21 @@ impl Actor {
 
     // ----- status and state -------------------------------------------------
 
-    /// The torrent's name; empty until the metadata is known.
+    /// The torrent's name; until the metadata is known, the magnet's `dn`
+    /// or empty.
     pub(super) fn name(&self) -> &str {
-        self.loaded
-            .as_ref()
-            .map_or("", |l| l.meta.info.name.as_str())
+        match (&self.loaded, &self.magnet) {
+            (Some(l), _) => l.meta.info.name.as_str(),
+            (None, Some(m)) => m.magnet.display_name.as_deref().unwrap_or(""),
+            (None, None) => "",
+        }
+    }
+
+    /// Sets the metadata and the storage built for it: the one place either
+    /// is set, so neither exists without the other.
+    pub(super) fn install(&mut self, loaded: Loaded, storage: Arc<dyn Storage>) {
+        self.loaded = Some(loaded);
+        self.storage = Some(storage);
     }
 
     /// Drops every partially downloaded piece.
@@ -255,14 +347,28 @@ impl Actor {
         self.shared.emit(ev);
     }
 
-    /// Ready and not paused: peers may connect and data may flow.
+    /// Ready and not paused: data may flow.
     pub(super) fn active(&self) -> bool {
         matches!(self.phase, Phase::Ready) && !self.paused
+    }
+
+    /// Peers may connect: ready, or a magnet fetching its metadata, and not
+    /// paused.
+    pub(super) fn connectable(&self) -> bool {
+        matches!(self.phase, Phase::Ready | Phase::Metadata) && !self.paused
+    }
+
+    /// What the announcer is told: announcing while peers may connect, and
+    /// through the check that follows a magnet's metadata.
+    fn running(&self) -> bool {
+        self.connectable() || (self.metadata_check && !self.paused)
     }
 
     pub(super) fn state(&self) -> TorrentState {
         match &self.phase {
             Phase::Error(_) => TorrentState::Error,
+            Phase::Metadata if self.paused => TorrentState::Paused,
+            Phase::Metadata => TorrentState::DownloadingMetadata,
             Phase::Checking { done, .. } => {
                 let n = self.loaded.as_ref().map_or(0, |l| l.layout.num_pieces());
                 let progress = if n == 0 {
@@ -318,6 +424,7 @@ impl Actor {
         TorrentStatus {
             info_hashes: self.ih,
             name: self.name().to_owned(),
+            has_metadata: self.loaded.is_some(),
             state: self.state(),
             progress,
             total_wanted,
@@ -350,7 +457,8 @@ impl Actor {
     }
 
     /// Publishes the status and emits `StateChanged` only if the state
-    /// changed; other changes wait for the next status tick.
+    /// changed; other changes wait for the next status tick. The announcer
+    /// learns whether to run.
     pub(super) fn refresh_state(&mut self) {
         let state = self.state();
         if !same_state(&state, &self.last_state) {
@@ -360,18 +468,23 @@ impl Actor {
                 torrent: self.ih,
                 state,
             });
-            let running = self.active();
-            self.signal(|s| {
-                if s.running == running {
-                    return false;
-                }
-                s.running = running;
-                if running {
-                    s.starts = s.starts.wrapping_add(1);
-                }
-                true
-            });
         }
+        self.sync_running();
+    }
+
+    /// Tells the announcer whether to run; a new run is a new `started`.
+    fn sync_running(&self) {
+        let running = self.running();
+        self.signal(|s| {
+            if s.running == running {
+                return false;
+            }
+            s.running = running;
+            if running {
+                s.starts = s.starts.wrapping_add(1);
+            }
+            true
+        });
     }
 
     // ----- announcing ---------------------------------------------------------
@@ -392,7 +505,7 @@ impl Actor {
             if dialable(&addr)
                 && !self.retries.is_never(&addr)
                 && self.remember(addr)
-                && self.active()
+                && self.connectable()
             {
                 self.queue_addr(addr);
             }
@@ -452,11 +565,21 @@ impl Actor {
                 let mut picker = PiecePicker::new(l.layout, &have);
                 picker.set_piece_priorities(&l.piece_prio);
                 picker.set_sequential(l.sequential);
+                // Peers still connected (a magnet keeps those it fetched
+                // the metadata through) count toward availability.
+                let generation = self.generation;
+                for p in self.peers.values() {
+                    if p.tx.is_some() && p.generation == generation {
+                        picker.add_peer_pieces(p.pieces());
+                    }
+                }
                 // Finishing during this session is what `TorrentFinished` reports.
                 self.finished_emitted = picker.is_finished();
                 l.picker = Some(picker);
                 self.phase = Phase::Ready;
+                self.metadata_check = false;
                 self.refresh_state();
+                self.catch_up_peers();
                 self.requeue_known();
                 self.try_connect();
             }
@@ -484,11 +607,101 @@ impl Actor {
         self.refresh_state();
     }
 
+    /// The metadata is unusable (it matches the info hash but does not
+    /// parse): the torrent stops with `TorrentState::Error`. A resume
+    /// fetches it again.
+    pub(super) fn metadata_failed(&mut self, message: String) {
+        warn!(torrent = %self.name(), %message, "metadata failed");
+        self.phase = Phase::Error(message);
+        self.close_all();
+        self.refresh_state();
+    }
+
     pub(super) fn on_job_result(&mut self, r: Result<Job, JoinError>) {
         match r {
             Ok(job) => self.on_job(job),
             Err(e) => warn!(error = %e, "torrent background job failed"),
         }
+    }
+
+    // ----- metadata -------------------------------------------------------------
+
+    /// A complete metadata buffer was hashed and parsed off the actor.
+    pub(super) fn on_metadata_job(
+        &mut self,
+        key: PeerKey,
+        result: Result<Box<Metainfo>, MetainfoError>,
+    ) {
+        if self.loaded.is_some() || !matches!(self.phase, Phase::Metadata) {
+            return;
+        }
+        match result {
+            Ok(meta) => self.install_metadata(*meta),
+            Err(MetainfoError::InfoHashMismatch) => {
+                let sends = self
+                    .magnet
+                    .as_mut()
+                    .map(|m| m.fetch.on_verify_failed(key))
+                    .unwrap_or_default();
+                self.ban(key);
+                self.send_metadata(sends);
+            }
+            Err(e) => self.metadata_failed(format!("invalid metadata: {e}")),
+        }
+    }
+
+    /// The verified metadata: build `Loaded` and the storage, tell the
+    /// handle and every peer, then check the existing data as for a
+    /// `.torrent`.
+    fn install_metadata(&mut self, meta: Metainfo) {
+        let Some(m) = self.magnet.take() else {
+            return;
+        };
+        let m = *m;
+        let file_prio = selected_priorities(&meta, m.magnet.select_only.as_deref());
+        let storage: Arc<dyn Storage> = match m.storage {
+            Some(s) => s,
+            None => Arc::new(FsStorage::new(m.save_path, &meta)),
+        };
+        let meta = Arc::new(meta);
+        let loaded = Loaded::new(Arc::clone(&meta), file_prio, m.sequential);
+        let layout = loaded.layout;
+        let total_wanted = loaded.total_wanted;
+        self.install(loaded, storage);
+        let _ = self.metainfo_cell.set(meta);
+        self.emit(Event::MetadataReceived { torrent: self.ih });
+        // Peers were set up with no pieces; they get the layout now.
+        let n = layout.num_pieces();
+        let ext = self.ext_config();
+        let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
+        for key in keys {
+            if let Some(p) = self.peers.get_mut(&key) {
+                p.bits = Bitfield::new(n);
+                p.fast_has = None;
+                if p.have_sent.is_some() {
+                    p.have_sent = Some(Bitfield::new(n));
+                }
+            }
+            self.send(key, PeerCommand::MetadataReady { layout, ext });
+        }
+        // Until the check is done, `stopped` (if any) reports everything
+        // as left.
+        self.signal(|s| {
+            s.left = total_wanted;
+            true
+        });
+        self.metadata_check = true;
+        self.start_check();
+        self.refresh_state();
+    }
+
+    /// Advances the metadata fetch's timers.
+    fn metadata_tick(&mut self) {
+        let sends = match self.magnet.as_mut() {
+            Some(m) if matches!(self.phase, Phase::Metadata) => m.fetch.on_tick(Instant::now()),
+            _ => return,
+        };
+        self.send_metadata(sends);
     }
 
     // ----- commands -----------------------------------------------------------
@@ -498,6 +711,7 @@ impl Actor {
             Cmd::Pause(tx) => {
                 if !self.paused {
                     self.paused = true;
+                    self.metadata_check = false;
                     self.close_all();
                     self.refresh_state();
                 }
@@ -570,7 +784,14 @@ impl Actor {
     pub(super) fn resume(&mut self) {
         let was_error = matches!(self.phase, Phase::Error(_));
         self.paused = false;
-        if was_error {
+        if was_error && self.loaded.is_none() {
+            // Bad metadata: fetch it again from scratch.
+            let max = self.shared.settings.max_metadata_size;
+            if let Some(m) = self.magnet.as_mut() {
+                m.fetch = m.new_fetch(max);
+            }
+            self.phase = Phase::Metadata;
+        } else if was_error {
             // Whatever was in flight when the error hit is unknown: forget
             // the picker and partial pieces and trust only the disk.
             self.remember_left();
@@ -599,6 +820,9 @@ impl Actor {
     }
 
     pub(super) fn recheck(&mut self) {
+        if self.loaded.is_none() {
+            return;
+        }
         self.remember_left();
         self.generation = self.generation.wrapping_add(1);
         self.close_all();
@@ -652,7 +876,9 @@ impl Actor {
         // Its result would be thrown away; do not wait for a whole check.
         self.cancel_check();
         let deadline = Instant::now() + PEER_DRAIN_TIMEOUT;
-        while !self.peers.is_empty() {
+        // Only connected peers read their commands; one still connecting
+        // or handshaking ends on its own timeout, its slots released below.
+        while self.peers.values().any(|p| p.connected) {
             match tokio::time::timeout_at(deadline, self.peer_rx.recv()).await {
                 Ok(Some(ev @ PeerEvent::Disconnected { .. })) => self.on_peer_event(ev),
                 Ok(Some(_)) => {}
@@ -712,6 +938,26 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// File priorities from a magnet's `so` selection: unselected files are
+/// skipped; no selection means every file at `Normal`.
+fn selected_priorities(
+    meta: &Metainfo,
+    select: Option<&[std::ops::RangeInclusive<usize>]>,
+) -> Vec<Priority> {
+    let Some(select) = select else {
+        return Vec::new();
+    };
+    (0..meta.info.files.len())
+        .map(|i| {
+            if select.iter().any(|r| r.contains(&i)) {
+                Priority::Normal
+            } else {
+                Priority::Skip
+            }
+        })
+        .collect()
 }
 
 /// Bytes of the pieces with a non-zero priority.

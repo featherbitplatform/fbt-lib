@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fbt_core::{Bitfield, BlockRef};
+use fbt_metainfo::{Metainfo, MetainfoError};
 use tracing::debug;
 
 use super::actor::{Actor, Phase};
@@ -38,6 +39,11 @@ pub(crate) enum Job {
     },
     /// Storage was flushed.
     Flushed(io::Result<()>),
+    /// A complete metadata buffer from `key` was verified and parsed.
+    Metadata {
+        key: PeerKey,
+        result: Result<Box<Metainfo>, MetainfoError>,
+    },
     /// A block requested by a peer was read.
     Read {
         generation: u64,
@@ -72,6 +78,7 @@ impl Actor {
                 tracing::warn!(torrent = %self.name(), error = %e, "flush failed");
             }
             Job::Flushed(Ok(())) => {}
+            Job::Metadata { key, result } => self.on_metadata_job(key, result),
         }
     }
 

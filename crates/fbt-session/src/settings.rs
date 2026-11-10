@@ -11,6 +11,10 @@ pub const MAX_EVENT_QUEUE: usize = 1 << 20;
 /// Largest accepted [`Settings::max_incoming_requests`]; each peer's command
 /// queue is sized from it.
 pub const MAX_INCOMING_REQUESTS: usize = 1 << 16;
+/// Largest accepted [`Settings::max_metadata_size`].
+pub const MAX_METADATA_SIZE: usize = 64 * 1024 * 1024;
+/// Smallest accepted [`Settings::max_metadata_size`]: one metadata piece.
+const MIN_METADATA_SIZE: usize = 16_384;
 
 /// Whether peer connections use MSE/PE (message stream encryption).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,7 +37,8 @@ pub enum EncryptionPolicy {
 /// Build with [`Settings::default`] and assign the fields to change.
 /// [`Session::new`](crate::Session::new) refuses values that cannot work
 /// (zero intervals and timeouts that drive timers, queues of zero or beyond
-/// [`MAX_EVENT_QUEUE`] / [`MAX_INCOMING_REQUESTS`]) with
+/// [`MAX_EVENT_QUEUE`] / [`MAX_INCOMING_REQUESTS`], a metadata cap outside
+/// 16 KiB..=[`MAX_METADATA_SIZE`]) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -85,6 +90,10 @@ pub struct Settings {
     /// not part of the stable API. Non-zero.
     #[doc(hidden)]
     pub tracker_retry_base: Duration,
+    /// Largest info dictionary a magnet torrent fetches from peers (BEP 9),
+    /// in bytes; peers advertising more are disconnected. 16 KiB to
+    /// [`MAX_METADATA_SIZE`].
+    pub max_metadata_size: usize,
 }
 
 impl Settings {
@@ -116,6 +125,12 @@ impl Settings {
                 self.max_incoming_requests
             ));
         }
+        if !(MIN_METADATA_SIZE..=MAX_METADATA_SIZE).contains(&self.max_metadata_size) {
+            return Err(format!(
+                "max_metadata_size must be between {MIN_METADATA_SIZE} and {MAX_METADATA_SIZE}, got {}",
+                self.max_metadata_size
+            ));
+        }
         Ok(())
     }
 }
@@ -143,6 +158,7 @@ impl Default for Settings {
             num_want: 50,
             tracker: TrackerConfig::default(),
             tracker_retry_base: Duration::from_secs(60),
+            max_metadata_size: 16 * 1024 * 1024,
         }
     }
 }

@@ -6,6 +6,7 @@ use bytes::Bytes;
 use fbt_core::{Bitfield, BlockRef, PeerId, PieceLayout};
 use fbt_wire::{ExtHandshake, MetadataMsg, PexMsg, Reserved};
 
+use super::ext::ExtConfig;
 use crate::picker::PeerKey;
 
 /// Why a peer connection ended.
@@ -33,6 +34,10 @@ pub enum DisconnectReason {
     /// We closed it because the same peer id is already connected to the
     /// torrent; the older connection stays.
     Duplicate,
+    /// The peer advertised an unacceptable metadata size or sent metadata
+    /// that is inconsistent or fails the info-hash check; it is never
+    /// dialled again.
+    BadMetadata,
 }
 
 /// The pieces a remote announced, owned.
@@ -133,22 +138,16 @@ pub(crate) enum PeerCommand {
     /// Refuse a queued request.
     Reject(BlockRef),
     /// The metadata arrived: validate and replay the buffered piece
-    /// announcements against `layout`, then run normally.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "sent by the torrent from Tasks 13 and 15 on")
-    )]
-    MetadataReady { layout: PieceLayout },
+    /// announcements against `layout`, then run normally. `ext` is what we
+    /// advertise now (our `metadata_size`, and `ut_pex` off for a private
+    /// torrent): a remote speaking BEP 10 gets a repeated handshake.
+    MetadataReady { layout: PieceLayout, ext: ExtConfig },
     /// Send a `ut_metadata` message (dropped if the remote lacks it).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "sent by the torrent from Tasks 13 and 15 on")
-    )]
     SendMetadata(MetadataMsg),
     /// Send a `ut_pex` message (dropped if the remote lacks it).
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "sent by the torrent from Tasks 13 and 15 on")
+        expect(dead_code, reason = "sent by the torrent from Task 15 on")
     )]
     SendPex(PexMsg),
     /// Close the connection.

@@ -5,7 +5,9 @@
 //! channel and receives peers through a bounded channel it polls. Transfer
 //! totals come from the torrent's status watch.
 //!
-//! - `started` when the torrent becomes active (after checking, on resume);
+//! - `started` when the torrent becomes active (after checking, on resume;
+//!   a magnet at once, and it keeps running through the check that follows
+//!   its metadata);
 //! - `none` after the tracker's `interval`, or on a forced re-announce once
 //!   `min interval` has passed since the last announce;
 //! - `completed` once, when the torrent finished during this session;
@@ -48,6 +50,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const PEER_QUEUE: usize = 16;
 /// Peers taken from one reply.
 const MAX_PEERS_PER_REPLY: usize = 200;
+/// `left` reported while a magnet has no metadata, so trackers treat us as
+/// a leecher (what libtorrent reports).
+pub(super) const NO_METADATA_LEFT: u64 = 16_384;
 
 /// What the actor wants from the announcer.
 #[derive(Debug, Clone, Default)]
@@ -309,14 +314,11 @@ impl Task {
     }
 
     /// `checking_left` stands in for the live figure while the files are
-    /// being checked (the picker is gone then).
+    /// being checked (the picker is gone then); without metadata the figure
+    /// is [`NO_METADATA_LEFT`], `stopped` included.
     fn request_template(&self, event: AnnounceEvent, checking_left: u64) -> AnnounceRequest {
         let st = self.status.borrow();
-        let left = if matches!(st.state, TorrentState::CheckingFiles { .. }) {
-            checking_left
-        } else {
-            st.total_wanted.saturating_sub(st.wanted_done)
-        };
+        let left = announce_left(&st, checking_left);
         AnnounceRequest {
             info_hash: self.info_hash,
             peer_id: self.shared.peer_id,
@@ -356,6 +358,17 @@ impl Task {
 
     fn error(&self, url: String, e: &TrackerError) {
         emit_error(&self.shared, self.ih, url, e);
+    }
+}
+
+/// The `left` to announce for status `st`.
+fn announce_left(st: &TorrentStatus, checking_left: u64) -> u64 {
+    if !st.has_metadata {
+        NO_METADATA_LEFT
+    } else if matches!(st.state, TorrentState::CheckingFiles { .. }) {
+        checking_left
+    } else {
+        st.total_wanted.saturating_sub(st.wanted_done)
     }
 }
 
@@ -583,6 +596,22 @@ mod tests {
         assert_eq!(backoff(base, 2), 4 * base);
         assert_eq!(backoff(base, 10), MAX_BACKOFF);
         assert_eq!(backoff(base, 200), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn left_is_16384_without_metadata() {
+        let ih = InfoHashes::from_v1(fbt_core::InfoHashV1([1; 20]));
+        let mut st = TorrentStatus::initial(ih, String::new(), false);
+        // A `DownloadingMetadata` status says nothing is wanted or done.
+        assert_eq!(announce_left(&st, 0), NO_METADATA_LEFT);
+        st.state = TorrentState::Paused;
+        assert_eq!(announce_left(&st, 7), NO_METADATA_LEFT, "stopped too");
+        st.has_metadata = true;
+        st.total_wanted = 1000;
+        st.wanted_done = 400;
+        assert_eq!(announce_left(&st, 7), 600);
+        st.state = TorrentState::CheckingFiles { progress: 0.5 };
+        assert_eq!(announce_left(&st, 7), 7);
     }
 
     #[test]

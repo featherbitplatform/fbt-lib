@@ -292,6 +292,9 @@ pub(super) struct Peer {
     pub listen_port: Option<u16>,
     /// The connection is RC4-encrypted (for PEX flags).
     pub encrypted: bool,
+    /// `ut_metadata` requests it sent (served up to
+    /// [`MAX_METADATA_REQUESTS_PER_PEER`](super::metadata::MAX_METADATA_REQUESTS_PER_PEER)).
+    pub metadata_requests: u32,
 }
 
 impl Peer {
@@ -326,6 +329,7 @@ impl Peer {
             ext: None,
             listen_port: None,
             encrypted: false,
+            metadata_requests: 0,
         }
     }
 
@@ -409,7 +413,7 @@ impl Actor {
 
     /// What new connections advertise. A torrent without metadata may be
     /// private; until it is known, PEX is advertised (the magnet exception).
-    fn ext_config(&self) -> ExtConfig {
+    pub(super) fn ext_config(&self) -> ExtConfig {
         let meta = self.loaded.as_ref().map(|l| &l.meta);
         ExtConfig {
             listen_port: self.shared.listen_port,
@@ -427,7 +431,7 @@ impl Actor {
     }
 
     pub(super) fn requeue_known(&mut self) {
-        if !self.active() {
+        if !self.connectable() {
             return;
         }
         let known: Vec<SocketAddr> = self.known.iter().copied().collect();
@@ -471,7 +475,7 @@ impl Actor {
 
     /// Queues the addresses whose retry time has come.
     pub(super) fn queue_retries(&mut self) {
-        if !self.active() {
+        if !self.connectable() {
             return;
         }
         for addr in self.retries.due(Instant::now()) {
@@ -482,7 +486,7 @@ impl Actor {
     /// Starts outgoing connections while every limit allows.
     pub(super) fn try_connect(&mut self) {
         let s = Arc::clone(&self.shared.settings);
-        while self.active() && !self.candidates.is_empty() {
+        while self.connectable() && !self.candidates.is_empty() {
             if self.peers.len() >= s.max_peers_per_torrent {
                 break;
             }
@@ -536,7 +540,7 @@ impl Actor {
         addr: SocketAddr,
     ) {
         let s = &self.shared.settings;
-        if !self.active() || self.peers.len() >= s.max_peers_per_torrent {
+        if !self.connectable() || self.peers.len() >= s.max_peers_per_torrent {
             debug!(%addr, "torrent inactive or full; dropping incoming connection");
             return;
         }

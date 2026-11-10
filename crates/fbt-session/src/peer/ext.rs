@@ -58,6 +58,20 @@ pub(crate) fn handshake_message(cfg: &ExtConfig, remote_ip: IpAddr) -> Message {
     }
 }
 
+/// A repeated handshake after `cfg` changed (the metadata arrived): like
+/// [`handshake_message`], and an extension we no longer speak is turned off
+/// explicitly with id 0, since a repeat that omits it changes nothing.
+pub(crate) fn repeat_handshake_message(cfg: &ExtConfig, remote_ip: IpAddr) -> Message {
+    let mut hs = our_handshake(cfg, remote_ip);
+    if !cfg.pex {
+        hs.m.insert(UT_PEX.to_owned(), 0);
+    }
+    Message::Extended {
+        id: EXT_HANDSHAKE_ID,
+        payload: hs.encode(),
+    }
+}
+
 /// The ids the remote assigned to the extensions we speak; `None` while it
 /// has not enabled one (or has not sent its handshake yet).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

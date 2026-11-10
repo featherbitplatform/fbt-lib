@@ -647,13 +647,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         .await
     }
 
-    /// Leaves no-metadata mode: validates the buffered piece set against
-    /// `layout` and replays it and the in-range `Have`s as if they had just
-    /// arrived.
-    async fn metadata_ready(&mut self, layout: PieceLayout) -> Flow {
+    /// Leaves no-metadata mode: repeats our extension handshake with `ext`
+    /// (now carrying `metadata_size`), validates the buffered piece set
+    /// against `layout` and replays it and the in-range `Have`s as if they
+    /// had just arrived.
+    async fn metadata_ready(&mut self, layout: PieceLayout, ext: ExtConfig) -> Flow {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
+        self.ext = ext;
+        if self.remote_reserved.supports_extended() {
+            self.send(ext::repeat_handshake_message(&self.ext, self.remote_ip))
+                .await?;
+        }
         let n = layout.num_pieces();
         self.num_pieces = n;
         *self.framed.codec_mut() = MessageCodec::new(max_frame(Some(n)));
@@ -796,7 +802,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     self.send(Message::RejectRequest(b)).await?;
                 }
             }
-            PeerCommand::MetadataReady { layout } => self.metadata_ready(layout).await?,
+            PeerCommand::MetadataReady { layout, ext } => self.metadata_ready(layout, ext).await?,
             PeerCommand::SendMetadata(msg) => {
                 if let Some(m) = self.remote_ids.metadata(&msg) {
                     self.send(m).await?;
@@ -1845,8 +1851,11 @@ mod tests {
         // Nothing about pieces reached the torrent: the marker comes first.
         assert_eq!(r.next().await, PeerEvent::Interested { key: KEY });
 
-        r.cmd(PeerCommand::MetadataReady { layout: layout(4) })
-            .await;
+        r.cmd(PeerCommand::MetadataReady {
+            layout: layout(4),
+            ext: ext_cfg(),
+        })
+        .await;
         let bits = Bitfield::from_bytes(&[0b1010_0000], 4).expect("bits");
         assert_eq!(
             r.next().await,
@@ -1866,6 +1875,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn metadata_ready_repeats_the_extension_handshake() {
+        let mut cfg = ext_cfg();
+        cfg.metadata_size = None;
+        let h = start_ctx(Bitfield::new(0), None, cfg);
+        let (mut wire, r, _) = connect_ext(h, reserved(true, true, false)).await;
+        let first = our_ext(&mut wire).await;
+        assert_eq!(first.metadata_size, None);
+        assert_eq!(first.m.get(UT_PEX), Some(&OUR_UT_PEX_ID));
+        assert_eq!(recv(&mut wire).await, Message::HaveNone);
+        // Private after all: the repeat carries the size and turns PEX off.
+        let mut now = ext_cfg();
+        now.metadata_size = Some(4321);
+        now.pex = false;
+        r.cmd(PeerCommand::MetadataReady {
+            layout: layout(4),
+            ext: now,
+        })
+        .await;
+        let again = our_ext(&mut wire).await;
+        assert_eq!(again.metadata_size, Some(4321));
+        assert_eq!(again.m.get(UT_PEX), Some(&0));
+        assert_eq!(again.m.get(UT_METADATA), Some(&OUR_UT_METADATA_ID));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn invalid_buffered_bitfield_fails_at_metadata() {
         for bad in [&[0xffu8][..], &[0xf0, 0]] {
             let h = start_ctx(Bitfield::new(0), None, ext_cfg());
@@ -1875,8 +1909,11 @@ mod tests {
             send(&mut wire, Message::Interested).await;
             // Buffered unvalidated: the connection is still up.
             assert_eq!(r.next().await, PeerEvent::Interested { key: KEY });
-            r.cmd(PeerCommand::MetadataReady { layout: layout(4) })
-                .await;
+            r.cmd(PeerCommand::MetadataReady {
+                layout: layout(4),
+                ext: ext_cfg(),
+            })
+            .await;
             let (reason, _) = r.disconnected().await;
             assert!(
                 matches!(reason, DisconnectReason::Protocol(_)),
@@ -1902,6 +1939,7 @@ mod tests {
         let mut wire = writer.await.expect("writer");
         r.cmd(PeerCommand::MetadataReady {
             layout: layout(200_000),
+            ext: ext_cfg(),
         })
         .await;
         // All replayed Haves are emitted while handling the command, so a
