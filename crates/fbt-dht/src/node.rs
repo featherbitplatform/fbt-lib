@@ -21,7 +21,7 @@ use rand::rngs::StdRng;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::id::{NodeId, bep42_id, canonical, canonical_addr, is_local};
 use crate::krpc::{Body, MAX_DATAGRAM, Message, NodeInfo, Query, QueryMsg, Response, Want};
@@ -411,7 +411,15 @@ impl DatagramHandler for DhtInput {
         // one byte past the maximum, so an oversized datagram is still
         // detected (and dropped) by the node
         let data = data.get(..=MAX_DATAGRAM).unwrap_or(data);
-        let _ = self.tx.try_send((from, data.into()));
+        match self.tx.try_send((from, data.into())) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                trace!(%from, "DHT: input queue full, datagram dropped");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                trace!(%from, "DHT: node stopped, datagram dropped");
+            }
+        }
     }
 }
 
@@ -445,12 +453,12 @@ impl Dht {
         }
         let (recv_v4, send_v4) = sock_v4.unzip();
         let (recv_v6, send_v6) = sock_v6.unzip();
-        let wrap = |s: std::net::UdpSocket| -> Option<Arc<dyn DatagramSender>> {
-            let local = s.local_addr().ok()?;
-            Some(Arc::new(StdSender { sock: s, local }))
+        let wrap = |s: std::net::UdpSocket| -> Result<Arc<dyn DatagramSender>, DhtError> {
+            let local = s.local_addr().map_err(DhtError::Bind)?;
+            Ok(Arc::new(StdSender { sock: s, local }))
         };
-        let send_v4 = send_v4.and_then(wrap);
-        let send_v6 = send_v6.and_then(wrap);
+        let send_v4 = send_v4.map(wrap).transpose()?;
+        let send_v6 = send_v6.map(wrap).transpose()?;
         Ok(Self::start(
             cfg,
             send_v4,
@@ -824,6 +832,8 @@ impl Actor {
                 Event::Input(Some((from, data))) => {
                     if data.len() <= MAX_DATAGRAM {
                         self.on_datagram(&data, from, now);
+                    } else {
+                        trace!(%from, "DHT: oversized datagram dropped");
                     }
                 }
                 // every DhtInput is gone: nothing more will arrive
@@ -1237,6 +1247,18 @@ impl Actor {
             } else {
                 self.boot_due = None;
             }
+        }
+        // safety net: an attempt that died without reporting back (panic,
+        // abort) must not stop the retries for good
+        if self.boot_started
+            && self.boot_due.is_none()
+            && self.boot_task.as_ref().is_none_or(|t| t.is_finished())
+            && self.tables().all(|t| t.len() == 0)
+        {
+            self.boot_due = Some(after(
+                now,
+                backoff(self.retry_base, self.retry_max, self.boot_attempt),
+            ));
         }
     }
 
@@ -1916,6 +1938,79 @@ mod tests {
             .expect("still answering");
         assert!(matches!(m.body, Body::Response(_)), "{m:?}");
         dht.shutdown().await;
+    }
+
+    /// An attempt that ends without `BootstrapDone` still gets a successor.
+    #[tokio::test]
+    async fn dead_bootstrap_attempt_is_rescheduled() {
+        let (mut a, _tx) = actor(DhtConfig {
+            bootstrap: vec!["127.0.0.1:9".into()],
+            ..cfg()
+        });
+        let t0 = Instant::now();
+        a.boot_started = true;
+        a.boot_due = None;
+        let dead = tokio::spawn(async { panic!("attempt died") });
+        let _ = dead.await;
+        a.boot_task = Some(tokio::spawn(async {}));
+        while !a.boot_task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        a.on_timer(t0);
+        assert_eq!(
+            a.boot_due,
+            Some(t0 + backoff(a.retry_base, a.retry_max, a.boot_attempt))
+        );
+        // while the attempt still runs, nothing is scheduled
+        a.boot_due = None;
+        a.boot_task = Some(tokio::spawn(std::future::pending::<()>()));
+        a.on_timer(t0);
+        assert_eq!(a.boot_due, None);
+        if let Some(t) = a.boot_task.take() {
+            t.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_stops_when_the_handle_drops_in_spawn_on_mode() {
+        let std_sock = bind_v4("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local = std_sock.local_addr().unwrap();
+        let sender: Arc<dyn DatagramSender> = Arc::new(StdSender {
+            sock: std_sock,
+            local,
+        });
+        let weak = Arc::downgrade(&sender);
+        let (dht, input) = Dht::spawn_on(cfg(), vec![sender]).await.unwrap();
+        drop(dht);
+        // the actor ends and releases the sender
+        let released = timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "the actor kept running");
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        input.handle(from, b"late");
+        input.clone().handle(from, b"later");
+    }
+
+    #[tokio::test]
+    async fn spawn_on_rejects_two_v6_sockets() {
+        let Ok(a) = bind_v6("[::1]:0".parse().unwrap()) else {
+            return;
+        };
+        let Ok(b) = bind_v6("[::1]:0".parse().unwrap()) else {
+            return;
+        };
+        let mk = |s: std::net::UdpSocket| -> Arc<dyn DatagramSender> {
+            let local = s.local_addr().unwrap();
+            Arc::new(StdSender { sock: s, local })
+        };
+        assert!(matches!(
+            Dht::spawn_on(cfg(), vec![mk(a), mk(b)]).await,
+            Err(DhtError::DuplicateFamily)
+        ));
     }
 
     #[tokio::test]
