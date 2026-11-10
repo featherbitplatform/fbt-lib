@@ -2,9 +2,10 @@
 
 use std::collections::HashSet;
 
-use fbt_bencode::{DecodeError, Dict, Value, decode};
+use fbt_bencode::{DecodeError, Dict, Limits, Value, decode, decode_with};
 use fbt_core::{FileLayout, InfoHashV1, InfoHashV2, InfoHashes, PieceLayout};
 
+use crate::magnet::Magnet;
 use crate::path::{RelPath, sanitize_component, sanitize_path};
 
 /// Deepest accepted file path, in components (including the root name).
@@ -12,6 +13,10 @@ const MAX_PATH_DEPTH: usize = 256;
 const MAX_PIECE_LEN: i64 = 268_435_456;
 /// Most tracker URLs kept across all tiers; later ones are ignored.
 const MAX_TRACKERS: usize = 64;
+/// Item cap when decoding an info dictionary received from a peer.
+const MAX_INFO_ITEMS: usize = 4_194_304;
+/// Nesting cap when decoding an info dictionary received from a peer.
+const MAX_INFO_DEPTH: usize = 32;
 
 /// Errors from [`Metainfo::from_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -37,6 +42,9 @@ pub enum MetainfoError {
     /// A v2-only torrent (no v1 `pieces`); supported from milestone 6.
     #[error("v2-only torrents are not supported yet")]
     V2OnlyUnsupported,
+    /// The info dictionary does not hash to the expected info hash.
+    #[error("info dictionary does not match the expected info hash")]
+    InfoHashMismatch,
 }
 
 fn invalid(field: &'static str, reason: &'static str) -> MetainfoError {
@@ -102,86 +110,68 @@ impl Metainfo {
         let info_val = root
             .get(b"info")
             .ok_or(MetainfoError::MissingField("info"))?;
-        let info_dict = info_val
-            .as_dict()
-            .ok_or_else(|| invalid("info", "not a dictionary"))?;
-        let raw_info = info_val.raw().to_vec();
-
-        let v2 = match info_dict.get(b"meta version") {
-            None => false,
-            Some(v) => {
-                v.as_int()
-                    .ok_or_else(|| invalid("meta version", "not an integer"))?
-                    == 2
-            }
-        };
-        let pieces_raw = match info_dict.get(b"pieces") {
-            Some(p) => p
-                .as_bytes()
-                .ok_or_else(|| invalid("pieces", "not a byte string"))?,
-            None if v2 => return Err(MetainfoError::V2OnlyUnsupported),
-            None => return Err(MetainfoError::MissingField("pieces")),
-        };
-
-        let v1 = InfoHashV1::of(&raw_info);
-        let info_hashes = if v2 {
-            InfoHashes::hybrid(v1, InfoHashV2::of(&raw_info))
-        } else {
-            InfoHashes::from_v1(v1)
-        };
-
-        let piece_len = int_field(info_dict, b"piece length", "piece length")?;
-        if !(1..=MAX_PIECE_LEN).contains(&piece_len) {
-            return Err(invalid("piece length", "out of range"));
-        }
-        let piece_len =
-            u32::try_from(piece_len).map_err(|_| invalid("piece length", "out of range"))?;
-        if pieces_raw.len() % 20 != 0 {
-            return Err(invalid("pieces", "length is not a multiple of 20"));
-        }
-
-        let name_bytes = info_dict
-            .get(b"name")
-            .ok_or(MetainfoError::MissingField("name"))?
-            .as_bytes()
-            .ok_or_else(|| invalid("name", "not a byte string"))?;
-        let name = sanitize_component(name_bytes).unwrap_or_else(|| v1.to_string());
-
-        let private = matches!(info_dict.get(b"private").and_then(Value::as_int), Some(1));
-        let (files, single_file) = parse_files(info_dict, &name)?;
-
-        let mut total: u64 = 0;
-        for f in &files {
-            total = total
-                .checked_add(f.len)
-                .ok_or_else(|| invalid("length", "total length overflows"))?;
-        }
-        let layout = PieceLayout::new(total, piece_len)
-            .map_err(|_| invalid("length", "total length is zero or too large"))?;
-        if usize::try_from(layout.num_pieces()).ok() != Some(pieces_raw.len() / 20) {
-            return Err(invalid("pieces", "count does not match total length"));
-        }
-        check_duplicates(&files)?;
-
-        let pieces: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
+        let parsed = parse_info(info_val)?;
 
         Ok(Metainfo {
-            info_hashes,
-            info: Info {
-                name,
-                piece_len,
-                pieces,
-                files,
-                private,
-                single_file,
-            },
+            info_hashes: parsed.info_hashes,
+            info: parsed.info,
             trackers: parse_trackers(root),
             comment: lossy(root, b"comment"),
             created_by: lossy(root, b"created by"),
             creation_date: root.get(b"creation date").and_then(Value::as_int),
-            raw_info,
-            layout,
+            raw_info: parsed.raw_info,
+            layout: parsed.layout,
         })
+    }
+
+    /// Builds a `Metainfo` from an `info` dictionary received from peers
+    /// (BEP 9), verifying it against `expected` first.
+    ///
+    /// The bytes are decoded with explicit limits and parsed with the same
+    /// rules as [`Metainfo::from_bytes`]. SHA-1 is checked against
+    /// `expected.v1`, and SHA-256 against `expected.v2` when the dictionary
+    /// declares `meta version` 2. `comment`, `created_by` and `creation_date`
+    /// are `None`; `trackers` get the usual de-duplication and URL cap.
+    pub fn from_info_bytes(
+        info: &[u8],
+        expected: InfoHashes,
+        trackers: Vec<Vec<String>>,
+    ) -> Result<Metainfo, MetainfoError> {
+        let val = decode_with(info, Limits::new(MAX_INFO_DEPTH, MAX_INFO_ITEMS))?;
+        let parsed = parse_info(&val)?;
+        if let Some(v1) = expected.v1
+            && v1 != parsed.info_hashes.v1.unwrap_or(InfoHashV1([0; 20]))
+        {
+            return Err(MetainfoError::InfoHashMismatch);
+        }
+        if let Some(v2) = expected.v2
+            && Some(v2) != parsed.info_hashes.v2
+        {
+            return Err(MetainfoError::InfoHashMismatch);
+        }
+        Ok(Metainfo {
+            info_hashes: parsed.info_hashes,
+            info: parsed.info,
+            trackers: clean_trackers(trackers),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            raw_info: parsed.raw_info,
+            layout: parsed.layout,
+        })
+    }
+
+    /// A magnet link for this torrent: info hashes, name and the first
+    /// tracker of each tier.
+    pub fn magnet(&self) -> Magnet {
+        let mut m = Magnet::from_info_hashes(self.info_hashes);
+        m.display_name = Some(self.info.name.clone());
+        m.trackers = self
+            .trackers
+            .iter()
+            .filter_map(|t| t.first().cloned())
+            .collect();
+        m
     }
 
     /// The exact bencoded `info` dictionary bytes (what the hashes cover).
@@ -203,6 +193,93 @@ impl Metainfo {
     pub fn total_len(&self) -> u64 {
         self.layout.total_len()
     }
+}
+
+struct ParsedInfo {
+    info_hashes: InfoHashes,
+    info: Info,
+    raw_info: Vec<u8>,
+    layout: PieceLayout,
+}
+
+/// Validates an `info` value; shared by `from_bytes` and `from_info_bytes`.
+fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
+    let info_dict = info_val
+        .as_dict()
+        .ok_or_else(|| invalid("info", "not a dictionary"))?;
+    let raw_info = info_val.raw().to_vec();
+
+    let v2 = match info_dict.get(b"meta version") {
+        None => false,
+        Some(v) => {
+            v.as_int()
+                .ok_or_else(|| invalid("meta version", "not an integer"))?
+                == 2
+        }
+    };
+    let pieces_raw = match info_dict.get(b"pieces") {
+        Some(p) => p
+            .as_bytes()
+            .ok_or_else(|| invalid("pieces", "not a byte string"))?,
+        None if v2 => return Err(MetainfoError::V2OnlyUnsupported),
+        None => return Err(MetainfoError::MissingField("pieces")),
+    };
+
+    let v1 = InfoHashV1::of(&raw_info);
+    let info_hashes = if v2 {
+        InfoHashes::hybrid(v1, InfoHashV2::of(&raw_info))
+    } else {
+        InfoHashes::from_v1(v1)
+    };
+
+    let piece_len = int_field(info_dict, b"piece length", "piece length")?;
+    if !(1..=MAX_PIECE_LEN).contains(&piece_len) {
+        return Err(invalid("piece length", "out of range"));
+    }
+    let piece_len =
+        u32::try_from(piece_len).map_err(|_| invalid("piece length", "out of range"))?;
+    if pieces_raw.len() % 20 != 0 {
+        return Err(invalid("pieces", "length is not a multiple of 20"));
+    }
+
+    let name_bytes = info_dict
+        .get(b"name")
+        .ok_or(MetainfoError::MissingField("name"))?
+        .as_bytes()
+        .ok_or_else(|| invalid("name", "not a byte string"))?;
+    let name = sanitize_component(name_bytes).unwrap_or_else(|| v1.to_string());
+
+    let private = matches!(info_dict.get(b"private").and_then(Value::as_int), Some(1));
+    let (files, single_file) = parse_files(info_dict, &name)?;
+
+    let mut total: u64 = 0;
+    for f in &files {
+        total = total
+            .checked_add(f.len)
+            .ok_or_else(|| invalid("length", "total length overflows"))?;
+    }
+    let layout = PieceLayout::new(total, piece_len)
+        .map_err(|_| invalid("length", "total length is zero or too large"))?;
+    if usize::try_from(layout.num_pieces()).ok() != Some(pieces_raw.len() / 20) {
+        return Err(invalid("pieces", "count does not match total length"));
+    }
+    check_duplicates(&files)?;
+
+    let pieces: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
+
+    Ok(ParsedInfo {
+        info_hashes,
+        info: Info {
+            name,
+            piece_len,
+            pieces,
+            files,
+            private,
+            single_file,
+        },
+        raw_info,
+        layout,
+    })
 }
 
 fn int_field(d: &Dict<'_>, key: &[u8], field: &'static str) -> Result<i64, MetainfoError> {
@@ -314,30 +391,42 @@ fn lossy(root: &Dict<'_>, key: &[u8]) -> Option<String> {
 }
 
 fn parse_trackers(root: &Dict<'_>) -> Vec<Vec<String>> {
-    let mut seen = HashSet::new();
-    let mut tiers = Vec::new();
+    let mut tiers: Vec<Vec<String>> = Vec::new();
     if let Some(list) = root.get(b"announce-list").and_then(Value::as_list) {
         for tier in list {
-            let room = MAX_TRACKERS.saturating_sub(seen.len());
-            let urls: Vec<String> = tier
-                .as_list()
-                .unwrap_or(&[])
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|u| !u.is_empty() && seen.insert(u.to_string()))
-                .take(room)
-                .map(str::to_string)
-                .collect();
-            if !urls.is_empty() {
-                tiers.push(urls);
-            }
+            tiers.push(
+                tier.as_list()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            );
         }
     }
-    if tiers.is_empty()
+    if tiers.iter().all(|t| t.iter().all(String::is_empty))
         && let Some(a) = root.get(b"announce").and_then(Value::as_str)
-        && !a.is_empty()
     {
-        tiers.push(vec![a.to_string()]);
+        tiers = vec![vec![a.to_string()]];
     }
-    tiers
+    clean_trackers(tiers)
+}
+
+/// Drops empty and duplicate URLs and empty tiers, keeping at most
+/// `MAX_TRACKERS` URLs in tier order.
+fn clean_trackers(tiers: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for tier in tiers {
+        let room = MAX_TRACKERS.saturating_sub(seen.len());
+        let urls: Vec<String> = tier
+            .into_iter()
+            .filter(|u| !u.is_empty() && seen.insert(u.clone()))
+            .take(room)
+            .collect();
+        if !urls.is_empty() {
+            out.push(urls);
+        }
+    }
+    out
 }
