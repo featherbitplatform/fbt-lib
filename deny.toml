@@ -1,0 +1,32 @@
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "OFL-1.1",
+    # Permitted for general-purpose transitive dependencies (error-code, clipboard-style crates)
+    "BSL-1.0",
+    # Public-domain dedications used by small utility crates
+    "CC0-1.0",
+    # webpki-roots (Mozilla's root certificates as data, for HTTPS trackers over rustls)
+    "CDLA-Permissive-2.0",
+]
+
+[advisories]
+version = 2
+# Unmaintained notices only for crates we depend on directly; transitive ones are outside our
+# control. Vulnerabilities still fail at any depth.
+unmaintained = "workspace"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

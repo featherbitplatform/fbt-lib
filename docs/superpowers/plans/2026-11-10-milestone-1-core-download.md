@@ -17,7 +17,7 @@
 - No panic, hang or unbounded allocation from remote input (peers, trackers, `.torrent` bytes). `unwrap`/`expect`/indexing on remote-derived values is a review rejection; clippy lints `unwrap_used`, `expect_used`, `indexing_slicing`, `panic` set to `deny` in non-test code of `fbt-bencode`, `fbt-metainfo`, `fbt-wire`, `fbt-tracker`.
 - Edition `2024`, `rust-version = "1.99"` (stable when milestone 1 started), workspace version `0.0.0` until the `release/0.1.0` branch bumps it.
 - License Apache-2.0 for every crate; `NOTICE` at the root.
-- Default build may need a C toolchain only for `ring`. `cargo tree -e normal --no-default-features --features pure-rust -p fbt` must contain neither `ring` nor `cc`.
+- Default build may need a C toolchain only for `ring`. `cargo tree -e normal,build --no-default-features --features pure-rust -p fbt` (normal and build edges) must contain neither `ring` nor `cc`.
 - All crates `publish = false` until the owner decides on crates.io.
 - `tracing` for logs; the library never installs a subscriber. `thiserror` for errors.
 - Builds and tests pass on macOS, Linux and Windows.

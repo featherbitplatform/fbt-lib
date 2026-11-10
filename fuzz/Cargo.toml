@@ -1,0 +1,74 @@
+[package]
+name = "fbt-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1.12"
+tokio-util = { version = "0.7", features = ["codec"] }
+fbt-bencode = { path = "../crates/fbt-bencode" }
+fbt-metainfo = { path = "../crates/fbt-metainfo" }
+fbt-wire = { path = "../crates/fbt-wire" }
+fbt-tracker = { path = "../crates/fbt-tracker" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+
+[[bin]]
+name = "bencode"
+path = "fuzz_targets/bencode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metainfo"
+path = "fuzz_targets/metainfo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_codec"
+path = "fuzz_targets/wire_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_announce"
+path = "fuzz_targets/http_announce.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_announce"
+path = "fuzz_targets/udp_announce.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path"
+path = "fuzz_targets/path.rs"
+test = false
+doc = false
+bench = false

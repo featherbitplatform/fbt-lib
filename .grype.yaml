@@ -1,0 +1,23 @@
+# grype configuration: dependency/CVE scanning over the repo filesystem
+# (Cargo.lock and the GitHub Actions the workflows use). High/critical
+# findings fail the scan; lower severities are reported.
+
+fail-on-severity: high
+
+# Directory scans: skip build outputs and scanner output.
+exclude:
+  - ./target/**
+  - ./fuzz/target/**
+  - ./sast-out/**
+  - ./.superpowers/**
+
+# Accepted findings, each with a comment explaining why.
+ignore:
+  # actions/download-artifact path traversal, fixed in 4.1.3. The workflows
+  # use the floating `@v4` tag, which grype reads as version 4 (< 4.1.3); the
+  # tag resolves to the newest v4 release, which has the fix. Remove if the
+  # workflows ever pin download-artifact to an exact version.
+  - vulnerability: GHSA-cxww-7g56-2vh6
+    package:
+      name: actions/download-artifact
+      type: github-action

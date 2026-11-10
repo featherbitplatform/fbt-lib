@@ -1,0 +1,112 @@
+name: Security
+
+# Security scans: the same scanners and thresholds as dev/sast.sh and
+# dev/sast.ps1. Every tool reads its config from the repo root (deny.toml,
+# .semgrepignore, .gitleaks.toml, .grype.yaml) so local
+# runs and CI can't drift. Jobs fail on high/critical findings (semgrep: ERROR);
+# the SARIF reports go to the Security tab.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  # Weekly re-scan of main (the default branch): advisories get published
+  # without any code change, so a green merge can silently go red.
+  schedule:
+    - cron: '30 5 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default; only the jobs that upload SARIF get security-events.
+permissions:
+  contents: read
+
+jobs:
+  # Code patterns (Rust). Blocks on ERROR-severity findings
+  # only; rulesets mirror dev/sast.sh.
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: >-
+          semgrep scan
+          --config p/default --config p/rust
+          --severity ERROR --error --metrics=off
+          --sarif --output semgrep.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # RustSec advisories + license/ban/source checks on Cargo.lock (deny.toml).
+  # This subsumes cargo-audit: the advisories check queries the same RustSec DB.
+  # Lives here rather than in ci.yml so the weekly re-scan covers it too.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # CVEs in Cargo.lock and the GitHub Actions the
+  # workflows use.
+  grype-fs:
+    name: grype (filesystem)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: anchore/scan-action@v7
+        id: scan
+        with:
+          path: '.'
+          fail-build: true
+          severity-cutoff: high
+          output-format: sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: grype-fs
+
+  # Secrets scanning over the full git history (every branch and tag the
+  # checkout fetches), so a secret committed and later deleted still fails.
+  # Same container as dev/sast.sh; allowlisted test fixtures live in
+  # .gitleaks.toml.
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - run: >-
+          docker run --rm -v "$PWD:/src" zricethezav/gitleaks:latest
+          git /src --config /src/.gitleaks.toml --no-banner --redact
+          --report-format sarif --report-path /src/gitleaks.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks

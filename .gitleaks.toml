@@ -1,0 +1,18 @@
+# gitleaks configuration: secrets scanning over the full git history (CI) and
+# the working tree. Extends the built-in default ruleset; the allowlist below
+# covers build outputs and scanner output, not real secrets. gitleaks
+# auto-loads this file from the repo root.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Build outputs, fuzzing artifacts and scanner output"
+paths = [
+    '''target/''',
+    '''sast-out/''',
+    # cargo-fuzz crashes and corpora are raw random bytes, not secrets.
+    '''fuzz/artifacts/''',
+    '''fuzz/corpus/''',
+    '''\.superpowers/''',
+]

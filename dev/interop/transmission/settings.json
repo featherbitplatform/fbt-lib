@@ -1,0 +1,21 @@
+{
+    "dht-enabled": false,
+    "download-dir": "/interop/tr-dl",
+    "idle-seeding-limit-enabled": false,
+    "incomplete-dir-enabled": false,
+    "lpd-enabled": false,
+    "peer-port": 51413,
+    "peer-port-random-on-start": false,
+    "pex-enabled": false,
+    "port-forwarding-enabled": false,
+    "ratio-limit-enabled": false,
+    "rpc-authentication-required": false,
+    "rpc-enabled": true,
+    "rpc-host-whitelist-enabled": false,
+    "rpc-port": 9091,
+    "rpc-whitelist-enabled": false,
+    "speed-limit-up": 4096,
+    "speed-limit-up-enabled": true,
+    "start-added-torrents": true,
+    "watch-dir-enabled": false
+}

@@ -1,0 +1,588 @@
+//! Shared helpers for the session integration tests.
+
+#![allow(dead_code, reason = "each test binary uses a different subset")]
+
+use std::io;
+use std::net::SocketAddr;
+use std::ops::Range;
+use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use bytes::Bytes;
+use fbt_bencode::{DictBuilder, OwnedValue, encode};
+use fbt_core::PeerId;
+use fbt_metainfo::Metainfo;
+use fbt_session::storage::{MemStorage, Storage, sha1_piece};
+use fbt_session::{Event, EventStream, Settings, TorrentHandle, TorrentState};
+use fbt_wire::{Handshake, Message, MessageCodec, Reserved, read_handshake, write_handshake};
+use futures_util::{SinkExt, StreamExt};
+use rand::RngExt;
+use tokio::net::TcpStream;
+use tokio_util::codec::Framed;
+
+/// Settings for tests: loopback listener on a free port, fast status updates.
+pub fn test_settings() -> Settings {
+    let mut s = Settings::default();
+    s.listen_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    s.status_interval = Duration::from_millis(50);
+    s
+}
+
+/// A multi-file torrent named `torrent` over random data. Returns the
+/// metainfo and the concatenated payload.
+pub fn make_torrent(files: &[(&str, usize)], piece_len: u32) -> (Metainfo, Vec<u8>) {
+    let total: usize = files.iter().map(|f| f.1).sum();
+    let mut payload = vec![0u8; total];
+    rand::rng().fill(payload.as_mut_slice());
+    let mut pieces = Vec::new();
+    for chunk in payload.chunks(piece_len as usize) {
+        pieces.extend_from_slice(&sha1_piece(chunk));
+    }
+    let file_list = files
+        .iter()
+        .map(|(name, len)| {
+            let mut f = DictBuilder::new();
+            f.insert(b"length", *len as i64);
+            f.insert(
+                b"path",
+                OwnedValue::List(name.split('/').map(OwnedValue::from).collect::<Vec<_>>()),
+            );
+            f.build()
+        })
+        .collect();
+    let mut info = DictBuilder::new();
+    info.insert(b"files", OwnedValue::List(file_list));
+    info.insert(b"name", "torrent");
+    info.insert(b"piece length", i64::from(piece_len));
+    info.insert(b"pieces", pieces);
+    let mut root = DictBuilder::new();
+    root.insert(b"info", info.build());
+    let bytes = encode(&root.build());
+    let m = Metainfo::from_bytes(&bytes).expect("valid generated torrent");
+    (m, payload)
+}
+
+/// Writes `payload` as the torrent's files below `save_path`.
+pub fn write_payload(save_path: &Path, m: &Metainfo, payload: &[u8]) {
+    let mut off = 0usize;
+    for f in &m.info.files {
+        // Entry paths already start with the torrent's directory.
+        let p = save_path.join(f.path.to_path_buf());
+        std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+        let len = f.len as usize;
+        std::fs::write(&p, &payload[off..off + len]).expect("write payload");
+        off += len;
+    }
+}
+
+/// The next event matching `pred` within `timeout`; `None` on timeout or end.
+pub async fn next_matching(
+    stream: &mut EventStream,
+    pred: impl Fn(&Event) -> bool,
+    timeout: Duration,
+) -> Option<Event> {
+    tokio::time::timeout(timeout, async {
+        while let Some(ev) = stream.recv().await {
+            if pred(&ev) {
+                return Some(ev);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Polls `handle.status()` until its state matches `pred`.
+pub async fn wait_state(
+    handle: &TorrentHandle,
+    pred: impl Fn(&TorrentState) -> bool,
+    timeout: Duration,
+) -> bool {
+    let end = tokio::time::Instant::now() + timeout;
+    loop {
+        if pred(&handle.status().state) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A minimal hand-driven remote peer speaking the wire protocol.
+pub struct ScriptedPeer {
+    pub framed: Framed<TcpStream, MessageCodec>,
+    pub remote: Handshake,
+}
+
+impl ScriptedPeer {
+    /// Connects to `addr` and exchanges handshakes for `info_hash` (no fast
+    /// extension) under a fresh random peer id.
+    pub async fn connect(addr: SocketAddr, info_hash: [u8; 20]) -> ScriptedPeer {
+        Self::connect_as(addr, info_hash, random_id(), false).await
+    }
+
+    /// Like [`connect`](Self::connect), advertising the fast extension.
+    pub async fn connect_fast(addr: SocketAddr, info_hash: [u8; 20]) -> ScriptedPeer {
+        Self::connect_as(addr, info_hash, random_id(), true).await
+    }
+
+    /// Connects under the given peer id.
+    pub async fn connect_as(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        peer_id: PeerId,
+        fast: bool,
+    ) -> ScriptedPeer {
+        let mut reserved = Reserved::default();
+        if fast {
+            reserved.set_fast();
+        }
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let ours = Handshake {
+            reserved,
+            info_hash,
+            peer_id,
+        };
+        write_handshake(&mut stream, &ours)
+            .await
+            .expect("handshake");
+        let remote = tokio::time::timeout(Duration::from_secs(5), read_handshake(&mut stream))
+            .await
+            .expect("handshake in time")
+            .expect("remote handshake");
+        ScriptedPeer {
+            framed: Framed::new(stream, MessageCodec::new(1 << 20)),
+            remote,
+        }
+    }
+
+    pub async fn send(&mut self, m: Message) {
+        self.framed.send(m).await.expect("send");
+    }
+
+    /// The next message matching `pred` within five seconds.
+    pub async fn next_matching(&mut self, pred: impl Fn(&Message) -> bool) -> Option<Message> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(m)) = self.framed.next().await {
+                if pred(&m) {
+                    return Some(m);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Reads until the remote closes the connection (messages before the
+    /// close are skipped) or `timeout` passes.
+    pub async fn wait_closed(&mut self, timeout: Duration) -> PeerEnd {
+        let r = tokio::time::timeout(timeout, async {
+            loop {
+                match self.framed.next().await {
+                    Some(Ok(_)) => {}
+                    // A reset is a close too.
+                    Some(Err(_)) | None => return PeerEnd::Closed,
+                }
+            }
+        })
+        .await;
+        r.unwrap_or(PeerEnd::TimedOut)
+    }
+
+    /// Answers every request with the matching bytes of `payload` until the
+    /// connection closes.
+    pub async fn serve(&mut self, payload: &[u8], piece_len: u32) {
+        while let Some(Ok(m)) = self.framed.next().await {
+            if let Message::Request(b) = m {
+                let start = b.piece as usize * piece_len as usize + b.offset as usize;
+                let data = Bytes::copy_from_slice(&payload[start..start + b.len as usize]);
+                let piece = Message::Piece {
+                    piece: b.piece,
+                    offset: b.offset,
+                    data,
+                };
+                if self.framed.send(piece).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn random_id() -> PeerId {
+    let mut id = [0u8; 20];
+    rand::rng().fill(&mut id[..]);
+    PeerId(id)
+}
+
+/// How waiting for a connection to end turned out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeerEnd {
+    /// The remote closed (or reset) the connection.
+    Closed,
+    /// Still open when the wait ran out.
+    TimedOut,
+}
+
+/// Polls `cond` every 10 ms until it holds or `timeout` passes.
+pub async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let end = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Memory storage that serves reads one at a time, each after `delay`: a
+/// rate-throttled seeder (about `16 KiB / delay` per second).
+#[derive(Debug)]
+pub struct SlowStorage {
+    pub inner: MemStorage,
+    pub delay: Duration,
+    gate: Mutex<()>,
+}
+
+impl SlowStorage {
+    pub fn new(data: Vec<u8>, delay: Duration) -> Self {
+        SlowStorage {
+            inner: MemStorage::from_bytes(data),
+            delay,
+            gate: Mutex::new(()),
+        }
+    }
+}
+
+impl Storage for SlowStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::sleep(self.delay);
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// Memory storage that, once `armed`, returns flipped bytes for reads
+/// overlapping `bad`. Armed after the initial check, it passes the check and
+/// then serves corrupt data.
+#[derive(Debug)]
+pub struct CorruptStorage {
+    pub inner: MemStorage,
+    pub bad: Range<u64>,
+    pub armed: AtomicBool,
+}
+
+impl CorruptStorage {
+    pub fn new(data: Vec<u8>, bad: Range<u64>) -> Self {
+        CorruptStorage {
+            inner: MemStorage::from_bytes(data),
+            bad,
+            armed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Storage for CorruptStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, buf)?;
+        if self.armed.load(Ordering::SeqCst) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                if self.bad.contains(&(offset + i as u64)) {
+                    *b ^= 0xff;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+// ----- fake trackers ----------------------------------------------------------
+
+/// One announce as a fake tracker recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Announce {
+    pub info_hash: [u8; 20],
+    /// The announcing peer's listen port.
+    pub port: u16,
+    /// `started`, `completed`, `stopped` or `none`.
+    pub event: String,
+}
+
+/// How a fake tracker answers.
+#[derive(Debug, Clone)]
+pub enum Reply {
+    /// Peers from its swarm.
+    Peers,
+    /// A bencoded `failure reason` (HTTP) or an error action (UDP).
+    Failure(String),
+    /// HTTP 500 (HTTP only).
+    ServerError,
+}
+
+#[derive(Debug, Default)]
+struct TrackerState {
+    /// Peers per info hash; every peer is on 127.0.0.1.
+    swarms: std::collections::HashMap<[u8; 20], Vec<SocketAddr>>,
+    announces: Vec<Announce>,
+}
+
+impl TrackerState {
+    /// Records `a`, updates the swarm and returns the other peers.
+    fn announce(&mut self, a: Announce) -> Vec<SocketAddr> {
+        let me = SocketAddr::from(([127, 0, 0, 1], a.port));
+        let swarm = self.swarms.entry(a.info_hash).or_default();
+        if a.event == "stopped" {
+            swarm.retain(|p| *p != me);
+        } else if !swarm.contains(&me) {
+            swarm.push(me);
+        }
+        let others = swarm.iter().copied().filter(|p| *p != me).collect();
+        self.announces.push(a);
+        others
+    }
+}
+
+fn compact(peers: &[SocketAddr]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in peers {
+        if let SocketAddr::V4(v4) = p {
+            out.extend_from_slice(&v4.ip().octets());
+            out.extend_from_slice(&v4.port().to_be_bytes());
+        }
+    }
+    out
+}
+
+/// An in-memory HTTP or UDP tracker on loopback that keeps a swarm per info
+/// hash and records every announce.
+#[derive(Debug)]
+pub struct FakeTracker {
+    pub url: String,
+    state: std::sync::Arc<Mutex<TrackerState>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FakeTracker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FakeTracker {
+    /// An HTTP tracker answering every announce with `reply`.
+    pub async fn http(reply: Reply) -> FakeTracker {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = std::sync::Arc::new(Mutex::new(TrackerState::default()));
+        let st = state.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(http_conn(stream, st.clone(), reply.clone()));
+            }
+        });
+        FakeTracker {
+            url: format!("http://{addr}/announce"),
+            state,
+            task,
+        }
+    }
+
+    /// A UDP (BEP 15) tracker answering every announce with `reply`.
+    pub async fn udp(reply: Reply) -> FakeTracker {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let state = std::sync::Arc::new(Mutex::new(TrackerState::default()));
+        let st = state.clone();
+        let task = tokio::spawn(udp_loop(sock, st, reply));
+        FakeTracker {
+            url: format!("udp://{addr}"),
+            state,
+            task,
+        }
+    }
+
+    /// Every announce so far.
+    pub fn announces(&self) -> Vec<Announce> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .announces
+            .clone()
+    }
+
+    /// The events announced by the peer listening on `port`, in order.
+    pub fn events_of(&self, port: u16) -> Vec<String> {
+        self.announces()
+            .into_iter()
+            .filter(|a| a.port == port)
+            .map(|a| a.event)
+            .collect()
+    }
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap();
+            out.push(u8::from_str_radix(hex, 16).unwrap());
+            i += 3;
+        } else {
+            out.push(if b[i] == b'+' { b' ' } else { b[i] });
+            i += 1;
+        }
+    }
+    out
+}
+
+async fn http_conn(
+    mut stream: TcpStream,
+    state: std::sync::Arc<Mutex<TrackerState>>,
+    reply: Reply,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 * 1024 {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let head = String::from_utf8_lossy(&buf).into_owned();
+    let target = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+    let query = target.split_once('?').map_or("", |(_, q)| q);
+    let mut info_hash = [0u8; 20];
+    let mut port = 0u16;
+    let mut event = "none".to_owned();
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "info_hash" => info_hash.copy_from_slice(&percent_decode(v)),
+            "port" => port = v.parse().unwrap(),
+            "event" => event = v.to_owned(),
+            _ => {}
+        }
+    }
+    let peers = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .announce(Announce {
+            info_hash,
+            port,
+            event,
+        });
+    let (status, body) = match reply {
+        Reply::Peers => {
+            let c = compact(&peers);
+            let mut body = format!("d8:intervali1800e5:peers{}:", c.len()).into_bytes();
+            body.extend_from_slice(&c);
+            body.push(b'e');
+            ("200 OK", body)
+        }
+        Reply::Failure(msg) => (
+            "200 OK",
+            format!("d14:failure reason{}:{}e", msg.len(), msg).into_bytes(),
+        ),
+        Reply::ServerError => ("500 Internal Server Error", Vec::new()),
+    };
+    let mut resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    resp.extend_from_slice(&body);
+    let _ = stream.write_all(&resp).await;
+    let _ = stream.shutdown().await;
+}
+
+async fn udp_loop(
+    sock: tokio::net::UdpSocket,
+    state: std::sync::Arc<Mutex<TrackerState>>,
+    reply: Reply,
+) {
+    const CID: u64 = 0x0102_0304_0506_0708;
+    let be32 = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+            continue;
+        };
+        let b = &buf[..n];
+        if n < 16 {
+            continue;
+        }
+        let action = be32(b, 8);
+        let tid = &b[12..16];
+        let mut out = Vec::new();
+        if action == 0 && b[..8] == 0x0417_2710_1980u64.to_be_bytes() {
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(tid);
+            out.extend_from_slice(&CID.to_be_bytes());
+        } else if action == 1 && n >= 98 && b[..8] == CID.to_be_bytes() {
+            let event = match be32(b, 80) {
+                1 => "completed",
+                2 => "started",
+                3 => "stopped",
+                _ => "none",
+            };
+            let peers = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .announce(Announce {
+                    info_hash: b[16..36].try_into().unwrap(),
+                    port: u16::from_be_bytes([b[96], b[97]]),
+                    event: event.to_owned(),
+                });
+            match &reply {
+                Reply::Failure(msg) => {
+                    out.extend_from_slice(&3u32.to_be_bytes());
+                    out.extend_from_slice(tid);
+                    out.extend_from_slice(msg.as_bytes());
+                }
+                _ => {
+                    out.extend_from_slice(&1u32.to_be_bytes());
+                    out.extend_from_slice(tid);
+                    out.extend_from_slice(&1800u32.to_be_bytes());
+                    out.extend_from_slice(&0u32.to_be_bytes());
+                    out.extend_from_slice(&(peers.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&compact(&peers));
+                }
+            }
+        } else {
+            continue;
+        }
+        let _ = sock.send_to(&out, from).await;
+    }
+}

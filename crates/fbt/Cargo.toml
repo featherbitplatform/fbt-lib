@@ -1,0 +1,29 @@
+[package]
+name = "fbt"
+description = "pure-Rust BitTorrent library: public facade."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["tls"]
+# HTTPS trackers over rustls with the `ring` provider (needs a C toolchain).
+tls = ["fbt-session/tls-ring"]
+# HTTPS trackers over rustls with the pure-Rust RustCrypto provider.
+pure-rust = ["fbt-session/tls-rustcrypto"]
+
+[dependencies]
+fbt-session = { path = "../fbt-session" }
+fbt-bencode = { path = "../fbt-bencode" }
+fbt-metainfo = { path = "../fbt-metainfo" }
+fbt-core = { path = "../fbt-core" }
+fbt-tracker = { path = "../fbt-tracker" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

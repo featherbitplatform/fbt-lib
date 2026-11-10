@@ -1,0 +1,8 @@
+# Build context is the repository root; send only what cargo needs.
+.git
+target
+sast-out
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+.superpowers
