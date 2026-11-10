@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `fbt-dht`: new crate with the Mainline DHT (BEP 5): node ids with BEP 42 restrictions, KRPC messages, routing table, announce tokens, a bounded peer store, rate limiting, iterative lookups, bootstrap with backoff, announce, external-IP votes and a persistable state blob; it bootstraps from nothing unless told to ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-bencode`: `Limits::new(depth, items)`, the `MAX_DEPTH_CAP` hard depth cap and `DecodeError::TooManyItems` ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-wire`: the extension protocol (BEP 10) with `ut_metadata` (BEP 9) and `ut_pex` (BEP 11) messages, the DHT `Port` message, and MSE/PE (message stream encryption) handshake and encrypted stream ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-metainfo`: magnet URIs (`btih`, `btmh`, `so`) and building a `Metainfo` from verified info bytes ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: magnet links with metadata exchange: `TorrentSource`, `AddTorrent::magnet`, `Settings::max_metadata_size`, `Event::MetadataReceived`, `TorrentState::DownloadingMetadata` and `DisconnectReason::BadMetadata` (peers that send bad metadata are banned for that torrent) ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: a session DHT with `Settings::dht_enabled` and `Settings::dht_bootstrap_nodes` (public routers by default, `DEFAULT_DHT_BOOTSTRAP`), `Settings::dht_state` and `Session::dht_state()` to persist the routing table across runs, `Event::DhtBootstrapped`, and `EventMask::DHT`, which is now part of `EventMask::ALL`; private torrents never use the DHT ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: `Settings::encryption` (`EncryptionPolicy`: `Forced`, `Preferred`, `Disabled`) for MSE/PE on outgoing and incoming connections ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: peer exchange with `Settings::pex_enabled` and `PeerSource` on discovered peers; off for private torrents ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt`: facade re-exports for magnets, encryption and the DHT, with a magnet doctest ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-example`: magnet download (`fbt-example download <magnet:...>`), `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht`, `--no-pex`, and a `dht-node` subcommand that runs a bare DHT node ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- Fuzz targets `krpc`, `extension`, `mse` and `magnet`, with seed corpora, a persisted corpus and manual runs ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- Interop scenarios on an isolated network that never reaches the public DHT: magnet via DHT, forced encryption and PEX, against qBittorrent-nox and Transmission ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+
+### Changed
+
+- `AddTorrent.metainfo` is now `AddTorrent.source: TorrentSource`; `AddTorrent::new` still takes a `Metainfo`. Breaking under 0.x ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-bencode`: `Limits` gained a field (`max_items`), so struct-literal construction no longer compiles; use `Limits::new` ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `Settings::default()` now has encryption `Preferred`: outgoing connections open with an MSE handshake and fall back to plain text only where the policy allows it ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `TorrentState` and `Event` gained variants (`DownloadingMetadata`, `MetadataReceived`, `DhtBootstrapped`); match with a wildcard arm ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- When two peers dial each other at once, the connection initiated by the lower peer id is kept ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+
+### Fixed
+
+- `fbt-session`: the `completed` tracker announce is sent at most once, and is retried after a failed attempt ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: the `left` value of a `stopped` announce after a recheck is the last known one ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+
 ## [0.1.0] - 2026-11-10
 
 ### Added
@@ -23,4 +53,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Security CI: semgrep, cargo-deny, grype and gitleaks (`.github/workflows/security.yml`, `dev/sast.sh`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 - Release workflow: tag check against the workspace version, CycloneDX SBOM and a GitHub release with the changelog section (`.github/workflows/release.yml`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 
+[Unreleased]: https://github.com/featherbitplatform/fbt-lib/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.1.0
