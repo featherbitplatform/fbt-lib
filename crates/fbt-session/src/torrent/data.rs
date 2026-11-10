@@ -290,6 +290,8 @@ mod tests {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
             listen_port: 6881,
+            listen_port_v4: Some(6881),
+            listen_port_v6: None,
             tracker,
             events: broadcast::channel(64).0,
             shutdown: AtomicBool::new(false),

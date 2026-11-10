@@ -281,6 +281,46 @@ async fn dht_port_taken_falls_back() {
     session.shutdown().await;
 }
 
+/// A taken UDP port drops only that family's shared socket: the DHT still
+/// runs over IPv4 (on a fallback socket) and over IPv6.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dht_falls_back_per_family() {
+    if std::net::UdpSocket::bind("[::1]:0").is_err() {
+        return;
+    }
+    let (udp, port) = loop {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = udp.local_addr().unwrap().port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            break (udp, port);
+        }
+    };
+    let mut s = dht_settings(Vec::new());
+    s.listen_addrs = vec![
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        "[::1]:0".parse().unwrap(),
+    ];
+    let session = Session::new(s).await.unwrap();
+    assert_eq!(session.local_addrs().len(), 2);
+    let dht = session.dht_stats().expect("DHT running");
+    assert!(
+        dht.local_addrs
+            .iter()
+            .any(|a| a.is_ipv4() && a.port() != port),
+        "{:?}",
+        dht.local_addrs
+    );
+    assert!(
+        dht.local_addrs.iter().any(SocketAddr::is_ipv6),
+        "{:?}",
+        dht.local_addrs
+    );
+    // The fallback socket is the session's: listed and closed with it.
+    assert_eq!(session.demux_stats().len(), 2);
+    drop(udp);
+    session.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dht_on_listener_port_when_free() {
     let session = Session::new(dht_settings(Vec::new())).await.unwrap();

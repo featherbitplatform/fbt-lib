@@ -471,7 +471,7 @@ impl Actor {
     pub(super) fn ext_config(&self, addr: &SocketAddr) -> ExtConfig {
         let meta = self.loaded.as_ref().map(|l| &l.meta);
         ExtConfig {
-            listen_port: self.shared.listen_port,
+            listen_port: self.shared.listen_port_for(addr),
             metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),
             pex: self.shared.settings.pex_enabled && !meta.is_some_and(|m| m.info.private),
             // No DHT bit or `Port` for a private torrent (a magnet's

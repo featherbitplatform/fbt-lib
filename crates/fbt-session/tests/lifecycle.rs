@@ -885,28 +885,40 @@ async fn unspecified_v4_and_v6_share_a_port() {
     if !ipv6_available() {
         return;
     }
-    // A port free for TCP and UDP on both families.
-    let port = loop {
-        let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        let free = std::net::UdpSocket::bind(("0.0.0.0", p)).is_ok()
-            && std::net::TcpListener::bind(("::", p)).is_ok()
-            && std::net::UdpSocket::bind(("::", p)).is_ok();
-        if free {
-            break p;
-        }
+    // A port free for TCP and UDP on both families. Another process may
+    // take it before the session binds it, so a start that reports an
+    // error is retried with a new port.
+    let free_port = || {
+        (0..50).find_map(|_| {
+            let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            let free = std::net::UdpSocket::bind(("0.0.0.0", p)).is_ok()
+                && std::net::TcpListener::bind(("::", p)).is_ok()
+                && std::net::UdpSocket::bind(("::", p)).is_ok();
+            free.then_some(p)
+        })
     };
-    let mut st = test_settings();
-    st.listen_addrs = vec![
-        std::net::SocketAddr::from(([0, 0, 0, 0], port)),
-        std::net::SocketAddr::from(([0u16; 8], port)),
-    ];
-    let s = Session::new(st).await.unwrap();
-    assert_eq!(s.local_addrs().len(), 2, "{:?}", s.listen_errors());
-    assert!(s.listen_errors().is_empty(), "{:?}", s.listen_errors());
-    assert!(s.local_addrs().iter().all(|a| a.port() == port));
-    s.shutdown().await;
+    let mut last_errors = Vec::new();
+    for _ in 0..5 {
+        let port = free_port().expect("a port free on both families in 50 tries");
+        let mut st = test_settings();
+        st.listen_addrs = vec![
+            std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+            std::net::SocketAddr::from(([0u16; 8], port)),
+        ];
+        let s = Session::new(st).await.unwrap();
+        last_errors = s.listen_errors();
+        if !last_errors.is_empty() {
+            s.shutdown().await;
+            continue;
+        }
+        assert_eq!(s.local_addrs().len(), 2);
+        assert!(s.local_addrs().iter().all(|a| a.port() == port));
+        s.shutdown().await;
+        return;
+    }
+    panic!("no start without listen errors in 5 tries: {last_errors:?}");
 }
 
 #[tokio::test]
@@ -917,6 +929,10 @@ async fn empty_listen_addrs_is_invalid() {
         Err(SessionError::InvalidSettings(msg)) => assert!(msg.contains("listen_addrs"), "{msg}"),
         other => panic!("expected InvalidSettings, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn duplicate_listen_addrs_is_invalid() {
     let mut st = test_settings();
     let a = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
     st.listen_addrs = vec![a, a];

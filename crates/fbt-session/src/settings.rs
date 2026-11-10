@@ -54,7 +54,9 @@ pub enum EncryptionPolicy {
 pub struct Settings {
     /// Addresses the session listens on (non-empty, no duplicates). Each
     /// gets a TCP peer listener and, on the same port, a UDP socket shared
-    /// by the DHT and UDP tracker announces. An IPv6 address binds
+    /// by the DHT and UDP tracker announces. The first address of each
+    /// family carries that family's DHT and UDP tracker traffic, so put the
+    /// routable address first. An IPv6 address binds
     /// IPv6-only, so `0.0.0.0:p` and `[::]:p` can share a port. An address
     /// that cannot be bound is skipped and reported by
     /// [`Session::listen_errors`](crate::Session::listen_errors).

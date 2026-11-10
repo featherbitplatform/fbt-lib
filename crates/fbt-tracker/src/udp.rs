@@ -304,7 +304,8 @@ fn event_code(e: AnnounceEvent) -> u32 {
     }
 }
 
-fn build_announce(cid: u64, tid: u32, req: &AnnounceRequest) -> Vec<u8> {
+/// An announce over IPv6 (`ipv6`) or IPv4, carrying that family's port.
+fn build_announce(cid: u64, tid: u32, req: &AnnounceRequest, ipv6: bool) -> Vec<u8> {
     let num_want = req
         .num_want
         .and_then(|n| i32::try_from(n).ok())
@@ -322,7 +323,7 @@ fn build_announce(cid: u64, tid: u32, req: &AnnounceRequest) -> Vec<u8> {
     b.extend_from_slice(&0u32.to_be_bytes());
     b.extend_from_slice(&req.key.to_be_bytes());
     b.extend_from_slice(&num_want.to_be_bytes());
-    b.extend_from_slice(&req.port.to_be_bytes());
+    b.extend_from_slice(&req.port_for(ipv6).to_be_bytes());
     b
 }
 
@@ -456,7 +457,7 @@ impl UdpClient {
                 None => (self.connect(sock, addr).await?, false),
             };
             let tid = new_tid(sock.pending());
-            let dgram = build_announce(cid, tid, req);
+            let dgram = build_announce(cid, tid, req, ipv6);
             let resp = self.exchange(sock, addr, tid, &dgram).await?;
             match parse_udp_announce(&resp, tid, ipv6) {
                 // A cached connection id the tracker no longer knows:
@@ -549,6 +550,8 @@ mod tests {
             info_hash: [0xaa; 20],
             peer_id: PeerId([b'x'; 20]),
             port: 6881,
+            port_v4: None,
+            port_v6: None,
             uploaded: 1,
             downloaded: 2,
             left: 3,
@@ -557,6 +560,18 @@ mod tests {
             key: 0xbeef,
             tracker_id: None,
         }
+    }
+
+    #[test]
+    fn announce_carries_the_port_of_its_family() {
+        let port = |b: &[u8]| u16::from_be_bytes([b[96], b[97]]);
+        let mut req = request();
+        assert_eq!(port(&build_announce(1, 2, &req, false)), 6881);
+        assert_eq!(port(&build_announce(1, 2, &req, true)), 6881);
+        req.port_v4 = Some(7000);
+        req.port_v6 = Some(7001);
+        assert_eq!(port(&build_announce(1, 2, &req, false)), 7000);
+        assert_eq!(port(&build_announce(1, 2, &req, true)), 7001);
     }
 
     fn client() -> TrackerClient {
