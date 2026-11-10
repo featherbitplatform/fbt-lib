@@ -440,6 +440,41 @@ async fn remove_before_metadata_creates_no_files() {
     task.abort();
 }
 
+/// The check that follows a magnet's metadata keeps the torrent announced
+/// and its peers connected, so a peer dialling in meanwhile is answered
+/// too, not dropped before our handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_answers_incoming_peers_during_its_metadata_check() {
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let (seed, _sh) = seeder(&m, &payload).await;
+    let leech = Session::new(settings()).await.unwrap();
+    let mut ev = leech.subscribe(EventMask::STATUS);
+    let mut p = AddTorrent::magnet(
+        magnet_of(m.info_hashes, vec![seed.local_addr()]),
+        PathBuf::from("unused"),
+    );
+    // Four pieces at 500 ms a read: the check lasts about two seconds.
+    p.storage = Some(Arc::new(SlowStorage::new(
+        vec![0; payload.len()],
+        Duration::from_millis(500),
+    )));
+    let h = leech.add_torrent(p).await.unwrap();
+    wait_event(&mut ev, "MetadataReceived", |e| {
+        matches!(e, Event::MetadataReceived { .. })
+    })
+    .await;
+    let checking =
+        |h: &TorrentHandle| matches!(h.status().state, TorrentState::CheckingFiles { .. });
+    assert!(wait_until(|| checking(&h), T).await);
+
+    let peer =
+        ScriptedPeer::connect_with(leech.local_addr(), m.info_hashes.wire_hash(), fast_ext()).await;
+    assert_eq!(peer.remote.info_hash, m.info_hashes.wire_hash());
+    assert!(checking(&h), "the handshake was answered during the check");
+    leech.shutdown().await;
+    seed.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeder_serves_metadata_and_rejects_out_of_range() {
     let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);

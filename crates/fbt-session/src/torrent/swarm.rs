@@ -590,7 +590,9 @@ impl Actor {
         addr: SocketAddr,
     ) {
         let s = &self.shared.settings;
-        if !self.connectable() || self.peers.len() >= s.max_peers_per_torrent {
+        // While announced: through the check after a magnet's metadata too,
+        // which keeps the peers it has (they catch up when it ends).
+        if !self.running() || self.peers.len() >= s.max_peers_per_torrent {
             debug!(%addr, "torrent inactive or full; dropping incoming connection");
             return;
         }

@@ -400,7 +400,7 @@ impl Actor {
 
     /// What the announcer is told: announcing while peers may connect, and
     /// through the check that follows a magnet's metadata.
-    fn running(&self) -> bool {
+    pub(super) fn running(&self) -> bool {
         self.connectable() || (self.metadata_check && !self.paused)
     }
 
