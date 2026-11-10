@@ -18,6 +18,15 @@ mod id;
 /// KRPC message codec. Public for the fuzz targets; use the re-exports.
 #[doc(hidden)]
 pub mod krpc;
+// The node runtime (Task 7) drives these; until then only tests use them.
+#[allow(dead_code)]
+mod rate;
+#[allow(dead_code)]
+mod store;
+#[allow(dead_code)]
+mod table;
+#[allow(dead_code)]
+mod token;
 
 pub use id::{NODE_ID_LEN, NodeId, bep42_id, is_local};
 pub use krpc::{
