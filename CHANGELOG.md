@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fbt-session`: a magnet answers incoming peers during the check that follows its metadata instead of dropping them ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-session`: a torrent whose check after the metadata fails stops like any errored torrent: it announces `stopped`, refuses incoming peers, and a resume starts over cleanly ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-session`: a slow metadata source can no longer stall a magnet: each request times out on its own, and a source that has not delivered the whole metadata within its deadline gives its slot to the next one ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
+- `fbt-session`: the status read on `TorrentFinished` already has the final counters and the `Seeding` state, instead of the last periodic snapshot ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 - `fbt-dht`: a node that queries us enters the routing table only after answering our ping, so spoofed sources cannot fill it ([#4](https://github.com/featherbitplatform/fbt-lib/pull/4))
 
 ## [0.1.0] - 2026-11-10

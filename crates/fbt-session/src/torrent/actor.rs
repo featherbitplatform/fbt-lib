@@ -43,6 +43,14 @@ const PEER_EVENT_QUEUE: usize = 1024;
 /// How long remove and shutdown wait for peer tasks to report back.
 const PEER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
+thread_local! {
+    /// Unit tests: every event emitted on this thread, with the status
+    /// handles could read at that moment.
+    pub(super) static EMITTED: std::cell::RefCell<Vec<(Event, TorrentStatus)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Where the torrent is in its life.
 #[derive(Debug)]
 pub(super) enum Phase {
@@ -384,6 +392,11 @@ impl Actor {
     }
 
     pub(super) fn emit(&self, ev: Event) {
+        #[cfg(test)]
+        EMITTED.with(|log| {
+            log.borrow_mut()
+                .push((ev.clone(), self.status_tx.borrow().clone()));
+        });
         self.shared.emit(ev);
     }
 

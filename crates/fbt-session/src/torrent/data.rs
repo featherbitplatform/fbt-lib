@@ -230,6 +230,8 @@ impl Actor {
         let just_finished = finished && !self.finished_emitted;
         if just_finished {
             self.finished_emitted = true;
+            // Whoever reacts to the event reads the final counters and state.
+            self.publish();
             self.emit(Event::TorrentFinished { torrent: self.ih });
             // Durability point; a failure here is logged, the next write
             // would surface a real storage problem.
@@ -243,5 +245,112 @@ impl Actor {
             // After `refresh_state`, so the announce reads `left` = 0.
             self.signal(|s| !std::mem::replace(&mut s.completed, true));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{OnceLock, Weak};
+
+    use fbt_core::PeerId;
+    use fbt_tracker::TrackerClient;
+    use tokio::sync::{broadcast, mpsc, watch};
+
+    use super::*;
+    use crate::session::{AddTorrent, Shared};
+    use crate::settings::Settings;
+    use crate::status::{TorrentState, TorrentStatus};
+    use crate::storage::{MemStorage, Storage};
+    use crate::torrent::actor::EMITTED;
+    use crate::torrent::swarm::Peer;
+
+    /// Whoever reacts to `TorrentFinished` reads the final status: every
+    /// downloaded byte counted and the torrent seeding, not the last tick's
+    /// snapshot.
+    #[tokio::test]
+    async fn torrent_finished_sees_the_final_status() {
+        const LEN: usize = 32_768;
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let mut bytes =
+            format!("d4:infod6:lengthi{LEN}e4:name1:a12:piece lengthi{LEN}e6:pieces20:")
+                .into_bytes();
+        bytes.extend_from_slice(&sha1_piece(&payload));
+        bytes.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+        let settings = Settings {
+            dht_enabled: false,
+            dht_bootstrap_nodes: Vec::new(),
+            ..Settings::default()
+        };
+        let tracker = TrackerClient::new(settings.tracker.clone()).expect("tracker client");
+        let shared = Arc::new(Shared {
+            settings: Arc::new(settings),
+            peer_id: PeerId::generate(),
+            listen_port: 6881,
+            tracker,
+            events: broadcast::channel(64).0,
+            shutdown: AtomicBool::new(false),
+            global_peers: AtomicUsize::new(0),
+            half_open: AtomicUsize::new(0),
+            dht: None,
+            dht_addrs: Vec::new(),
+        });
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(LEN as u64));
+        let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
+        add.storage = Some(Arc::clone(&storage));
+        let ih = add.source.info_hashes();
+        let (status_tx, _status_rx) = watch::channel(TorrentStatus::initial(ih, "a".into(), true));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut actor = Actor::new(
+            add,
+            Some(storage),
+            Arc::new(OnceLock::new()),
+            shared,
+            Weak::new(),
+            cmd_rx,
+            status_tx,
+        );
+        actor.on_checked(actor.generation, Ok(Bitfield::new(1)));
+
+        let key = PeerKey(0);
+        let (tx, _peer_rx) = mpsc::channel(16);
+        let mut peer = Peer::new(
+            SocketAddr::from(([10, 0, 0, 1], 6881)),
+            tx,
+            actor.generation,
+            1,
+        );
+        peer.connected = true;
+        peer.seed = true;
+        let blocks = actor
+            .loaded
+            .as_mut()
+            .and_then(|l| l.picker.as_mut())
+            .expect("picker")
+            .pick(key, peer.pieces(), 16, &mut actor.rng);
+        peer.requested.extend(blocks.iter().copied());
+        actor.peers.insert(key, peer);
+        assert_eq!(blocks.len(), 2);
+        for b in blocks {
+            let start = b.offset as usize;
+            let end = start + b.len as usize;
+            actor.on_block(key, b, Bytes::copy_from_slice(&payload[start..end]));
+        }
+        // Hashed, then Written (which finishes), then Flushed.
+        while let Some(r) = actor.jobs.join_next().await {
+            actor.on_job_result(r);
+        }
+
+        let log = EMITTED.take();
+        let (_, seen) = log
+            .iter()
+            .find(|(e, _)| matches!(e, Event::TorrentFinished { .. }))
+            .expect("TorrentFinished");
+        assert_eq!(seen.total_downloaded, LEN as u64);
+        assert_eq!(seen.total_wasted, 0);
+        assert_eq!(seen.state, TorrentState::Seeding);
     }
 }
