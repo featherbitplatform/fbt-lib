@@ -32,6 +32,7 @@ mod tests {
     use fbt_core::{Bitfield, PieceLayout};
     use fbt_metainfo::Metainfo;
     use std::io::ErrorKind;
+    use std::ops::ControlFlow;
     use std::path::Path;
 
     fn bstr(out: &mut Vec<u8>, s: &[u8]) {
@@ -178,7 +179,11 @@ mod tests {
         s.write(0, data.get(0..16).unwrap()).unwrap();
         s.write(32, data.get(32..48).unwrap()).unwrap();
         let mut seen = Vec::new();
-        let bf: Bitfield = check_pieces(&s, &layout, &hashes, |i| seen.push(i)).unwrap();
+        let bf: Bitfield = check_pieces(&s, &layout, &hashes, |i| {
+            seen.push(i);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
         assert_eq!(bf.iter_ones().collect::<Vec<_>>(), vec![0, 2]);
         assert_eq!(seen, vec![0, 1, 2, 3]);
     }
@@ -189,8 +194,28 @@ mod tests {
         let hashes = piece_hashes(&data, 4);
         let layout = PieceLayout::new(10, 4).unwrap();
         let s = MemStorage::from_bytes(data);
-        let bf = check_pieces(&s, &layout, &hashes, |_| {}).unwrap();
+        let bf = check_pieces(&s, &layout, &hashes, |_| ControlFlow::Continue(())).unwrap();
         assert!(bf.is_full());
+    }
+
+    #[test]
+    fn check_pieces_can_be_cancelled() {
+        let data: Vec<u8> = (0..10u8).collect();
+        let hashes = piece_hashes(&data, 4);
+        let layout = PieceLayout::new(10, 4).unwrap();
+        let s = MemStorage::from_bytes(data);
+        let mut seen = Vec::new();
+        let e = check_pieces(&s, &layout, &hashes, |i| {
+            seen.push(i);
+            if i == 1 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Interrupted);
+        assert_eq!(seen, vec![0, 1]);
     }
 
     #[test]

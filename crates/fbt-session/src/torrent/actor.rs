@@ -6,8 +6,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use fbt_core::{Bitfield, InfoHashes, PieceLayout};
@@ -40,8 +41,12 @@ const PEER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Where the torrent is in its life.
 #[derive(Debug)]
 pub(super) enum Phase {
-    /// `check_pieces` is running; it counts checked pieces into `done`.
-    Checking { done: Arc<AtomicU32> },
+    /// `check_pieces` is running; it counts checked pieces into `done` and
+    /// stops at the next piece once `cancel` is set.
+    Checking {
+        done: Arc<AtomicU32>,
+        cancel: Arc<AtomicBool>,
+    },
     /// Checked; downloading or seeding (unless paused).
     Ready,
     /// Stopped by a storage error.
@@ -143,6 +148,7 @@ impl Actor {
             generation: 0,
             phase: Phase::Checking {
                 done: Arc::new(AtomicU32::new(0)),
+                cancel: Arc::new(AtomicBool::new(false)),
             },
             paused: params.paused,
             picker: None,
@@ -218,7 +224,7 @@ impl Actor {
     pub(super) fn state(&self) -> TorrentState {
         match &self.phase {
             Phase::Error(_) => TorrentState::Error,
-            Phase::Checking { done } => {
+            Phase::Checking { done, .. } => {
                 let n = self.layout.num_pieces();
                 let progress = if n == 0 {
                     1.0
@@ -343,9 +349,14 @@ impl Actor {
     // ----- checking -----------------------------------------------------------
 
     pub(super) fn start_check(&mut self) {
+        // A check still running belongs to an older generation: stop it
+        // instead of letting checks pile up.
+        self.cancel_check();
         let done = Arc::new(AtomicU32::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
         self.phase = Phase::Checking {
             done: Arc::clone(&done),
+            cancel: Arc::clone(&cancel),
         };
         self.picker = None;
         let storage = Arc::clone(&self.storage);
@@ -355,9 +366,21 @@ impl Actor {
         self.jobs.spawn_blocking(move || {
             let result = check_pieces(&*storage, &layout, &meta.info.pieces, |i| {
                 done.store(i.saturating_add(1), Ordering::Relaxed);
+                if cancel.load(Ordering::Relaxed) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
             });
             Job::Checked { generation, result }
         });
+    }
+
+    /// Stops the running check, if any, at its next piece.
+    fn cancel_check(&self) {
+        if let Phase::Checking { cancel, .. } = &self.phase {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn on_checked(&mut self, generation: u64, result: io::Result<Bitfield>) {
@@ -534,6 +557,8 @@ impl Actor {
             true
         });
         self.close_all();
+        // Its result would be thrown away; do not wait for a whole check.
+        self.cancel_check();
         let deadline = Instant::now() + PEER_DRAIN_TIMEOUT;
         while !self.peers.is_empty() {
             match tokio::time::timeout_at(deadline, self.peer_rx.recv()).await {

@@ -526,3 +526,46 @@ async fn resume_after_error_rechecks_and_finishes() {
     assert!(h.pieces().await.unwrap().is_full());
     s.shutdown().await;
 }
+
+/// A torrent whose check takes about 6.4 s (64 reads of 100 ms each).
+async fn slow_checking(s: &Session) -> fbt_session::TorrentHandle {
+    use std::sync::Arc;
+    let (m, payload) = make_torrent(&[("a", 64 * 16_384)], 16_384);
+    let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+    p.storage = Some(Arc::new(SlowStorage::new(
+        payload,
+        Duration::from_millis(100),
+    )));
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(matches!(
+        h.status().state,
+        TorrentState::CheckingFiles { .. }
+    ));
+    h
+}
+
+/// Shutdown and remove during a long check (and after rechecks that would
+/// otherwise stack up) return without waiting for the checks to finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_during_check_is_prompt() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let h = slow_checking(&s).await;
+    for _ in 0..3 {
+        h.force_recheck().await.unwrap();
+    }
+    let t0 = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), s.shutdown())
+        .await
+        .expect("shutdown in time");
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+
+    let s = Session::new(test_settings()).await.unwrap();
+    let h = slow_checking(&s).await;
+    let t0 = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), h.remove(RemoveMode::KeepData))
+        .await
+        .expect("remove in time")
+        .unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    s.shutdown().await;
+}

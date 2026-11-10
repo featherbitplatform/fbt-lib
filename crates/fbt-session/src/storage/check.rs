@@ -2,6 +2,7 @@ use super::Storage;
 use fbt_core::{Bitfield, PieceLayout};
 use sha1::{Digest, Sha1};
 use std::io;
+use std::ops::ControlFlow;
 
 /// SHA-1 of one piece.
 pub fn sha1_piece(data: &[u8]) -> [u8; 20] {
@@ -11,12 +12,14 @@ pub fn sha1_piece(data: &[u8]) -> [u8; 20] {
 /// Reads every piece through `storage` and returns the ones matching `hashes`.
 ///
 /// One piece-sized buffer is reused. A `NotFound` piece counts as missing; any
-/// other error propagates. `on_piece(i)` runs after each piece is processed.
+/// other error propagates. `on_piece(i)` runs after each piece is processed;
+/// returning [`ControlFlow::Break`] cancels the check, which then fails with
+/// [`io::ErrorKind::Interrupted`].
 pub fn check_pieces(
     storage: &dyn Storage,
     layout: &PieceLayout,
     hashes: &[[u8; 20]],
-    mut on_piece: impl FnMut(u32),
+    mut on_piece: impl FnMut(u32) -> ControlFlow<()>,
 ) -> io::Result<Bitfield> {
     let n = layout.num_pieces();
     let mut have = Bitfield::new(n);
@@ -34,7 +37,12 @@ pub fn check_pieces(
                 Err(e) => return Err(e),
             }
         }
-        on_piece(i);
+        if on_piece(i).is_break() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "piece check cancelled",
+            ));
+        }
     }
     Ok(have)
 }
