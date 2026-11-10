@@ -3,8 +3,8 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use fbt_core::{Bitfield, BlockRef, PeerId};
-use fbt_wire::Reserved;
+use fbt_core::{Bitfield, BlockRef, PeerId, PieceLayout};
+use fbt_wire::{ExtHandshake, MetadataMsg, PexMsg, Reserved};
 
 use crate::picker::PeerKey;
 
@@ -87,6 +87,17 @@ pub(crate) enum PeerEvent {
     Cancel { key: PeerKey, block: BlockRef },
     /// Payload bytes dropped because they matched no outstanding request.
     Wasted { key: PeerKey, bytes: u64 },
+    /// The remote's BEP 10 extension handshake (again after each repeat).
+    /// Every field is untrusted: `metadata_size` is not capped here (the
+    /// metadata fetch applies `max_metadata_size`), `reqq` is clamped to
+    /// [`MAX_REMOTE_REQQ`](super::ext::MAX_REMOTE_REQQ).
+    ExtHandshake { key: PeerKey, hs: Box<ExtHandshake> },
+    /// A BEP 9 `ut_metadata` message.
+    Metadata { key: PeerKey, msg: MetadataMsg },
+    /// A BEP 11 `ut_pex` message.
+    Pex { key: PeerKey, msg: PexMsg },
+    /// The remote's DHT port (BEP 5 `Port`), at most once per connection.
+    DhtPort { key: PeerKey, port: u16 },
     /// The connection ended; `outstanding` lists requests never satisfied.
     Disconnected {
         key: PeerKey,
@@ -117,6 +128,25 @@ pub(crate) enum PeerCommand {
     SendBlock { block: BlockRef, data: Bytes },
     /// Refuse a queued request.
     Reject(BlockRef),
+    /// The metadata arrived: validate and replay the buffered piece
+    /// announcements against `layout`, then run normally.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "sent by the torrent from Tasks 13 and 15 on")
+    )]
+    MetadataReady { layout: PieceLayout },
+    /// Send a `ut_metadata` message (dropped if the remote lacks it).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "sent by the torrent from Tasks 13 and 15 on")
+    )]
+    SendMetadata(MetadataMsg),
+    /// Send a `ut_pex` message (dropped if the remote lacks it).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "sent by the torrent from Tasks 13 and 15 on")
+    )]
+    SendPex(PexMsg),
     /// Close the connection.
     Close,
 }

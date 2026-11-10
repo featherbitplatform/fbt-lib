@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
+use fbt_wire::ExtHandshake;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
@@ -15,6 +16,7 @@ use tracing::debug;
 use super::actor::Actor;
 use crate::peer::DisconnectReason;
 use crate::peer::conn::{MAX_ALLOWED_FAST, PeerCtx, spawn_incoming, spawn_outgoing};
+use crate::peer::ext::ExtConfig;
 use crate::peer::messages::PeerCommand;
 use crate::picker::{PeerKey, PeerPieces};
 use crate::rate::RateMeter;
@@ -254,6 +256,10 @@ pub(super) struct Peer {
     pub from_rate: RateMeter,
     /// Payload we upload to the peer.
     pub to_rate: RateMeter,
+    /// The peer's latest BEP 10 extension handshake (untrusted values).
+    pub ext: Option<Box<ExtHandshake>>,
+    /// The listen port from that handshake (`p`).
+    pub listen_port: Option<u16>,
 }
 
 impl Peer {
@@ -285,6 +291,8 @@ impl Peer {
             demand: 0,
             from_rate: RateMeter::new(),
             to_rate: RateMeter::new(),
+            ext: None,
+            listen_port: None,
         }
     }
 
@@ -340,21 +348,43 @@ impl Peer {
 impl Actor {
     // ----- connections ----------------------------------------------------------
 
-    /// The context of a new peer task; `None` until the metadata is known.
-    pub(super) fn ctx(&self, key: PeerKey) -> Option<PeerCtx> {
-        let l = self.loaded.as_ref()?;
-        Some(PeerCtx {
+    /// The context of a new peer task. Without metadata the task runs in
+    /// no-metadata mode (no layout, an empty `have`).
+    pub(super) fn ctx(&self, key: PeerKey) -> PeerCtx {
+        let l = self.loaded.as_ref();
+        let have = l.map_or_else(
+            || Bitfield::new(0),
+            |l| {
+                l.picker.as_ref().map_or_else(
+                    || Bitfield::new(l.layout.num_pieces()),
+                    |p| p.have().clone(),
+                )
+            },
+        );
+        PeerCtx {
             key,
             info_hash: self.ih.wire_hash(),
             our_id: self.shared.peer_id,
-            layout: l.layout,
-            have: l.picker.as_ref().map_or_else(
-                || Bitfield::new(l.layout.num_pieces()),
-                |p| p.have().clone(),
-            ),
+            layout: l.map(|l| l.layout),
+            have,
+            ext: self.ext_config(),
             settings: Arc::clone(&self.shared.settings),
             events: self.peer_tx.clone(),
-        })
+        }
+    }
+
+    /// What new connections advertise. A torrent without metadata may be
+    /// private; until it is known, PEX is advertised (the magnet exception).
+    fn ext_config(&self) -> ExtConfig {
+        let meta = self.loaded.as_ref().map(|l| &l.meta);
+        ExtConfig {
+            listen_port: self.shared.listen_port,
+            metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),
+            pex: !meta.is_some_and(|m| m.info.private),
+            // Set once the session runs a DHT.
+            dht_port: None,
+            reqq: u32::try_from(self.shared.settings.max_incoming_requests).unwrap_or(u32::MAX),
+        }
     }
 
     pub(super) fn new_key(&mut self) -> PeerKey {
@@ -441,14 +471,9 @@ impl Actor {
                 continue;
             }
             let key = self.new_key();
-            let Some(ctx) = self.ctx(key) else {
-                self.candidates.push_front(addr);
-                release(&self.shared.half_open);
-                release(&self.shared.global_peers);
-                break;
-            };
+            let ctx = self.ctx(key);
             let have = ctx.have.clone();
-            let num_pieces = ctx.layout.num_pieces();
+            let num_pieces = ctx.have.len();
             let tx = spawn_outgoing(addr, ctx);
             let mut peer = Peer::new(addr, tx, self.generation, num_pieces);
             peer.outgoing = true;
@@ -474,12 +499,9 @@ impl Actor {
             return;
         }
         let key = self.new_key();
-        let Some(ctx) = self.ctx(key) else {
-            release(&self.shared.global_peers);
-            return;
-        };
+        let ctx = self.ctx(key);
         let have = ctx.have.clone();
-        let num_pieces = ctx.layout.num_pieces();
+        let num_pieces = ctx.have.len();
         let tx = spawn_incoming(stream, hs, addr, ctx);
         let mut peer = Peer::new(addr, tx, self.generation, num_pieces);
         peer.have_sent = Some(have);

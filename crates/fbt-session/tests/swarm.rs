@@ -16,7 +16,10 @@ use fbt_session::{
     AddTorrent, DisconnectReason, Event, EventMask, Priority, Session, Settings, TorrentHandle,
     TorrentState,
 };
-use fbt_wire::Message;
+use fbt_wire::{
+    ExtHandshake, Message, MetadataMsg, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, Reserved, UT_METADATA,
+    UT_PEX,
+};
 use support::*;
 
 const T: Duration = Duration::from_secs(30);
@@ -819,5 +822,56 @@ async fn request_for_missing_piece_is_rejected_on_the_wire() {
         .next_matching(|m| matches!(m, Message::RejectRequest(_) | Message::Piece { .. }))
         .await;
     assert_eq!(got, Some(Message::RejectRequest(block)));
+    s.shutdown().await;
+}
+
+/// A BEP 10 peer gets our extension handshake (listen port, metadata size,
+/// `ut_metadata` and `ut_pex` for a public torrent) before our pieces, and
+/// its own handshake and extended messages leave the connection up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_handshake_with_a_session() {
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let (s, _h) = seeder(&m, Arc::new(MemStorage::from_bytes(payload))).await;
+    let mut reserved = Reserved::default();
+    reserved.set_fast();
+    reserved.set_extended();
+    let mut peer =
+        ScriptedPeer::connect_with(s.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    assert!(peer.remote.reserved.supports_extended());
+    assert!(!peer.remote.reserved.supports_dht());
+    let first = peer.next_matching(|_| true).await.expect("first message");
+    let Message::Extended { id: 0, payload } = first else {
+        panic!("expected the extension handshake first, got {first:?}");
+    };
+    let hs = ExtHandshake::decode(&payload).expect("decode");
+    assert_eq!(hs.id_of(UT_METADATA), Some(OUR_UT_METADATA_ID));
+    assert_eq!(hs.id_of(UT_PEX), Some(OUR_UT_PEX_ID));
+    assert_eq!(hs.listen_port, Some(s.local_addr().port()));
+    assert_eq!(hs.metadata_size, Some(m.raw_info().len() as u32));
+    assert!(matches!(
+        peer.next_matching(|_| true).await,
+        Some(Message::HaveAll)
+    ));
+
+    let mut theirs = ExtHandshake {
+        listen_port: Some(7000),
+        ..ExtHandshake::default()
+    };
+    theirs.m.insert(UT_METADATA.to_owned(), 3);
+    peer.send_ext_handshake(&theirs).await;
+    // Metadata and PEX are not acted on yet; the connection stays up.
+    peer.send(Message::Extended {
+        id: OUR_UT_METADATA_ID,
+        payload: MetadataMsg::Request { piece: 0 }.encode(),
+    })
+    .await;
+    peer.send(Message::Port(7001)).await;
+    peer.send(Message::Interested).await;
+    assert!(
+        peer.next_matching(|m| *m == Message::Unchoke)
+            .await
+            .is_some(),
+        "the seeder unchokes the interested peer"
+    );
     s.shutdown().await;
 }

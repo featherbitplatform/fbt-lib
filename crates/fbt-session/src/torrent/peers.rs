@@ -64,6 +64,14 @@ impl Actor {
             PeerEvent::Wasted { bytes, .. } => {
                 self.counters.wasted = self.counters.wasted.saturating_add(bytes);
             }
+            PeerEvent::ExtHandshake { key, hs } => {
+                if let Some(p) = self.peers.get_mut(&key) {
+                    p.listen_port = hs.listen_port;
+                    p.ext = Some(hs);
+                }
+            }
+            // Metadata exchange, PEX and the DHT come with later tasks.
+            PeerEvent::Metadata { .. } | PeerEvent::Pex { .. } | PeerEvent::DhtPort { .. } => {}
             PeerEvent::Disconnected {
                 key,
                 reason,

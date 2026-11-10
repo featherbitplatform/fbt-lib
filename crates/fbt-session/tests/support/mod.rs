@@ -16,7 +16,9 @@ use fbt_core::PeerId;
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage, sha1_piece};
 use fbt_session::{Event, EventStream, Settings, TorrentHandle, TorrentState};
-use fbt_wire::{Handshake, Message, MessageCodec, Reserved, read_handshake, write_handshake};
+use fbt_wire::{
+    ExtHandshake, Handshake, Message, MessageCodec, Reserved, read_handshake, write_handshake,
+};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
 use tokio::net::TcpStream;
@@ -143,6 +145,24 @@ impl ScriptedPeer {
         if fast {
             reserved.set_fast();
         }
+        Self::connect_raw(addr, info_hash, peer_id, reserved).await
+    }
+
+    /// Connects advertising exactly the `reserved` bits.
+    pub async fn connect_with(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        reserved: Reserved,
+    ) -> ScriptedPeer {
+        Self::connect_raw(addr, info_hash, random_id(), reserved).await
+    }
+
+    async fn connect_raw(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        peer_id: PeerId,
+        reserved: Reserved,
+    ) -> ScriptedPeer {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let ours = Handshake {
             reserved,
@@ -164,6 +184,27 @@ impl ScriptedPeer {
 
     pub async fn send(&mut self, m: Message) {
         self.framed.send(m).await.expect("send");
+    }
+
+    /// Sends a BEP 10 extension handshake.
+    pub async fn send_ext_handshake(&mut self, hs: &ExtHandshake) {
+        self.send(Message::Extended {
+            id: 0,
+            payload: hs.encode(),
+        })
+        .await;
+    }
+
+    /// The payload of the next extended message with `id` within five
+    /// seconds.
+    pub async fn next_ext(&mut self, id: u8) -> Option<Bytes> {
+        match self
+            .next_matching(|m| matches!(m, Message::Extended { id: i, .. } if *i == id))
+            .await
+        {
+            Some(Message::Extended { payload, .. }) => Some(payload),
+            _ => None,
+        }
     }
 
     /// The next message matching `pred` within five seconds.
