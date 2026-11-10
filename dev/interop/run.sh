@@ -19,8 +19,12 @@ logs="$INTEROP_DIR/logs"
 tracker_url=http://tracker:6969/announce
 # The private DHT's bootstrap node; every fbt-example run uses only this one.
 dht_bootstrap=dht-node:6881
-# Seconds both clients get to announce the magnet torrent to the DHT.
-dht_announce_wait=150
+# DHT nodes in the dht-node container: 6881 plus the helpers 6882-6892.
+dht_nodes=12
+# Nodes there whose store must grow before the magnet test: measured, a
+# qBittorrent announce lands on 2 of them (libtorrent searches through one
+# node per /24) and a Transmission announce on 8 (the closest K).
+announced_nodes=4
 
 dc() { docker compose -f "$here/compose.yaml" "$@"; }
 # Commands inside the long-running containers.
@@ -153,9 +157,34 @@ tr_uploaded_changed() { # tr_uploaded_changed <hash> <previous Uploaded>
     [ -n "$up" ] && [ "$up" != "$2" ]
 }
 
-dht_node_ready() {
-    dc logs dht-node | grep -q 'dht node listening on'
+dht_log() { dc logs --no-color --no-log-prefix dht-node; }
+
+# dht_nodes_up: every node in the dht-node container is listening, every
+# helper knows a node, and the bootstrap node 6881 knows at least as many
+# nodes as there are helpers.
+dht_nodes_up() {
+    local log listening joined v4
+    log=$(dht_log)
+    listening=$(echo "$log" | grep -c '^\[[0-9]*\] dht node listening on ' || true)
+    joined=$(echo "$log" | sed -n 's/^\[\(68[89][0-9]\)\] dht nodes: v4=\([0-9]*\) .*/\1 \2/p' |
+        awk '$1 != 6881 {c[$1] = $2} END {for (p in c) if (c[p] > 0) n++; print n + 0}')
+    v4=$(echo "$log" | sed -n 's/^\[6881\] dht nodes: v4=\([0-9]*\) .*/\1/p' | tail -n 1)
+    [ "$listening" -eq "$dht_nodes" ] && [ "$joined" -eq $((dht_nodes - 1)) ] &&
+        [ "${v4:-0}" -ge $((dht_nodes - 1)) ]
 }
+
+# dht_store_counts: "<port> <stored info hashes>" per node, latest report.
+dht_store_counts() {
+    dht_log | sed -n 's/^\[\([0-9]*\)\] dht nodes: .* torrents=\([0-9]*\)$/\1 \2/p' |
+        awk '{c[$1] = $2} END {for (p in c) print p, c[p]}' | sort
+}
+
+# dht_new_stores <baseline>: nodes whose store grew past the baseline counts.
+dht_new_stores() {
+    join <(echo "$1") <(dht_store_counts) | awk '$3 > $2 {n++} END {print n + 0}'
+}
+
+dht_announced() { [ "$(dht_new_stores "$1")" -ge "$announced_nodes" ]; }
 
 # set_encryption required|preferred: both clients at once.
 set_encryption() {
@@ -168,6 +197,8 @@ set_encryption() {
     trc transmission-remote "$tr_flag" >/dev/null
     [ "$(qbt_api app/preferences | fbt jq -r .encryption)" = "$qbt_level" ] ||
         fail "qBittorrent did not take encryption=$qbt_level"
+    trc timeout 15 transmission-remote -si | grep -Eq "^ *Encryption: $1$" ||
+        fail "Transmission did not take encryption $1"
 }
 
 # start_seed <torrent> <data dir> <port> <log> [extra args...]: background
@@ -187,10 +218,14 @@ seed_ready() {
     grep -q ' seeding$' "$seed_log"
 }
 
+fbt_example_gone() { ! fbt pidof fbt-example >/dev/null; }
+
 # stop_seed: ends the background fbt-example seed (the only fbt-example
-# process in the fbt container while it runs).
+# process in the fbt container while it runs) and waits until it is gone.
 stop_seed() {
-    fbt sh -c 'pids=$(pidof fbt-example) && kill $pids' >/dev/null 2>&1 || true
+    fbt sh -c 'kill $(pidof fbt-example)' ||
+        fail "no fbt-example seed was running to stop (see $seed_log)"
+    wait_for "fbt-example seed to exit" 30 fbt_example_gone
     wait "$seed_pid" 2>/dev/null || true
 }
 
@@ -212,10 +247,13 @@ dc --progress quiet pull --ignore-buildable --policy missing
 dc up -d --quiet-pull
 [ "$(docker network inspect fbt-interop_swarm --format '{{.Internal}}')" = true ] ||
     fail "the swarm network is not internal"
-wait_for "dht-node" 60 dht_node_ready
+wait_for "all $dht_nodes DHT nodes in dht-node to listen and join" 120 dht_nodes_up
 wait_for "opentracker" 60 fbt curl -fsS http://tracker:6969/stats
 wait_for "qBittorrent WebUI" 120 qbt_api app/version
 wait_for "Transmission RPC" 120 trc timeout 15 transmission-remote -l
+tr_ip=$(container_ip transmission)
+qbt_ip=$(container_ip qbittorrent)
+[ -n "$tr_ip" ] && [ -n "$qbt_ip" ] || fail "could not resolve the client addresses"
 
 # ---------------------------------------------------------------- download --
 echo "interop: creating payload and fixture.torrent"
@@ -263,25 +301,6 @@ wait_for "Transmission to complete fixture2" 300 tr_complete "$hash2"
 stop_seed
 echo "interop: seed OK (transmission)"
 
-# ------------------------------------------------- magnet through DHT, setup --
-# Seeded now, a few minutes before the magnet test runs: Transmission's first
-# DHT announce of a new torrent took up to a minute in local runs once
-# fbt-example sessions (DHT nodes too) had come and gone, and our download
-# looks the torrent up once at its start.
-echo "interop: creating payload and trackerless fixture3.torrent"
-make_payload /interop/payload3/fixture3
-make_trackerless_torrent /interop/payload3/fixture3 /interop/fixture3.torrent
-hash3=$(info_hash /interop/fixture3.torrent)
-[ -n "$hash3" ] || fail "could not read the info hash of fixture3.torrent"
-
-echo "interop: seeding fixture3 from qBittorrent and Transmission (DHT only)"
-qbt_api torrents/add -F torrents=@/interop/fixture3.torrent -F savepath=/interop/payload3 \
-    -F skip_checking=false >/dev/null
-trc transmission-remote -a /interop/fixture3.torrent -w /interop/payload3 >/dev/null
-wait_for "qBittorrent to verify and seed fixture3" 120 qbt_seeding "$hash3"
-wait_for "Transmission to verify and seed fixture3" 120 tr_complete "$hash3"
-fixture3_seeding_since=$SECONDS
-
 # -------------------------------------------------------- forced encryption --
 echo "interop: switching qBittorrent and Transmission to encryption required"
 set_encryption required
@@ -309,37 +328,64 @@ trc transmission-remote -a /interop/fixture2.torrent -w /interop/tr-dl-enc >/dev
 wait_for "Transmission to complete fixture2 from the encrypted seed" 300 tr_complete "$hash2"
 [ "$(hashes /interop/payload2 fixture2)" = "$(hashes /interop/tr-dl-enc fixture2)" ] ||
     fail "data Transmission downloaded from the encrypted seed differs from the payload"
+grep -q "^peer connected $tr_ip:" "$logs/fbt-seed-enc.log" ||
+    fail "Transmission never connected to the encrypted seed (see $logs/fbt-seed-enc.log)"
 stop_seed
 set_encryption preferred
 echo "interop: encryption OK (qbittorrent, transmission)"
 
 # ------------------------------------------------------- magnet through DHT --
-# fixture3 was seeded before the encryption test (see above); give the
-# clients at least 30 s more, and dht_announce_wait in all, to announce it.
-wait=$((dht_announce_wait - (SECONDS - fixture3_seeding_since)))
-[ "$wait" -ge 30 ] || wait=30
-echo "interop: waiting ${wait}s for both clients to announce fixture3 to the DHT"
-sleep "$wait"
+echo "interop: creating payload and trackerless fixture3.torrent"
+make_payload /interop/payload3/fixture3
+make_trackerless_torrent /interop/payload3/fixture3 /interop/fixture3.torrent
+hash3=$(info_hash /interop/fixture3.torrent)
+[ -n "$hash3" ] || fail "could not read the info hash of fixture3.torrent"
+
+# Nothing else is announcing now, so a node whose store count grows from here
+# on stores fixture3. qBittorrent's announce alone grows 2 of dht-node's
+# stores; announced_nodes or more mean Transmission's has landed too.
+dht_baseline=$(dht_store_counts)
+echo "interop: seeding fixture3 from qBittorrent and Transmission (DHT only)"
+qbt_api torrents/add -F torrents=@/interop/fixture3.torrent -F savepath=/interop/payload3 \
+    -F skip_checking=false >/dev/null
+trc transmission-remote -a /interop/fixture3.torrent -w /interop/payload3 >/dev/null
+wait_for "qBittorrent to verify and seed fixture3" 120 qbt_seeding "$hash3"
+wait_for "Transmission to verify and seed fixture3" 120 tr_complete "$hash3"
+announce_started=$SECONDS
+wait_for "Transmission to announce fixture3 ($announced_nodes or more dht-node stores grown)" 240 \
+    dht_announced "$dht_baseline"
+echo "interop: fixture3 stored on $(dht_new_stores "$dht_baseline") of $dht_nodes dht-node nodes after $((SECONDS - announce_started))s"
 
 # --no-pex: with no tracker and no x.pe either, an outgoing connection to a
-# client's listen port can only come from an address the DHT handed out.
-echo "interop: fbt-example download magnet (timeout 300s)"
-set +e
-fbt timeout 300 fbt-example download "magnet:?xt=urn:btih:$hash3&dn=fixture3" --out /interop/fbt-magnet \
-    --port 6892 --dht-bootstrap "$dht_bootstrap" --no-pex >"$logs/fbt-magnet.log" 2>&1
-status=$?
-set -e
-check_download "$logs/fbt-magnet.log" "$status" "fbt-example download magnet"
-[ "$(hashes /interop/payload3 fixture3)" = "$(hashes /interop/fbt-magnet fixture3)" ] ||
-    fail "data downloaded from the magnet differs from the payload"
-grep -Eq 'found .* peers via dht' "$logs/fbt-magnet.log" ||
-    fail "no peers came from the DHT (see $logs/fbt-magnet.log)"
-grep -q 'metadata received: fixture3' "$logs/fbt-magnet.log" ||
-    fail "no metadata received for the magnet (see $logs/fbt-magnet.log)"
-for peer in "$(container_ip qbittorrent):6882" "$(container_ip transmission):51413"; do
-    grep -q "^peer connected $peer$" "$logs/fbt-magnet.log" ||
-        fail "the magnet download never connected to $peer found via the DHT (see $logs/fbt-magnet.log)"
+# client's listen port can only come from an address the DHT handed out. Our
+# download looks the DHT up once metadata arrives only every
+# dht_announce_interval (15 min), so a Transmission announce that lands just
+# after its first lookup is caught by a fresh attempt (at most 3 in all).
+attempt=1
+while :; do
+    log="$logs/fbt-magnet-$attempt.log"
+    echo "interop: fbt-example download magnet, attempt $attempt (timeout 300s)"
+    set +e
+    fbt timeout 300 fbt-example download "magnet:?xt=urn:btih:$hash3&dn=fixture3" \
+        --out "/interop/fbt-magnet-$attempt" --port 6892 --dht-bootstrap "$dht_bootstrap" --no-pex \
+        >"$log" 2>&1
+    status=$?
+    set -e
+    check_download "$log" "$status" "fbt-example download magnet"
+    [ "$(hashes /interop/payload3 fixture3)" = "$(hashes "/interop/fbt-magnet-$attempt" fixture3)" ] ||
+        fail "data downloaded from the magnet differs from the payload"
+    grep -Eq 'found .* peers via dht' "$log" || fail "no peers came from the DHT (see $log)"
+    grep -q 'metadata received: fixture3' "$log" || fail "no metadata received for the magnet (see $log)"
+    grep -q "^peer connected $qbt_ip:6882$" "$log" ||
+        fail "the magnet download never connected to qBittorrent ($qbt_ip:6882) found via the DHT (see $log)"
+    grep -q "^peer connected $tr_ip:51413$" "$log" && break
+    [ "$attempt" -lt 3 ] ||
+        fail "no attempt connected to Transmission ($tr_ip:51413) found via the DHT (see $logs/fbt-magnet-*.log)"
+    echo "interop: attempt $attempt did not reach Transmission through the DHT; retrying in 30s"
+    attempt=$((attempt + 1))
+    sleep 30
 done
+echo "interop: magnet attempt $attempt passed"
 echo "interop: magnet via DHT OK"
 
 # --------------------------------------------------------------------- PEX --
@@ -348,9 +394,6 @@ make_payload /interop/payload4/fixture4
 make_trackerless_torrent /interop/payload4/fixture4 /interop/fixture4.torrent
 hash4=$(info_hash /interop/fixture4.torrent)
 [ -n "$hash4" ] || fail "could not read the info hash of fixture4.torrent"
-tr_ip=$(container_ip transmission)
-qbt_ip=$(container_ip qbittorrent)
-[ -n "$tr_ip" ] && [ -n "$qbt_ip" ] || fail "could not resolve the client addresses"
 
 echo "interop: Transmission seeds fixture4; qBittorrent fetches it from $tr_ip:51413"
 trc transmission-remote -a /interop/fixture4.torrent -w /interop/payload4 >/dev/null
@@ -371,6 +414,6 @@ check_download "$logs/fbt-pex.log" "$status" "fbt-example download (PEX)"
     fail "data downloaded in the PEX scenario differs from the payload"
 grep -Eq 'found .* peers via pex' "$logs/fbt-pex.log" ||
     fail "no peers came from PEX (see $logs/fbt-pex.log)"
-grep -q "^peer connected $tr_ip:" "$logs/fbt-pex.log" ||
+grep -q "^peer connected $tr_ip:51413$" "$logs/fbt-pex.log" ||
     fail "never connected to Transmission, which only PEX could name (see $logs/fbt-pex.log)"
 echo "interop: PEX OK"

@@ -53,14 +53,23 @@ services:
     user: "${HOST_UID}:${HOST_GID}"
     environment:
       RUST_LOG: ${RUST_LOG:-info}
+    # Every node's output is prefixed with its port (`[6881] dht nodes: ...`);
+    # run.sh reads the listening lines and the per-node `torrents=` counts.
     command:
       - sh
       - -c
       - |
+        trap 'trap - TERM INT; kill 0' TERM INT
+        node() {
+          p=$$1
+          shift
+          fbt-example dht-node --port "$$p" "$$@" 2>&1 | sed -u "s/^/[$$p] /"
+        }
+        node 6881 &
         for port in $$(seq 6882 6892); do
-          fbt-example dht-node --port "$$port" --dht-bootstrap dht-node:6881 >/dev/null &
+          node "$$port" --dht-bootstrap dht-node:6881 &
         done
-        exec fbt-example dht-node --port 6881
+        wait
     networks: [swarm]
 
   fbt:

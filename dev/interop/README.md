@@ -10,24 +10,32 @@
   must download it to 100 % with matching hashes.
 - **Forced encryption:** both clients switch to encryption required
   (qBittorrent `app/setPreferences` `{"encryption":1}`, Transmission
-  `--encryption-required`). `fbt-example download --encryption forced`
-  fetches the first torrent again (both seeds' upload counters must move), then
-  `fbt-example seed --encryption forced` serves the second torrent to
-  Transmission in a fresh directory. Both clients go back to preferred.
+  `--encryption-required`; both settings are read back).
+  `fbt-example download --encryption forced` fetches the first torrent again
+  (both seeds' upload counters must move). Then, with the first seed's process
+  confirmed gone, `fbt-example seed --encryption forced` serves the second
+  torrent to Transmission in a fresh directory, and its log must show
+  Transmission connecting. Both clients go back to preferred.
 - **Magnet through DHT:** a third 64 MiB torrent with no tracker, seeded by
-  both clients from before the encryption test on, so they get at least
-  150 s (and 30 s after that test) to announce it to the private DHT:
-  Transmission's first announce of a new torrent took up to a minute in local
-  runs, and our download looks the torrent up once, when it starts. Then
+  both clients. `run.sh` waits (up to 240 s) until Transmission has announced
+  it: every node in the `dht-node` container prints its stored info-hash
+  count (`[<port>] dht nodes: ... torrents=N`), and with nothing else
+  announcing, a qBittorrent announce grows 2 of those stores and a
+  Transmission one 8, so 4 or more grown stores is the signal. Then
   `fbt-example download "magnet:?xt=urn:btih:<hash>&dn=fixture3" --no-pex`
   must find peers via the DHT, fetch the metadata (BEP 9) and finish with
   matching hashes. With no tracker, no `x.pe` and no PEX, its outgoing
   connections to qBittorrent's port 6882 and Transmission's port 51413 (both
-  required) can only come from addresses the DHT returned.
+  required) can only come from addresses the DHT returned. Once a magnet has
+  its metadata, our session looks the DHT up again only every
+  `dht_announce_interval` (15 min; every 60 s while the metadata is missing),
+  so if Transmission is missing the download is run again, at most 3
+  attempts in all, and the script prints which attempt passed.
 - **PEX:** a fourth trackerless torrent seeded by Transmission only.
   qBittorrent is pointed at Transmission (`torrents/addPeers`);
   `fbt-example download --no-dht --peer <qbittorrent>:6882` must learn
-  Transmission's address via PEX (BEP 11) from qBittorrent and connect to it.
+  Transmission's address via PEX (BEP 11) from qBittorrent and connect to its
+  listen port, `<transmission>:51413`.
 
 Every `fbt-example` run passes `--dht-bootstrap dht-node:6881`. On success it
 prints `interop: download OK (qbittorrent, transmission)`,
@@ -79,17 +87,21 @@ DHT and PEX are on in both clients; LSD and UPnP/NAT-PMP stay off. Our own
   and more than 8 nodes in all (`tr-dht.cc`, `swarm_status`). With only
   `dht-node` and qBittorrent in the network it never announces, so the
   `dht-node` container also runs eleven helper `fbt-example dht-node`
-  processes on UDP 6882-6892, bootstrapped from 6881. Transmission pings
+  processes on UDP 6882-6892, bootstrapped from 6881. `run.sh` waits until
+  all twelve are listening, every helper knows a node and 6881 knows at
+  least eleven. That took about 40 s locally (likely because the helpers' first
+  bootstrap queries reach 6881 at once from one IP). Transmission pings
   every `dht.bootstrap` entry (one every 2 s), so it reaches that threshold
   within about half a minute of starting. With only `dht-node 6881` listed it
   had to learn the helpers through `find_node` replies and, in a local run,
   had still not announced the magnet torrent two minutes after starting.
 - **libtorrent's /24 rule.** libtorrent keeps at most one routing-table node
   per /24 by default, and every container shares one bridge subnet, so
-  qBittorrent's table holds a single node. The scenarios only need each client
-  to reach `dht-node`: qBittorrent announces to it, Transmission to the
-  closest of `dht-node` and its helpers, and a `get_peers` lookup from
-  `dht-node` finds both.
+  qBittorrent's table holds a single node, and its announces reach only 2 of
+  the `dht-node` container's nodes. The scenarios only need each client to
+  reach `dht-node`. Transmission announces to the 8 closest of `dht-node`
+  and its helpers, and a `get_peers` lookup from `dht-node` finds both
+  clients.
 
 The first download and seed tests run `fbt-example` with `--no-dht`, so their
 peers come only from the tracker (and PEX). Both seeds cap their upload at
