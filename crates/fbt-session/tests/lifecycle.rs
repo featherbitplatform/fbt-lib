@@ -1,0 +1,441 @@
+//! Session and torrent lifecycle: adding, checking, pausing, removing,
+//! storage errors, events and shutdown.
+
+mod support;
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use bytes::Bytes;
+use fbt_session::{AddTorrent, Event, EventMask, RemoveMode, Session, SessionError, TorrentState};
+use fbt_wire::Message;
+use support::*;
+
+const T: Duration = Duration::from_secs(10);
+
+fn is_state(e: &Event, want: fn(&TorrentState) -> bool) -> bool {
+    matches!(e, Event::StateChanged { state, .. } if want(state))
+}
+
+#[tokio::test]
+async fn add_then_status_downloading_with_no_data() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 100_000), ("b", 7)], 16_384);
+    let mut ev = s.subscribe(EventMask::ALL);
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        ev.recv().await,
+        Some(Event::TorrentAdded { torrent }) if torrent == m.info_hashes
+    ));
+    next_matching(
+        &mut ev,
+        |e| is_state(e, |s| *s == TorrentState::Downloading),
+        T,
+    )
+    .await
+    .expect("Downloading");
+    let st = h.status();
+    assert_eq!(st.state, TorrentState::Downloading);
+    assert_eq!(st.info_hashes, m.info_hashes);
+    assert_eq!(st.name, "torrent");
+    assert_eq!(st.total_wanted, 100_007);
+    assert_eq!(st.wanted_done, 0);
+    assert_eq!(st.progress, 0.0);
+    assert_eq!(st.num_peers, 0);
+    assert!(st.error.is_none());
+    assert_eq!(h.info_hashes(), m.info_hashes);
+    assert_eq!(h.pieces().await.unwrap().count_ones(), 0);
+    assert!(s.torrent(&m.info_hashes).is_some());
+    assert_eq!(s.torrents().len(), 1);
+    assert_eq!(s.torrents_status().len(), 1);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn add_with_complete_data_becomes_seeding() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, payload) = make_torrent(&[("a", 40_000), ("sub/b", 30_000)], 16_384);
+    write_payload(dir.path(), &m, &payload);
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    let st = h.status();
+    assert_eq!(st.progress, 1.0);
+    assert_eq!(st.wanted_done, 70_000);
+    assert!(h.pieces().await.unwrap().is_full());
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_add_rejected() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 1000)], 16_384);
+    s.add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    let e = s
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SessionError::DuplicateTorrent), "{e:?}");
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_priorities_rejected() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 1000), ("b", 1000)], 16_384);
+    let h = s
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    let e = h
+        .set_file_priorities(vec![fbt_session::Priority::Skip])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            SessionError::InvalidPriorities {
+                expected: 2,
+                got: 1
+            }
+        ),
+        "{e:?}"
+    );
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn pause_resume_state_events() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 50_000)], 16_384);
+    let mut ev = s.subscribe(EventMask::STATUS);
+    let h = s
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    next_matching(
+        &mut ev,
+        |e| is_state(e, |s| *s == TorrentState::Downloading),
+        T,
+    )
+    .await
+    .expect("Downloading");
+    h.pause().await.unwrap();
+    next_matching(&mut ev, |e| is_state(e, |s| *s == TorrentState::Paused), T)
+        .await
+        .expect("Paused");
+    assert_eq!(h.status().state, TorrentState::Paused);
+    h.resume().await.unwrap();
+    next_matching(
+        &mut ev,
+        |e| is_state(e, |s| *s == TorrentState::Downloading),
+        T,
+    )
+    .await
+    .expect("Downloading again");
+    assert_eq!(h.status().state, TorrentState::Downloading);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn added_paused_stays_paused_after_checking() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 50_000)], 16_384);
+    let mut p = AddTorrent::new(m, dir.path().to_path_buf());
+    p.paused = true;
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Paused, T).await);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn remove_delete_data_removes_files() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, payload) = make_torrent(&[("a", 40_000), ("b", 3000)], 16_384);
+    write_payload(dir.path(), &m, &payload);
+    let mut ev = s.subscribe(EventMask::STATUS);
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    let root = dir.path().join("torrent");
+    assert!(root.join("a").exists());
+    h.remove(RemoveMode::DeleteData).await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentRemoved { .. }), T)
+        .await
+        .expect("TorrentRemoved");
+    assert!(!root.join("a").exists());
+    assert!(!root.join("b").exists());
+    assert!(s.torrent(&m.info_hashes).is_none());
+    assert!(s.torrents().is_empty());
+    assert!(matches!(
+        h.pause().await,
+        Err(SessionError::TorrentNotFound)
+    ));
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn checking_reports_progress() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, payload) = make_torrent(&[("big", 64 * 65_536)], 65_536);
+    assert_eq!(m.info.pieces.len(), 64);
+    write_payload(dir.path(), &m, &payload);
+    let mut ev = s.subscribe(EventMask::STATUS);
+    let h = s
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    next_matching(
+        &mut ev,
+        |e| is_state(e, |s| matches!(s, TorrentState::CheckingFiles { .. })),
+        T,
+    )
+    .await
+    .expect("CheckingFiles observed");
+    next_matching(&mut ev, |e| is_state(e, |s| *s == TorrentState::Seeding), T)
+        .await
+        .expect("Seeding after the check");
+    assert_eq!(h.status().progress, 1.0);
+    s.shutdown().await;
+}
+
+/// A save path the torrent cannot write below.
+struct Unwritable {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+fn unwritable_save_path() -> Unwritable {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ro");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).unwrap();
+    Unwritable { _dir: dir, path }
+}
+
+#[cfg(unix)]
+impl Drop for Unwritable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(windows)]
+fn unwritable_save_path() -> Unwritable {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let path = file.join("sub");
+    Unwritable { _dir: dir, path }
+}
+
+#[tokio::test]
+async fn unwritable_save_path_puts_torrent_in_error() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let mut ev = s.subscribe(EventMask::ALL);
+
+    // A healthy seeding torrent in the same session.
+    let good_dir = tempfile::tempdir().unwrap();
+    let (gm, gpayload) = make_torrent(&[("g", 20_000)], 16_384);
+    write_payload(good_dir.path(), &gm, &gpayload);
+    let good = s
+        .add_torrent(AddTorrent::new(gm, good_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&good, |s| *s == TorrentState::Seeding, T).await);
+
+    // One 16 KiB piece, fed by a scripted peer, that cannot be written.
+    let bad_path = unwritable_save_path();
+    let (m, payload) = make_torrent(&[("a", 16_384)], 16_384);
+    let bad = s
+        .add_torrent(AddTorrent::new(m.clone(), bad_path.path.clone()))
+        .await
+        .unwrap();
+    assert!(wait_state(&bad, |s| *s == TorrentState::Downloading, T).await);
+
+    let mut peer = ScriptedPeer::connect(s.local_addr(), m.info_hashes.wire_hash()).await;
+    assert_eq!(peer.remote.info_hash, m.info_hashes.wire_hash());
+    peer.send(Message::Bitfield(Bytes::from_static(&[0x80])))
+        .await;
+    peer.send(Message::Unchoke).await;
+    let Some(Message::Request(block)) = peer
+        .next_matching(|m| matches!(m, Message::Request(_)))
+        .await
+    else {
+        panic!("no request from the session");
+    };
+    assert_eq!((block.piece, block.offset, block.len), (0, 0, 16_384));
+    peer.send(Message::Piece {
+        piece: 0,
+        offset: 0,
+        data: Bytes::copy_from_slice(&payload),
+    })
+    .await;
+
+    let fe = next_matching(&mut ev, |e| matches!(e, Event::FileError { .. }), T)
+        .await
+        .expect("FileError");
+    assert!(matches!(fe, Event::FileError { torrent, .. } if torrent == m.info_hashes));
+    assert!(wait_state(&bad, |s| *s == TorrentState::Error, T).await);
+    assert!(bad.status().error.is_some());
+    // The peer is disconnected.
+    assert!(
+        peer.next_matching(|_| false).await.is_none(),
+        "connection closed"
+    );
+    // The other torrent is unaffected.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(good.status().state, TorrentState::Seeding);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn event_mask_filters_and_lag_reported() {
+    // Filtering: a PEER-only subscriber sees none of the status traffic.
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 1000)], 16_384);
+    let mut peers_only = s.subscribe(EventMask::PEER);
+    let mut status = s.subscribe(EventMask::STATUS | EventMask::STORAGE);
+    let h = s
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        status.recv().await,
+        Some(Event::TorrentAdded { .. })
+    ));
+    h.pause().await.unwrap();
+    next_matching(
+        &mut status,
+        |e| is_state(e, |s| *s == TorrentState::Paused),
+        T,
+    )
+    .await
+    .expect("Paused");
+    assert!(
+        next_matching(&mut peers_only, |_| true, Duration::from_millis(300))
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        Event::TorrentAdded {
+            torrent: h.info_hashes()
+        }
+        .category(),
+        EventMask::STATUS
+    );
+    s.shutdown().await;
+
+    // Lag: a subscriber that never reads a 4-slot queue is told what it missed.
+    let mut settings = test_settings();
+    settings.event_queue = 4;
+    let s = Session::new(settings).await.unwrap();
+    let mut lagging = s.subscribe(EventMask::PEER);
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 1000)], 16_384);
+    let h = s
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+    for _ in 0..3 {
+        h.pause().await.unwrap();
+        h.resume().await.unwrap();
+    }
+    match lagging.recv().await {
+        Some(Event::Lagged { missed }) => assert!(missed > 0),
+        other => panic!("expected Lagged, got {other:?}"),
+    }
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_is_idempotent_and_rejects_new_commands() {
+    let s = Session::new(test_settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = make_torrent(&[("a", 1000)], 16_384);
+    let h = s
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+    s.shutdown().await;
+    s.clone().shutdown().await;
+    assert!(matches!(h.pause().await, Err(SessionError::Shutdown)));
+    assert!(matches!(h.resume().await, Err(SessionError::Shutdown)));
+    assert!(matches!(h.pieces().await, Err(SessionError::Shutdown)));
+    assert!(matches!(
+        h.add_peer("127.0.0.1:1".parse().unwrap()).await,
+        Err(SessionError::Shutdown)
+    ));
+    let (m2, _) = make_torrent(&[("b", 1000)], 16_384);
+    assert!(matches!(
+        s.add_torrent(AddTorrent::new(m2, dir.path().to_path_buf()))
+            .await,
+        Err(SessionError::Shutdown)
+    ));
+    // The last snapshot stays readable.
+    assert_eq!(h.status().name, "torrent");
+}
+
+/// Smoke test of the data path between two sessions; the full swarm suite
+/// lives in `swarm.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leecher_downloads_from_seeding_session() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let (m, payload) = make_torrent(&[("a", 300_000), ("e", 0), ("b", 123_457)], 32_768);
+    write_payload(seed_dir.path(), &m, &payload);
+    let seeder = Session::new(test_settings()).await.unwrap();
+    let leecher = Session::new(test_settings()).await.unwrap();
+    let sh = seeder
+        .add_torrent(AddTorrent::new(m.clone(), seed_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&sh, |s| *s == TorrentState::Seeding, T).await);
+    let mut ev = leecher.subscribe(EventMask::STATUS | EventMask::PIECE | EventMask::PEER);
+    let lh = leecher
+        .add_torrent(AddTorrent::new(m.clone(), leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&lh, |s| *s == TorrentState::Downloading, T).await);
+    lh.add_peer(seeder.local_addr()).await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    assert!(wait_state(&lh, |s| *s == TorrentState::Seeding, T).await);
+    let mut got = Vec::new();
+    for f in ["a", "e", "b"] {
+        got.extend(std::fs::read(leech_dir.path().join("torrent").join(f)).unwrap());
+    }
+    assert!(got == payload, "downloaded bytes differ");
+    let st = lh.status();
+    assert_eq!(st.total_downloaded, payload.len() as u64);
+    assert_eq!(st.num_peers, 1);
+    assert_eq!(st.num_seeds, 1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(sh.status().total_uploaded >= payload.len() as u64);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}

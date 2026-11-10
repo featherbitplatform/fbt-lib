@@ -451,17 +451,22 @@ dependencies = [
 name = "fbt-session"
 version = "0.0.0"
 dependencies = [
+ "bitflags",
  "bytes",
+ "fbt-bencode",
  "fbt-core",
  "fbt-metainfo",
  "fbt-tracker",
  "fbt-wire",
+ "futures-core",
  "futures-util",
  "rand",
  "sha1",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

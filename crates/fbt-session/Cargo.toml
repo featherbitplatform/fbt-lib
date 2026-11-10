@@ -27,7 +27,12 @@ tokio-util.workspace = true
 futures-util.workspace = true
 sha1.workspace = true
 rand.workspace = true
+bitflags.workspace = true
+futures-core.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
+fbt-bencode = { path = "../fbt-bencode" }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }

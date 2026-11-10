@@ -38,3 +38,6 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.1.0-pre.0"
 webpki-roots = "1"
+bitflags = "2"
+futures-core = { version = "0.3", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
