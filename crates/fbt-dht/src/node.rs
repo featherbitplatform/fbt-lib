@@ -268,7 +268,7 @@ impl ExternalIpVotes {
 
     /// Records `reporter`'s view of our address. Returns a new, non-local
     /// address once it leads the held votes: at least
-    /// [`EXTERNAL_IP_QUORUM`] distinct reporters agree on it and strictly
+    /// three (`EXTERNAL_IP_QUORUM`) distinct reporters agree on it and strictly
     /// more than on any other address. A minority, however many Sybils it
     /// has, never overrides the majority; a tie keeps the current address.
     pub fn vote(&mut self, reporter: IpAddr, ip: IpAddr) -> Option<IpAddr> {
@@ -293,7 +293,7 @@ impl ExternalIpVotes {
         Some(leader)
     }
 
-    /// The address with at least [`EXTERNAL_IP_QUORUM`] votes and strictly
+    /// The address with at least three (`EXTERNAL_IP_QUORUM`) votes and strictly
     /// more than the runner-up.
     fn leader(&self) -> Option<IpAddr> {
         let mut counts: HashMap<IpAddr, usize> = HashMap::new();
