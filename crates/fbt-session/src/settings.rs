@@ -90,6 +90,12 @@ pub struct Settings {
     /// not part of the stable API. Non-zero.
     #[doc(hidden)]
     pub tracker_retry_base: Duration,
+    /// While a magnet's metadata is pending and its peer slots are full, a
+    /// peer connected this long without offering `ut_metadata` is closed
+    /// to make room. Internal tunable (tests shorten it); not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub metadata_peer_grace: Duration,
     /// Largest info dictionary a magnet torrent fetches from peers (BEP 9),
     /// in bytes; peers advertising more are disconnected. 16 KiB to
     /// [`MAX_METADATA_SIZE`].
@@ -158,6 +164,7 @@ impl Default for Settings {
             num_want: 50,
             tracker: TrackerConfig::default(),
             tracker_retry_base: Duration::from_secs(60),
+            metadata_peer_grace: Duration::from_secs(30),
             max_metadata_size: 16 * 1024 * 1024,
         }
     }

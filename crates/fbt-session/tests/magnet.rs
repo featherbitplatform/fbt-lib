@@ -114,6 +114,11 @@ async fn magnet_with_peer_hint_downloads() {
     loop {
         let e = wait_event(&mut ev, "TorrentFinished", |_| true).await;
         let last = matches!(e, Event::TorrentFinished { .. });
+        if matches!(e, Event::MetadataReceived { .. }) {
+            // The status is published before the event goes out.
+            assert!(h.status().has_metadata);
+            assert!(h.metainfo().is_some());
+        }
         seen.push(e);
         if last {
             break;
@@ -172,8 +177,11 @@ async fn metadata_from_lying_peer_is_rejected_then_fetched_from_honest_one() {
     let mut liar =
         ScriptedPeer::connect_with(leech.local_addr(), m.info_hashes.wire_hash(), fast_ext()).await;
     let liar_addr = liar.framed.get_ref().local_addr().unwrap();
-    liar.send_ext_handshake(&their_hs(Some(raw.len() as u32)))
-        .await;
+    // It names a listen port, so its listen address is banned, not its IP
+    // (the honest seeder shares 127.0.0.1).
+    let mut hs = their_hs(Some(raw.len() as u32));
+    hs.listen_port = Some(1);
+    liar.send_ext_handshake(&hs).await;
     let serve = tokio::spawn(async move {
         while let Some(msg) = next_metadata(&mut liar).await {
             if let MetadataMsg::Request { piece } = msg {
@@ -231,7 +239,9 @@ async fn oversized_or_inconsistent_metadata_is_refused() {
     // Claims 1 GiB: never asked, closed with BadMetadata.
     let mut huge = ScriptedPeer::connect_with(leech.local_addr(), ih.wire_hash(), fast_ext()).await;
     let huge_addr = huge.framed.get_ref().local_addr().unwrap();
-    huge.send_ext_handshake(&their_hs(Some(1 << 30))).await;
+    let mut hs = their_hs(Some(1 << 30));
+    hs.listen_port = Some(1);
+    huge.send_ext_handshake(&hs).await;
     let asked = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match huge.framed.next().await {
@@ -248,7 +258,8 @@ async fn oversized_or_inconsistent_metadata_is_refused() {
     })
     .await;
 
-    // Advertises 10 000 bytes, then serves a different total_size.
+    // Advertises 10 000 bytes, then serves a different total_size. It names
+    // no listen port, so its IP is banned while the metadata is pending.
     let mut liar = ScriptedPeer::connect_with(leech.local_addr(), ih.wire_hash(), fast_ext()).await;
     let liar_addr = liar.framed.get_ref().local_addr().unwrap();
     liar.send_ext_handshake(&their_hs(Some(10_000))).await;
@@ -266,7 +277,73 @@ async fn oversized_or_inconsistent_metadata_is_refused() {
     })
     .await;
     assert_eq!(liar.wait_closed(T).await, PeerEnd::Closed);
+    // A new connection from that IP is refused before any handshake.
+    let mut s = tokio::net::TcpStream::connect(leech.local_addr())
+        .await
+        .unwrap();
+    fbt_wire::write_handshake(
+        &mut s,
+        &fbt_wire::Handshake {
+            reserved: fast_ext(),
+            info_hash: ih.wire_hash(),
+            peer_id: fbt_core::PeerId([5; 20]),
+        },
+    )
+    .await
+    .unwrap();
+    let mut buf = [0u8; 68];
+    let n = tokio::time::timeout(T, tokio::io::AsyncReadExt::read(&mut s, &mut buf))
+        .await
+        .expect("closed in time")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "no handshake for a banned IP");
     assert!(dir_is_empty(dir.path()));
+    leech.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_without_ut_metadata_make_room_when_full() {
+    let mut s = settings();
+    s.max_peers_per_torrent = 1;
+    s.metadata_peer_grace = Duration::from_millis(500);
+    let leech = Session::new(s).await.unwrap();
+    let mut ev = leech.subscribe(EventMask::PEER);
+    let add = |seed: u8| {
+        AddTorrent::magnet(
+            magnet_of(InfoHashes::from_v1(InfoHashV1([seed; 20])), vec![]),
+            PathBuf::from("unused"),
+        )
+    };
+    // A peer offering ut_metadata keeps its slot past the grace.
+    let ih = InfoHashes::from_v1(InfoHashV1([11; 20]));
+    leech.add_torrent(add(11)).await.unwrap();
+    let mut useful =
+        ScriptedPeer::connect_with(leech.local_addr(), ih.wire_hash(), fast_ext()).await;
+    useful.send_ext_handshake(&their_hs(Some(1000))).await;
+    assert_eq!(
+        useful.wait_closed(Duration::from_secs(2)).await,
+        PeerEnd::TimedOut
+    );
+
+    // One without it is closed once the grace is over.
+    let ih = InfoHashes::from_v1(InfoHashV1([12; 20]));
+    leech.add_torrent(add(12)).await.unwrap();
+    let mut useless = ScriptedPeer::connect_fast(leech.local_addr(), ih.wire_hash()).await;
+    let addr = useless.framed.get_ref().local_addr().unwrap();
+    let start = tokio::time::Instant::now();
+    assert_eq!(useless.wait_closed(T).await, PeerEnd::Closed);
+    assert!(
+        start.elapsed() >= Duration::from_millis(400),
+        "{:?}",
+        start.elapsed()
+    );
+    wait_event(&mut ev, "the useless peer's disconnect", |e| {
+        matches!(
+            e,
+            Event::PeerDisconnected { addr: a, reason: DisconnectReason::Closed, .. } if *a == addr
+        )
+    })
+    .await;
     leech.shutdown().await;
 }
 

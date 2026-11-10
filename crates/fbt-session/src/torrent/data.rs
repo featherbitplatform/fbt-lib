@@ -11,6 +11,7 @@ use fbt_metainfo::{Metainfo, MetainfoError};
 use tracing::debug;
 
 use super::actor::{Actor, Phase};
+use super::swarm::BanTarget;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
@@ -42,6 +43,8 @@ pub(crate) enum Job {
     /// A complete metadata buffer from `key` was verified and parsed.
     Metadata {
         key: PeerKey,
+        /// Banned if the buffer fails the hash, even if the peer is gone.
+        ban: Option<BanTarget>,
         result: Result<Box<Metainfo>, MetainfoError>,
     },
     /// A block requested by a peer was read.
@@ -78,7 +81,7 @@ impl Actor {
                 tracing::warn!(torrent = %self.name(), error = %e, "flush failed");
             }
             Job::Flushed(Ok(())) => {}
-            Job::Metadata { key, result } => self.on_metadata_job(key, result),
+            Job::Metadata { key, ban, result } => self.on_metadata_job(key, ban, result),
         }
     }
 

@@ -13,7 +13,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
 use tracing::debug;
 
-use super::actor::Actor;
+use super::actor::{Actor, Phase};
 use crate::peer::DisconnectReason;
 use crate::peer::conn::{MAX_ALLOWED_FAST, PeerCtx, PeerStream, spawn_incoming, spawn_outgoing};
 use crate::peer::ext::ExtConfig;
@@ -114,6 +114,16 @@ pub(super) fn keep_new_connection(
     new_outgoing == (our_id.0 < their_id.0)
 }
 
+/// What a bad-metadata ban applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BanTarget {
+    /// An address never dialled again.
+    Addr(SocketAddr),
+    /// An incoming peer with no known listen address: its IP is refused
+    /// for the rest of the metadata fetch.
+    Ip(IpAddr),
+}
+
 /// What a failed attempt leads to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AfterFailure {
@@ -143,6 +153,11 @@ pub(super) struct Retries {
     plaintext_only: HashSet<SocketAddr>,
     /// `plaintext_only` in insertion order, to forget the oldest.
     plaintext_order: VecDeque<SocketAddr>,
+    /// IPs that sent bad metadata, refused while the metadata is pending
+    /// (the last [`MAX_NEVER`]).
+    metadata_ips: HashSet<IpAddr>,
+    /// `metadata_ips` in insertion order, to forget the oldest.
+    metadata_ip_order: VecDeque<IpAddr>,
 }
 
 impl Retries {
@@ -155,7 +170,26 @@ impl Retries {
             never_order: VecDeque::new(),
             plaintext_only: HashSet::new(),
             plaintext_order: VecDeque::new(),
+            metadata_ips: HashSet::new(),
+            metadata_ip_order: VecDeque::new(),
         }
+    }
+
+    /// `ip` sent bad metadata.
+    pub(super) fn ban_metadata_ip(&mut self, ip: IpAddr) {
+        if !self.metadata_ips.insert(ip) {
+            return;
+        }
+        self.metadata_ip_order.push_back(ip);
+        while self.metadata_ip_order.len() > MAX_NEVER {
+            if let Some(old) = self.metadata_ip_order.pop_front() {
+                self.metadata_ips.remove(&old);
+            }
+        }
+    }
+
+    pub(super) fn is_metadata_banned(&self, ip: &IpAddr) -> bool {
+        self.metadata_ips.contains(ip)
     }
 
     /// An MSE handshake to `addr` failed. True when a plaintext retry is
@@ -292,6 +326,8 @@ pub(super) struct Peer {
     pub listen_port: Option<u16>,
     /// The connection is RC4-encrypted (for PEX flags).
     pub encrypted: bool,
+    /// When the handshake finished.
+    pub connected_at: Option<Instant>,
     /// `ut_metadata` requests it sent (served up to
     /// [`MAX_METADATA_REQUESTS_PER_PEER`](super::metadata::MAX_METADATA_REQUESTS_PER_PEER)).
     pub metadata_requests: u32,
@@ -329,6 +365,7 @@ impl Peer {
             ext: None,
             listen_port: None,
             encrypted: false,
+            connected_at: None,
             metadata_requests: 0,
         }
     }
@@ -502,8 +539,9 @@ impl Actor {
                 release(&self.shared.global_peers);
                 break;
             };
-            // It may have connected (or connected to us) since it was queued.
-            if self.addr_busy(&addr) {
+            // It may have connected (or connected to us) since it was
+            // queued; an IP that sent bad metadata waits for the metadata.
+            if self.addr_busy(&addr) || self.metadata_ip_banned(&addr) {
                 release(&self.shared.half_open);
                 release(&self.shared.global_peers);
                 continue;
@@ -519,6 +557,11 @@ impl Actor {
             peer.have_sent = Some(have);
             self.peers.insert(key, peer);
         }
+    }
+
+    /// `addr`'s IP sent bad metadata and the metadata is still pending.
+    fn metadata_ip_banned(&self, addr: &SocketAddr) -> bool {
+        matches!(self.phase, Phase::Metadata) && self.retries.is_metadata_banned(&addr.ip())
     }
 
     /// The MSE `crypto_provide` for dialling `addr`, `None` for a plain
@@ -542,6 +585,10 @@ impl Actor {
         let s = &self.shared.settings;
         if !self.connectable() || self.peers.len() >= s.max_peers_per_torrent {
             debug!(%addr, "torrent inactive or full; dropping incoming connection");
+            return;
+        }
+        if self.metadata_ip_banned(&addr) {
+            debug!(%addr, "IP sent bad metadata; dropping incoming connection");
             return;
         }
         if !try_reserve(&self.shared.global_peers, s.max_peers_global) {
@@ -633,6 +680,7 @@ impl Actor {
             release(&self.shared.half_open);
         }
         p.connected = true;
+        p.connected_at = Some(Instant::now());
         p.peer_id = Some(peer_id);
         p.encrypted = encrypted;
         if p.outgoing {

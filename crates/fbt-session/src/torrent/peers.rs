@@ -13,6 +13,7 @@ use tracing::debug;
 use super::actor::Actor;
 use super::data::Job;
 use super::metadata::{FetchStep, MAX_METADATA_REQUESTS_PER_PEER, serve_metadata};
+use super::swarm::BanTarget;
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
@@ -294,7 +295,8 @@ impl Actor {
         let Some(m) = self.magnet.as_mut() else {
             return;
         };
-        if size.is_some_and(|s| !m.fetch.acceptable_size(s)) {
+        // 0 is merely "no metadata": not a source, not banned.
+        if size.is_some_and(|s| s != 0 && !m.fetch.acceptable_size(s)) {
             debug!(key = key.0, ?size, "unacceptable metadata_size");
             self.ban(key);
             return;
@@ -320,12 +322,15 @@ impl Actor {
             // Only from a fetch that hashes inline, which the actor does not
             // use: verify it the same way.
             FetchStep::Done(bytes) | FetchStep::Verify(_, bytes) => {
+                // Taken now: the peer may be gone when the result is in.
                 let expected = m.magnet.info_hashes;
                 let trackers = m.magnet.trackers.iter().map(|t| vec![t.clone()]).collect();
+                let ban = self.ban_target(key);
                 // Hashing up to `max_metadata_size` bytes and parsing stay off
                 // the actor.
                 self.jobs.spawn_blocking(move || Job::Metadata {
                     key,
+                    ban,
                     result: Metainfo::from_info_bytes(&bytes, expected, trackers).map(Box::new),
                 });
             }
@@ -356,15 +361,75 @@ impl Actor {
     /// Closes a peer that sent bad metadata; its address is never dialled
     /// again.
     pub(super) fn ban(&mut self, key: PeerKey) {
+        let target = self.ban_target(key);
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
         p.close_reason = Some(DisconnectReason::BadMetadata);
-        let addr = p.addr;
-        self.retries.never(addr);
-        self.known.remove(&addr);
-        self.candidates.retain(|a| *a != addr);
+        if let Some(t) = target {
+            self.apply_ban(t);
+        }
         self.close_peer(key);
+    }
+
+    /// What to ban for peer `key`: the address we dialled; for an incoming
+    /// peer its advertised listen address, else its IP.
+    pub(super) fn ban_target(&self, key: PeerKey) -> Option<BanTarget> {
+        let p = self.peers.get(&key)?;
+        Some(if p.outgoing {
+            BanTarget::Addr(p.addr)
+        } else if let Some(port) = p.listen_port {
+            BanTarget::Addr(SocketAddr::new(p.addr.ip(), port))
+        } else {
+            BanTarget::Ip(p.addr.ip())
+        })
+    }
+
+    /// Never dials the address again; an IP is refused, both ways, for
+    /// the rest of the metadata fetch.
+    pub(super) fn apply_ban(&mut self, target: BanTarget) {
+        match target {
+            BanTarget::Addr(addr) => {
+                self.retries.never(addr);
+                self.known.remove(&addr);
+                self.candidates.retain(|a| *a != addr);
+            }
+            BanTarget::Ip(ip) => self.retries.ban_metadata_ip(ip),
+        }
+    }
+
+    /// While the metadata is pending and every peer slot is taken, closes
+    /// one peer connected for `Settings::metadata_peer_grace` that never
+    /// offered `ut_metadata`, so useless peers cannot stall the fetch.
+    pub(super) fn close_useless_metadata_peer(&mut self, now: Instant) {
+        let s = &self.shared.settings;
+        if self.peers.len() < s.max_peers_per_torrent {
+            return;
+        }
+        let grace = s.metadata_peer_grace;
+        let useless = self
+            .peers
+            .iter()
+            .filter(|(_, p)| {
+                p.tx.is_some()
+                    && p.connected_at
+                        .is_some_and(|t| now.duration_since(t) >= grace)
+                    && p.ext
+                        .as_ref()
+                        .is_none_or(|e| e.id_of(UT_METADATA).is_none())
+            })
+            .min_by_key(|(_, p)| p.connected_at)
+            .map(|(k, _)| *k);
+        if let Some(key) = useless {
+            debug!(
+                key = key.0,
+                "closing a peer without ut_metadata to free a slot"
+            );
+            if let Some(p) = self.peers.get_mut(&key) {
+                p.close_reason = Some(DisconnectReason::Closed);
+            }
+            self.close_peer(key);
+        }
     }
 
     /// After the first check of a magnet: the peers connected meanwhile

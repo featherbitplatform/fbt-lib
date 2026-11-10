@@ -23,7 +23,7 @@ use tracing::warn;
 use super::announcer::{self, Announcer, STOPPED_TIMEOUT, Signals};
 use super::data::Job;
 use super::metadata::MetadataFetch;
-use super::swarm::{Known, Peer, Retries, dialable};
+use super::swarm::{BanTarget, Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
 use crate::error::SessionError;
@@ -630,6 +630,7 @@ impl Actor {
     pub(super) fn on_metadata_job(
         &mut self,
         key: PeerKey,
+        ban: Option<BanTarget>,
         result: Result<Box<Metainfo>, MetainfoError>,
     ) {
         if self.loaded.is_some() || !matches!(self.phase, Phase::Metadata) {
@@ -643,7 +644,11 @@ impl Actor {
                     .as_mut()
                     .map(|m| m.fetch.on_verify_failed(key))
                     .unwrap_or_default();
-                self.ban(key);
+                if self.peers.contains_key(&key) {
+                    self.ban(key);
+                } else if let Some(t) = ban {
+                    self.apply_ban(t);
+                }
                 self.send_metadata(sends);
             }
             Err(e) => self.metadata_failed(format!("invalid metadata: {e}")),
@@ -669,6 +674,8 @@ impl Actor {
         let total_wanted = loaded.total_wanted;
         self.install(loaded, storage);
         let _ = self.metainfo_cell.set(meta);
+        // Whoever reacts to the event sees `has_metadata` already.
+        self.publish();
         self.emit(Event::MetadataReceived { torrent: self.ih });
         // Peers were set up with no pieces; they get the layout now.
         let n = layout.num_pieces();
@@ -697,11 +704,13 @@ impl Actor {
 
     /// Advances the metadata fetch's timers.
     fn metadata_tick(&mut self) {
+        let now = Instant::now();
         let sends = match self.magnet.as_mut() {
-            Some(m) if matches!(self.phase, Phase::Metadata) => m.fetch.on_tick(Instant::now()),
+            Some(m) if matches!(self.phase, Phase::Metadata) => m.fetch.on_tick(now),
             _ => return,
         };
         self.send_metadata(sends);
+        self.close_useless_metadata_peer(now);
     }
 
     // ----- commands -----------------------------------------------------------

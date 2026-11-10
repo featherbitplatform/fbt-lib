@@ -245,9 +245,13 @@ impl MetadataFetch {
     }
 
     /// A deferred buffer from `key` failed the info hash: `key` is banned.
+    /// A peer that disconnected meanwhile is not remembered (its key is
+    /// never reused).
     pub(super) fn on_verify_failed(&mut self, key: PeerKey) -> Vec<(PeerKey, MetadataMsg)> {
+        if self.verifying.remove(&key) {
+            self.banned.insert(key);
+        }
         self.forget(key);
-        self.banned.insert(key);
         self.start_sources()
     }
 
@@ -286,13 +290,15 @@ impl MetadataFetch {
         self.start_sources()
     }
 
-    /// Starts candidates while source slots are free.
+    /// Starts candidates while source slots are free. A buffer being
+    /// verified keeps its slot, so at most [`MAX_METADATA_SOURCES`] buffers
+    /// exist at once.
     fn start_sources(&mut self) -> Vec<(PeerKey, MetadataMsg)> {
         let mut out = Vec::new();
         if self.done {
             return out;
         }
-        while self.sources.len() < MAX_METADATA_SOURCES {
+        while self.sources.len() + self.verifying.len() < MAX_METADATA_SOURCES {
             let Some((key, size)) = self.candidates.pop_front() else {
                 break;
             };
@@ -482,6 +488,35 @@ mod tests {
         // B goes on.
         f.on_message(b, data(&info, 0), now);
         assert!(matches!(f.on_message(b, data(&info, 1), now), FetchStep::Verify(k, _) if k == b));
+    }
+
+    #[test]
+    fn buffers_being_verified_keep_their_slots() {
+        let info = info(1000);
+        let mut f = MetadataFetch::new(InfoHashes::from_v1(InfoHashV1::of(&info)), MAX).deferred();
+        let now = Instant::now();
+        let (a, b, c) = (PeerKey(1), PeerKey(2), PeerKey(3));
+        for k in [a, b, c] {
+            f.on_ext_handshake(k, Some(1000), true, now);
+        }
+        assert!(matches!(
+            f.on_message(a, data(&info, 0), now),
+            FetchStep::Verify(..)
+        ));
+        assert!(matches!(
+            f.on_message(b, data(&info, 0), now),
+            FetchStep::Verify(..)
+        ));
+        // Two buffers are out for verification: C waits.
+        assert!(f.on_tick(now).is_empty());
+        assert!(f.on_ext_handshake(c, Some(1000), true, now).is_empty());
+        assert_eq!(f.on_verify_failed(a), vec![req(3, 0)]);
+        // A peer gone while verifying frees its slot too, and is not
+        // remembered as banned.
+        f.on_peer_gone(b);
+        assert!(!f.banned.contains(&b));
+        assert!(f.on_verify_failed(b).is_empty());
+        assert!(!f.banned.contains(&b));
     }
 
     #[test]
