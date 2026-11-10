@@ -482,7 +482,9 @@ impl Shared {
             }
             let before = s.readiness();
             s.conn.on_packet(p, now);
-            let confirmed = p.ty != PacketType::Syn && s.unconfirmed_until.take().is_some();
+            // Only a packet the core accepted with a valid ack of our
+            // handshake confirms: a blind spoofer cannot guess our ISN.
+            let confirmed = s.conn.is_established() && s.unconfirmed_until.take().is_some();
             let mut st = self.settle(&mut s, now, Some(before));
             st.confirmed = confirmed;
             (s.peer, st)
@@ -490,11 +492,14 @@ impl Shared {
         self.finish(key, slot, peer, st);
     }
 
-    /// Room for one more half-open connection from `ip`.
-    fn has_room(&self, table: &Table, pending: usize, ip: IpAddr) -> bool {
+    /// Room for one more half-open connection at `key`: under the limits,
+    /// and no neighbouring id in use by that peer (as `connect` keeps them
+    /// free), so a reset by send id matches one connection only.
+    fn has_room(&self, table: &Table, pending: usize, key: Key) -> bool {
         table.slots.len() < self.cfg.max_connections
             && pending < self.cfg.max_pending_accept
-            && table.half_open_from(ip) < MAX_PENDING_PER_IP
+            && table.half_open_from(key.0.ip()) < MAX_PENDING_PER_IP
+            && neighbours_free(table, key)
     }
 
     fn incoming_syn(&self, key: Key, syn: &Packet, now: Instant) {
@@ -502,7 +507,7 @@ impl Shared {
         {
             let table = lock(&self.table);
             let pending = lock(&self.pending).len();
-            if !self.has_room(&table, pending, key.0.ip()) {
+            if !self.has_room(&table, pending, key) {
                 return;
             }
         }
@@ -518,7 +523,7 @@ impl Shared {
         {
             let mut table = lock(&self.table);
             let mut pending = lock(&self.pending);
-            if table.slots.contains_key(&key) || !self.has_room(&table, pending.len(), key.0.ip()) {
+            if table.slots.contains_key(&key) || !self.has_room(&table, pending.len(), key) {
                 return;
             }
             table.slots.insert(key, Arc::clone(&slot));
@@ -628,6 +633,15 @@ impl Shared {
             s.notify_one();
         }
     }
+}
+
+/// No slot uses an id within 2 of `key`'s for the same peer (`key` itself
+/// is not checked).
+fn neighbours_free(table: &Table, key: Key) -> bool {
+    [1u16, 2]
+        .into_iter()
+        .flat_map(|d| [key.1.wrapping_add(d), key.1.wrapping_sub(d)])
+        .all(|id| !table.slots.contains_key(&(key.0, id)))
 }
 
 /// Feeds datagrams to the socket. Holds it weakly: the socket ends with its
@@ -754,13 +768,8 @@ impl UtpSocket {
             // Keep the neighbouring ids free too: an incoming SYN from the
             // same peer must not land on this connection, and a reset by
             // send id must match one connection only.
-            let free = |id: u16| {
-                (0..=4u16).all(|d| {
-                    !table
-                        .slots
-                        .contains_key(&(to, id.wrapping_add(d).wrapping_sub(2)))
-                })
-            };
+            let free =
+                |id: u16| !table.slots.contains_key(&(to, id)) && neighbours_free(&table, (to, id));
             let mut rng = rand::rng();
             let Some(id) = (0..ID_ATTEMPTS)
                 .map(|_| rng.random::<u16>())
@@ -805,6 +814,11 @@ impl UtpSocket {
     }
 
     /// The next incoming connection and its peer address.
+    ///
+    /// An incoming connection must hear from the dialer (a packet with a
+    /// valid ack of our handshake, in BitTorrent its handshake) within
+    /// `connect_timeout` of the SYN; otherwise it fails with `TimedOut`,
+    /// accepted or not.
     pub async fn accept(&self) -> Result<(UtpStream, SocketAddr), UtpError> {
         let sh = &self.inner;
         loop {

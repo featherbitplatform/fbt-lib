@@ -190,6 +190,8 @@ pub struct Connection {
     syn_ack_pending: bool,
     /// Acceptor: the SYN's sequence number, to recognise a retransmission.
     syn_seq_seen: u16,
+    /// See [`Connection::is_established`].
+    established: bool,
 }
 
 impl Connection {
@@ -248,6 +250,7 @@ impl Connection {
             is_acceptor: false,
             syn_ack_pending: false,
             syn_seq_seen: 0,
+            established: false,
         }
     }
 
@@ -306,6 +309,20 @@ impl Connection {
     /// The peer's FIN was reached and every byte before it was read.
     pub fn is_eof(&self) -> bool {
         self.eof && self.inbox.is_empty()
+    }
+
+    /// The peer proved it saw our side of the handshake: the initiator got
+    /// the acceptor's STATE, or the acceptor got a packet acking its own.
+    pub fn is_established(&self) -> bool {
+        self.established
+    }
+
+    /// An `ack_nr` a real peer could send: never past our newest packet
+    /// and, before the handshake is proven, not below our first one (as in
+    /// libutp's SYN_RECV). Anything else is forged or garbage.
+    fn ack_in_range(&self, ack_nr: u16) -> bool {
+        let newest = self.seq_nr.wrapping_sub(1);
+        seq_le(ack_nr, newest) && (self.established || seq_le(self.peer_ack, ack_nr))
     }
 
     /// Our FIN was sent and the peer acknowledged it.
@@ -527,7 +544,10 @@ impl Connection {
             }
             self.state = ConnState::Connected;
             self.ack_nr = p.seq_nr.wrapping_sub(1);
+        } else if !self.ack_in_range(p.ack_nr) {
+            return;
         }
+        self.established = true;
         self.last_recv = now;
         self.reply_micro = self.timestamp(now).wrapping_sub(p.timestamp_us);
         let old_wnd = self.peer_wnd;

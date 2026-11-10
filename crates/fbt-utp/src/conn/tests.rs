@@ -445,6 +445,15 @@ fn reset_sets_error() {
     assert_eq!(a.next_deadline(), None);
 }
 
+/// DATA from the initiator to the acceptor of [`accepted`], acking its
+/// handshake STATE (ISN 777).
+fn acc_data(seq_nr: u16, len: usize) -> Packet {
+    Packet {
+        ack_nr: 776,
+        ..data_pkt(101, seq_nr, len)
+    }
+}
+
 fn accepted(cfg: &UtpConfig) -> (Connection, Instant) {
     let t0 = Instant::now();
     let mut a = Connection::connect(cfg, v4(), 100, t0);
@@ -460,7 +469,7 @@ fn far_ahead_and_duplicate_packets_are_bounded() {
     // The SYN had seq 1, so the acceptor's ack_nr is 1.
     let (mut b, t) = accepted(&cfg);
     for i in 0..10_000u16 {
-        b.on_packet(&data_pkt(101, 3u16.wrapping_add(i), 1400), t);
+        b.on_packet(&acc_data(3u16.wrapping_add(i), 1400), t);
         assert!(b.buffered_bytes() <= cfg.recv_buffer);
         if i % 64 == 0 {
             assert!(drain(&mut b, t).len() <= 2);
@@ -469,14 +478,14 @@ fn far_ahead_and_duplicate_packets_are_bounded() {
     assert!(b.buffered_bytes() > 0);
 
     let (mut b, t) = accepted(&cfg);
-    b.on_packet(&data_pkt(101, 2, 1400), t);
-    b.on_packet(&data_pkt(101, 4, 1400), t);
+    b.on_packet(&acc_data(2, 1400), t);
+    b.on_packet(&acc_data(4, 1400), t);
     assert_eq!(b.buffered_bytes(), 2800);
     for _ in 0..1000 {
-        b.on_packet(&data_pkt(101, 2, 1400), t);
-        b.on_packet(&data_pkt(101, 4, 1400), t);
-        b.on_packet(&data_pkt(101, 1, 1400), t);
-        b.on_packet(&data_pkt(101, 0x8000, 1400), t);
+        b.on_packet(&acc_data(2, 1400), t);
+        b.on_packet(&acc_data(4, 1400), t);
+        b.on_packet(&acc_data(1, 1400), t);
+        b.on_packet(&acc_data(0x8000, 1400), t);
     }
     assert_eq!(b.buffered_bytes(), 2800);
     // A duplicate is acked, with a SACK for the hole at 3.
@@ -622,14 +631,14 @@ fn hole_filler_always_fits_after_full_reorder_buffer() {
     let (mut b, t) = accepted(&cfg);
     let mut last = 0u16;
     for seq in 3u16..40 {
-        b.on_packet(&data_pkt(101, seq, 1452), t);
+        b.on_packet(&acc_data(seq, 1452), t);
         if b.buffered_bytes() == usize::from(seq - 2) * 1452 {
             last = seq;
         }
     }
     assert!(last >= 3, "nothing buffered out of order");
     drain(&mut b, t);
-    b.on_packet(&data_pkt(101, 2, 1452), t);
+    b.on_packet(&acc_data(2, 1452), t);
     let acks = drain(&mut b, t);
     assert_eq!(
         acks.last().map(|p| p.ack_nr),
@@ -758,4 +767,33 @@ fn huge_timeouts_never_panic() {
     assert_eq!(got.len(), 10_000);
     p.a.on_timer(p.t + Duration::from_secs(3600));
     assert_eq!(p.a.state(), ConnState::Connected);
+}
+
+#[test]
+fn acceptor_ignores_packets_with_a_forged_ack() {
+    let cfg = UtpConfig::default();
+    let (mut b, t) = accepted(&cfg);
+    // Acks below our first packet (a blind guess) or past our newest one.
+    for ack in [0u16, 775, 777, 5000] {
+        let p = Packet {
+            ack_nr: ack,
+            ..acc_data(2, 100)
+        };
+        b.on_packet(&p, t);
+        let mut st = state_pkt(101, 2, ack, 1 << 20);
+        st.ack_nr = ack;
+        b.on_packet(&st, t);
+        assert!(!b.is_established(), "ack {ack} confirmed the handshake");
+        assert_eq!(b.buffered_bytes(), 0, "ack {ack} delivered data");
+    }
+    b.on_packet(&acc_data(2, 100), t);
+    assert!(b.is_established());
+    assert_eq!(b.buffered_bytes(), 100);
+    // Once established, an ack of something never sent is still refused.
+    let p = Packet {
+        ack_nr: 9000,
+        ..acc_data(3, 100)
+    };
+    b.on_packet(&p, t);
+    assert_eq!(b.buffered_bytes(), 100);
 }

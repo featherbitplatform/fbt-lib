@@ -602,3 +602,84 @@ async fn zero_buffers_are_clamped_to_one_packet() {
     r.unwrap();
     assert_eq!(got, msg);
 }
+
+/// Records the sequence number of every STATE sent, per destination.
+#[derive(Debug)]
+struct StateRecorder {
+    inner: Arc<dyn DatagramSender>,
+    states: Mutex<Vec<(SocketAddr, u16)>>,
+}
+
+impl DatagramSender for StateRecorder {
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr()
+    }
+
+    fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
+        if let Ok(p) = Packet::decode(&Bytes::copy_from_slice(data))
+            && p.ty == PacketType::State
+        {
+            self.states.lock().unwrap().push((to, p.seq_nr));
+        }
+        self.inner.send_to(data, to)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_ack_does_not_confirm_a_half_open_connection() {
+    let mut cfg = UtpConfig::default();
+    cfg.connect_timeout = Duration::from_millis(500);
+    let udp = shared_bind();
+    let rec = Arc::new(StateRecorder {
+        inner: udp.sender(),
+        states: Mutex::new(Vec::new()),
+    });
+    let server = UtpSocket::new(rec.clone(), cfg);
+    udp.set_handler(PacketKind::Utp, server.handler());
+    let handler = server.handler();
+
+    // A spoofer at one IP follows each SYN with STATE and DATA packets whose
+    // ack_nr misses our handshake: below our ISN or past anything we sent.
+    // (The recorder tells the test the ISN; the spoofer would have to guess.)
+    let started = Instant::now();
+    for i in 0..20u16 {
+        let from = SocketAddr::from(([127, 0, 0, 3], 2000 + i));
+        let id = i * 10;
+        handler.handle(from, &packet(PacketType::Syn, id, 1));
+        let isn = rec
+            .states
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(to, _)| *to == from)
+            .map(|(_, seq)| *seq);
+        let Some(isn) = isn else {
+            assert!(i >= 8, "SYN {i} was refused below the cap");
+            continue;
+        };
+        for ack in [isn.wrapping_sub(2), isn, isn.wrapping_add(5)] {
+            for ty in [PacketType::State, PacketType::Data] {
+                let mut p =
+                    Packet::decode(&Bytes::from(packet(ty, id.wrapping_add(1), 2))).unwrap();
+                p.ack_nr = ack;
+                if ty == PacketType::Data {
+                    p.payload = Bytes::from_static(b"spoofed");
+                }
+                let mut d = Vec::new();
+                p.encode(&mut d);
+                handler.handle(from, &d);
+            }
+        }
+        assert!(server.num_connections() <= fbt_utp::MAX_PENDING_PER_IP);
+    }
+    assert_eq!(server.num_connections(), fbt_utp::MAX_PENDING_PER_IP);
+
+    // Still half-open, so reaped at connect_timeout, not idle_timeout.
+    step(async {
+        while server.num_connections() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
