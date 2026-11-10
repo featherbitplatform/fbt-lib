@@ -20,3 +20,9 @@ pure-rust = ["fbt-session/tls-rustcrypto"]
 
 [dependencies]
 fbt-session = { path = "../fbt-session" }
+fbt-metainfo = { path = "../fbt-metainfo" }
+fbt-core = { path = "../fbt-core" }
+fbt-tracker = { path = "../fbt-tracker" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

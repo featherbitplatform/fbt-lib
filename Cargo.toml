@@ -41,3 +41,5 @@ webpki-roots = "1"
 bitflags = "2"
 futures-core = { version = "0.3", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+clap = { version = "4.6", features = ["derive"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
