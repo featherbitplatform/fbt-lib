@@ -8,7 +8,7 @@ mod mem;
 use std::io;
 
 pub use check::{check_pieces, sha1_piece};
-pub use fs::FsStorage;
+pub use fs::{FsStorage, StorageError, error_path};
 pub use mem::MemStorage;
 
 /// Random-access storage for the concatenated torrent content.
@@ -44,7 +44,7 @@ mod tests {
     }
 
     /// Builds a multi-file torrent: (path components, len, pad).
-    fn torrent(name: &str, files: &[(&[&str], u64, bool)], piece_len: u32) -> Metainfo {
+    pub(super) fn torrent(name: &str, files: &[(&[&str], u64, bool)], piece_len: u32) -> Metainfo {
         let total: u64 = files.iter().map(|f| f.1).sum();
         let n = total.div_ceil(u64::from(piece_len)) as usize;
         let mut b = b"d4:infod5:filesl".to_vec();

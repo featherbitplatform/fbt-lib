@@ -3,6 +3,7 @@
 use std::io;
 
 use fbt_core::Bitfield;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::warn;
 
@@ -187,7 +188,8 @@ impl Actor {
         self.dht_announcer = None;
         self.dht_rx = None;
         self.close_all();
-        // Its result would be thrown away; do not wait for a whole check.
+        // Its result would be thrown away; do not wait for a whole check
+        // (one still queued leaves the queue).
         self.cancel_check();
         let deadline = Instant::now() + PEER_DRAIN_TIMEOUT;
         // Only connected peers read their commands; one still connecting
@@ -210,15 +212,20 @@ impl Actor {
         while self.jobs.join_next().await.is_some() {}
         let delete = remove == Some(RemoveMode::DeleteData);
         let r = match self.storage.clone() {
-            Some(storage) => tokio::task::spawn_blocking(move || {
-                if delete {
-                    storage.delete_files()
-                } else {
-                    storage.flush()
+            Some(storage) => {
+                let mut job = JoinSet::new();
+                self.shared.disk.spawn(&mut job, move || {
+                    if delete {
+                        storage.delete_files()
+                    } else {
+                        storage.flush()
+                    }
+                });
+                match job.join_next().await {
+                    Some(r) => r.unwrap_or_else(|e| Err(io::Error::other(e))),
+                    None => Ok(()),
                 }
-            })
-            .await
-            .unwrap_or_else(|e| Err(io::Error::other(e))),
+            }
             None => Ok(()),
         };
         if let Some(a) = self.announcer.take()

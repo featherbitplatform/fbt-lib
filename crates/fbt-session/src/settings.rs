@@ -13,6 +13,10 @@ pub const MAX_EVENT_QUEUE: usize = 1 << 20;
 pub const MAX_INCOMING_REQUESTS: usize = 1 << 16;
 /// Largest accepted [`Settings::max_metadata_size`].
 pub const MAX_METADATA_SIZE: usize = 64 * 1024 * 1024;
+/// Largest accepted [`Settings::disk_threads`].
+pub const MAX_DISK_THREADS: usize = 64;
+/// Largest accepted [`Settings::max_active_checks`].
+const MAX_ACTIVE_CHECKS: usize = 64;
 /// Smallest accepted [`Settings::max_metadata_size`]: one metadata piece.
 const MIN_METADATA_SIZE: usize = 16_384;
 /// The public DHT routers [`Settings::default`] bootstraps from. Nothing
@@ -48,7 +52,7 @@ pub enum EncryptionPolicy {
 /// [`MAX_EVENT_QUEUE`] / [`MAX_INCOMING_REQUESTS`], a metadata cap outside
 /// 16 KiB..=[`MAX_METADATA_SIZE`], a DHT bootstrap entry that is not
 /// `host:port`, an empty or duplicated `listen_addrs`, every transport
-/// switched off) with
+/// switched off, `disk_threads` or `max_active_checks` outside 1..=64) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -181,6 +185,14 @@ pub struct Settings {
     /// the stable API. Non-zero.
     #[doc(hidden)]
     pub utp_connect_timeout: Duration,
+    /// Storage jobs (piece reads, writes, flushes and checks) running at
+    /// once across the session, each on a blocking thread (1 to
+    /// [`MAX_DISK_THREADS`]). A running check holds one for its whole run.
+    pub disk_threads: usize,
+    /// Torrents hash-checking their data at once across the session (1 to
+    /// 64; libtorrent's `active_checking`). The others wait as
+    /// [`TorrentState::QueuedForChecking`](crate::TorrentState::QueuedForChecking).
+    pub max_active_checks: usize,
 }
 
 impl Settings {
@@ -231,6 +243,18 @@ impl Settings {
             return Err(format!(
                 "max_metadata_size must be between {MIN_METADATA_SIZE} and {MAX_METADATA_SIZE}, got {}",
                 self.max_metadata_size
+            ));
+        }
+        if !(1..=MAX_DISK_THREADS).contains(&self.disk_threads) {
+            return Err(format!(
+                "disk_threads must be between 1 and {MAX_DISK_THREADS}, got {}",
+                self.disk_threads
+            ));
+        }
+        if !(1..=MAX_ACTIVE_CHECKS).contains(&self.max_active_checks) {
+            return Err(format!(
+                "max_active_checks must be between 1 and {MAX_ACTIVE_CHECKS}, got {}",
+                self.max_active_checks
             ));
         }
         if self.listen_addrs.is_empty() {
@@ -317,6 +341,8 @@ impl Default for Settings {
             enable_outgoing_utp: true,
             enable_incoming_utp: true,
             utp_connect_timeout: Duration::from_secs(3),
+            disk_threads: 8,
+            max_active_checks: 1,
         }
     }
 }

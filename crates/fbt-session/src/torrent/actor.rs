@@ -1,11 +1,12 @@
 //! The torrent actor: one task owning a torrent's picker, peers, buffers and
-//! status. It never blocks: disk and hashing run in `spawn_blocking` and
-//! come back as [`Job`]s, and commands to peers use `try_send` (a peer whose
+//! status. It never blocks: storage jobs run through the session's disk
+//! pool and hashing in `spawn_blocking`, and both come back as [`Job`]s, and commands to peers use `try_send` (a peer whose
 //! queue is full is closed as stalled).
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
@@ -15,7 +16,7 @@ use fbt_metainfo::Metainfo;
 use fbt_wire::PexFlags;
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, watch};
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::warn;
 
@@ -33,7 +34,7 @@ use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
 use crate::session::{AddTorrent, Priority, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
-use crate::storage::Storage;
+use crate::storage::{Storage, error_path};
 
 /// Capacity of the channel carrying every peer's events into the actor.
 const PEER_EVENT_QUEUE: usize = 1024;
@@ -54,6 +55,9 @@ pub(super) enum Phase {
     /// A magnet without metadata: peers connect and the metadata is
     /// fetched from them.
     Metadata,
+    /// Waiting for one of the session's `max_active_checks` slots; the
+    /// waiting job is aborted through `cancel`.
+    QueuedForCheck { cancel: AbortHandle },
     /// `check_pieces` is running; it counts checked pieces into `done` and
     /// stops at the next piece once `cancel` is set.
     Checking {
@@ -132,6 +136,9 @@ pub(crate) struct Actor {
     /// The check that follows a magnet's metadata is running: the announcer
     /// keeps running through it (no `stopped`/`started` pair).
     pub(super) metadata_check: bool,
+    /// Bumped by every `start_check`: a check slot that arrives for an
+    /// older one is given back.
+    pub(super) check_seq: u64,
     pub(super) shared: Arc<Shared>,
     /// The session's registry, which the actor leaves when removed.
     pub(super) session: Weak<SessionInner>,
@@ -266,6 +273,7 @@ impl Actor {
             magnet,
             metainfo_cell,
             metadata_check: false,
+            check_seq: 0,
             shared,
             session,
             cmds,
@@ -307,6 +315,9 @@ impl Actor {
 
     pub(super) async fn run(mut self) {
         self.start_check();
+        // Checking, queued for it, or fetching the metadata.
+        self.last_state = self.state();
+        self.publish();
         self.emit(Event::StateChanged {
             torrent: self.ih,
             state: self.last_state,
@@ -415,10 +426,15 @@ impl Actor {
 
     /// What the announcer is told: announcing while peers may connect, and
     /// through the check that follows a magnet's metadata (only while that
-    /// check is still running).
+    /// check is still queued or running).
     pub(super) fn running(&self) -> bool {
         self.connectable()
-            || (self.metadata_check && matches!(self.phase, Phase::Checking { .. }) && !self.paused)
+            || (self.metadata_check
+                && matches!(
+                    self.phase,
+                    Phase::Checking { .. } | Phase::QueuedForCheck { .. }
+                )
+                && !self.paused)
     }
 
     pub(super) fn state(&self) -> TorrentState {
@@ -426,6 +442,7 @@ impl Actor {
             Phase::Error(_) => TorrentState::Error,
             Phase::Metadata if self.paused => TorrentState::Paused,
             Phase::Metadata => TorrentState::DownloadingMetadata,
+            Phase::QueuedForCheck { .. } => TorrentState::QueuedForChecking,
             Phase::Checking { done, .. } => {
                 let n = self.loaded.as_ref().map_or(0, |l| l.layout.num_pieces());
                 let progress = if n == 0 {
@@ -598,11 +615,12 @@ impl Actor {
         }
         warn!(torrent = %self.name(), error = %e, "storage error while {during}");
         let message = format!("{during}: {e}");
+        self.cancel_check();
         self.phase = Phase::Error(message.clone());
         // A failed metadata check ends the announce like any other error.
         self.metadata_check = false;
         self.emit(Event::FileError {
-            path: None,
+            path: error_path(e).map(Path::to_path_buf),
             torrent: self.ih,
             message,
         });
@@ -625,6 +643,8 @@ impl Actor {
     pub(super) fn on_job_result(&mut self, r: Result<Job, JoinError>) {
         match r {
             Ok(job) => self.on_job(job),
+            // A check that left the queue.
+            Err(e) if e.is_cancelled() => {}
             Err(e) => warn!(error = %e, "torrent background job failed"),
         }
     }

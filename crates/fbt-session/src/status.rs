@@ -8,6 +8,10 @@ use fbt_core::InfoHashes;
 pub enum TorrentState {
     /// A magnet torrent is fetching its metadata from peers.
     DownloadingMetadata,
+    /// Waiting for one of the session's
+    /// [`max_active_checks`](crate::Settings::max_active_checks) slots to
+    /// check its data.
+    QueuedForChecking,
     /// Existing data is being hash-checked; `progress` is in `0.0..=1.0`.
     CheckingFiles {
         /// Fraction of pieces checked.

@@ -369,7 +369,10 @@ impl Task {
 fn announce_left(st: &TorrentStatus, checking_left: u64) -> u64 {
     if !st.has_metadata {
         NO_METADATA_LEFT
-    } else if matches!(st.state, TorrentState::CheckingFiles { .. }) {
+    } else if matches!(
+        st.state,
+        TorrentState::CheckingFiles { .. } | TorrentState::QueuedForChecking
+    ) {
         checking_left
     } else {
         st.total_wanted.saturating_sub(st.wanted_done)
@@ -615,6 +618,8 @@ mod tests {
         st.wanted_done = 400;
         assert_eq!(announce_left(&st, 7), 600);
         st.state = TorrentState::CheckingFiles { progress: 0.5 };
+        assert_eq!(announce_left(&st, 7), 7);
+        st.state = TorrentState::QueuedForChecking;
         assert_eq!(announce_left(&st, 7), 7);
     }
 

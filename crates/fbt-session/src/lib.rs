@@ -38,6 +38,7 @@
 #![forbid(unsafe_code)]
 
 pub mod choker;
+mod disk;
 pub mod error;
 mod event;
 mod listener;
@@ -58,8 +59,11 @@ pub use net::ListenError;
 pub use peer::{DisconnectReason, Transport};
 pub use rate::RateMeter;
 pub use session::{AddTorrent, Priority, RemoveMode, Session, TorrentSource};
-pub use settings::{DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_METADATA_SIZE, Settings};
+pub use settings::{
+    DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, Settings,
+};
 pub use status::{TorrentState, TorrentStatus};
+pub use storage::StorageError;
 pub use torrent::TorrentHandle;
 
 #[cfg(test)]

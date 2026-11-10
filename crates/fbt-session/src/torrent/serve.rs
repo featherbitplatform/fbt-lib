@@ -1,5 +1,5 @@
-//! Serving blocks to peers: each request is validated, read in
-//! `spawn_blocking` and sent back with `SendBlock`.
+//! Serving blocks to peers: each request is validated, read through
+//! the session's disk pool and sent back with `SendBlock`.
 
 use std::io;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ impl Actor {
         let storage = Arc::clone(storage);
         let offset = l.layout.piece_offset(block.piece) + u64::from(block.offset);
         let generation = self.generation;
-        self.jobs.spawn_blocking(move || {
+        self.shared.disk.spawn(&mut self.jobs, move || {
             let mut buf = vec![0u8; block.len as usize];
             let result = storage.read(offset, &mut buf).map(|()| buf);
             Job::Read {

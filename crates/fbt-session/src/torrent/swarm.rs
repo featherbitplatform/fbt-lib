@@ -1160,6 +1160,7 @@ pub(super) mod tests {
             dht: None,
             dht_addrs: Vec::new(),
             utp: Vec::new(),
+            disk: crate::disk::DiskPool::new(1, 1),
         });
         let add = AddTorrent::new(meta, PathBuf::from("unused"));
         let ih = add.source.info_hashes();

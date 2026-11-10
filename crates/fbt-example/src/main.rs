@@ -234,6 +234,7 @@ fn human_bytes(n: u64) -> String {
 fn state_name(state: TorrentState) -> &'static str {
     match state {
         TorrentState::DownloadingMetadata => "metadata",
+        TorrentState::QueuedForChecking => "queued",
         TorrentState::CheckingFiles { .. } => "checking",
         TorrentState::Downloading => "downloading",
         TorrentState::Seeding => "seeding",

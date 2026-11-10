@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::disk::DiskPool;
 use crate::error::SessionError;
 use crate::event::{Event, EventMask, EventStream};
 use crate::listener::ListenerState;
@@ -157,6 +158,8 @@ pub(crate) struct Shared {
     /// One uTP socket per shared UDP socket, in the same order (the
     /// endpoints', then the per-family fallbacks).
     pub utp: Vec<UtpSocket>,
+    /// Runs every storage job and bounds the concurrent checks.
+    pub disk: DiskPool,
 }
 
 /// The DHT port to send a peer at `peer` in `Port`: that of our DHT socket
@@ -356,6 +359,7 @@ impl Session {
         // One for every accept loop, so all of them together allow only
         // `max_peers_global` pending handshakes.
         let listener_state = Arc::new(ListenerState::new(settings.max_peers_global));
+        let disk = DiskPool::new(settings.disk_threads, settings.max_active_checks);
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -370,6 +374,7 @@ impl Session {
             dht,
             dht_addrs,
             utp,
+            disk,
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -712,6 +717,7 @@ mod tests {
             dht: None,
             dht_addrs: Vec::new(),
             utp: Vec::new(),
+            disk: crate::disk::DiskPool::new(1, 1),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();

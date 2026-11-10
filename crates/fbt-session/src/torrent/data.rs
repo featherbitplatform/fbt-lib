@@ -1,6 +1,6 @@
 //! Downloaded data: blocks are buffered per piece in memory, a complete
-//! piece is hashed and then written in `spawn_blocking`, and only a written
-//! piece counts as ours.
+//! piece is hashed in `spawn_blocking` and then written through the
+//! session's disk pool, and only a written piece counts as ours.
 
 use std::io;
 use std::sync::Arc;
@@ -20,6 +20,12 @@ use crate::storage::sha1_piece;
 /// Result of a blocking job, fed back into the actor loop.
 #[derive(Debug)]
 pub(crate) enum Job {
+    /// A check slot is free for the check `seq` (`None` only if the
+    /// semaphore was closed, which it never is).
+    CheckSlot {
+        seq: u64,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    },
     /// `check_pieces` finished.
     Checked {
         generation: u64,
@@ -59,6 +65,7 @@ pub(crate) enum Job {
 impl Actor {
     pub(super) fn on_job(&mut self, job: Job) {
         match job {
+            Job::CheckSlot { seq, permit } => self.on_check_slot(seq, permit),
             Job::Checked { generation, result } => self.on_checked(generation, result),
             Job::Hashed {
                 generation,
@@ -176,11 +183,13 @@ impl Actor {
             };
             let storage = Arc::clone(storage);
             let offset = l.layout.piece_offset(piece);
-            self.jobs.spawn_blocking(move || Job::Written {
-                generation,
-                piece,
-                result: storage.write(offset, &data),
-            });
+            self.shared
+                .disk
+                .spawn(&mut self.jobs, move || Job::Written {
+                    generation,
+                    piece,
+                    result: storage.write(offset, &data),
+                });
             return;
         }
         debug!(torrent = %l.meta.info.name, piece, "piece failed its hash check");
@@ -236,8 +245,9 @@ impl Actor {
             // Durability point; a failure here is logged, the next write
             // would surface a real storage problem.
             if let Some(storage) = self.storage.clone() {
-                self.jobs
-                    .spawn_blocking(move || Job::Flushed(storage.flush()));
+                self.shared
+                    .disk
+                    .spawn(&mut self.jobs, move || Job::Flushed(storage.flush()));
             }
         }
         self.refresh_state();
@@ -300,6 +310,7 @@ mod tests {
             dht: None,
             dht_addrs: Vec::new(),
             utp: Vec::new(),
+            disk: crate::disk::DiskPool::new(1, 1),
         });
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(LEN as u64));
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
