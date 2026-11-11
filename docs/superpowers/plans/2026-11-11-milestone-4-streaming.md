@@ -47,7 +47,7 @@ The milestone starts with the uTP work, then the `torrent/swarm.rs` split the mi
    - Tests: Task 6 `straddling_pieces_fetch_only_the_boundaries`, `reader_on_a_skipped_file_downloads_its_window`, `finished_torrent_keeps_seeds_for_a_skipped_file_reader`, `seek_away_from_skipped_file_drops_its_partial_pieces`.
 4. **A reader dropped mid-wait.** A read future is pending on a missing piece and the `FileReader` is dropped.
    - Expected: its deadlines are gone within one status tick, even when the drop's `CloseReader` could not be queued. The actor's waiter is dropped without effect. Other readers are unaffected.
-   - Tests: Task 5 `dropped_reader_is_forgotten_within_a_tick`; Task 6 `dropped_reader_clears_its_deadlines_only`.
+   - Tests: Task 5 `dropped_reader_is_forgotten_within_a_tick` (a `readers.rs` unit test) and `dropped_reader_frees_its_slot`; Task 6 `dropped_reader_clears_its_deadlines_only`.
 5. **A torrent removed, paused, rechecked or failing while a reader waits.**
    - Expected: remove fails the pending read with `StreamError::TorrentRemoved` (`ErrorKind::NotFound`), session shutdown with `StreamError::Shutdown`; a storage error fails it with `StreamError::TorrentError`. Pause serves pieces we have and leaves missing ones waiting until resume. A recheck keeps waiters and answers them after the check.
    - Tests: Task 5 `remove_while_waiting_fails_the_read`, `shutdown_while_waiting_fails_the_read`, `storage_error_fails_waiting_reads`, `pause_serves_have_pieces_and_waits_for_missing`, `recheck_keeps_waiters`.
@@ -91,6 +91,20 @@ The builder made these calls (they can be revisited by whoever plans a later mil
 - **No fuzz target.** This milestone adds no parser of remote input; Task 1 re-runs `utp_packet` and `utp_conn` because it rewrites the code they reach.
 - Version `0.4.0`; changelog entries go under `## [Unreleased]`.
 
+### Pre-flight rulings
+
+From the pre-flight scan (`.superpowers/sdd/2026-11-11-milestone-4-streaming/preflight.md`, findings F1 to F37). Each is folded into its task's text below; this list is the index.
+
+- **Task 1.** Payloads under `MERGE_BELOW` = 1024 bytes are copied (coalesced in order), so a 1-byte payload cannot pin a 2 KiB datagram; `check_invariants` bounds the inbox chunk count; new test `tiny_payloads_do_not_amplify_memory` (F1). The SYN victim is re-chosen under the table lock and evicted after it is released, never taking a slot lock inside the table lock; `resend_probe` reads `live_packets` (F2). `write_takes_at_most_send_room` accounts for the congestion window (F3).
+- **Task 2.** Private consts stay private; every path to a moved item is fixed, listed or not.
+- **Task 3.** Step 2 runs `cargo test -p fbt-session -- rate:: retries::`; the productive-peer redial test is in `tests/swarm.rs` (F4).
+- **Task 4.** `CleanLru`'s cold counter counts up from 0 (earliest demoted evicted first) (F5). `window()` is all-integer and saturating, never a panicking `Duration`/`Instant` operation (F6). `pick_piece` takes `late: &[PeerKey]` and duplicates only those owners' blocks (F7). One `ReadAhead::validate` (F9). `ReaderId` is re-exported by `torrent/mod.rs`; `MAX_DEADLINE_PIECES` lives in `stream/window.rs`; `Deadlines::ordered` is a cached slice (F10, F33).
+- **Task 5.** `open_file`/`open_file_with` are `async` (F11). The reader reaches the actor through `TorrentHandle::cmd_sender()`/`gone()` (`pub(crate)`) and a `PollSender`; a closed answer channel means "gone" only when the command channel is closed, else the read is re-sent (F12). No path drops a reader's answer while the torrent lives: discarded whole-piece reads and stale chunk reads put reader waiters back (F13). `PieceRead.reserved == 0` means "not kept"; reader waiters do not count against `MAX_PIECE_READ_WAITERS`; prefetch stays within `WHOLE_PIECE_READ_MAX` (F14). The tick drops dead readers and closed *waiters*; a new `Read` replaces the reader's old waiter (F15). Windows are filtered by `have` before `set` (F16). `set_read_ahead` returns a `Result` and nudges (F17). `FileReader::is_empty` (F18). Support gains `GatedWriteStorage` and `make_torrent_with_pad` (F19, F20). The dropped-reader tick test becomes a `readers.rs` unit test on the new `swarm::tests::actor_with` helper (F21, F24). The prefetch test uses `CountingStorage`'s read log; demotion is a unit test (F22). The unverified-bytes test fixes the peer order (F23).
+- **Task 6.** Unit tests use `actor_with` (F24). The seek-storm test bounds pieces in progress by the cache, not by `partial_cap` (F25). A seed is interesting while a deadline piece is missing, and BEP 21 "finished" means `Seeding` with no missing deadline piece, so seeds closed at the finish are redialled (F26). File A is 3 MiB + 1000 B (F27); the skipped-file test uses a 1 MiB window (F28); the seek-away test targets a file no peer has (F29); `seek_reads_ahead_of_the_rest` bounds bytes, not seconds (F30); tick-length waits become 5 s (F31). Files add `check.rs` and `tests/support/mod.rs` (`serve_recording`) (F32). `fill_deadlines` ranks peers once per call (F33).
+- **Task 7.** `stream` has `--port` and sets the other files to `Skip`; every `stream` test passes `--port 0 --no-dht` (F34, F35). Exit 2 is explicit; the bench's offsets come from an inline xorshift, no `rand` (F35).
+- **Task 8.** Only the logs of steps 2 and 3 must show `peer connected`; `ci.yml` is touched only for the timeout (F36).
+- **Task 9 and Deferred.** CHANGELOG names the async `open_file` and the new `PiecePicker` methods; the part file moves to the Milestone 5 list, per the controller's ruling (F37).
+
 ---
 
 ## File Structure
@@ -114,6 +128,7 @@ crates/fbt-session/src/
   torrent/readers.rs                              actor side: reader commands, waiters, prefetch, deadline fill
   torrent/{mod.rs,actor.rs,commands.rs,data.rs,serve.rs,peers.rs,check.rs}   wiring
 crates/fbt-session/tests/stream.rs                integration tests
+crates/fbt-session/tests/support/mod.rs           CountingStorage, FailWritesStorage, GatedWriteStorage, make_torrent_with_pad, ScriptedPeer::serve_recording
 crates/fbt/src/lib.rs, crates/fbt/tests/lib_surface.rs
 crates/fbt-example/src/main.rs, crates/fbt-example/tests/cli.rs   `stream`, `bench --stream`
 dev/bench.sh, docs/benchmarks.md
@@ -134,19 +149,20 @@ Milestone 3 final review, I2. The behaviour on the wire does not change.
 - Produces (crate-internal unless noted; the public `Connection` API keeps its signatures):
   - **Ordinals.** Every packet pushed to `outstanding` gets `ord: u64`, increasing by one per packet; `Connection` keeps `front_ord: u64`, the ordinal of `outstanding.front()`. The index of a packet is `ord - front_ord`.
   - **`to_send: BTreeSet<u64>`**: the ordinals of packets with `lost && !acked`. New packets enter it at `push_outstanding` (they keep `lost: true`), `transmit_outstanding` takes `to_send.first()`, an ack or SACK removes the ordinal, loss detection and the RTO insert it. `has_pending_send` and the guard in `packetize` read `!to_send.is_empty()`.
-  - **`live_packets: usize`**: packets neither acked nor lost. `process_ack`'s RTO re-arm and `detect_loss`'s "nothing in flight" check read it instead of scanning.
-  - **Payload.** `unsent: BytesMut` (`write` is `extend_from_slice`; `packetize` is `split_to(len).freeze()`). `inbox: VecDeque<Bytes>` plus `inbox_len: usize`; `read` copies with `copy_from_slice` chunk by chunk and drops or advances the front chunk. `ooo: BTreeMap<u16, Bytes>` stores `p.payload.clone()` (a slice of the datagram, no copy). `buffered_bytes` and `readable_bytes` read `inbox_len`.
-  - `#[doc(hidden)] pub fn check_invariants(&self) -> Result<(), String>` on `Connection`: recomputes `to_send`, `live_packets`, `flight`, `unacked_bytes`, `inbox_len` and `ooo_bytes` with full scans and reports the first mismatch. Tests and fuzzing call it; production code never does.
+  - **`live_packets: usize`**: packets neither acked nor lost. `process_ack`'s RTO re-arm, `detect_loss`'s "nothing in flight" check and `resend_probe`'s (conn.rs:596) read it instead of scanning. The SACK loss loop in `detect_loss` (conn.rs:725) stays a bounded scan (`MAX_IN_FLIGHT_PACKETS`, breaks early).
+  - **Payload.** `unsent: BytesMut` (`write` is `extend_from_slice`; `packetize` is `split_to(len).freeze()`). `inbox: VecDeque<Bytes>` plus `inbox_len: usize`; `read` copies with `copy_from_slice` chunk by chunk and drops or advances the front chunk. `ooo: BTreeMap<u16, Bytes>`. A payload of at least `MERGE_BELOW = 1024` bytes is kept as `p.payload.clone()` (a slice of the datagram, no copy). A shorter one is copied, so a tiny payload never pins a whole datagram (up to 20 + 8 × 257 header bytes) and the chunk count stays bounded: in order, it is appended to a tail `BytesMut` that is frozen into `inbox` once it holds `MERGE_BELOW` bytes or a larger chunk follows (`read` and `is_eof` see the tail too); out of order, it is stored as `Bytes::copy_from_slice`. `buffered_bytes` and `readable_bytes` read `inbox_len` (tail included).
+  - `#[doc(hidden)] pub fn check_invariants(&self) -> Result<(), String>` on `Connection`: recomputes `to_send`, `live_packets`, `flight`, `unacked_bytes`, `inbox_len` and `ooo_bytes` with full scans, checks `inbox.len() <= recv_buffer / MERGE_BELOW + 1`, and reports the first mismatch. Tests and fuzzing call it; production code never does.
   - `UtpStream::poll_read`: when `readable_bytes()` is 0 it reads nothing; otherwise it reads into `buf.initialize_unfilled_to(buf.remaining().min(readable))`.
   - `socket.rs` `handle`: a datagram that fails `Packet::decode` emits `tracing::trace!(%from, len, error = %e, "uTP datagram failed to decode")`, at most once per second per socket; the suppressed count goes in the next event's `suppressed` field.
-  - `socket.rs` `incoming_syn`: the half-open victim is evicted only after the final re-check under the table lock passed, chosen again under that lock, so a SYN that loses the re-check evicts nobody.
+  - `socket.rs` `incoming_syn`: the half-open victim is evicted only after the final re-check under the table lock passed, so a SYN that loses the re-check evicts nobody. The final re-check re-chooses the victim under the table lock and admits the SYN when `admissible` holds and either `half_open.len() < max_pending_accept` or a victim exists; the new slot is inserted; then, after the table lock is released, the existing `evict(victim)` runs (it takes the victim's slot lock and re-checks confirmation there). No slot lock is ever taken while the table lock is held.
 - The one copy per datagram (`Bytes::copy_from_slice` in `handle`) stays: `DatagramHandler` hands out `&[u8]`, and that copy is now the only one on the receive path.
 
 - [ ] **Step 1: Write failing tests.**
   - `conn/tests.rs`:
     - `pending_index_matches_a_full_scan`: two connections joined by a deterministic loop that drops every 7th datagram and reorders pairs. 2 MiB each way. `check_invariants()` is `Ok` on both sides after every `on_packet`, `on_timer` and `poll_transmit`; the bytes arrive intact.
     - `read_spans_chunks`: three DATA packets of 1000, 1, 1400 bytes arrive in order; `read` with buffers of 1, 999, 5000 and 4096 bytes returns the concatenation exactly, and `readable_bytes()` falls to 0.
-    - `write_takes_at_most_send_room`: `write` of 2 × `send_buffer` returns `send_buffer`; after packetizing, the outstanding payloads concatenate to the written bytes.
+    - `write_takes_at_most_send_room`: on an established connection, `write` of 2 × `send_buffer` returns `send_buffer`; after `poll_transmit` has run, the outstanding payloads followed by `unsent` concatenate to the first `send_buffer` written bytes (the congestion window limits how much is packetized).
+    - `tiny_payloads_do_not_amplify_memory`: 20,000 in-order 1-byte DATA packets, each carrying 8 extensions of 255 bytes, then 500 out of order: `check_invariants()` is `Ok` throughout (the chunk bound holds), `buffered_bytes()` stays within `recv_buffer`, and reading returns the bytes in order.
   - `tests/sim.rs`: `transfer_survives_loss_reorder_and_duplication` calls `check_invariants()` on both connections after every event.
   - `tests/socket.rs`: `poll_read_initialises_only_what_it_fills`: a 100-byte message read into `ReadBuf::uninit` over a `[MaybeUninit<u8>; 16384]` leaves `buf.initialized().len() == 100` and `buf.filled() == message`.
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-utp`: `check_invariants` and the initialised-length assertion do not exist or fail.
@@ -164,12 +180,12 @@ Deferred by milestone 3 (1569 lines, 1174 of them non-test). The task moves code
 
 **Files:**
 - Create: `crates/fbt-session/src/torrent/{known.rs,retries.rs,peer.rs}`.
-- Modify: `crates/fbt-session/src/torrent/{swarm.rs,mod.rs}` and every `use super::swarm::...` that names a moved item (`actor.rs`, `peers.rs`, `data.rs`, `check.rs`, `pex.rs`, `holepunch.rs`, `magnet.rs`, `commands.rs`, `serve.rs`).
+- Modify: `crates/fbt-session/src/torrent/{swarm.rs,mod.rs}` and every use of a moved item, by `use` or by path: `actor.rs` (`use super::swarm::{Known, Peer, Retries, dialable}`), `peers.rs` (`use super::swarm::dialable` and the paths `super::swarm::Peer`, `super::swarm::MAX_KNOWN`), `check.rs`, `pex.rs` (including its test's `super::super::swarm::tests::actor()`, which stays valid), `magnet.rs`, `data.rs` (and its test's `crate::torrent::swarm::Peer`). `holepunch.rs`, `commands.rs` and `serve.rs` import nothing from `swarm` today; touch them only if the compiler says so.
 
 **Interfaces:**
-- Produces (all `pub(super)` as today):
+- Produces (visibility as today: `pub(super)` items stay `pub(super)`, private consts stay private to their new file unless a sibling needs them):
   - `known.rs`: `KnownPeer`, `Known` and its methods, `MAX_KNOWN`, `dialable`.
-  - `retries.rs`: `Retries` and its methods, `AfterFailure`, `MAX_ATTEMPTS`, `FIRST_RETRY_DIVISOR`, `MAX_NEVER`.
+  - `retries.rs`: `Retries` and its methods, `AfterFailure`, `MAX_ATTEMPTS`, `FIRST_RETRY_DIVISOR`, `MAX_NEVER` (the last three private today).
   - `peer.rs`: `Peer` and its methods.
   - `swarm.rs` keeps `keep_new_connection`, `ConnectOutcome`, `BanTarget` and the `impl Actor` block (connecting, accepting, sending, closing, `on_connected`, `on_disconnected`).
   - Tests move with the code they test; the shared `tests::actor()` helper stays in `swarm.rs` at its current path `pub(in crate::torrent)`.
@@ -197,9 +213,9 @@ Two parked items from the milestone 3 uTP stall report.
 - [ ] **Step 1: Write failing tests.**
   - `rate.rs` (paused time): `fresh_meter_is_not_diluted`: record 10,000 at t0; `rate` at t0 + 0.5 s is 10,000, at t0 + 1.5 s is 5,000; after 6 s idle it is 0. Update `rate_meter_window` to the new divisor (1000 at 0 s and 4000 at 1 s read 2,500 at 1 s; the values from 5 s on are unchanged).
   - `retries.rs`: `repeated_drops_back_off`: drops at 0, 10 s, 20 s, 30 s with `connected_for` 1 s give redials due after 5 s, 60 s, 120 s and 180 s (default `peer_retry_delay` 60 s); `drops_are_capped_at_thirty_minutes` (100 drops); `a_stable_connection_resets_the_count` (`connected_for` 5 min gives 5 s again); `drop_map_is_bounded` (`MAX_NEVER + 10` addresses keep `MAX_NEVER`).
-- [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session rate:: retries::`
+- [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session -- rate:: retries::` (libtest takes several filters after `--`; cargo takes only one before it).
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run.** `cargo test -p fbt-session`: PASS, including milestone 3's `tests/utp.rs` redial tests.
+- [ ] **Step 4: Run.** `cargo test -p fbt-session`: PASS, including `tests/swarm.rs` `productive_peer_that_dropped_is_redialled` (the first drop still redials after 5 s) and the redial tests in `tests/utp.rs`.
 - [ ] **Step 5: Commit.** `fix(session): rate meter warm-up and backoff for peers that keep dropping` No trailers or attribution of any kind.
 
 ---
@@ -228,11 +244,11 @@ Pure building blocks, each with unit tests; nothing calls them yet except tests.
         pub bitrate: Option<u64>,
     }
     ```
-    with `Default` as above and `ReadAhead::new(bytes, time, bitrate)`. `Settings::read_ahead: ReadAhead` (default `ReadAhead::default()`); `Settings::validate` rejects a zero `read_ahead.time` and a `Some(0)` bitrate (`"read_ahead.time must be greater than zero"`, `"read_ahead.bitrate must be greater than zero"`).
-  - `pub(crate) const MAX_DEADLINE_PIECES: usize = 512;`
+    with `Default` as above and `ReadAhead::new(bytes, time, bitrate)`. One crate-internal `pub(crate) fn validate(&self) -> Result<(), String>` on `ReadAhead` holds the two rules (`"read_ahead.time must be greater than zero"`, `"read_ahead.bitrate must be greater than zero"`); `Settings::validate`, Task 5's `open_file_with` and `FileReader::set_read_ahead` all call it, nobody repeats the checks. `Settings::read_ahead: ReadAhead` (default `ReadAhead::default()`).
+  - `pub(crate) const MAX_DEADLINE_PIECES: usize = 512;` in `stream/window.rs`.
   - Every `Instant` in this task and Tasks 5 and 6 is `tokio::time::Instant`, as in the actor, so paused-time tests drive deadlines.
-  - `stream/window.rs`: `pub(crate) fn window(file: Range<u64>, pos: u64, layout: &PieceLayout, ra: &ReadAhead, now: Instant) -> Vec<(u32, Instant)>`. `pos` is torrent-global. Empty when the file is empty or `pos >= file.end`. Otherwise the pieces covering `[pos, min(pos + W, file.end))` with `W = max(ra.bytes, bitrate × time)` saturating, at most `MAX_DEADLINE_PIECES`, in index order; the piece holding `pos` gets `now`, piece `i` after it gets `now + (piece_offset(i) - pos) / rate` with `rate = bitrate.unwrap_or(max(1, bytes / time.as_secs_f64()))`.
-  - `torrent/deadline.rs`, `pub(crate) struct ReaderId(pub u64)` (`Copy`, `Eq`, `Hash`, `Ord`, `Debug`) and:
+  - `stream/window.rs`: `pub(crate) fn window(file: Range<u64>, pos: u64, layout: &PieceLayout, ra: &ReadAhead, now: Instant) -> Vec<(u32, Instant)>`. `pos` is torrent-global. Empty when the file is empty or `pos >= file.end`. Otherwise the pieces covering `[pos, min(pos + W, file.end))` with `W = max(ra.bytes, rate × time)` saturating, at most `MAX_DEADLINE_PIECES`, in index order; the piece holding `pos` gets `now`, piece `i` after it gets `now + delay(piece_offset(i) - pos)`. All in integers, never `f64` or a panicking `Duration`/`Instant` operation: `rate = bitrate.unwrap_or(max(1, bytes × 1000 / time_ms))` (saturating, bytes per second), `delay(d) = Duration::from_millis(d.saturating_mul(1000) / rate)`, deadline `now.checked_add(delay).unwrap_or(now + FAR)` with `FAR` = 365 days.
+  - `torrent/deadline.rs`, `pub(crate) struct ReaderId(pub u64)` (`Copy`, `Eq`, `Hash`, `Ord`, `Debug`), re-exported for the crate by `torrent/mod.rs` (`pub(crate) use deadline::ReaderId;`, since `torrent` and `deadline` are private modules and `stream/reader.rs` names it), and:
     ```rust
     pub(super) struct Deadlines { /* per reader: Vec<(u32, Instant)>; merged: HashMap<u32, Instant> */ }
     impl Deadlines {
@@ -242,8 +258,10 @@ Pure building blocks, each with unit tests; nothing calls them yet except tests.
         pub fn remove(&mut self, reader: ReaderId) -> Vec<u32>;
         pub fn deadline(&self, piece: u32) -> Option<Instant>;   // earliest over readers
         pub fn contains(&self, piece: u32) -> bool;
-        /// Every piece with a deadline, earliest first (ties by index).
-        pub fn ordered(&self) -> Vec<(u32, Instant)>;
+        /// Every piece with a deadline, earliest first (ties by index). Kept
+        /// sorted and rebuilt only when `set`, `remove` or `piece_done`
+        /// change something, so `fill` never sorts.
+        pub fn ordered(&self) -> &[(u32, Instant)];
         /// The piece passed: dropped from every window until the next `set`.
         pub fn piece_done(&mut self, piece: u32);
         pub fn holders(&self, piece: u32) -> usize;              // readers whose window has it
@@ -251,10 +269,10 @@ Pure building blocks, each with unit tests; nothing calls them yet except tests.
     }
     ```
   - `PiecePicker` additions:
-    - `pub fn pick_piece(&mut self, peer: PeerKey, piece: u32, max_blocks: usize, duplicate: bool) -> Vec<BlockRef>`: free blocks of `piece`, starting it if `Unrequested` whatever its priority (0 included); with `duplicate`, then blocks held by exactly one other peer and not by `peer` (never past `MAX_OWNERS`). Nothing for a piece we have, one pending its hash check, or out of range. A started priority-0 piece never enters `partial` or the buckets, so the normal pick never continues it.
+    - `pub fn pick_piece(&mut self, peer: PeerKey, piece: u32, max_blocks: usize, late: &[PeerKey]) -> Vec<BlockRef>`: free blocks of `piece`, starting it if `Unrequested` whatever its priority (0 included); then blocks whose single owner is in `late` and is not `peer` (never past `MAX_OWNERS`). An empty `late` takes no duplicate, so only the blocks of late owners are ever duplicated, never those of a fast owner of the same piece. Nothing for a piece we have, one pending its hash check, or out of range. A started priority-0 piece never enters `partial` or the buckets, so the normal pick never continues it.
     - `#[derive(Debug, Clone, PartialEq, Eq)] pub struct PieceProgress { pub free: usize, pub owners: Vec<PeerKey> }` and `pub fn progress(&self, piece: u32) -> Option<PieceProgress>`: `None` for a piece we have, pending its hash or out of range; `owners` are the peers holding an unreceived block, sorted, deduplicated.
     - `pub fn abandon(&mut self, piece: u32) -> Vec<(PeerKey, BlockRef)>`: drops the piece's download progress like `piece_failed` and returns the blocks that were outstanding, for the caller to cancel.
-  - `PieceCache` additions: `pub(crate) fn demote(&mut self, piece: u32)` (a clean entry of this torrent becomes the session's next eviction; dirty or writing pieces are unaffected) and `pub(crate) fn is_cached(&self, piece: u32) -> bool` (dirty, writing or clean, without touching the LRU order). `CleanLru` starts `next_use` at `1 << 62` and keeps a `next_cold` counter going down from `(1 << 62) - 1`, so demoted entries sort before every used one, most recently demoted last among them.
+  - `PieceCache` additions: `pub(crate) fn demote(&mut self, piece: u32)` (a clean entry of this torrent becomes the session's next eviction; dirty or writing pieces are unaffected) and `pub(crate) fn is_cached(&self, piece: u32) -> bool` (dirty, writing or clean, without touching the LRU order). `CleanLru` starts `next_use` at `1 << 62` (a hand-written `Default` replaces the derive) and keeps a `next_cold` counter that starts at 0 and counts up, so demoted entries sort before every used one and, among them, the earliest demoted is evicted first (for a sequential reader, the piece furthest behind it).
 
 - [ ] **Step 1: Write failing tests.**
   - `layout.rs`: `file_range_of_each_file` (lengths 10, 0, 5: `0..10`, `10..10`, `10..15`, `None` for 3).
@@ -263,16 +281,17 @@ Pure building blocks, each with unit tests; nothing calls them yet except tests.
     - `bitrate_extends_the_window`: bitrate 4 MiB/s × 10 s gives 40 MiB;
     - `window_stops_at_the_file_end` and `empty_at_or_past_the_end`;
     - `window_is_capped`: piece length 16 KiB, 64 MiB window gives `MAX_DEADLINE_PIECES`;
-    - `huge_values_saturate`: `bytes: u64::MAX`, `bitrate: Some(u64::MAX)` neither panics nor exceeds the cap.
+    - `huge_values_saturate`: `bytes: u64::MAX`, `bitrate: Some(u64::MAX)` neither panics nor exceeds the cap; nor does `bitrate: Some(1)` over a layout of 4 GiB pieces (deadlines saturate at `now + FAR`).
   - `deadline.rs`: `earliest_deadline_wins_across_readers`, `set_returns_pieces_left_by_everyone` (two readers overlap; moving one returns only pieces the other does not hold), `remove_returns_orphans`, `ordered_is_by_deadline_then_index`, `piece_done_drops_it_from_every_window`.
   - `picker.rs`:
     - `pick_piece_starts_a_skipped_piece`: priority 0 piece 3 is started by `pick_piece`, then `pick` from any peer never returns its blocks;
-    - `pick_piece_duplicates_once`: peer A holds all blocks; `pick_piece(B, .., true)` returns them, `pick_piece(C, .., true)` returns none; `on_block` from B cancels A;
+    - `pick_piece_duplicates_once`: peer A holds all blocks; `pick_piece(B, .., &[A])` returns them, `pick_piece(C, .., &[A])` returns none (two owners), `pick_piece(C, .., &[])` returns none; `on_block` from B cancels A;
+    - `pick_piece_duplicates_only_late_owners`: A holds blocks 0 and 1, D holds blocks 2 and 3; `pick_piece(B, .., &[A])` returns blocks 0 and 1 only;
     - `progress_lists_owners_and_free`;
     - `abandon_returns_outstanding_and_requeues`: a normal-priority piece goes back to the buckets; a priority-0 one does not;
     - `random_operations_keep_invariants` gains `pick_piece` and `abandon` operations.
-  - `cache.rs`: `demoted_entry_is_evicted_first`, `demote_leaves_dirty_pieces_alone`, `is_cached_does_not_touch_the_lru`.
-  - `settings.rs`: `zero_read_ahead_time_is_invalid`.
+  - `cache.rs`: `demoted_entry_is_evicted_first` (two pieces demoted in order p, q: p goes before q, both before any used entry), `demote_leaves_dirty_pieces_alone`, `is_cached_does_not_touch_the_lru`.
+  - `settings.rs`: `zero_read_ahead_time_is_invalid` (both messages: a zero `time` and a `Some(0)` bitrate).
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-core -p fbt-session`
 - [ ] **Step 3: Implement.** Mark the not-yet-called items `#[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]` as milestone 3 did, and remove those attributes in the task that calls them.
 - [ ] **Step 4: Run.** `cargo test -p fbt-core -p fbt-session && cargo clippy --workspace --all-targets -- -D warnings`: PASS.
@@ -286,58 +305,66 @@ Reads work end to end, waiting for the normal download; deadlines are recorded b
 
 **Files:**
 - Create: `crates/fbt-session/src/stream/reader.rs`, `crates/fbt-session/src/torrent/readers.rs`, `crates/fbt-session/tests/stream.rs`.
-- Modify: `crates/fbt-session/src/stream/mod.rs`, `crates/fbt-session/src/{error.rs,lib.rs}`, `crates/fbt-session/src/torrent/{mod.rs,actor.rs,commands.rs,data.rs,serve.rs,check.rs}`, `crates/fbt-session/tests/support/mod.rs` (`CountingStorage`, counting reads; `FailWritesStorage`, failing writes while a shared `AtomicBool` is set).
+- Modify: `crates/fbt-session/src/stream/mod.rs`, `crates/fbt-session/src/{error.rs,lib.rs}`, `crates/fbt-session/src/storage/cache.rs` (the test-only `next_clean_victim`), `crates/fbt-session/src/torrent/{mod.rs,actor.rs,commands.rs,data.rs,serve.rs,check.rs}`, `crates/fbt-session/src/torrent/swarm.rs` (test module only: `actor_with`, below), `crates/fbt-session/tests/support/mod.rs` (`CountingStorage`, counting reads and logging each read's offset; `FailWritesStorage`, failing writes while a shared `AtomicBool` is set; `GatedWriteStorage`, whose writes block while a shared `AtomicBool` is set, polling it every 10 ms; `make_torrent_with_pad(files, pad_after: usize, piece_len)`, which inserts a BEP 47 pad entry (`attr: "p"`) after file `pad_after`, as the `storage/mod.rs` tests do). `SlowStorage` delays reads only and is not used for write delays.
 
 **Interfaces:**
 - Consumes: Task 4's `window`, `Deadlines`, `ReaderId`, `ReadAhead`, `PieceCache::{demote, is_cached}`, `FileLayout::file_range`.
 - Produces (public):
   - `SessionError::InvalidFileIndex { index: usize, files: usize }` (out of range or a pad file) and `SessionError::TooManyReaders`.
   - `#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] #[non_exhaustive] pub enum StreamError { TorrentRemoved, Shutdown, TorrentError(String) }`, carried inside the `io::Error` a read returns, with the kinds listed under Decisions; `err.get_ref()` downcasts to it.
-  - `TorrentHandle::open_file(&self, index: usize) -> Result<FileReader, SessionError>` (with `Settings::read_ahead`) and `open_file_with(&self, index: usize, read_ahead: ReadAhead) -> Result<FileReader, SessionError>`. Errors: `NoMetadata`, `InvalidFileIndex`, `TooManyReaders`, `InvalidSettings` for a zero `time` or `Some(0)` bitrate, `TorrentNotFound`/`Shutdown` as the other commands.
-  - `pub struct FileReader` (`Send`, `Unpin`, `Debug`; not `Clone`): `impl AsyncRead`, `impl AsyncSeek`, and `len(&self) -> u64`, `position(&self) -> u64`, `index(&self) -> usize`, `set_read_ahead(&mut self, ReadAhead)` (applied with the next nudge). Seeks are local: `start_seek` computes the new position (`InvalidInput` below 0, saturating above), drops a pending fetch for another chunk, stores the position in the link and nudges; `poll_complete` is ready at once. A read at or past `len` returns `Ok(0)` without a command. Otherwise the reader asks for `[pos, pos + min(MAX_READ_CHUNK, piece end, file end))`, keeps the returned `Bytes` as its current chunk and serves later reads from it while they fall inside it.
+  - `pub async fn open_file(&self, index: usize) -> Result<FileReader, SessionError>` on `TorrentHandle` (with `Settings::read_ahead`) and `pub async fn open_file_with(&self, index: usize, read_ahead: ReadAhead) -> Result<FileReader, SessionError>`. Both are `async`: the reader slot is taken by the actor (`Cmd::OpenReader`), which is the only place `TooManyReaders` can be decided. `NoMetadata` and `InvalidFileIndex` are checked first from `metainfo()`, without a command, as `set_file_priorities` does; `InvalidSettings` comes from `ReadAhead::validate`; `TorrentNotFound`/`Shutdown` as the other commands.
+  - `pub struct FileReader` (`Send`, `Unpin`; `Debug` written by hand, since it holds a future; not `Clone`): `impl AsyncRead`, `impl AsyncSeek`, and `len(&self) -> u64`, `is_empty(&self) -> bool` (clippy's `len_without_is_empty` is denied under `-D warnings`), `position(&self) -> u64`, `index(&self) -> usize`, `set_read_ahead(&mut self, ReadAhead) -> Result<(), SessionError>` (`InvalidSettings` through `ReadAhead::validate`; on success it stores the value in the link and calls `moved(position)`, so the actor applies it at once instead of at some later move). Seeks are local: `start_seek` computes the new position (`InvalidInput` below 0, saturating above), drops a pending fetch for another chunk, stores the position in the link and nudges; `poll_complete` is ready at once. A read at or past `len` returns `Ok(0)` without a command. Otherwise the reader asks for `[pos, pos + min(MAX_READ_CHUNK, piece end, file end))`, keeps the returned `Bytes` as its current chunk and serves later reads from it while they fall inside it.
 - Produces (crate-internal):
   - `stream/reader.rs`: `pub(crate) struct ReaderLink { pos: AtomicU64 /* torrent-global */, seq: AtomicU64, nudged: AtomicBool, read_ahead: Mutex<ReadAhead> }` with:
     - `fn moved(&self, pos: u64, send: impl FnOnce() -> bool)`: stores `pos`, bumps `seq`, and calls `send` (the reader's `try_send` of `Cmd::ReaderMoved(id)`) only when `nudged` was false (swap); a `send` returning false clears `nudged` again;
     - `fn take(&self) -> (u64, u64)`: the actor clears `nudged` and reads `(pos, seq)`.
-    The reader calls `moved` on every seek and when its position enters a new piece.
+    The reader calls `moved` on every seek, when its position enters a new piece, and from `set_read_ahead`. All `ReaderLink` atomics use `SeqCst`.
+  - **Reaching the actor.** `HandleInner` and its `cmds` are private to `torrent`, so `TorrentHandle` gains `pub(crate) fn cmd_sender(&self) -> mpsc::Sender<Cmd>` and makes `gone()` `pub(crate)`. The `FileReader` keeps a `TorrentHandle` clone. `poll_read` cannot `.await`: it sends `Read` through `tokio_util::sync::PollSender` (or a boxed send-then-receive future); `tokio-util` is already a dependency, so nothing is added to `Cargo.toml`. A closed answer channel means the torrent is gone only when `cmd_sender().is_closed()`; the reader then maps it through `gone()` (`TorrentNotFound` → `StreamError::TorrentRemoved`, `Shutdown` → `StreamError::Shutdown`). Otherwise, the actor dropped the answer while the torrent still lives, and the reader sends the `Read` again.
   - `#[doc(hidden)] pub async fn debug_deadlines(&self) -> Vec<(u32, Duration)>` on `TorrentHandle` (a `Cmd::DebugDeadlines(oneshot::Sender<..>)`): the merged deadlines as time left per piece, for tests.
   - New `Cmd`s:
     - `OpenReader { file: usize, link: Arc<ReaderLink>, tx: oneshot::Sender<Result<ReaderId, SessionError>> }`;
     - `ReaderMoved(ReaderId)`;
     - `CloseReader(ReaderId)` (sent by `Drop` with `try_send`);
-    - `Read { reader: ReaderId, offset: u64, len: u32, tx: oneshot::Sender<Result<Bytes, StreamError>> }`, at most one in flight per reader.
+    - `Read { reader: ReaderId, offset: u64 /* torrent-global */, len: u32, tx: oneshot::Sender<Result<Bytes, StreamError>> }`, at most one in flight per reader: a new `Read` from a reader first removes that reader's earlier waiter (the one a seek abandoned), wherever it waits.
   - `pub(crate) const MAX_READERS: usize = 16;`, `pub(crate) const MAX_READ_CHUNK: u32 = 1 << 20;`, `pub(crate) const READ_PREFETCH_PIECES: u32 = 2;`
+  - Test helper `swarm::tests::actor_with(files: &[u64], piece_len: u32, cache_size: u64) -> Actor` (`pub(in crate::torrent)`, next to `actor()`, which stays as it is): a multi-file torrent of those lengths, `Loaded` with a `PiecePicker` built from an empty bitfield (priorities from `piece_priorities`), `Phase::Ready`, not paused, and a `CacheBudget` of `cache_size`. Peers are added the way `pex.rs`'s `actor_with_peers` does. `actor()` cannot serve: it is a one-piece, one-block torrent with a zero budget and no picker.
   - `torrent/readers.rs`, owned by the actor as `readers: Readers`: per reader the file range, a `Weak<ReaderLink>`, the last applied `seq`, its current piece, and the window it last set in `actor.deadlines: Deadlines`. `waiting: HashMap<u32, Vec<(ReaderId, u64 /*offset*/, u32 /*len*/, oneshot::Sender<..>)>>`, at most one entry per reader.
-  - Actor methods: `on_open_reader`, `on_reader_moved(id)`, `on_close_reader(id)`, `on_read(...)`, `readers_tick()` (on the status tick: drop readers whose `Weak` is dead or whose answer channel is closed, re-sync any whose `seq` moved, recompute every window relative to now), `answer_piece(piece, &Arc<[u8]>)` (answers that piece's waiters with `Bytes::from_owner(Arc::clone(data)).slice(..)`), `fail_readers(StreamError)`.
+  - Actor methods: `on_open_reader`, `on_reader_moved(id)`, `on_close_reader(id)`, `on_read(...)`, `readers_tick()` (on the status tick: drop readers whose `Weak` is dead; drop *waiters* whose sender `is_closed()`, in `waiting` and in `PieceReads`, without touching their reader, since a seek closes its pending fetch on purpose; re-sync any reader whose `seq` moved; recompute every window relative to now), `answer_piece(piece, &Arc<[u8]>)` (answers that piece's waiters with `Bytes::from_owner(Arc::clone(data)).slice(..)`), `fail_readers(StreamError)`.
+  - **Windows hold missing pieces only.** Before every `Deadlines::set` the actor drops the pieces `picker.have()` has (no picker while checking: the window is set unfiltered and filtered again after `on_checked`). So a piece that passed never comes back with the next re-sync, and `debug_deadlines()` lists missing pieces only.
   - **Serving a `Read`:**
     1. `Phase::Error` answers `TorrentError` at once;
-    2. a piece the picker has is served from `cache.get`, else read from disk through the pool: the whole piece when it is at most `WHOLE_PIECE_READ_MAX` (kept clean when `reserve_clean` succeeds, else not kept), the chunk alone otherwise. A whole-piece read shares `PieceReads` with peer requests: `PieceRead.waiting` becomes `Vec<Waiter>` with `enum Waiter { Peer(PeerKey, BlockRef), Reader(ReaderId, u64, u32, oneshot::Sender<Result<Bytes, StreamError>>) }`, and `MAX_PIECE_READS` still bounds them (a reader read beyond it uses a one-off chunk read);
+    2. a piece the picker has is served from `cache.get`, else read from disk through the pool: the whole piece when it is at most `WHOLE_PIECE_READ_MAX` (made `pub(super)` in `serve.rs`; kept clean when `reserve_clean` succeeds, else not kept), the chunk alone otherwise (a new `Job::ReadChunk { generation, reader, offset, len, tx }`). A whole-piece read shares `PieceReads` with peer requests: `PieceRead.waiting` becomes `Vec<Waiter>` with `enum Waiter { Peer(PeerKey, BlockRef), Reader(ReaderId, u64, u32, oneshot::Sender<Result<Bytes, StreamError>>) }`, and `MAX_PIECE_READS` still bounds the reads (a reader read beyond it uses a one-off chunk read). `PieceRead.reserved` may now be 0, meaning "read without a reservation, not kept": `on_read_piece` checks the buffer length against the piece size (not against `reserved`), keeps the piece clean only when `reserved > 0`, and gives back only what was reserved. Reader waiters (at most `MAX_READERS` per torrent) do not count against `MAX_PIECE_READ_WAITERS`, which keeps bounding peer waiters;
     3. otherwise the request waits in `waiting`.
-  - **Answers from the download.** `on_hashed` converts the verified data to `Arc<[u8]>` once, calls `answer_piece` and then `insert_dirty` with the same `Arc`, so a waiting read returns before the piece is written. `on_checked` answers the waiters whose pieces the check found and keeps the rest. A `NotFound` disk read for a reader goes through the existing `piece_lost` path and the read waits again for the re-download.
-  - **Lifecycle.** `fail()` (storage error) calls `fail_readers(TorrentError(message))`; the actor dropping on remove or shutdown drops the senders, and the reader maps a closed channel to `TorrentRemoved` or `Shutdown` through `TorrentHandle`'s existing `gone()` rule. Pause and recheck keep waiters.
-  - **Sequential read cache.** When a reader's current piece moves from `p` to `q`, the actor demotes `p` unless `Deadlines::holders(p) > 0` for another reader, then prefetches up to `READ_PREFETCH_PIECES` pieces after `q` in the file that the picker has, that are not `is_cached` and not in `PieceReads`, each only if `reserve_clean` succeeds.
+  - **Answers from the download.** `on_hashed` converts the verified data to `Arc<[u8]>` once, calls `answer_piece` and then `insert_dirty` with the same `Arc`, so a waiting read returns before the piece is written. `on_checked` answers the waiters whose pieces the check found and keeps the rest. A `NotFound` disk read for a reader goes through the existing `piece_lost` path (which now takes `Vec<Waiter>`: peers are rejected as today, readers go back to `waiting`) and the read waits again for the re-download.
+  - **No answer is dropped while the torrent lives.** Every path that today discards a whole-piece read moves its `Waiter::Reader`s back to `readers.waiting` instead of dropping their senders: `drop_piece_reads` (reached from `clear_bufs` on recheck, on `fail()` and on resume after an error), and in `on_read_piece` a stale generation, a phase other than `Ready`, a wrong length and a non-`NotFound` error. A stale `Job::ReadChunk` does the same. Otherwise the reader would see a closed channel and report `TorrentRemoved` for a recheck.
+  - **Lifecycle.** `fail()` (storage error) calls `fail_readers(TorrentError(message))` after `clear_bufs`, so the waiters moved back above are failed too; the actor exiting on remove or shutdown drops the senders, and the reader maps that (command channel closed) to `TorrentRemoved` or `Shutdown` through `gone()`. Pause and recheck keep waiters.
+  - **Sequential read cache.** When a reader's current piece moves from `p` to `q`, the actor demotes `p` unless `Deadlines::holders(p) > 0` for another reader, then prefetches up to `READ_PREFETCH_PIECES` pieces after `q` in the file that the picker has, that are at most `WHOLE_PIECE_READ_MAX`, not `is_cached` and not in `PieceReads`, each only if `reserve_clean` succeeds. `CacheBudget` gains a `#[cfg(test)] fn next_clean_victim(&self) -> Option<(u64, u32)>` for the unit test below.
 
 - [ ] **Step 1: Write failing tests.** Unit tests in `stream/reader.rs` and integration tests in `tests/stream.rs` (a seed and a leech session on loopback with `test_settings()`, payload from `support::make_torrent`, files of 3 MiB, 0 B and 5 MiB, piece length 256 KiB):
   - `stream/reader.rs`: `seek_storm_queues_one_nudge`: 10,000 `moved` calls with a counting `send` that returns true call it once, and `take()` gives the last position and `seq` 10,000; the next `moved` calls it again; with a `send` returning false every call retries.
+  - `torrent/readers.rs` (unit tests on `swarm::tests::actor_with`, the helper Task 6 specifies; this task adds it):
+    - `dropped_reader_is_forgotten_within_a_tick`: a reader is opened through `on_open_reader` with a `Read` waiting on a missing piece; its `Arc<ReaderLink>` and answer receiver are dropped without any `CloseReader` (what a full command queue leaves); one `readers_tick()` later the deadlines are empty, the waiter is gone and `MAX_READERS` new readers open. (An integration test cannot fill the actor's queue: `Cmd` is crate-internal and the actor drains it.)
+    - `moving_on_demotes_the_previous_piece`: with pieces p and q clean in the cache, a reader moving from p to q makes p the cache's `next_clean_victim()`; with a second reader whose window holds p, p is not demoted.
+    - `abandoned_whole_piece_read_requeues_its_reader`: a `Waiter::Reader` in a `PieceRead` survives `drop_piece_reads()` (it is back in `waiting`, its sender open).
   - `tests/stream.rs`:
     - `reads_whole_file_while_downloading`: the leech opens file 2 before any piece arrives and `read_to_end` equals the file's bytes; the torrent finishes.
     - `seek_then_read_returns_the_right_bytes`: offsets 0, 1, 262,143, 262,144, `len − 1` and a chunk straddling a piece boundary, 4 KiB each.
     - `read_at_and_past_eof`: on a leech that has no peer, `read` at `len` and at `len + 1000` returns 0 at once; on the seed, a read straddling the end is short and ends there.
     - `negative_seek_is_invalid_input`: `seek(Current(-1))` from 0 and `seek(End(-(len + 1)))`; the position is unchanged afterwards.
     - `zero_length_file_reads_eof_without_deadlines`: file 1 (0 B) opens; `read` returns 0; `debug_deadlines()` is empty.
-    - `open_file_index_checks`: index 3 gives `InvalidFileIndex { index: 3, files: 3 }`; a pad file's index (from a torrent built with a pad entry) gives the same; 17 readers give `TooManyReaders` on the 17th.
+    - `open_file_index_checks`: index 3 gives `InvalidFileIndex { index: 3, files: 3 }`; a pad file's index (from `make_torrent_with_pad`) gives `InvalidFileIndex` with that torrent's file count; 17 readers give `TooManyReaders` on the 17th; `open_file_with` with a zero `time` gives `InvalidSettings`.
     - `open_file_on_magnet_without_metadata`: `NoMetadata`; after `MetadataReceived` it opens.
-    - `waiting_read_is_answered_from_the_hash_pass`: the leech's storage is `SlowStorage` with a 2 s write delay; a read of piece 5 returns within 1 s of `PieceFinished { piece: 5 }`, before the write.
-    - `reader_never_sees_unverified_bytes`: a `ScriptedPeer` sends a corrupt piece 2 inside the window, a real seed then serves it; the read returns the real bytes and `HashFailed { piece: 2 }` was emitted.
-    - `have_pieces_are_read_from_disk_and_cached`: a complete torrent (seeding) reads its file twice; `cache_stats().clean` grows on the first pass and the second pass does no storage read (a counting `Storage` wrapper).
-    - `sequential_reader_demotes_and_prefetches`: `cache_size` 2 MiB, piece 256 KiB: while one reader reads the seeding torrent front to back, the clean cache never holds more than 3 pieces behind the reader, and pieces `q+1`, `q+2` are cached before the reader reaches them.
+    - `waiting_read_is_answered_from_the_hash_pass`: the leech's storage is `GatedWriteStorage` with its gate closed (every write blocks); a read of piece 5 waits, and returns after `PieceFinished { piece: 5 }` while the writes are still held (so it came from memory); then the gate opens and the torrent finishes. No wall-clock bound.
+    - `reader_never_sees_unverified_bytes`: a `ScriptedPeer` whose bitfield has only piece 2 connects first and sends a corrupt piece 2 inside the window; after `HashFailed { piece: 2 }` a real seed is added and serves it; the read returns the real bytes.
+    - `have_pieces_are_read_from_disk_and_cached`: a complete torrent (seeding) reads its file twice; `cache_stats().clean` grows on the first pass and the second pass does no storage read (`CountingStorage`, counted from the end of the initial check).
+    - `sequential_reader_prefetches`: `cache_size` 2 MiB, piece 256 KiB, a seeding torrent on `CountingStorage`. One reader reads file 2 front to back; after it finishes piece `q` it pauses, and the storage log shows reads of `q+1` and `q+2` within 5 s without the reader asking; over the whole pass every piece is read from storage exactly once. (Demotion is checked by the `moving_on_demotes_the_previous_piece` unit test: demotion only reorders the clean LRU, the cache still fills to its budget, and `cache_stats()` has no per-piece view.)
     - `pause_serves_have_pieces_and_waits_for_missing`: half downloaded, paused: a read of a piece we have returns; one of a missing piece is still pending after 1 s and returns after `resume`.
-    - `recheck_keeps_waiters`: a read waits on a missing piece, `force_recheck` runs, the read completes once the piece downloads.
+    - `recheck_keeps_waiters`: a read waits on a missing piece, `force_recheck` runs, the read completes once the piece downloads; a second read of a piece we have, issued just before the recheck, also completes (never `TorrentRemoved`).
     - `remove_while_waiting_fails_the_read`: the pending read fails with `ErrorKind::NotFound` wrapping `StreamError::TorrentRemoved`.
     - `shutdown_while_waiting_fails_the_read`: `StreamError::Shutdown`.
     - `storage_error_fails_waiting_reads`: `FailWritesStorage` with the flag set stops the torrent; the pending read fails with `StreamError::TorrentError`; with the flag cleared and after `resume`, a read works.
-    - `dropped_reader_is_forgotten_within_a_tick`: the command queue is filled so `CloseReader` cannot be sent, the reader is dropped mid-read; within two status ticks `debug_deadlines()` is empty and the read slot is free (16 new readers open).
-- [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session --test stream && cargo test -p fbt-session stream::`
+    - `dropped_reader_frees_its_slot`: 16 readers open, one is dropped mid-read; within 5 s (`wait_until`) a 17th opens and `debug_deadlines()` no longer holds the dropped one's window.
+- [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session --test stream && cargo test -p fbt-session -- stream:: readers::`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test --workspace`: PASS.
 - [ ] **Step 5: Commit.** `feat(session): FileReader with seekable reads that wait for pieces` No trailers or attribution of any kind.
@@ -349,41 +376,42 @@ Reads work end to end, waiting for the normal download; deadlines are recorded b
 The readers' windows now drive requests (spec 5.5).
 
 **Files:**
-- Modify: `crates/fbt-session/src/torrent/{readers.rs,peers.rs,data.rs,commands.rs,actor.rs}`, `crates/fbt-session/tests/stream.rs`.
+- Modify: `crates/fbt-session/src/torrent/{readers.rs,peers.rs,data.rs,commands.rs,actor.rs,check.rs}` (`check.rs`: deadlines reapplied in `on_checked`), `crates/fbt-session/tests/stream.rs`, `crates/fbt-session/tests/support/mod.rs` (`ScriptedPeer::serve_recording(payload, piece_len, log: Arc<Mutex<Vec<BlockRef>>>)`: `serve` that also logs every `Request` and `Cancel` it receives, and can be told to stop answering).
 
 **Interfaces:**
-- Consumes: `Deadlines`, `PiecePicker::{pick_piece, progress, abandon}` (Task 4); the reader plumbing and `debug_deadlines()` (Task 5); `Peer::{from_rate, requested, choked_us, snubbed, demand}`.
+- Consumes: `Deadlines`, `PiecePicker::{pick_piece, progress, abandon}` (Task 4; `pick_piece` takes `late: &[PeerKey]`); the reader plumbing, `debug_deadlines()` and the `swarm::tests::actor_with` helper (Task 5); `Peer::{from_rate, requested, choked_us, snubbed, demand, fast_has}`.
 - Produces (crate-internal):
   - `const MIN_DEADLINE_RATE: u64 = 16 * 1024;` and `fn arrival(&self, key: PeerKey, now: Instant) -> Duration`: `(requested.len() + 1) × BLOCK_SIZE / max(from_rate.rate(now), MIN_DEADLINE_RATE)`.
-  - `fn fill_deadlines(&mut self, key: PeerKey, room: usize, now: Instant) -> Vec<BlockRef>`, called first in `fill()` (its blocks count against `room`, the rest goes to the normal `pick_capped`). For each `(piece, deadline)` in `deadlines.ordered()` that the peer has (or that is in its `fast_has` while it chokes us), with `left = deadline.saturating_duration_since(now)`:
-    1. free blocks, if `arrival(key) <= left` or `key` is the fastest live peer that has the piece and does not choke us: `pick_piece(key, piece, n, false)`;
-    2. late blocks: if some owner in `progress(piece).owners` has `arrival(owner) > left`, chokes us or is snubbed, and `key` is not an owner and `arrival(key) < arrival(owner)` (a choking or snubbed owner counts as infinitely late): `pick_piece(key, piece, n, true)`.
-    Buffers are reserved as in `fill`; a deadline piece that cannot reserve a buffer waits like any other.
+  - `fn fill_deadlines(&mut self, key: PeerKey, room: usize, now: Instant) -> Vec<BlockRef>`, called first in `fill()` (its blocks count against `room`, the rest goes to the normal `pick_capped`). It ranks the live peers that do not choke us by `arrival` once per call (not once per piece), then, for each `(piece, deadline)` in `deadlines.ordered()` (a cached slice, never sorted here) that the peer has (or that is in its `fast_has` while it chokes us), with `left = deadline.saturating_duration_since(now)`:
+    1. free blocks, if `arrival(key) <= left` or `key` is the best-ranked peer that has the piece: `pick_piece(key, piece, n, &[])`;
+    2. late blocks: `late` = the owners in `progress(piece).owners` that have `arrival(owner) > left`, choke us or are snubbed, and have `arrival(owner) > arrival(key)` (a choking or snubbed owner counts as infinitely late); if `key` is not an owner and `late` is not empty: `pick_piece(key, piece, n, &late)`, which duplicates only those owners' blocks.
+    Buffers are reserved as in `fill`; a deadline piece that cannot reserve a buffer waits like any other (its blocks go back with `picker.release`).
   - `top_up_all` orders peers by ascending `arrival` while `deadlines` is not empty.
-  - `wants_piece(piece)` is also true for a missing piece with a deadline, and every deadline change calls `update_interest` for the peers that have a newly added piece. `sync_upload_only` and `close_if_upload_only` treat "a deadline piece is missing" as not finished.
+  - `wants_piece(piece)` is also true for a missing piece with a deadline, and every deadline change calls `update_interest` for the peers that have a newly added piece. `update_interest`'s seed branch (today `!picker.is_finished()`, which never calls `wants_piece`) becomes `!is_finished() || a deadline piece is missing`.
+  - **Finished torrents.** "Finished" for BEP 21 becomes `Seeding` and no missing deadline piece. Every deadline change calls `sync_upload_only`, so a reader opening on a seeding torrent sends `UploadOnly(false)`, and the existing off branch clears `seed_addrs` and redials the seeds `close_if_upload_only` closed when the torrent finished. `close_if_upload_only` closes nobody while a deadline piece is missing; once the window is complete, `sync_upload_only` turns it on again.
   - `on_hashed` (pass) calls `deadlines.piece_done(piece)`. `PeerEvent::Choked` calls `top_up_all` when the peer held deadline blocks.
   - Pieces returned by `Deadlines::set`/`remove` with priority 0 are `abandon`ed: their blocks are cancelled (`PeerCommand::Cancel`, removed from `Peer::requested`), their buffer dropped and `cache.release_partial` called. Other returned pieces are left alone.
   - Deadlines are reapplied after `on_checked` and on `resume`; while paused or checking they are kept but nothing is requested.
 
 - [ ] **Step 1: Write failing tests.**
-  - Unit tests in `readers.rs` on `swarm::tests::actor()` with fabricated peers (rates recorded into `from_rate` under paused time):
+  - Unit tests in `readers.rs` on `swarm::tests::actor_with(..)` (several pieces of several blocks, a cache budget, a picker, `Phase::Ready`) with fabricated peers (rates recorded into `from_rate` under paused time):
     - `fastest_peer_gets_the_first_deadline_piece`: peers at 1 MiB/s and 20 KiB/s with demand; the window's first piece goes to the fast one, and the slow one takes no block of a piece whose `left` is below its arrival.
-    - `late_block_is_duplicated_to_a_faster_peer`: the slow peer holds the current piece's blocks; a fast peer's `fill` duplicates them; a third peer's does not (two owners).
+    - `late_block_is_duplicated_to_a_faster_peer`: the slow peer holds the current piece's blocks; a fast peer's `fill` duplicates them; a third peer's does not (two owners). A fast owner's blocks of the same piece are not duplicated.
     - `duplicate_never_goes_to_a_slower_peer`.
-    - `endgame_and_deadline_never_exceed_two_owners`: in end-game, `fill` for four peers leaves no block with three owners (checked through `progress`).
-    - `skipped_piece_with_deadline_is_requested_and_wanted`: priority 0 piece in a window; `wants_piece` is true and a peer that has only that piece becomes interesting.
-    - `seek_storm_leaves_only_the_last_window`: 1,000 `on_reader_moved` with positions across the file, each followed by a `fill` of two peers; then `actor.deadlines.ordered()` holds exactly the last window, and `num_in_progress()` never exceeds the partial cap of `fill` (old windows' normal-priority pieces stay in progress, none is started twice).
+    - `endgame_and_deadline_never_exceed_two_owners`: in end-game, `fill` for four peers leaves no `BlockRef` in more than two peers' `Peer::requested` sets (counted over the peers: `PieceProgress.owners` is a per-piece union and cannot show a per-block count).
+    - `skipped_piece_with_deadline_is_requested_and_wanted`: priority 0 piece in a window; `wants_piece` is true, a peer that has only that piece becomes interesting, and so does a seed once every wanted piece is done.
+    - `seek_storm_leaves_only_the_last_window`: 1,000 `on_reader_moved` with positions across the file, each followed by a `fill` of two peers; then `actor.deadlines.ordered()` holds exactly the last window; after every step `num_in_progress() <= cache_size / piece_len + PROGRESS_FLOOR_PIECES` and the cache's partial reservations equal the pieces in progress (old windows' normal-priority pieces stay in progress, abandoned priority-0 ones give their buffers back). Comparing with `partial_cap` would assert nothing: it is `num_in_progress + room` by definition.
   - Integration tests in `tests/stream.rs`:
-    - `seek_reads_ahead_of_the_rest`: a 64 MiB torrent from one seed, `rate_limit_local_peers` and a 4 MiB/s download limit; the reader seeks to 48 MiB and reads 1 MiB within 3 s (the whole torrent takes 16 s, and rarest-first alone would reach those 4 pieces at a random point of it).
+    - `seek_reads_ahead_of_the_rest`: a 64 MiB torrent from one seed, `rate_limit_local_peers` and a 4 MiB/s download limit; the reader seeks to 48 MiB and reads 1 MiB, and the read completes while the torrent's `total_downloaded` is still below 24 MiB (30 s timeout). Rarest-first alone would reach those pieces at a random point of the 64 MiB. A byte bound, not a wall-clock one, so CI load cannot fail it.
     - `two_readers_on_one_torrent`: readers on file 0 and file 2 read in parallel and both match; the merged deadlines hold both windows.
-    - `dropped_reader_clears_its_deadlines_only`: of two readers, one is dropped; within a tick only the other's window remains.
-    - `straddling_pieces_fetch_only_the_boundaries`: files A (3 MiB, `Skip`), B (2 MiB + 100 B, `Normal`), C (3 MiB, `Skip`), piece 256 KiB; reading B returns B exactly, and the seed (a `ScriptedPeer` that records requests) is never asked for a piece entirely inside A or C.
-    - `reader_on_a_skipped_file_downloads_its_window`: file C is `Skip`; reading its first 1 MiB completes, and no piece after C's window is requested.
-    - `finished_torrent_keeps_seeds_for_a_skipped_file_reader`: every wanted file done (state `Seeding`), the only peer a seed; a reader on a `Skip` file still completes, and the seed is not disconnected with `UploadOnly` while the window is missing.
-    - `seek_away_from_skipped_file_drops_its_partial_pieces`: after a seek from the skipped file to a wanted one, `cache_stats().partial` returns to the new window's buffers only and the scripted peer receives `Cancel`s.
-    - `choked_deadline_blocks_go_to_another_peer`: two scripted seeds; the one holding the window's blocks chokes us without rejecting (fast extension on, no `Reject`); the other receives requests for those blocks within one status tick, and the read completes.
+    - `dropped_reader_clears_its_deadlines_only`: of two readers, one is dropped; within 5 s (`wait_until`) only the other's window remains.
+    - `straddling_pieces_fetch_only_the_boundaries`: files A (3 MiB + 1000 B, `Skip`), B (2 MiB + 100 B, `Normal`), C (3 MiB, `Skip`), piece 256 KiB, so both of B's boundary pieces straddle a skipped file (with A at exactly 3 MiB, B would start on a piece boundary); reading B returns B exactly, and the seed (`serve_recording`) is never asked for a piece entirely inside A or C.
+    - `reader_on_a_skipped_file_downloads_its_window`: same torrent, file C is `Skip`; with `open_file_with(.., ReadAhead::new(1 MiB, 1 s, None))` reading C's first 1 MiB completes, and the seed is never asked for a piece that starts at or after C's offset + 2 MiB (the window after the read ends at + 2 MiB; the default 16 MiB window would cover all of C and prove nothing).
+    - `finished_torrent_keeps_seeds_for_a_skipped_file_reader`: every wanted file done, state `Seeding`, the only peer a seed, which the torrent then closes as upload-only. A reader opens on a `Skip` file *after* that: the torrent sends `UploadOnly(false)`, dials the seed again, the read completes, and the seed is not closed with `UploadOnly` while the window is missing.
+    - `seek_away_from_skipped_file_drops_its_partial_pieces`: the scripted seed has every piece of the skipped file and none of wanted file W; it stops answering once requests arrive. The reader seeks from the skipped file to W: `cache_stats().partial` falls to 0 (no peer has W, so nothing new starts) and the seed receives a `Cancel` for every block it still held.
+    - `choked_deadline_blocks_go_to_another_peer`: two scripted seeds; the one that received the window's requests chokes us without rejecting (fast extension on, no `Reject`); the other receives requests for those blocks within 5 s, and the read completes.
     - `only_peer_chokes_then_unchokes`: one scripted seed chokes us mid-piece; the read is still pending after 2 s with no error, the seed received no request while choking us (no busy loop), and the read completes after `Unchoke`.
-- [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session --test stream && cargo test -p fbt-session readers::`
+- [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-session --test stream && cargo test -p fbt-session readers::` (the scripted-peer tests use `dial_tcp(test_settings())`: scripted peers listen on TCP only).
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** `cargo test --workspace`: PASS, including milestone 3's `tests/swarm.rs` end-game and choker tests unchanged.
 - [ ] **Step 5: Commit.** `feat(session): deadline picker: fastest peers first, late duplicates, seeks replace windows` No trailers or attribution of any kind.
@@ -398,15 +426,15 @@ The readers' windows now drive requests (spec 5.5).
 **Interfaces:**
 - Consumes: `FileReader`, `ReadAhead`, `StreamError`, `SessionError::{InvalidFileIndex, TooManyReaders}` (Tasks 4 to 6).
 - Produces:
-  - `fbt` re-exports `FileReader`, `ReadAhead` and `StreamError`, each named in `lib_surface.rs`. The crate docs gain a "Streaming" section (open, read-ahead and bitrate, waits instead of errors, what fails a read, the choker and rate-limit notes, several readers) and a fourth `no_run` doctest: open file 0, `seek(SeekFrom::Start(1 << 20))`, copy 1 MiB to `tokio::io::sink()`.
-  - `fbt-example stream <TORRENT> --file <INDEX> --out <DIR> [--to <PATH>] [--seek <BYTES>] [--length <BYTES>] [--bitrate <BYTES/S>] [--peer <ADDR>]... [net flags]`. It adds the torrent (data under `--out`), opens the file, seeks, copies `--length` bytes (default: to the end) to `--to` or stdout, prints `stream: <n> bytes from <offset> in <s> s` to stderr, shuts down and exits 0. With stdout as the sink every other line the command prints (`listening on`, `peer connected ...`) goes to stderr. `--file` out of range is exit 2 with the `InvalidFileIndex` message. `--bitrate` takes the `K`/`M` suffixes of the limit flags.
-  - `fbt-example bench --stream --size <MiB>` (hidden): seed and leech in one process on loopback over TCP, `MemStorage` on the leech, one reader reading the file front to back while it downloads, then ten seeks to random offsets (fixed seed) reading 64 KiB each. Prints `bench: stream <MiB> MiB in <s> s = <Mbit/s> Mbit/s` and `bench: stream seek p50 <ms> ms p90 <ms> ms`.
+  - `fbt` re-exports `FileReader`, `ReadAhead` and `StreamError`, each named in `lib_surface.rs`. The crate docs gain a "Streaming" section (open, read-ahead and bitrate, waits instead of errors, what fails a read, the choker and rate-limit notes, several readers) and a fourth `no_run` doctest: open file 0 (`open_file(0).await?`), `seek(SeekFrom::Start(1 << 20))`, copy 1 MiB to `tokio::io::sink()`.
+  - `fbt-example stream <TORRENT> --file <INDEX> --out <DIR> [--port <PORT>] [--to <PATH>] [--seek <BYTES>] [--length <BYTES>] [--bitrate <BYTES/S>] [--peer <ADDR>]... [net flags]`. `--port` works as in `download` (default 6881, 0 picks a free one; `NetArgs` has no port). It adds the torrent (data under `--out`) with every other file set to `Skip` and the streamed one `Normal`, so it fetches only what is read plus the window and the boundary pieces (otherwise every run would download the whole torrent and could not be told from a `download`), opens the file, seeks, copies `--length` bytes (default: to the end) to `--to` or stdout, prints `stream: <n> bytes from <offset> in <s> s` to stderr, shuts down and exits 0. With stdout as the sink every other line the command prints (`listening on`, `peer connected ...`) goes to stderr. `--file` out of range exits with `ExitCode::from(2)` (errors exit 1 through `main` today) after printing the `InvalidFileIndex` message. `--bitrate` takes the `K`/`M` suffixes of the limit flags (`parse_rate`).
+  - `fbt-example bench --stream --size <MiB>` (hidden): seed and leech in one process on loopback over TCP, `MemStorage` on the leech, one reader reading the file front to back while it downloads, then ten seeks to pseudo-random offsets reading 64 KiB each. The offsets come from a fixed-seed xorshift written inline: `fbt-example` has no `rand` dependency and its `Cargo.toml` does not change. Prints `bench: stream <MiB> MiB in <s> s = <Mbit/s> Mbit/s` and `bench: stream seek p50 <ms> ms p90 <ms> ms`.
   - `dev/bench.sh` runs `bench --stream --size 256` and adds the "Stream Mbit/s" and "Seek p50 ms" columns to the table (earlier rows get `-`).
 
-- [ ] **Step 1: Write failing tests** in `tests/cli.rs`:
-  - `stream_to_a_path_matches_the_file`: `seed` a 3-file fixture, `stream fixture.torrent --file 1 --out <tmp> --to <tmp>/out.bin --peer 127.0.0.1:<port>`: exit 0 and `out.bin` equals file 1.
+- [ ] **Step 1: Write failing tests** in `tests/cli.rs`. Every `stream` invocation passes `--port 0 --no-dht`, as the existing `download` tests do: without them the process binds 6881 (parallel tests collide) and bootstraps from the public DHT routers, which no test may contact.
+  - `stream_to_a_path_matches_the_file`: `seed` the 3-file fixture (`seed_fixture`, `spawn_seed`), `stream t.torrent --file 1 --out <tmp> --port 0 --no-dht --to <tmp>/out.bin --peer 127.0.0.1:<port>`: exit 0 and `out.bin` equals file 1.
   - `stream_with_seek_and_length_to_stdout`: `--seek 300000 --length 70000` to stdout; stdout is exactly those bytes (nothing else on stdout).
-  - `stream_bad_file_index_is_a_clean_error`: exit 2 and stderr names the index.
+  - `stream_bad_file_index_is_a_clean_error`: exit code 2 and stderr names the index.
 - [ ] **Step 2: Run them and confirm they fail.** `cargo test -p fbt-example`
 - [ ] **Step 3: Implement.** Then run `BENCH_NO_RECORD=1 BENCH_TORRENTS=10 BENCH_IDLE_SECS=5 bash dev/bench.sh` once to see the stream columns.
 - [ ] **Step 4: Run.** `cargo test -p fbt-example -p fbt && RUSTDOCFLAGS="-D warnings" cargo doc -p fbt --no-deps`: PASS.
@@ -417,24 +445,24 @@ The readers' windows now drive requests (spec 5.5).
 ### Task 8: interop: streaming from qBittorrent with seeks
 
 **Files:**
-- Modify: `dev/interop/run.sh`, `dev/interop/README.md`.
+- Modify: `dev/interop/run.sh`, `dev/interop/README.md`; `.github/workflows/ci.yml` only if Step 3 raises the timeout (the stream logs are written under `$logs`, which the job archives already).
 
 **Interfaces:**
 - Consumes: `fbt-example stream` (Task 7), the existing fixture 1 (`alpha.bin` 30,000,000 B, `beta.bin` 25,000,000 B, `gamma.bin` 12,108,864 B, 256 KiB pieces, seeded by qBittorrent and Transmission), `qbt_field`, `check_download`.
 - Produces:
   - A `stream` scenario (`want stream`), after the uTP scenarios, with qBittorrent back on protocol 0 and Transmission's copy of fixture 1 stopped (`transmission-remote -t <hash> -S`, started again at the end) so qBittorrent is the only source:
     1. The index of `beta.bin` comes from `fbt-example info /interop/fixture.torrent` (files print in torrent order). `beta.bin` starts at 30,000,000 (not a multiple of 262,144) and ends at 55,000,000, so both boundary pieces straddle `alpha.bin` and `gamma.bin`.
-    2. `stream /interop/fixture.torrent --file <i> --out /interop/fbt-stream --port 6899 --no-dht --seek 12000000 --length 3000000 --to /interop/stream-mid.bin` (timeout 300 s).
+    2. `stream /interop/fixture.torrent --file <i> --out /interop/fbt-stream --port 6899 --no-dht --seek 12000000 --length 3000000 --to /interop/stream-mid.bin` (timeout 300 s; 6899 is free again once the setup's `lsd-probe` has exited). Each run's stdout and stderr go to `$logs/fbt-stream-<step>.log`.
     3. The same `--out` again with `--seek 0 --to /interop/stream-all.bin` (the whole file: what step 2 downloaded is read back from disk, the rest from qBittorrent).
-    4. The same `--out` with `--seek 24999000 --to /interop/stream-tail.bin` (1,000 bytes to the end).
-    5. Each output's SHA-1 equals the matching byte range of `/interop/payload/fixture/beta.bin` (`tail -c +$((offset + 1)) | head -c <len> | sha1sum`); every log shows `peer connected <qbittorrent ip>:6882`; qBittorrent's `uploaded` grew.
+    4. The same `--out` with `--seek 24999000 --to /interop/stream-tail.bin` (1,000 bytes to the end, all on disk after step 3).
+    5. Each output's SHA-1 equals the matching byte range of `/interop/payload/fixture/beta.bin` (`tail -c +$((offset + 1)) | head -c <len> | sha1sum`); the logs of steps 2 and 3 show `peer connected <qbittorrent ip>:6882` (step 4 may finish from disk before any peer connects, so its log is not checked for it); qBittorrent's `uploaded` grew.
     6. Prints `interop: stream with seeks OK (qbittorrent)`.
-  - `INTEROP_ONLY` accepts `stream`; an unknown name fails at once with `interop: unknown scenario '<name>' (known: download, seed, encryption, magnet, pex, utp, lsd, stream)`; a partial run ends with `interop: selected scenarios passed (<list>) ...` and only a full run prints `interop: all scenarios passed ...`.
+  - `INTEROP_ONLY` accepts `stream` (the uTP scenario keeps running unconditionally, as today, and its name stays accepted); an unknown name fails at once with `interop: unknown scenario '<name>' (known: download, seed, encryption, magnet, pex, utp, lsd, stream)`; a partial run ends with `interop: selected scenarios passed (<list>) ...` and only a full run prints `interop: all scenarios passed ...`.
   - The README documents the scenario and the `INTEROP_ONLY` names.
 
 - [ ] **Step 1: Write the scenario.** Run `INTEROP_ONLY=stream bash dev/interop/run.sh`, then `INTEROP_ONLY=nope bash dev/interop/run.sh` (exits non-zero with the unknown-scenario message before the setup).
 - [ ] **Step 2: Run the full suite.** `bash dev/interop/run.sh`: every milestone 1 to 3 line, then `interop: stream with seeks OK (qbittorrent)`, then `interop: all scenarios passed ...`, exit 0. `docker network inspect fbt-interop_swarm --format '{{.Internal}}'` prints `true`.
-- [ ] **Step 3: Raise the CI `interop` timeout** by 10 minutes if the new scenario needs it, and add the stream logs to the artifacts.
+- [ ] **Step 3: Raise the CI `interop` timeout** (55 minutes in `ci.yml`) by 10 minutes if the new scenario needs it. The stream logs land in `$logs`, which the job uploads already.
 - [ ] **Step 4: Commit.** `ci: interop streaming from qBittorrent with seeks; INTEROP_ONLY checks its names` No trailers or attribution of any kind.
 
 ---
@@ -447,7 +475,7 @@ The readers' windows now drive requests (spec 5.5).
 - [ ] **Step 1: Update the docs.**
   - `README.md`: streaming in the feature list; a streaming usage example matching the `fbt` doctest; `fbt-example stream` in the example CLI section; the interop paragraph names streaming with seeks; "Known limitations" drops the uTP performance note if Task 1 met its targets (keeps it, with the numbers, if not).
   - `CHANGELOG.md` gets a `## [Unreleased]` section. Every entry ends in `([#N](https://github.com/featherbitplatform/fbt-lib/pull/N))`, `N` being the milestone PR's number, filled in when the PR is opened:
-    - `### Added`: `FileReader` (`TorrentHandle::open_file`, `open_file_with`), `ReadAhead` and `Settings::read_ahead`, `StreamError`, the deadline picker, the sequential read cache (demote and prefetch), `FileLayout::file_range`, `fbt-example stream` and `bench --stream`, the interop scenario.
+    - `### Added`: `FileReader` (the async `TorrentHandle::open_file` and `open_file_with`), `ReadAhead` and `Settings::read_ahead`, `StreamError`, the deadline picker, `PiecePicker::{pick_piece, progress, abandon}` and `PieceProgress` (the `picker` module is public), the sequential read cache (demote and prefetch), `FileLayout::file_range`, `fbt-example stream` and `bench --stream`, the interop scenario.
     - `### Changed`: the new `SessionError` variants `InvalidFileIndex` and `TooManyReaders`; `RateMeter::rate` no longer dilutes its first five seconds (status rates and the request pipeline ramp up faster); repeated drops of a productive peer back off up to 30 minutes; uTP sends, acks and reads without per-byte copies or window scans (with the measured numbers).
     - `### Fixed`: `INTEROP_ONLY` reporting "all scenarios passed" for a partial run and ignoring unknown names; uTP decode failures now traced; the half-open eviction order on a lost re-check.
   - `CLAUDE.md` (the only task that edits it): the interop line names streaming with seeks; the bench line mentions the streaming row; nothing else changes.
@@ -467,13 +495,12 @@ No attribution lines anywhere.
 
 ## Deferred to later milestones (recorded so nobody builds them now)
 
-- **Milestone 5:** these stay there, per the earlier plans: resume data and session state, queueing and seed limits, move storage and rename (move must flush the cache first), proxies (SOCKS5 with UDP associate, HTTP CONNECT), IP filter, web seeds, smart ban, per-IP connection limits, `stopped` semantics, BEP 44/33/51, the rename scheme for case and Unicode collisions.
+- **Milestone 5:** these stay there, per the earlier plans: resume data and session state, queueing and seed limits, move storage and rename (move must flush the cache first), proxies (SOCKS5 with UDP associate, HTTP CONNECT), IP filter, web seeds, smart ban, per-IP connection limits, `stopped` semantics, BEP 44/33/51, the rename scheme for case and Unicode collisions, and (controller ruling) the part file for unwanted pieces that straddle wanted files (spec 5.4): until then skipped files that share a piece with a wanted or streamed file are still created, and only boundary pieces touch them.
 - **Milestone 7 (`fbt-api`):** HTTP `Range` serving on top of `FileReader` (206, `Content-Length`, `Accept-Ranges`, token in the query string).
 - **Backlog:**
   - per-peer uTP priority: revisit if a measurement shows uTP deadline peers lagging TCP ones at the same rate (see Decisions);
   - batched UDP sends and receives (`sendmmsg`/`recvmmsg`-style, or GSO) and splitting a socket's uTP processing over more than one task, the inherent costs left after Task 1;
   - an adaptive status tick for idle torrents (1,000 idle torrents at 1.13 % CPU against the 1 % target, milestone 3 "Performance misses");
-  - the part file for unwanted pieces that straddle wanted files (spec 5.4): skipped files that share a piece with a wanted or streamed file are still created;
   - the qBittorrent Docker-bridge ceiling of about 4 MiB/s (its 500 ms request batching), not investigated;
   - milestone 3 minors not touched here: the NAT-PMP gateway not looked up again after a network change, a double-NAT private address winning over the DHT's, shutdown releasing UDP ports asynchronously, port mapping ignoring which side bound, inconsistent `#[non_exhaustive]` on event variants, the rebalance task waking every second without a limit, a UPnP renewal deleting an old port by number after rediscovery, the gateway helper child not reaped on timeout, linger slots counting against `max_connections`, the keepalive STATE ambiguity, `send_lossy` dropping `DontHave`s on full queues, the stale snub timer after a timed-out pipeline;
   - serde support for all public config structs (spec 5.3), `ReadAhead` included;
