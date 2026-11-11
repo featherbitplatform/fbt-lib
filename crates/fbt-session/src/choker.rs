@@ -112,8 +112,13 @@ impl ChokerConfig {
     /// The choker settings of `s`, the seeding quota counted in pieces of
     /// `piece_len` bytes.
     pub(crate) fn from_settings(s: &Settings, piece_len: u64) -> Self {
+        // The automatic count leaves at least one regular slot, so a single
+        // slot is a regular one (rotated by the seeding algorithm) rather
+        // than an optimistic one pinned for `optimistic_unchoke_interval`.
         let optimistic = if s.optimistic_unchoke_slots == 0 {
-            (s.unchoke_slots / 5).max(1)
+            (s.unchoke_slots / 5)
+                .max(1)
+                .min(s.unchoke_slots.saturating_sub(1))
         } else {
             s.optimistic_unchoke_slots
         };
@@ -137,7 +142,10 @@ impl ChokerConfig {
 /// [`PeerKey`]; snubbed peers get none. The optimistic slots go to the
 /// interested peers left that are choked now, those that held one longest
 /// ago (or never) first, ties at random; they rotate every
-/// `rotate_rounds` rechokes and a vacated one is refilled at once.
+/// `rotate_rounds` rechokes and a vacated one is refilled at once. Peers
+/// unchoked already (by a free slot between rechokes, or a regular slot
+/// they just lost) are candidates only when no choked one is left, and the
+/// current holders at a rotation only after them.
 #[derive(Debug)]
 pub struct Choker {
     cfg: ChokerConfig,
@@ -686,6 +694,14 @@ mod tests {
         assert_eq!(ChokerConfig::from_settings(&s, 1).optimistic, 2);
         s.unchoke_slots = 4;
         assert_eq!(ChokerConfig::from_settings(&s, 1).optimistic, 1);
+        // At least one regular slot stays.
+        s.unchoke_slots = 2;
+        assert_eq!(ChokerConfig::from_settings(&s, 1).optimistic, 1);
+        s.unchoke_slots = 1;
+        assert_eq!(ChokerConfig::from_settings(&s, 1).optimistic, 0);
+        s.unchoke_slots = 0;
+        assert_eq!(ChokerConfig::from_settings(&s, 1).optimistic, 0);
+        s.unchoke_slots = 4;
         s.optimistic_unchoke_slots = 3;
         assert_eq!(ChokerConfig::from_settings(&s, 1).optimistic, 3);
         // 30 s over 10 s rechokes; the quota in bytes.

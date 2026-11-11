@@ -84,8 +84,10 @@ pub struct Settings {
     /// How regular upload slots are given while seeding.
     pub seed_choking_algorithm: SeedChokingAlgorithm,
     /// Optimistic upload slots per torrent, part of
-    /// [`unchoke_slots`](Self::unchoke_slots); 0 means
-    /// `max(1, unchoke_slots / 5)`.
+    /// [`unchoke_slots`](Self::unchoke_slots) (as with libtorrent, which
+    /// reserves them out of its upload slots); 0 means
+    /// `max(1, unchoke_slots / 5)`, but always leaving one regular slot (so
+    /// a single upload slot has no optimistic one).
     pub optimistic_unchoke_slots: usize,
     /// How often the optimistic slots move to other peers (30 s). At least
     /// [`rechoke_interval`](Self::rechoke_interval): they rotate every

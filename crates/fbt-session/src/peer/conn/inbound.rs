@@ -26,6 +26,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 }
                 // Without fast, a choke silently drops every pending request.
                 if !self.fast {
+                    if !self.outstanding.is_empty() {
+                        self.idle_since_block = false;
+                    }
                     for block in std::mem::take(&mut self.outstanding).into_keys() {
                         self.emit(PeerEvent::Rejected { key, block }).await?;
                     }
@@ -86,6 +89,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 if self.outstanding.remove(&block).is_some() {
                     self.block_rate.record(data.len() as u64);
                     self.snub_since = tokio::time::Instant::now();
+                    self.idle_since_block = true;
                     if self.snubbed {
                         self.snubbed = false;
                         self.emit(PeerEvent::Snubbed {
@@ -109,6 +113,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Message::RejectRequest(block) => {
                 self.require_fast()?;
                 if self.outstanding.remove(&block).is_some() {
+                    self.idle_since_block = false;
                     self.emit(PeerEvent::Rejected { key, block }).await?;
                     self.want_blocks().await?;
                 }

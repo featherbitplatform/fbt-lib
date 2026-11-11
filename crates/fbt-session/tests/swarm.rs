@@ -668,18 +668,20 @@ async fn rechoke_chokes_peer_that_lost_its_slot() {
 }
 
 /// A round-robin seeder with two upload slots (one regular, one
-/// optimistic) and six leechers that only know the seeder: its upload is
-/// throttled so no leecher is done within one turn, the regular slot
-/// moves on every quota or three rechokes, and every leecher finishes.
+/// optimistic) and six leechers that only know the seeder. Its upload is
+/// throttled so that a turn (three rechokes) is far shorter than the
+/// torrent: the regular slot moves on, so at least four leechers have
+/// data before the first one finishes (without rotation only the two
+/// holders would), and every leecher finishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeding_round_robin_serves_every_leecher() {
-    let (m, payload) = make_torrent(&[("a", 512 << 10)], 32_768);
+    let (m, payload) = make_torrent(&[("a", 384 << 10)], 32_768);
     let mut st = settings();
     st.unchoke_slots = 2;
     st.rechoke_interval = Duration::from_millis(200);
     st.seeding_piece_quota = 4;
     st.pex_enabled = false;
-    st.rate_limit = fbt_session::RateLimit::new(0, 2 << 20);
+    st.rate_limit = fbt_session::RateLimit::new(0, 256 << 10);
     st.rate_limit_local_peers = true;
     let s = Session::new(st).await.unwrap();
     let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
@@ -691,13 +693,26 @@ async fn seeding_round_robin_serves_every_leecher() {
     for _ in 0..6 {
         let mut ls = settings();
         ls.pex_enabled = false;
-        let (l, lh, storage) = mem_leecher_with(ls, &m, payload.len()).await;
-        let ev = l.subscribe(EventMask::ALL);
-        lh.add_peer(s.local_addr()).await.unwrap();
-        leechers.push((l, lh, storage, ev));
+        leechers.push(mem_leecher_with(ls, &m, payload.len()).await);
     }
-    for (_, _, storage, ev) in &mut leechers {
-        finished(ev).await;
+    for (_, lh, _) in &leechers {
+        lh.add_peer(s.local_addr()).await.unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + T;
+    let served = loop {
+        let statuses: Vec<_> = leechers.iter().map(|(_, lh, _)| lh.status()).collect();
+        if statuses.iter().any(|st| st.state == TorrentState::Seeding) {
+            break statuses.iter().filter(|st| st.wanted_done > 0).count();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "nobody finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        served >= 4,
+        "only {served} leechers served before the first finished"
+    );
+    for (_, lh, storage) in &leechers {
+        assert!(wait_state(lh, |s| *s == TorrentState::Seeding, T).await);
         assert!(stored(storage, payload.len()) == payload, "data differs");
     }
     for (l, ..) in leechers {

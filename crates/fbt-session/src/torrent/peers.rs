@@ -73,6 +73,11 @@ impl Actor {
             PeerEvent::Snubbed { key, snubbed } => {
                 if let Some(p) = self.peers.get_mut(&key) {
                     p.snubbed = snubbed;
+                    // Asked for at the old depth: the peer task asks again
+                    // for its single request.
+                    if snubbed {
+                        p.demand = 0;
+                    }
                 }
             }
             // The peer task drops the cancelled request itself; an answer

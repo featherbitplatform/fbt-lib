@@ -51,13 +51,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         )
     }
 
-    /// Asks the torrent for more blocks when we may request and the pipeline
-    /// is below half its target depth.
+    /// Asks the torrent for more blocks when we may request and at least a
+    /// quarter of the target depth (at least one request) is free.
     pub(super) async fn want_blocks(&mut self) -> Flow {
         let may_request = !self.choked || (self.fast && !self.allowed_fast.is_empty());
         let max = self.target_depth();
         let n = self.outstanding.len();
-        if may_request && n.saturating_mul(2) < max {
+        if may_request && n < max && max - n >= (max / 4).max(1) {
             self.emit(PeerEvent::WantBlocks {
                 key: self.key,
                 count: max - n,
@@ -73,16 +73,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 let now = Instant::now();
                 let mut rejected = Vec::new();
                 let mut sent = false;
-                if self.outstanding.is_empty() {
+                if self.outstanding.is_empty() && self.idle_since_block {
                     // The snub timer starts with the first request in flight.
                     self.snub_since = now;
                 }
+                // Never past the current depth (a snubbed peer's is 1):
+                // the surplus goes back to the torrent.
+                let depth = self.target_depth();
                 for b in blocks {
                     if self.outstanding.contains_key(&b) {
                         continue;
                     }
                     let fast_ok = self.fast && self.allowed_fast.contains(&b.piece);
-                    if self.choked && !fast_ok {
+                    if (self.choked && !fast_ok) || self.outstanding.len() >= depth {
                         rejected.push(b);
                         continue;
                     }

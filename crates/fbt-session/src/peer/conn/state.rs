@@ -114,9 +114,15 @@ pub(super) struct Conn<S> {
     pub(super) remote_reqq: Option<u32>,
     /// Our requests went unanswered for `snub_timeout`.
     pub(super) snubbed: bool,
-    /// Where the snub timer starts: the last block, or the first request
-    /// sent into an empty pipeline (or the unchoke). Paused with reads.
+    /// Where the snub timer starts: the last block, the unchoke, or the
+    /// first request sent into a pipeline that blocks emptied. Paused with
+    /// reads.
     pub(super) snub_since: Instant,
+    /// The pipeline was last emptied by blocks arriving (or never held a
+    /// request), not by timeouts or rejects: only then does a request into
+    /// an empty pipeline restart the snub timer, so a remote that answers
+    /// nothing is snubbed even when its requests time out first.
+    pub(super) idle_since_block: bool,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
@@ -162,6 +168,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             remote_reqq: None,
             snubbed: false,
             snub_since: now,
+            idle_since_block: true,
         }
     }
 
@@ -312,6 +319,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         if self.idle_deadline().is_some_and(|idle| now >= idle) {
             return Err(DisconnectReason::IdleTimeout);
         }
+        // Decided before the timed-out requests are dropped: with
+        // `snub_timeout <= request_timeout` they expire together, and the
+        // emptied pipeline must not hide the snub. Set before the refill
+        // below, so it asks for a snubbed peer's single request.
+        if self.snub_deadline().is_some_and(|t| now >= t) {
+            self.snubbed = true;
+            self.emit(PeerEvent::Snubbed {
+                key: self.key,
+                snubbed: true,
+            })
+            .await?;
+        }
         let limit = self.settings.request_timeout;
         let expired: Vec<BlockRef> = self
             .outstanding
@@ -320,6 +339,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .map(|(b, _)| *b)
             .collect();
         if !expired.is_empty() {
+            self.idle_since_block = false;
             for b in &expired {
                 self.outstanding.remove(b);
                 self.feed(Message::Cancel(*b)).await?;
@@ -333,14 +353,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .await?;
             }
             self.want_blocks().await?;
-        }
-        if self.snub_deadline().is_some_and(|t| now >= t) {
-            self.snubbed = true;
-            self.emit(PeerEvent::Snubbed {
-                key: self.key,
-                snubbed: true,
-            })
-            .await?;
         }
         if now >= after(self.last_send, self.settings.keepalive_interval) {
             self.send(Message::KeepAlive).await?;

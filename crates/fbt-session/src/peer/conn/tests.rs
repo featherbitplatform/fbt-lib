@@ -371,8 +371,8 @@ async fn requests_flow_when_unchoked() {
     let blocks = [block(0, 0), block(0, 16_384)];
     unchoke_and_request(&mut wire, &mut r, &blocks).await;
 
-    // A delivered block is forwarded; with one of two still outstanding
-    // the pipeline is half full, so it asks for nothing more.
+    // A delivered block is forwarded, and the freed request (at least a
+    // quarter of the depth) is asked for again.
     send(
         &mut wire,
         Message::Piece {
@@ -389,6 +389,7 @@ async fn requests_flow_when_unchoked() {
         }
         other => panic!("{other:?}"),
     }
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 1 });
 
     // Closing reports what is still outstanding.
     r.cmd(PeerCommand::Close).await;
@@ -643,18 +644,26 @@ async fn request_timeout_returns_block() {
     unchoke_and_request(&mut wire, &mut r, &[block(0, 0)]).await;
     // The remote keeps the connection alive but never answers.
     let mut keepalive = tokio::time::interval(Duration::from_secs(20));
-    let ev = loop {
+    let mut events = Vec::new();
+    while events.len() < 2 {
         tokio::select! {
-            ev = r.next() => break ev,
+            ev = r.next() => events.push(ev),
             _ = keepalive.tick() => send(&mut wire, Message::KeepAlive).await,
         }
-    };
+    }
+    // With the default timeouts (both 60 s) the snub comes first.
     assert_eq!(
-        ev,
-        PeerEvent::Rejected {
-            key: KEY,
-            block: block(0, 0),
-        }
+        events,
+        vec![
+            PeerEvent::Snubbed {
+                key: KEY,
+                snubbed: true
+            },
+            PeerEvent::Rejected {
+                key: KEY,
+                block: block(0, 0),
+            }
+        ]
     );
     assert!(t0.elapsed() >= Duration::from_secs(60));
     loop {
@@ -1500,6 +1509,7 @@ async fn snub_after_timeout_and_clear_on_block() {
         }
     );
     assert!(matches!(r.next().await, PeerEvent::Block { .. }));
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 1 });
     // Not snubbed again before another full timeout without a block.
     let t1 = Instant::now();
     assert_eq!(
@@ -1544,4 +1554,119 @@ async fn read_hold_pauses_the_snub_timer() {
     d.conn.choked = false;
     d.conn.snubbed = true;
     assert_eq!(d.conn.snub_deadline(), None);
+}
+
+/// Settings with the given snub and request timeouts, in milliseconds.
+fn snub_settings(snub: u64, request: u64) -> Settings {
+    Settings {
+        snub_timeout: Duration::from_millis(snub),
+        request_timeout: Duration::from_millis(request),
+        ..Settings::default()
+    }
+}
+
+/// A remote that never answers is snubbed even when its requests time
+/// out at the same moment, and when they time out earlier and are asked
+/// again (the timer then runs from before the timeouts).
+#[tokio::test(start_paused = true)]
+async fn snub_fires_when_requests_time_out() {
+    let h = start_full(
+        Bitfield::new(PIECES),
+        Some(layout(PIECES)),
+        ext_cfg(),
+        snub_settings(300, 300),
+    );
+    let (mut wire, mut r) = h.connect(true).await;
+    unchoke_and_request(&mut wire, &mut r, &[block(0, 0), block(0, 16_384)]).await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Snubbed {
+            key: KEY,
+            snubbed: true
+        }
+    );
+    for b in [block(0, 0), block(0, 16_384)] {
+        assert_eq!(r.next().await, PeerEvent::Rejected { key: KEY, block: b });
+    }
+    // The refill asks for a snubbed peer's single request.
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 1 });
+
+    let h = start_full(
+        Bitfield::new(PIECES),
+        Some(layout(PIECES)),
+        ext_cfg(),
+        snub_settings(500, 300),
+    );
+    let (mut wire, mut r) = h.connect(true).await;
+    let t0 = Instant::now();
+    unchoke_and_request(&mut wire, &mut r, &[block(0, 0)]).await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Rejected {
+            key: KEY,
+            block: block(0, 0)
+        }
+    );
+    assert!(matches!(r.next().await, PeerEvent::WantBlocks { .. }));
+    // Asked again into a pipeline the timeout emptied: no fresh timer.
+    r.cmd(PeerCommand::Request(vec![block(1, 0)])).await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Snubbed {
+            key: KEY,
+            snubbed: true
+        }
+    );
+    let at = t0.elapsed();
+    assert!(
+        at >= Duration::from_millis(500) && at < Duration::from_millis(600),
+        "{at:?}"
+    );
+}
+
+/// A snubbed peer never has more than one request in flight: requests
+/// beyond its depth go back to the torrent.
+#[tokio::test(start_paused = true)]
+async fn snubbed_peer_gets_one_request() {
+    let h = start_full(
+        Bitfield::new(PIECES),
+        Some(layout(PIECES)),
+        ext_cfg(),
+        snub_settings(300, 600),
+    );
+    let (mut wire, mut r) = h.connect(true).await;
+    unchoke_and_request(&mut wire, &mut r, &[block(0, 0), block(0, 16_384)]).await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Snubbed {
+            key: KEY,
+            snubbed: true
+        }
+    );
+    // Already two in flight: a stale request is refused locally.
+    r.cmd(PeerCommand::Request(vec![block(1, 0)])).await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Rejected {
+            key: KEY,
+            block: block(1, 0)
+        }
+    );
+    // The two time out; the freed pipeline takes exactly one.
+    for b in [block(0, 0), block(0, 16_384)] {
+        assert_eq!(r.next().await, PeerEvent::Rejected { key: KEY, block: b });
+    }
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 1 });
+    r.cmd(PeerCommand::Request(vec![block(2, 0), block(3, 0)]))
+        .await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Rejected {
+            key: KEY,
+            block: block(3, 0)
+        }
+    );
+    assert_eq!(recv(&mut wire).await, Message::Cancel(block(0, 0)));
+    assert_eq!(recv(&mut wire).await, Message::Cancel(block(0, 16_384)));
+    assert_eq!(recv(&mut wire).await, Message::Request(block(2, 0)));
 }
