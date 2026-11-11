@@ -114,7 +114,20 @@ impl Igd {
         port: u16,
         lease: u32,
     ) -> Result<u16, UpnpError> {
-        let (mut external, mut lease_now) = (port, lease);
+        self.add_mapping_from(p, port, port, lease).await
+    }
+
+    /// [`Igd::add_mapping`] asking for external port `first` first: a
+    /// renewal asks for the port it already holds, which may be a random
+    /// one granted after a conflict.
+    pub async fn add_mapping_from(
+        &self,
+        p: MapProtocol,
+        port: u16,
+        first: u16,
+        lease: u32,
+    ) -> Result<u16, UpnpError> {
+        let (mut external, mut lease_now) = (first, lease);
         let (mut conflicts, mut zero_tried) = (0, false);
         loop {
             let req = soap::add_port_mapping(

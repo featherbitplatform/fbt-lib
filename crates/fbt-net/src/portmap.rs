@@ -382,10 +382,25 @@ impl Worker {
         match self.method {
             Method::Upnp => {
                 let igd = self.igd.clone().ok_or_else(|| "no IGD".to_owned())?;
+                // A renewal asks for the port it holds: after a conflict
+                // (718) that is a random one, and asking for the internal
+                // port again would get another, leaking the first.
+                let prev = match held {
+                    Some(Held::Upnp { external }) => Some(external),
+                    _ => None,
+                };
+                let first = prev.unwrap_or(want.internal);
                 let external = igd
-                    .add_mapping(want.protocol, want.internal, self.cfg.lease)
+                    .add_mapping_from(want.protocol, want.internal, first, self.cfg.lease)
                     .await
                     .map_err(|e| e.to_string())?;
+                // Moved anyway (the held port was taken meanwhile): the old
+                // entry, if still ours, must not outlive us.
+                if let Some(old) = prev.filter(|&old| old != external)
+                    && let Err(e) = igd.delete_mapping(want.protocol, old).await
+                {
+                    debug!(port = old, error = %e, "UPnP: old mapping not removed");
+                }
                 self.last_igd = Some(igd);
                 // Retries an `ExternalIp` report the channel dropped.
                 if let Some(ip) = self.external {

@@ -387,3 +387,63 @@ async fn upnp_mappings_are_removed_after_a_failed_renewal() {
     assert_eq!(dels.len(), 1, "the held mapping was removed");
     assert_eq!(dels[0].arg("NewExternalPort"), PORT.to_string());
 }
+
+#[tokio::test(start_paused = true)]
+async fn upnp_renewal_after_a_conflict_keeps_its_port() {
+    let _tick = ticker();
+    let gw = FakeGateway::start(Mode::Pcp, false, 0).await;
+    // The internal port is taken on the router: the first grant is random.
+    let igd = FakeIgd::start(Script {
+        conflict_ports: vec![PORT],
+        ..Script::default()
+    })
+    .await;
+    let mut cfg = config(&gw, &igd, 120);
+    cfg.natpmp = false;
+    let (tx, mut rx) = mpsc::channel(64);
+    let mapper = PortMapper::spawn(cfg, tx);
+    mapper.map(MapProtocol::Tcp, PORT);
+    let events = wait_mapped(&mut rx, &[(MapProtocol::Tcp, MapMethod::Upnp)]).await;
+    let granted = events
+        .iter()
+        .find_map(|e| match e {
+            MapEvent::Mapped { external, .. } => Some(external.port()),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(granted, PORT);
+
+    // Two renewals (at 60 s and 120 s), each asking for the port it holds.
+    tokio::time::sleep(Duration::from_secs(135)).await;
+    let adds = igd.recorded("AddPortMapping");
+    let first_renewal = adds
+        .iter()
+        .position(|r| r.at.duration_since(adds[0].at) > Duration::from_secs(10))
+        .expect("a renewal");
+    let renewals = &adds[first_renewal..];
+    assert!(renewals.len() >= 2, "{} renewal calls", renewals.len());
+    for r in renewals {
+        assert_eq!(
+            r.arg("NewExternalPort"),
+            granted.to_string(),
+            "renewal moved"
+        );
+    }
+
+    // Shutdown removes every port the router granted: none is left behind.
+    mapper.shutdown().await;
+    let deleted: Vec<String> = igd
+        .recorded("DeletePortMapping")
+        .iter()
+        .map(|r| r.arg("NewExternalPort"))
+        .collect();
+    for r in &adds {
+        let ext = r.arg("NewExternalPort");
+        if ext != PORT.to_string() {
+            assert!(
+                deleted.contains(&ext),
+                "port {ext} leaked; deleted {deleted:?}"
+            );
+        }
+    }
+}
