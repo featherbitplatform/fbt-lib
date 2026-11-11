@@ -212,7 +212,7 @@ enum Command {
     #[command(hide = true)]
     Bench {
         /// Payload to move from the seed to the leech, in MiB (0: skip).
-        #[arg(long, value_name = "MiB", default_value_t = 0)]
+        #[arg(long, value_name = "MiB", default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=65536))]
         size: u64,
         /// Transport both sessions use.
         #[arg(long, value_enum, default_value = "tcp")]

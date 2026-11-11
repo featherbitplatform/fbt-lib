@@ -24,16 +24,23 @@ The script samples the process with `ps -o time=,rss=` at the start and end of
 each run. CPU is the whole process, so seed and leech together. The idle run
 seeds 1,000 one-piece torrents with no peers; RSS per idle torrent is the
 difference against a 10-torrent run, divided by 990. TCP and uTP rows use only
-that transport on both sides.
+that transport on both sides. CPU time comes from `ps` on macOS (centisecond
+resolution) and from `/proc/<pid>/stat` on Linux (clock-tick resolution).
 
 ## Status
 
-First row (0.2.0): TCP saturates 1 Gbit/s on loopback (about 4.2 Gbit/s) at
-about 5 % of a core per 100 Mbit/s, with seed and leech both counted. Three
-targets are missed and recorded as such: uTP reaches about 0.6 Gbit/s, not
-1 Gbit/s, at about 39 % of a core per 100 Mbit/s; and 1,000 idle seeding
-torrents use about 1.2 % CPU, over the 1 % target. RSS per idle torrent is
-about 18 KiB.
+First row (0.2.0), against each target:
+
+- TCP throughput: met, about 4.2 Gbit/s against 1 Gbit/s.
+- TCP CPU per 100 Mbit/s: 5.0 % of a core, seed and leech together;
+  borderline against "a few percent".
+- uTP throughput: missed, about 0.6 Gbit/s against 1 Gbit/s.
+- uTP CPU per 100 Mbit/s: missed, 39 % of a core.
+- 1,000 idle torrents under 1 % CPU: missed, 1.2 %.
+- Memory per idle torrent: recorded, about 18 KiB RSS.
+
+The transfer timer polls the torrent state every 20 ms, so a very fast run
+(TCP finishes in about 2 s) is accurate to roughly 1 %.
 
 | Date | Version | Host | TCP Mbit/s | TCP CPU % per 100 Mbit/s | uTP Mbit/s | uTP CPU % per 100 Mbit/s | Idle torrents | Idle CPU % | RSS per idle torrent | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|

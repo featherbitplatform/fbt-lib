@@ -59,12 +59,35 @@ cpu_secs() {
     }'
 }
 
-# sample PID -> "<cpu seconds> <rss KiB>"
+# sample PID -> "<cpu seconds> <rss KiB>". CPU time comes from /proc/PID/stat
+# (utime + stime, in clock ticks) where it exists, for better than the 1 s
+# resolution of Linux `ps`; macOS `ps` already reports centiseconds.
 sample() {
-    local out t r
+    local out t r stat rest
     out=$(ps -o time=,rss= -p "$1") || return 1
     read -r t r <<<"$out"
+    if [ -r "/proc/$1/stat" ] && stat=$(cat "/proc/$1/stat" 2>/dev/null); then
+        # Fields after the ")" that ends the command name start at field 3,
+        # so utime and stime (fields 14 and 15) are words 12 and 13.
+        rest=${stat##*) }
+        # shellcheck disable=SC2086
+        set -- $1 $rest
+        shift
+        echo "$(awk -v u="${12}" -v s="${13}" -v h="$(getconf CLK_TCK)" \
+            'BEGIN { printf "%.2f", (u + s) / h }') $r"
+        return 0
+    fi
     echo "$(cpu_secs "$t") $r"
+}
+
+# take_sample PID CPU_VAR RSS_VAR: sample, or stop with a clear error.
+take_sample() {
+    local out
+    if ! out=$(sample "$1") || [ -z "$out" ]; then
+        echo "bench: could not sample process $1 (ps or /proc failed)" >&2
+        exit 1
+    fi
+    read -r "$2" "$3" <<<"$out"
 }
 
 # wait_line FILE PATTERN: block until a line matching PATTERN appears.
@@ -95,9 +118,9 @@ run_bench() {
     "$BIN" bench "$@" >"$OUT" 2>"$WORK/$name.err" &
     BENCH_PID=$!
     wait_line "$OUT" "$start"
-    read -r CPU0 RSS0 < <(sample "$BENCH_PID")
+    take_sample "$BENCH_PID" CPU0 RSS0
     wait_line "$OUT" "$end"
-    read -r CPU1 RSS1 < <(sample "$BENCH_PID")
+    take_sample "$BENCH_PID" CPU1 RSS1
     wait "$BENCH_PID"
     BENCH_PID=
 }
