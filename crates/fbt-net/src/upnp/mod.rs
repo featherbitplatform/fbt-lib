@@ -203,10 +203,24 @@ async fn search(ssdp: SocketAddr, http_timeout: Duration) -> Result<Igd, UpnpErr
         }
         let deadline = Instant::now() + SEARCH_GAP;
         loop {
+            // `timeout_at` polls the receive first, so a flood or a failing
+            // socket would otherwise outlive the round.
+            if Instant::now() >= deadline {
+                break;
+            }
             let Ok(recv) = tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await else {
                 break;
             };
-            let Ok((n, from)) = recv else { break };
+            let (n, from) = match recv {
+                Ok(v) => v,
+                Err(e) => {
+                    // ConnectionReset after an ICMP unreachable and the like:
+                    // wait the round out rather than burn the next one now.
+                    tracing::debug!("ssdp receive failed: {e}");
+                    tokio::time::sleep_until(deadline).await;
+                    break;
+                }
+            };
             let data = buf.get(..n).unwrap_or_default();
             let loc = match parse_search_response(data, from) {
                 Ok(loc) => loc,
