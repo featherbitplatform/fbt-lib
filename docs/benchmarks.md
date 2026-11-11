@@ -51,11 +51,14 @@ The three implementation costs recorded against 0.3.0 are gone from
   O(log n) or O(1). Only loss handling still walks the window (the SACK loss
   loop, bounded by `MAX_IN_FLIGHT_PACKETS` and stopping early, and the RTO).
 - **No per-byte copies.** Send data sits in a `BytesMut` and is packetized
-  with `split_to(..).freeze()`; received payloads of 1024 bytes or more are
-  kept as slices of their datagram and read with `copy_from_slice`. Shorter
-  payloads are copied and merged so a tiny payload never pins a whole
-  datagram. The one copy left on the receive path is the datagram copy in the
-  socket's receive handler.
+  with `split_to(..).freeze()`; full-size received payloads (1024 bytes or
+  more) are normally kept as slices of their datagram and read with
+  `copy_from_slice`. Shorter payloads are copied and merged so a tiny payload
+  never pins a whole datagram; a full-size payload that arrives while such
+  merged bytes are still short of 1024 is appended to them (copied), so the
+  buffer's chunk count stays bounded. For
+  full-size traffic the only copy before `read` (which copies into the
+  reader's buffer) is the datagram copy in the socket's receive handler.
 - **No zero-fill per read.** `UtpStream::poll_read` initialises only the
   bytes it is about to fill.
 

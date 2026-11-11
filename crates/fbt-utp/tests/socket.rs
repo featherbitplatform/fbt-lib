@@ -860,3 +860,59 @@ async fn poll_read_initialises_only_what_it_fills() {
     assert_eq!(buf.initialized().len(), 100);
     assert_eq!(buf.filled(), &message[..]);
 }
+
+/// A SYN that passes the first check but fails the final one evicts no
+/// half-open connection. The accept filter runs between the two checks;
+/// here it confirms a half-open connection, which fills the accept queue,
+/// so the final check refuses the SYN. The oldest half-open slot (the
+/// victim it would have taken) must survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn syn_failing_the_final_check_evicts_nobody() {
+    let mut cfg = UtpConfig::default();
+    cfg.max_pending_accept = 2;
+    let server = bind(cfg).await;
+    let handler = server.handler();
+    let id = 4000u16;
+    let mut raws = Vec::new();
+    let mut isns = Vec::new();
+    for i in 0..3 {
+        let raw = tokio::net::UdpSocket::bind(loopback()).await.unwrap();
+        let from = raw.local_addr().unwrap();
+        handler.handle(from, &packet(PacketType::Syn, id, 1));
+        let mut buf = [0u8; 1500];
+        let (n, _) = step(raw.recv_from(&mut buf)).await.unwrap();
+        let state = Packet::decode(&Bytes::copy_from_slice(&buf[..n])).unwrap();
+        assert_eq!(state.ty, PacketType::State);
+        if i == 0 {
+            // The first dialler confirms: it waits in the accept queue (1 of 2).
+            handler.handle(
+                from,
+                &ack_of(PacketType::State, id, state.seq_nr.wrapping_sub(1)),
+            );
+        }
+        isns.push(state.seq_nr);
+        raws.push(from);
+    }
+    // The other two are half-open, filling that set (2 of 2).
+    assert_eq!(server.num_connections(), 3);
+
+    let late = tokio::net::UdpSocket::bind(loopback()).await.unwrap();
+    let late_addr = late.local_addr().unwrap();
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let handler = handler.clone();
+        let fired = fired.clone();
+        let (third, isn) = (raws[2], isns[2]);
+        server.set_accept_filter(Some(Arc::new(move |a| {
+            if a == late_addr && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // Fills the accept queue (2 of 2) before the final check.
+                handler.handle(third, &ack_of(PacketType::State, id, isn.wrapping_sub(1)));
+            }
+            true
+        })));
+    }
+    handler.handle(late_addr, &packet(PacketType::Syn, id, 1));
+    assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+    // Refused, and the oldest half-open slot (the second dialler) is kept.
+    assert_eq!(server.num_connections(), 3);
+}

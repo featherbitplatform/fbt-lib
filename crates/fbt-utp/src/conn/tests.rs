@@ -1013,3 +1013,37 @@ fn tiny_payloads_do_not_amplify_memory() {
     assert!(got == want, "bytes out of order");
     assert_eq!(a.buffered_bytes(), 0);
 }
+
+/// Short and full-size in-order payloads alternating: a short tail frozen
+/// on its own before each large chunk would give two chunks per 1401
+/// bytes, about `2 * recv_buffer / MERGE_BELOW`, past the chunk bound.
+#[test]
+fn alternating_short_and_full_payloads_keep_the_chunk_bound() {
+    let cfg = UtpConfig {
+        recv_buffer: 16 * 1024,
+        ..UtpConfig::default()
+    };
+    let (mut a, t) = hand_connected(&cfg, 1 << 20);
+    let max_chunks = cfg.recv_buffer / MERGE_BELOW + 1;
+    let mut sent = Vec::new();
+    let mut seq = 500u16;
+    loop {
+        let len = if seq.is_multiple_of(2) { 1 } else { 1400 };
+        let payload: Vec<u8> = (0..len)
+            .map(|i| (usize::from(seq) * 31 + i) as u8)
+            .collect();
+        let before = a.buffered_bytes();
+        a.on_packet(&data_with(seq, payload.clone()), t);
+        checked(&a, "alternating");
+        assert!(a.inbox.len() <= max_chunks, "{} chunks", a.inbox.len());
+        if a.buffered_bytes() == before {
+            break; // the window is full: the packet was refused
+        }
+        sent.extend_from_slice(&payload);
+        seq = seq.wrapping_add(1);
+    }
+    assert!(sent.len() > cfg.recv_buffer - 1401, "window not filled");
+    let mut got = Vec::new();
+    read_all(&mut a, &mut got);
+    assert!(got == sent, "bytes out of order");
+}

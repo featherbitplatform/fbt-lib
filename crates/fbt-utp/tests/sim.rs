@@ -439,6 +439,9 @@ async fn sequence_numbers_wrap_both_ways() {
     let d0 = random_bytes(&mut data_rng, LEN);
     let d1 = random_bytes(&mut data_rng, LEN);
     let mut sides = [Side::new(d0.clone()), Side::new(d1.clone())];
+    for s in sides.iter_mut() {
+        s.check = true;
+    }
     let mut net = SimNet::new(99, LinkCfg::lossy(0.02, 0.02));
     let out = run(&cfg, &mut net, &mut sides, Duration::from_secs(3600), |s| {
         eof(&s[0]) && eof(&s[1])

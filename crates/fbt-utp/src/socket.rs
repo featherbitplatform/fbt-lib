@@ -636,6 +636,13 @@ impl Shared {
                     None => return,
                 }
             };
+            // `handle` is not serialised (a shared socket's handler may be
+            // called from any thread), so the victim leaves the half-open
+            // set now: a concurrent SYN then picks another victim, and the
+            // set never grows past `max_pending_accept`.
+            if let Some((vkey, _)) = &victim {
+                table.drop_half_open(*vkey);
+            }
             table.slots.insert(key, Arc::clone(&slot));
             table.add_half_open(key);
             victim
