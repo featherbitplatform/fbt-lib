@@ -1,8 +1,9 @@
 //! One torrent: its public handle and the actor task behind it.
 //!
 //! - `actor`: the event loop, commands, state and status.
-//! - `swarm`: addresses to connect to, connections within the limits,
-//!   sending to and closing peers.
+//! - `swarm`: connections within the limits, sending to and closing peers.
+//! - `known`, `retries`, `peer`: the addresses to connect to, their retries
+//!   and fallbacks, and one connection's state.
 //! - `peers`: peer events, interest, choking and block requests.
 //! - `data`: block buffering, piece verification and writes.
 //! - `serve`: answering block requests from peers.
@@ -19,10 +20,13 @@ mod commands;
 mod data;
 mod dht;
 mod holepunch;
+mod known;
 mod magnet;
 mod metadata;
+mod peer;
 mod peers;
 mod pex;
+mod retries;
 mod serve;
 mod swarm;
 mod tiers;

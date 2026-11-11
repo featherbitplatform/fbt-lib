@@ -395,7 +395,7 @@ mod tests {
     use crate::status::{TorrentState, TorrentStatus};
     use crate::storage::{MemStorage, Storage};
     use crate::torrent::actor::EMITTED;
-    use crate::torrent::swarm::Peer;
+    use crate::torrent::peer::Peer;
 
     /// Whoever reacts to `TorrentFinished` reads the final status: every
     /// downloaded byte counted and the torrent seeding, not the last tick's

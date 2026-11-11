@@ -10,7 +10,7 @@ use fbt_core::Bitfield;
 
 use super::actor::{Actor, Phase};
 use super::data::Job;
-use super::swarm::Peer;
+use super::peer::Peer;
 use crate::picker::{PeerKey, PiecePicker};
 use crate::storage::check_pieces;
 use tokio::sync::OwnedSemaphorePermit;

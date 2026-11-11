@@ -15,9 +15,9 @@ use tracing::debug;
 use super::actor::Actor;
 use super::data::Job;
 use super::holepunch::{RelayAction, relay};
+use super::known::dialable;
 use super::metadata::{FetchStep, MAX_METADATA_REQUESTS_PER_PEER, serve_metadata};
 use super::pex::{PexPeer, connectable_addr};
-use super::swarm::dialable;
 use super::swarm::{BanTarget, ConnectOutcome};
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
@@ -322,11 +322,11 @@ impl Actor {
 
     /// Remembers the address of a seed or upload-only peer that is gone
     /// while we are finished, so it is not redialled in a loop.
-    fn note_seed_gone(&mut self, p: &super::swarm::Peer) {
+    fn note_seed_gone(&mut self, p: &super::peer::Peer) {
         if !self.upload_only_sent
             || !p.connected
             || !(p.upload_only || p.is_seed())
-            || self.seed_addrs.len() >= super::swarm::MAX_KNOWN
+            || self.seed_addrs.len() >= super::known::MAX_KNOWN
         {
             return;
         }
@@ -956,7 +956,7 @@ impl Actor {
 
 /// The peer's share of the torrent's `num_pieces` pieces in parts per
 /// million; 0 while the metadata is pending.
-fn progress_ppm(p: &super::swarm::Peer, num_pieces: Option<u32>) -> u32 {
+fn progress_ppm(p: &super::peer::Peer, num_pieces: Option<u32>) -> u32 {
     match num_pieces {
         _ if p.seed => 1_000_000,
         Some(n) if n > 0 => {
