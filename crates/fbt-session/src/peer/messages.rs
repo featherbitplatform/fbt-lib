@@ -95,6 +95,13 @@ pub(crate) enum PeerEvent {
     WantBlocks { key: PeerKey, count: usize },
     /// The remote requests a block (not validated).
     Request { key: PeerKey, block: BlockRef },
+    /// A `Piece` message answering the remote's request for `block` was
+    /// written and flushed: `len` payload bytes uploaded.
+    BlockSent {
+        key: PeerKey,
+        block: BlockRef,
+        len: u64,
+    },
     /// The remote cancels an earlier request.
     Cancel { key: PeerKey, block: BlockRef },
     /// Payload bytes dropped because they matched no outstanding request.
@@ -141,7 +148,9 @@ pub(crate) enum PeerCommand {
     /// Announce several pieces at once: those completed while the
     /// connection was being set up, after its initial bitfield was taken.
     Haves(Vec<u32>),
-    /// Answer a queued request.
+    /// Answer a queued request: the block waits in the connection's upload
+    /// queue for its rate limit, and is dropped there if cancelled or
+    /// choked away first.
     SendBlock { block: BlockRef, data: Bytes },
     /// Refuse a queued request.
     Reject(BlockRef),

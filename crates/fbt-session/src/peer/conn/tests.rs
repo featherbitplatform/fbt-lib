@@ -82,6 +82,8 @@ fn start_ctx(have: Bitfield, layout: Option<PieceLayout>, ext: ExtConfig) -> Har
         events: etx,
         encrypted: false,
         transport: crate::peer::transport::Transport::Tcp,
+        bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
+        torrent_rate: crate::bandwidth::BucketPair::new(Default::default()),
     };
     tokio::spawn(run_peer(ours, None, addr(), ctx, crx));
     Harness {
@@ -760,6 +762,15 @@ async fn serves_queued_requests_only() {
             piece: 1,
             offset: 0,
             data,
+        }
+    );
+    // Reported sent once written, the only point the upload counts.
+    assert_eq!(
+        r.next().await,
+        PeerEvent::BlockSent {
+            key: KEY,
+            block: block(1, 0),
+            len: 16_384,
         }
     );
     // A remote cancel is forwarded.

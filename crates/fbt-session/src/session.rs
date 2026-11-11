@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::bandwidth::{Bandwidth, PeerClassLimits, RateLimit};
 use crate::disk::DiskPool;
 use crate::error::SessionError;
 use crate::event::{Event, EventMask, EventStream};
@@ -104,6 +105,11 @@ pub struct AddTorrent {
     pub file_priorities: Vec<Priority>,
     /// Custom storage; `None` uses the filesystem below `save_path`.
     pub storage: Option<Arc<dyn Storage>>,
+    /// The torrent's own limit (0: unlimited), within the session's. Like
+    /// the global limit it applies to local-network peers only with
+    /// [`Settings::rate_limit_local_peers`]. Changed at runtime with
+    /// [`TorrentHandle::set_rate_limit`].
+    pub rate_limit: RateLimit,
 }
 
 impl AddTorrent {
@@ -127,6 +133,7 @@ impl AddTorrent {
             sequential: false,
             file_priorities: Vec::new(),
             storage: None,
+            rate_limit: RateLimit::default(),
         }
     }
 }
@@ -163,6 +170,8 @@ pub(crate) struct Shared {
     pub disk: DiskPool,
     /// The byte budget every torrent's write-back cache draws from.
     pub cache: Arc<CacheBudget>,
+    /// The global and class rate limits.
+    pub bandwidth: Arc<Bandwidth>,
 }
 
 /// The DHT port to send a peer at `peer` in `Port`: that of our DHT socket
@@ -364,6 +373,8 @@ impl Session {
         let listener_state = Arc::new(ListenerState::new(settings.max_peers_global));
         let disk = DiskPool::new(settings.disk_threads, settings.max_active_checks);
         let cache = Arc::new(CacheBudget::new(settings.cache_size));
+        let bandwidth = Arc::new(Bandwidth::new(&settings));
+        bandwidth.spawn_rebalance();
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -380,6 +391,7 @@ impl Session {
             utp,
             disk,
             cache,
+            bandwidth,
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -444,6 +456,18 @@ impl Session {
     /// [`Settings::cache_size`].
     pub fn cache_stats(&self) -> CacheStats {
         self.inner.shared.cache.stats()
+    }
+
+    /// Sets the session-wide rate limit ([`Settings::rate_limit`]); it
+    /// applies at once, and to waiting connections within a second.
+    pub fn set_rate_limit(&self, limit: RateLimit) {
+        self.inner.shared.bandwidth.set_global(limit);
+    }
+
+    /// Sets the peer class limits ([`Settings::peer_class_limits`]); they
+    /// apply at once, and to waiting connections within a second.
+    pub fn set_peer_class_limits(&self, limits: PeerClassLimits) {
+        self.inner.shared.bandwidth.set_classes(limits);
     }
 
     /// The address of the first peer listener (the first of
@@ -730,6 +754,7 @@ mod tests {
             utp: Vec::new(),
             disk: crate::disk::DiskPool::new(1, 1),
             cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
+            bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();

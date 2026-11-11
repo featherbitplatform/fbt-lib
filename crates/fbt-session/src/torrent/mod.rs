@@ -34,6 +34,7 @@ use fbt_metainfo::Metainfo;
 use fbt_wire::Handshake;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::bandwidth::RateLimit;
 use crate::error::SessionError;
 use crate::peer::conn::PeerStream;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource};
@@ -54,6 +55,7 @@ pub(crate) enum Cmd {
     SetPriorities(Vec<Priority>, oneshot::Sender<()>),
     AddPeer(SocketAddr, oneshot::Sender<()>),
     Pieces(oneshot::Sender<Bitfield>),
+    SetRateLimit(RateLimit, oneshot::Sender<()>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -225,6 +227,12 @@ impl TorrentHandle {
     /// at all before a magnet's metadata).
     pub async fn pieces(&self) -> Result<Bitfield, SessionError> {
         self.call(Cmd::Pieces).await
+    }
+
+    /// Sets the torrent's own rate limit ([`AddTorrent::rate_limit`]); it
+    /// applies at once, and to waiting connections within a second.
+    pub async fn set_rate_limit(&self, limit: RateLimit) -> Result<(), SessionError> {
+        self.call(|tx| Cmd::SetRateLimit(limit, tx)).await
     }
 
     fn gone(&self) -> SessionError {

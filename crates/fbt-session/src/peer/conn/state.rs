@@ -1,6 +1,6 @@
 //! Connection state and its timers.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -13,7 +13,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::codec::Framed;
 
-use super::{Flow, PeerCtx, after, max_frame, wire_reason};
+use super::{Flow, PeerCtx, after, max_frame, wire_len, wire_reason};
+use crate::bandwidth::{PeerThrottles, Throttle};
 use crate::peer::ext::{self, ExtConfig, RemoteIds};
 use crate::peer::messages::{DisconnectReason, PeerCommand, PeerEvent, PeerPiecesOwned};
 use crate::picker::PeerKey;
@@ -87,10 +88,28 @@ pub(super) struct Conn<S> {
     pub(super) incoming: HashSet<BlockRef>,
     pub(super) last_recv: Instant,
     pub(super) last_send: Instant,
+    /// What we read is charged here; reads wait while it is in debt.
+    pub(super) down: Throttle,
+    /// What we write is charged here; queued blocks wait while it is in
+    /// debt (other messages never do).
+    pub(super) up: Throttle,
+    /// Blocks the torrent answered, waiting for the upload throttle. An
+    /// entry whose block left `incoming` (cancelled, choked away) is
+    /// skipped; at most `max_incoming_requests` live ones.
+    pub(super) uploads: VecDeque<(BlockRef, Bytes)>,
+    /// Since when the download throttle holds reads back: the idle timer
+    /// is paused meanwhile, since unread messages are not silence.
+    pub(super) held_since: Option<Instant>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
-    pub(super) fn new(stream: S, theirs: &Handshake, remote_ip: IpAddr, ctx: &PeerCtx) -> Self {
+    pub(super) fn new(
+        stream: S,
+        theirs: &Handshake,
+        remote_ip: IpAddr,
+        ctx: &PeerCtx,
+        throttles: &PeerThrottles,
+    ) -> Self {
         let num_pieces = ctx.layout.map(|l| l.num_pieces());
         let now = Instant::now();
         Conn {
@@ -116,6 +135,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             incoming: HashSet::new(),
             last_recv: now,
             last_send: now,
+            down: throttles.down.clone(),
+            up: throttles.up.clone(),
+            uploads: VecDeque::new(),
+            held_since: None,
         }
     }
 
@@ -130,11 +153,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             return reason;
         }
         loop {
+            if let Err(reason) = self.drain_uploads().await {
+                return reason;
+            }
+            let now = Instant::now();
+            let read_held = self.down.ready_at(now).is_some();
+            self.hold_reads(read_held, now);
+            let upload_held = !self.uploads.is_empty();
             let deadline = self.next_deadline();
+            // Never blocks: a throttle only disables the read branch (the
+            // transport's window closes and the sender slows) or delays
+            // the upload queue, while commands and timers keep running.
             let step = tokio::select! {
-                msg = self.framed.next() => match msg {
+                msg = self.framed.next(), if !read_held => match msg {
                     Some(Ok(m)) => {
                         self.last_recv = Instant::now();
+                        self.down.charge(wire_len(&m));
                         self.on_message(m).await
                     }
                     Some(Err(e)) => Err(wire_reason(e)),
@@ -145,6 +179,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     None => Err(DisconnectReason::Shutdown),
                 },
                 () = sleep_until(deadline) => self.on_timer().await,
+                () = self.down.wait_ready(), if read_held => Ok(()),
+                () = self.up.wait_ready(), if upload_held => Ok(()),
             };
             if let Err(reason) = step {
                 return reason;
@@ -180,10 +216,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         self.flush().await
     }
 
+    /// Starts or ends a read hold; at its end the idle timer resumes where
+    /// it stood when the hold began.
+    pub(super) fn hold_reads(&mut self, held: bool, now: Instant) {
+        match (held, self.held_since) {
+            (true, None) => self.held_since = Some(now),
+            (false, Some(since)) => {
+                let paused = now.saturating_duration_since(since);
+                self.last_recv = after(self.last_recv, paused).min(now);
+                self.held_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The idle deadline; none while reads are held.
+    fn idle_deadline(&self) -> Option<Instant> {
+        self.held_since
+            .is_none()
+            .then(|| after(self.last_recv, self.settings.peer_idle_timeout))
+    }
+
     pub(super) fn next_deadline(&self) -> Instant {
         let s = &self.settings;
-        let idle = after(self.last_recv, s.peer_idle_timeout);
         let keepalive = after(self.last_send, s.keepalive_interval);
+        let idle = self.idle_deadline().unwrap_or(keepalive);
         let request = self
             .outstanding
             .values()
@@ -194,7 +251,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     pub(super) async fn on_timer(&mut self) -> Flow {
         let now = Instant::now();
-        if now >= after(self.last_recv, self.settings.peer_idle_timeout) {
+        if self.idle_deadline().is_some_and(|idle| now >= idle) {
             return Err(DisconnectReason::IdleTimeout);
         }
         let limit = self.settings.request_timeout;

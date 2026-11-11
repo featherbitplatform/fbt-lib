@@ -72,6 +72,10 @@ impl Actor {
                 );
                 let _ = tx.send(bf);
             }
+            Cmd::SetRateLimit(limit, tx) => {
+                self.rate.set(limit);
+                let _ = tx.send(());
+            }
             Cmd::Incoming {
                 stream,
                 handshake,

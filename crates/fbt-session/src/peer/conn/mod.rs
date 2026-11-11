@@ -39,9 +39,13 @@ use tokio::time::{Instant, timeout, timeout_at};
 use super::ext::ExtConfig;
 use super::messages::{DisconnectReason, PeerCommand, PeerEvent};
 use super::transport::{PeerTransport, Transport};
+use crate::bandwidth::{Bandwidth, BucketPair};
 use crate::picker::PeerKey;
 use crate::settings::Settings;
 use state::Conn;
+
+/// Bytes of a BitTorrent handshake.
+const HANDSHAKE_LEN: u64 = 68;
 
 /// Command queue room beyond `max_incoming_requests`: every queued remote
 /// request may be answered by one command, plus control commands.
@@ -92,6 +96,10 @@ pub(crate) struct PeerCtx {
     /// The transport the connection runs over; copied into
     /// `PeerEvent::Connected`.
     pub transport: Transport,
+    /// The session's rate limits.
+    pub bandwidth: Arc<Bandwidth>,
+    /// The torrent's own rate limit buckets.
+    pub torrent_rate: BucketPair,
 }
 
 /// A peer connection's stream: MSE (RC4 or plaintext after the MSE
@@ -235,7 +243,15 @@ async fn run_peer_until<S: AsyncRead + AsyncWrite + Unpin>(
     let (reason, outstanding) = match handshake(&mut stream, remote, &ctx, deadline).await {
         Err(reason) => (reason, Vec::new()),
         Ok(theirs) => {
-            let mut conn = Conn::new(stream, &theirs, addr.ip(), &ctx);
+            // Counted for mixed mode while connected (dropped with this
+            // scope).
+            let throttles = ctx
+                .bandwidth
+                .peer(ctx.transport, addr.ip(), &ctx.torrent_rate);
+            // The handshakes are charged, never delayed.
+            throttles.down.charge(HANDSHAKE_LEN);
+            throttles.up.charge(HANDSHAKE_LEN);
+            let mut conn = Conn::new(stream, &theirs, addr.ip(), &ctx, &throttles);
             let connected = PeerEvent::Connected {
                 key: ctx.key,
                 peer_id: theirs.peer_id,
@@ -341,3 +357,21 @@ pub(crate) fn after(t: Instant, d: Duration) -> Instant {
 }
 
 type Flow = Result<(), DisconnectReason>;
+
+/// The bytes `m` takes on the wire (its frame, length prefix included):
+/// what the rate limits count.
+pub(crate) fn wire_len(m: &fbt_wire::Message) -> u64 {
+    use fbt_wire::Message as M;
+    let payload = match m {
+        M::KeepAlive => return 4,
+        M::Choke | M::Unchoke | M::Interested | M::NotInterested | M::HaveAll | M::HaveNone => 0,
+        M::Have(_) | M::SuggestPiece(_) | M::AllowedFast(_) => 4,
+        M::Port(_) => 2,
+        M::Request(_) | M::Cancel(_) | M::RejectRequest(_) => 12,
+        M::Bitfield(b) => b.len(),
+        M::Piece { data, .. } => data.len().saturating_add(8),
+        M::Extended { payload, .. } => payload.len().saturating_add(1),
+        M::Unknown { payload, .. } => payload.len(),
+    };
+    (payload as u64).saturating_add(5)
+}

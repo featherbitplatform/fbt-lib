@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use fbt_tracker::TrackerConfig;
 
+use crate::bandwidth::{MixedMode, PeerClassLimits, RateLimit};
+
 /// Largest accepted [`Settings::event_queue`]; the queue is allocated up
 /// front.
 pub const MAX_EVENT_QUEUE: usize = 1 << 20;
@@ -222,6 +224,22 @@ pub struct Settings {
     pub cache_size: u64,
     /// How long a verified piece may stay unwritten (30 s). Non-zero.
     pub cache_expiry: Duration,
+    /// The session-wide limit, in bytes per second each way (0:
+    /// unlimited). It applies to peers on the local network only with
+    /// [`rate_limit_local_peers`](Self::rate_limit_local_peers). Changed
+    /// at runtime with [`Session::set_rate_limit`](crate::Session::set_rate_limit).
+    pub rate_limit: RateLimit,
+    /// Limits per peer class: TCP, uTP and local-network peers. They apply
+    /// to local peers too. Changed at runtime with
+    /// [`Session::set_peer_class_limits`](crate::Session::set_peer_class_limits).
+    pub peer_class_limits: PeerClassLimits,
+    /// Apply the global and per-torrent limits to peers on the local
+    /// network (loopback, RFC 1918, link-local, CGNAT, IPv6 unique-local)
+    /// as well (off: they are exempt, as with libtorrent's
+    /// `ignore_limits_on_local_network`). Their class limits apply anyway.
+    pub rate_limit_local_peers: bool,
+    /// How a global limit is shared between TCP and uTP peers.
+    pub mixed_mode: MixedMode,
 }
 
 impl Settings {
@@ -375,6 +393,10 @@ impl Default for Settings {
             max_active_checks: 1,
             cache_size: 64 * 1024 * 1024,
             cache_expiry: Duration::from_secs(30),
+            rate_limit: RateLimit::default(),
+            peer_class_limits: PeerClassLimits::default(),
+            rate_limit_local_peers: false,
+            mixed_mode: MixedMode::default(),
         }
     }
 }

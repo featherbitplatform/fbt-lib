@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Instant, timeout};
 
 use super::state::Conn;
-use super::{Flow, wire_reason};
+use super::{Flow, wire_len, wire_reason};
 use crate::peer::messages::{DisconnectReason, PeerCommand, PeerEvent};
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
@@ -65,8 +65,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 if !self.choking {
                     self.choking = true;
                     self.feed(Message::Choke).await?;
-                    // Queued requests die with the choke; with fast they are
-                    // rejected explicitly.
+                    // Queued requests die with the choke, answered or not;
+                    // with fast they are rejected explicitly.
+                    self.uploads.clear();
                     for b in std::mem::take(&mut self.incoming) {
                         if self.fast {
                             self.feed(Message::RejectRequest(b)).await?;
@@ -102,14 +103,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 }
             }
             PeerCommand::SendBlock { block, data } => {
-                // Only answer requests still queued (not cancelled or choked away).
-                if self.incoming.remove(&block) {
-                    self.send(Message::Piece {
-                        piece: block.piece,
-                        offset: block.offset,
-                        data,
-                    })
-                    .await?;
+                // Only answer requests still queued (not cancelled or choked
+                // away); the block stays in `incoming` until it is written.
+                if self.incoming.contains(&block) {
+                    if self.uploads.len() >= self.settings.max_incoming_requests {
+                        // Drop entries cancelled since: the live ones are
+                        // all in `incoming`, which is bounded.
+                        let incoming = &self.incoming;
+                        self.uploads.retain(|(b, _)| incoming.contains(b));
+                    }
+                    self.uploads.push_back((block, data));
                 }
             }
             PeerCommand::Reject(b) => {
@@ -129,6 +132,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 }
             }
             PeerCommand::Close => return Err(DisconnectReason::Shutdown),
+        }
+        Ok(())
+    }
+
+    /// Writes queued blocks while the upload throttle allows, each
+    /// charged as it is written, then reports each one sent once flushed.
+    pub(super) async fn drain_uploads(&mut self) -> Flow {
+        let mut sent = Vec::new();
+        while !self.uploads.is_empty() && self.up.ready_at(Instant::now()).is_none() {
+            let Some((block, data)) = self.uploads.pop_front() else {
+                break;
+            };
+            // Cancelled, rejected or choked away while queued.
+            if !self.incoming.remove(&block) {
+                continue;
+            }
+            let len = data.len() as u64;
+            self.feed(Message::Piece {
+                piece: block.piece,
+                offset: block.offset,
+                data,
+            })
+            .await?;
+            sent.push((block, len));
+        }
+        if sent.is_empty() {
+            return Ok(());
+        }
+        self.flush().await?;
+        for (block, len) in sent {
+            self.emit(PeerEvent::BlockSent {
+                key: self.key,
+                block,
+                len,
+            })
+            .await?;
         }
         Ok(())
     }
@@ -155,7 +194,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
     }
 
+    /// Queues `m` for writing, charged to the upload throttle (never
+    /// delayed by it: only blocks wait, in [`Self::drain_uploads`]).
     pub(super) async fn feed(&mut self, m: Message) -> Flow {
+        self.up.charge(wire_len(&m));
         let r = timeout(self.settings.peer_idle_timeout, self.framed.feed(m)).await;
         self.write_done(r)
     }

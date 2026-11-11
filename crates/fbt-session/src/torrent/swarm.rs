@@ -571,6 +571,8 @@ impl Actor {
             events: self.peer_tx.clone(),
             encrypted: false,
             transport: Transport::Tcp,
+            bandwidth: Arc::clone(&self.shared.bandwidth),
+            torrent_rate: self.rate.clone(),
         }
     }
 
@@ -1162,6 +1164,7 @@ pub(super) mod tests {
             utp: Vec::new(),
             disk: crate::disk::DiskPool::new(1, 1),
             cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
+            bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
         });
         let add = AddTorrent::new(meta, PathBuf::from("unused"));
         let ih = add.source.info_hashes();

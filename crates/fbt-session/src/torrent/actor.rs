@@ -28,6 +28,7 @@ use super::metadata::MetadataFetch;
 use super::serve::PieceReads;
 use super::swarm::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
+use crate::bandwidth::BucketPair;
 use crate::choker::Choker;
 use crate::event::{Event, PeerSource};
 use crate::peer::messages::PeerEvent;
@@ -206,6 +207,8 @@ pub(crate) struct Actor {
     /// waiting on each.
     /// Keyed by piece, with the generation the read was started in.
     pub(super) piece_reads: PieceReads,
+    /// The torrent's own rate limit buckets, chained by its peers.
+    pub(super) rate: BucketPair,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -224,6 +227,7 @@ impl Actor {
         status_tx: watch::Sender<TorrentStatus>,
     ) -> Self {
         let ih = params.source.info_hashes();
+        let rate = BucketPair::new(params.rate_limit);
         let (loaded, magnet, trackers) = match params.source {
             TorrentSource::Metainfo(m) => {
                 let trackers = m.trackers.clone();
@@ -329,6 +333,7 @@ impl Actor {
             finish_flush: false,
             piece_reads,
             write_error: None,
+            rate,
             #[cfg(test)]
             pex_live_builds: 0,
             #[cfg(test)]

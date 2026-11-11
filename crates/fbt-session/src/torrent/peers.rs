@@ -73,6 +73,7 @@ impl Actor {
             // The peer task drops the cancelled request itself; an answer
             // already being read is discarded there.
             PeerEvent::Cancel { .. } => {}
+            PeerEvent::BlockSent { key, len, .. } => self.on_block_sent(key, len),
             PeerEvent::Wasted { bytes, .. } => {
                 self.counters.wasted = self.counters.wasted.saturating_add(bytes);
             }

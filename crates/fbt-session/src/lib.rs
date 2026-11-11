@@ -37,6 +37,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bandwidth;
 pub mod choker;
 mod disk;
 pub mod error;
@@ -52,6 +53,7 @@ mod status;
 pub mod storage;
 mod torrent;
 
+pub use bandwidth::{MixedMode, PeerClassLimits, RateLimit};
 pub use error::SessionError;
 pub use event::{Event, EventMask, EventStream, PeerSource};
 pub use fbt_dht::DhtStats;

@@ -149,9 +149,9 @@ impl Actor {
         }
     }
 
-    /// Sends a block to a peer that still wants it, counting the upload.
+    /// Sends a block to a peer that still wants it; the upload counts once
+    /// the peer task reports it written ([`Actor::on_block_sent`]).
     fn deliver(&mut self, key: PeerKey, block: BlockRef, data: Bytes) {
-        let len = data.len() as u64;
         // Choked since the request: the peer task dropped it already.
         if self
             .peers
@@ -160,12 +160,17 @@ impl Actor {
         {
             return;
         }
-        if self.send(key, PeerCommand::SendBlock { block, data }) {
-            self.counters.uploaded = self.counters.uploaded.saturating_add(len);
-            self.counters.ul.record(len);
-            if let Some(p) = self.peers.get_mut(&key) {
-                p.to_rate.record(len);
-            }
+        self.send(key, PeerCommand::SendBlock { block, data });
+    }
+
+    /// A peer task wrote and flushed `len` bytes of block data: only
+    /// these count as uploaded, never blocks cancelled or choked away
+    /// while queued.
+    pub(super) fn on_block_sent(&mut self, key: PeerKey, len: u64) {
+        self.counters.uploaded = self.counters.uploaded.saturating_add(len);
+        self.counters.ul.record(len);
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.to_rate.record(len);
         }
     }
 
