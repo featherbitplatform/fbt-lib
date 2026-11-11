@@ -1144,6 +1144,23 @@ impl Actor {
                 self.known.remove(&p.addr);
                 self.candidates.retain(|a| *a != p.addr);
             }
+        } else if p.outgoing
+            && p.connected
+            && matches!(
+                reason,
+                DisconnectReason::IdleTimeout | DisconnectReason::Io(_) | DisconnectReason::Closed
+            )
+            && (p.from_rate.total() > 0 || p.to_rate.total() > 0)
+        {
+            // A peer that traded data and then went away (it closed, its
+            // transport timed out, or it went idle): dialled again as the
+            // first retry of a series, a twelfth of `peer_retry_delay`.
+            // Otherwise only a tracker or PEX naming it again would, and a
+            // lone seed lost mid-download stalls it for an announce
+            // interval. One that never traded data is left alone, so a peer
+            // that accepts and hangs up cannot keep us dialling it.
+            debug!(addr = %p.addr, "productive peer dropped; redialling soon");
+            self.retries.failed(p.addr, Instant::now());
         }
         match &reason {
             DisconnectReason::Protocol(msg) => {

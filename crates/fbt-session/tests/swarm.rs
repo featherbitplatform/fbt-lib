@@ -442,6 +442,101 @@ async fn failed_connect_is_retried_three_times_then_dropped() {
     s.shutdown().await;
 }
 
+/// Retry settings dialling over TCP in plaintext, as `ScriptedPeer`
+/// answers.
+fn plain_dialler() -> Settings {
+    let mut s = retry_settings();
+    s.encryption = EncryptionPolicy::Disabled;
+    dial_tcp(s)
+}
+
+/// Accepts the session's dial on `listener` as a seed of all 7 pieces,
+/// unchokes it and answers its requests until `blocks` blocks went out,
+/// then drops the connection (a seed that died, or that our idle or uTP
+/// timeout cut, after doing useful work).
+async fn seed_then_drop(listener: &tokio::net::TcpListener, payload: &[u8], blocks: usize) {
+    let mut seed = ScriptedPeer::accept_with(listener, Reserved::default()).await;
+    seed.send(Message::Bitfield(bytes::Bytes::from_static(&[0xfe])))
+        .await;
+    seed.send(Message::Unchoke).await;
+    for _ in 0..blocks {
+        let Some(Message::Request(b)) = seed
+            .next_matching(|m| matches!(m, Message::Request(_)))
+            .await
+        else {
+            panic!("no request");
+        };
+        let start = b.piece as usize * 16_384 + b.offset as usize;
+        seed.send(Message::Piece {
+            piece: b.piece,
+            offset: b.offset,
+            data: bytes::Bytes::copy_from_slice(&payload[start..start + b.len as usize]),
+        })
+        .await;
+    }
+}
+
+/// An outgoing peer that delivered data and then dropped is dialled again
+/// soon (the first retry of a series, a twelfth of `peer_retry_delay`),
+/// not only when a tracker names it again. In CI qBittorrent's uTP
+/// connection timed out at 31 % and the lone seed was never redialled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn productive_peer_that_dropped_is_redialled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seed_addr = listener.local_addr().unwrap();
+    let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
+    let (s, h, storage) = mem_leecher_with(plain_dialler(), &m, payload.len()).await;
+    let mut ev = s.subscribe(EventMask::ALL);
+    h.add_peer(seed_addr).await.unwrap();
+    seed_then_drop(&listener, &payload, 2).await;
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == seed_addr),
+        T,
+    )
+    .await
+    .expect("the drop is reported");
+    // Redialled: this time the seed serves everything.
+    let mut seed = tokio::time::timeout(
+        Duration::from_secs(5),
+        ScriptedPeer::accept_with(&listener, Reserved::default()),
+    )
+    .await
+    .expect("the productive seed is dialled again");
+    seed.send(Message::Bitfield(bytes::Bytes::from_static(&[0xfe])))
+        .await;
+    seed.send(Message::Unchoke).await;
+    let serving = tokio::spawn(async move { seed.serve(&payload, 16_384).await });
+    finished(&mut ev).await;
+    assert_eq!(stored(&storage, 100_000).len(), 100_000);
+    serving.abort();
+    s.shutdown().await;
+}
+
+/// A peer that dropped without sending a single block is not redialled on
+/// its own (it is retried only when a tracker or PEX names it again), so a
+/// peer that accepts and hangs up at once cannot make us dial it in a loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unproductive_peer_that_dropped_is_not_redialled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seed_addr = listener.local_addr().unwrap();
+    let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
+    let (s, h, _) = mem_leecher_with(plain_dialler(), &m, payload.len()).await;
+    let mut ev = s.subscribe(EventMask::ALL);
+    h.add_peer(seed_addr).await.unwrap();
+    seed_then_drop(&listener, &payload, 0).await;
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == seed_addr),
+        T,
+    )
+    .await
+    .expect("the drop is reported");
+    let again = tokio::time::timeout(Duration::from_millis(1500), listener.accept()).await;
+    assert!(again.is_err(), "an unproductive peer was redialled");
+    s.shutdown().await;
+}
+
 /// A fast-extension peer flooding `AllowedFast` while choking us: the actor
 /// stays responsive, requests nothing the peer lacks, and requests an
 /// allowed-fast piece as soon as the peer announces it.

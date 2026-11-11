@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fbt-utp`: an incoming connection reaches `UtpSocket::accept` only once the dialler acks our handshake, and at most `UtpConfig::max_pending_accept` connections are half-open (the oldest is dropped for a newer SYN), so a flood of forged SYNs no longer takes the session's pending-handshake slots or fills the uTP connection table ([#8](https://github.com/featherbitplatform/fbt-lib/pull/8))
 - `fbt-net`: a UPnP renewal asks for the external port it holds, so a mapping moved to a random port after a conflict is no longer leaked on the router at each renewal ([#8](https://github.com/featherbitplatform/fbt-lib/pull/8))
 - `fbt-utp`: a selective ack of any non-empty length is accepted. libtorrent (qBittorrent) sends only the bytes its bits need rather than a multiple of four, and such packets, data included, were dropped whole: transfers from libtorrent stalled for an RTO whenever it had a hole in our stream, and deadlocked once a lost packet of ours left every one of its packets carrying a SACK ([#8](https://github.com/featherbitplatform/fbt-lib/pull/8))
+- `fbt-session`: an outgoing peer that traded data and then went away (closed, timed out or idle) is dialled again after the first retry delay (5 s by default) instead of only when a tracker or PEX names it again ([#8](https://github.com/featherbitplatform/fbt-lib/pull/8))
 
 ## [0.2.0] - 2026-11-10
 
