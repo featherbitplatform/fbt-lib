@@ -144,7 +144,7 @@ cargo deny --all-features check
 
 ## Known limitations
 
-- uTP throughput and CPU, and the CPU of 1,000 idle torrents, miss their targets on the recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)); they are to be revisited.
+- uTP throughput and CPU, and the CPU of 1,000 idle torrents, miss their targets on the recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)). The uTP misses are known implementation costs (in-flight window scans per send, byte-wise `VecDeque` payload, zero-fill per read) scheduled for milestone 4; the idle CPU is to be revisited.
 - LSD joins the multicast group on the default interface only, and on a host with no default route it fails to start: the session then runs without LSD.
 
 ## Interop and fuzzing

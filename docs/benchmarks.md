@@ -39,6 +39,30 @@ First row (0.2.0), against each target:
 - 1,000 idle torrents under 1 % CPU: missed, 1.2 %.
 - Memory per idle torrent: recorded, about 18 KiB RSS.
 
+### Known defects: uTP throughput and CPU
+
+The uTP misses are known implementation costs in `fbt-utp`'s hot path, not
+open tuning targets:
+
+- **In-flight window scans per send.** Every packet sent, and every ack
+  processed, scans the whole in-flight window for packets to retransmit
+  (`transmit_outstanding`, `packetize`, `has_pending_send`). With a 1 MiB
+  send buffer that is about 750 packets, so CPU per packet grows with the
+  window and the faster the link, the worse it gets.
+- **Byte-wise `VecDeque` payload.** Send and receive payload sits in
+  `VecDeque<u8>` buffers and moves through byte iterators
+  (`extend(iter().take(n))`, `drain(..n)`), about three non-`memcpy` copies
+  per payload byte on each side.
+- **Zero-fill per read.** `UtpStream::poll_read` zero-fills the reader's
+  whole spare capacity (`initialize_unfilled`) on every call, often 8 to
+  16 KiB to deliver 1.4 to 3 KiB.
+
+They are scheduled for milestone 4: an O(1) path to the next unsent and
+lost packets, chunked or slice-copied payload buffers, and a read that
+initialises only what it fills. What remains after that is inherent to the
+design for now (one syscall per datagram, and one receive task per socket
+running all of its uTP processing) and is tuning work.
+
 The transfer timer polls the torrent state every 20 ms, so a very fast run
 (TCP finishes in about 2 s) is accurate to roughly 1 %.
 
