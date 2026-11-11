@@ -6,8 +6,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -360,6 +360,44 @@ impl Storage for SlowStorage {
     fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         std::thread::sleep(self.delay);
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// Memory storage whose reads take `delay` each while `slow` is set and are
+/// instant otherwise: a test decides when a check or an upload is slow and
+/// when it may end, so no assertion depends on wall-clock durations.
+#[derive(Debug)]
+pub struct ToggleStorage {
+    inner: MemStorage,
+    delay: Duration,
+    slow: Arc<AtomicBool>,
+}
+
+impl ToggleStorage {
+    pub fn new(data: Vec<u8>, delay: Duration, slow: Arc<AtomicBool>) -> Self {
+        ToggleStorage {
+            inner: MemStorage::from_bytes(data),
+            delay,
+            slow,
+        }
+    }
+}
+
+impl Storage for ToggleStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if self.slow.load(Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
         self.inner.read(offset, buf)
     }
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {

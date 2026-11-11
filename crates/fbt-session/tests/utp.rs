@@ -6,6 +6,7 @@ mod support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fbt_metainfo::Metainfo;
@@ -51,6 +52,29 @@ async fn seeder(st: Settings, m: &Metainfo, payload: &[u8]) -> (Session, Torrent
     let h = s.add_torrent(p).await.unwrap();
     assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
     (s, h)
+}
+
+/// A seeder that serves each block after 250 ms once it is seeding (its
+/// check runs at full speed). A leecher stays unfinished for seconds, so a
+/// pause and resume shortly after connecting happen mid-download, before
+/// the finished-torrent rules (BEP 21 disconnect, seed guard) apply.
+async fn slow_seeder(st: Settings, m: &Metainfo, payload: &[u8]) -> Session {
+    let slow = Arc::new(AtomicBool::new(false));
+    let s = Session::new(st).await.unwrap();
+    add_slow_seed(&s, m, payload, &slow).await;
+    s
+}
+
+async fn add_slow_seed(s: &Session, m: &Metainfo, payload: &[u8], slow: &Arc<AtomicBool>) {
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(Arc::new(ToggleStorage::new(
+        payload.to_vec(),
+        Duration::from_millis(250),
+        slow.clone(),
+    )));
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    slow.store(true, Ordering::SeqCst);
 }
 
 struct Leecher {
@@ -136,7 +160,7 @@ async fn utp_connect_failure_falls_back_to_tcp() {
     let (m, payload) = torrent();
     let mut seed_st = settings();
     seed_st.enable_incoming_utp = false;
-    let (seed, _) = seeder(seed_st, &m, &payload).await;
+    let seed = slow_seeder(seed_st, &m, &payload).await;
     let mut st = settings();
     st.utp_connect_timeout = Duration::from_millis(300);
     let mut l = leecher(st, &m, payload.len()).await;
@@ -160,10 +184,12 @@ async fn utp_connect_failure_falls_back_to_tcp() {
         "expected the uTP connect timeout first, got {first:?}"
     );
     assert_eq!(connected(&mut l.events).await.0, Transport::Tcp);
-    l.finish(&payload).await;
 
-    // Paused and resumed, the address is dialled again: over TCP first, so
-    // no further connect failure shows up (only the pause's own close).
+    // Paused mid-download and resumed, the address is dialled again: over
+    // TCP first, so no further connect failure shows up (only the pause's
+    // own close). The leecher must still be unfinished: a finished one
+    // closes the seed (BEP 21) and does not re-dial it.
+    assert_ne!(l.handle.status().state, TorrentState::Seeding);
     l.handle.pause().await.unwrap();
     let paused = next_matching(&mut l.events, is_disconnect, T).await;
     assert!(
@@ -194,6 +220,7 @@ async fn utp_connect_failure_falls_back_to_tcp() {
     };
     assert_eq!(transport, Transport::Tcp);
     assert_eq!(failures, 1, "one connect failure in total");
+    l.finish(&payload).await;
 }
 
 /// The next `PeerConnected` or `PeerDisconnected`.
@@ -251,7 +278,7 @@ async fn tcp_connect_failure_falls_back_to_utp() {
     // address TCP-only.
     let mut st = settings();
     st.enable_incoming_utp = false;
-    let (seed1, _) = seeder(st, &m, &payload).await;
+    let seed1 = slow_seeder(st, &m, &payload).await;
     let addr = seed1.local_addr();
     let mut lst = settings();
     lst.utp_connect_timeout = Duration::from_millis(300);
@@ -260,8 +287,7 @@ async fn tcp_connect_failure_falls_back_to_utp() {
     let first = next_peer_event(&mut l.events).await;
     assert!(is_disconnect(&first), "{first:?}");
     assert_eq!(connected(&mut l.events).await.0, Transport::Tcp);
-    l.finish(&payload).await;
-    // The leecher closes first, so the seed's port is not held by
+    // The leecher is still downloading (the seed is slow) and closes first, so the seed's port is not held by
     // TIME_WAIT when the second seed binds it.
     l.handle.pause().await.unwrap();
     assert!(is_disconnect(&next_peer_event(&mut l.events).await));
@@ -272,10 +298,7 @@ async fn tcp_connect_failure_falls_back_to_utp() {
     let mut st = settings();
     st.enable_incoming_tcp = false;
     let seed2 = session_on(st, addr).await;
-    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
-    p.storage = Some(Arc::new(MemStorage::from_bytes(payload.clone())));
-    let h2 = seed2.add_torrent(p).await.unwrap();
-    assert!(wait_state(&h2, |s| *s == TorrentState::Seeding, T).await);
+    add_slow_seed(&seed2, &m, &payload, &Arc::new(AtomicBool::new(false))).await;
     l.handle.resume().await.unwrap();
     l.handle.add_peer(addr).await.unwrap();
     let first = next_peer_event(&mut l.events).await;
@@ -292,6 +315,7 @@ async fn tcp_connect_failure_falls_back_to_utp() {
     assert_eq!(connected(&mut l.events).await.0, Transport::Utp);
 
     // uTP worked: the next dial goes over uTP first, with no failure.
+    assert_ne!(l.handle.status().state, TorrentState::Seeding);
     redial(&mut l, addr).await;
     let next = next_peer_event(&mut l.events).await;
     assert!(
@@ -304,6 +328,7 @@ async fn tcp_connect_failure_falls_back_to_utp() {
         ),
         "{next:?}"
     );
+    l.finish(&payload).await;
     seed2.shutdown().await;
 }
 

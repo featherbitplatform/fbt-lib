@@ -1090,7 +1090,19 @@ async fn queued_check_can_be_removed() {
     st.max_active_checks = 1;
     let s = Session::new(st).await.unwrap();
     let mut ev = s.subscribe(EventMask::ALL);
-    let first = slowchecking(&s).await;
+    let slow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let first = {
+        let (m, payload) = make_torrent(&[("a", 64 * 16_384)], 16_384);
+        let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+        p.storage = Some(std::sync::Arc::new(ToggleStorage::new(
+            payload,
+            Duration::from_millis(100),
+            slow.clone(),
+        )));
+        let h = s.add_torrent(p).await.unwrap();
+        assert!(wait_state(&h, |s| matches!(s, TorrentState::CheckingFiles { .. }), T).await);
+        h
+    };
     let counter = std::sync::Arc::new(ReadCounter::default());
     let queued = s
         .add_torrent(counted_torrent(4, Duration::ZERO, &counter))
@@ -1104,13 +1116,15 @@ async fn queued_check_can_be_removed() {
     queued.resume().await.unwrap();
     assert_eq!(queued.status().state, TorrentState::QueuedForChecking);
     assert_eq!(counter.total.load(SeqCst), 0);
-    // `first`'s check (about 6.4 s) ends and hands the slot on.
+    // `first`'s check, slow until now, may end and hand the slot on.
+    slow.store(false, SeqCst);
     assert!(wait_state(&first, |s| *s == TorrentState::Seeding, T).await);
     assert!(wait_state(&queued, |s| *s == TorrentState::Seeding, T).await);
     assert_eq!(counter.total.load(SeqCst), 4, "one check of four pieces");
 
     // A recheck of `first` takes the slot again; a new torrent queues and
     // is removed while it waits.
+    slow.store(true, SeqCst);
     first.force_recheck().await.unwrap();
     assert!(
         wait_state(
