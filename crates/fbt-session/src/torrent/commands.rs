@@ -12,7 +12,7 @@ use super::announcer::STOPPED_TIMEOUT;
 use super::data::Job;
 use super::{Cmd, piece_priorities};
 use crate::error::SessionError;
-use crate::event::Event;
+use crate::event::{Event, PeerSource};
 use crate::peer::messages::PeerEvent;
 use crate::picker::PeerKey;
 use crate::session::{Priority, RemoveMode, release};
@@ -92,6 +92,13 @@ impl Actor {
                 }
                 let _ = tx.send(r);
                 return Flow::Exit;
+            }
+            Cmd::FoundPeers(source, peers) => {
+                // LSD must never feed a private torrent (a magnet is public
+                // until its metadata says otherwise).
+                if !(source == PeerSource::Lsd && self.is_private()) {
+                    self.on_found_peers(source, peers);
+                }
             }
             Cmd::Shutdown(tx) => {
                 let _ = self.stop(None).await;

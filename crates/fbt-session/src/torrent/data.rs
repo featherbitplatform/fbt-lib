@@ -434,6 +434,7 @@ mod tests {
             cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
             holepunch: Default::default(),
+            lsd: crate::net::LsdHub::disabled(),
         });
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(LEN as u64));
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));

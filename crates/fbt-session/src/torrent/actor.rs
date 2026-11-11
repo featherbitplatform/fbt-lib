@@ -430,6 +430,7 @@ impl Actor {
                     self.top_up_all(None);
                     self.metadata_tick();
                     self.pex_tick();
+                    self.lsd_tick();
                     self.queue_retries();
                     self.try_connect();
                     self.publish();
@@ -663,6 +664,18 @@ impl Actor {
         }
         self.peers_found(source, count);
         self.try_connect();
+    }
+
+    /// Asks the session to announce this torrent on the LAN (BEP 14) while
+    /// it is running, public (a magnet counts as public until its metadata
+    /// says otherwise) and not paused. The session keeps it to one announce
+    /// per interval.
+    fn lsd_tick(&self) {
+        if self.connectable() && !self.is_private() {
+            self.shared
+                .lsd
+                .want(self.ih.wire_hash(), std::time::Instant::now());
+        }
     }
 
     /// `PeersFound` for a non-empty batch.

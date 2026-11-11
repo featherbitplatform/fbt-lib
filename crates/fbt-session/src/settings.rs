@@ -3,6 +3,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use fbt_net::lsd::{LSD_V4, LSD_V6};
 use fbt_tracker::TrackerConfig;
 
 use crate::bandwidth::{MixedMode, PeerClassLimits, RateLimit};
@@ -233,6 +234,23 @@ pub struct Settings {
     /// `enable_outgoing_utp` and `enable_incoming_utp`, and never for
     /// private torrents.
     pub enable_holepunch: bool,
+    /// BEP 14 local service discovery: announce each public torrent on the
+    /// LAN's multicast groups (at most every 5 minutes) and connect to the
+    /// peers that announce the same torrent. Private torrents never use it.
+    pub enable_lsd: bool,
+    /// The multicast groups LSD announces to. Internal tunable (tests point
+    /// it at unicast loopback); not part of the stable API.
+    #[doc(hidden)]
+    pub lsd_groups: Vec<SocketAddr>,
+    /// Time between LSD announces of one torrent (a torrent is never
+    /// announced more often). Internal tunable; not part of the stable API.
+    #[doc(hidden)]
+    pub lsd_announce_interval: Duration,
+    /// Binds LSD to this plain UDP socket instead of joining the real
+    /// multicast groups, for tests. Internal tunable; not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub lsd_bind: Option<SocketAddr>,
     /// Emulates an endpoint-dependent NAT in front of the session, for
     /// tests: incoming TCP is refused, and a uTP SYN is accepted only from
     /// an address the session sent a uTP datagram to in the last 30 s.
@@ -453,6 +471,10 @@ impl Default for Settings {
             enable_incoming_utp: true,
             utp_connect_timeout: Duration::from_secs(3),
             enable_holepunch: true,
+            enable_lsd: true,
+            lsd_groups: vec![LSD_V4, LSD_V6],
+            lsd_announce_interval: Duration::from_secs(5 * 60),
+            lsd_bind: None,
             nat_emulation: false,
             disk_threads: 8,
             max_active_checks: 1,

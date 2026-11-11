@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::bandwidth::RateLimit;
 use crate::error::SessionError;
+use crate::event::PeerSource;
 use crate::peer::conn::PeerStream;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
@@ -57,6 +58,8 @@ pub(crate) enum Cmd {
     AddPeer(SocketAddr, oneshot::Sender<()>),
     Pieces(oneshot::Sender<Bitfield>),
     SetRateLimit(RateLimit, oneshot::Sender<()>),
+    /// Peers discovered outside the torrent (local service discovery).
+    FoundPeers(PeerSource, Vec<SocketAddr>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -275,6 +278,15 @@ impl TorrentHandle {
                 handshake,
                 addr,
             })
+            .is_ok()
+    }
+
+    /// Hands discovered peers to the actor without waiting; false if its
+    /// queue is full or it is gone.
+    pub(crate) fn offer_found_peers(&self, source: PeerSource, peers: Vec<SocketAddr>) -> bool {
+        self.inner
+            .cmds
+            .try_send(Cmd::FoundPeers(source, peers))
             .is_ok()
     }
 

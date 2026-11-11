@@ -23,7 +23,7 @@ use crate::disk::DiskPool;
 use crate::error::SessionError;
 use crate::event::{Event, EventMask, EventStream};
 use crate::listener::ListenerState;
-use crate::net::{Endpoint, ListenError, bind_all, utp_for, utp_sockets};
+use crate::net::{Endpoint, ListenError, LsdHub, bind_all, spawn_lsd_task, utp_for, utp_sockets};
 use crate::settings::Settings;
 use crate::status::TorrentStatus;
 use crate::storage::cache::{CacheBudget, CacheStats};
@@ -174,6 +174,9 @@ pub(crate) struct Shared {
     pub bandwidth: Arc<Bandwidth>,
     /// BEP 55 holepunch activity, for [`Session::holepunch_stats`].
     pub holepunch: HolepunchCounters,
+    /// Local service discovery (BEP 14): the instance and its announce
+    /// bookkeeping.
+    pub lsd: LsdHub,
 }
 
 /// BEP 55 holepunch messages handled, over every torrent of the session.
@@ -394,6 +397,7 @@ impl Session {
         let cache = Arc::new(CacheBudget::new(settings.cache_size));
         let bandwidth = Arc::new(Bandwidth::new(&settings));
         bandwidth.spawn_rebalance();
+        let (lsd, lsd_found) = LsdHub::start(&settings);
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -412,6 +416,7 @@ impl Session {
             cache,
             bandwidth,
             holepunch: HolepunchCounters::default(),
+            lsd,
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -447,6 +452,9 @@ impl Session {
                     Arc::clone(&shared),
                 )
             }));
+        }
+        if let Some(found) = lsd_found {
+            tasks.push(spawn_lsd_task(found, Arc::downgrade(&inner)));
         }
         *inner.listeners.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
         Ok(Session { inner })
@@ -659,6 +667,7 @@ impl Session {
         for rx in waits {
             let _ = rx.await;
         }
+        self.inner.shared.lsd.shutdown().await;
         if let Some(dht) = &self.inner.shared.dht {
             dht.shutdown().await;
         }
@@ -790,6 +799,7 @@ mod tests {
             cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
             holepunch: HolepunchCounters::default(),
+            lsd: LsdHub::disabled(),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();

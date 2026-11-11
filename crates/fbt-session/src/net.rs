@@ -9,8 +9,11 @@ use std::time::{Duration, Instant};
 
 use fbt_core::udp::DatagramSender;
 use fbt_net::demux::{PacketKind, SharedUdpSocket};
+use fbt_net::lsd::{Lsd, LsdConfig, LsdPeer};
 use fbt_utp::{UtpConfig, UtpSocket};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::error::SessionError;
@@ -157,6 +160,156 @@ fn bind_tcp(addr: SocketAddr, listen: bool) -> io::Result<TcpListener> {
         s.listen(LISTEN_BACKLOG)?;
     }
     TcpListener::from_std(s.into())
+}
+
+/// Capacity of the channel LSD hands found peers over.
+const LSD_FOUND_QUEUE: usize = 256;
+
+/// How often the session sends the announces the torrents asked for,
+/// batching them across torrents.
+const LSD_FLUSH: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Default)]
+struct LsdState {
+    /// When each wire hash was last queued for announcing.
+    last: HashMap<[u8; 20], Instant>,
+    /// Hashes waiting for the next flush.
+    pending: Vec<[u8; 20]>,
+}
+
+/// The session's local service discovery: the [`Lsd`] instance (none when
+/// disabled or when no group could be joined) and the per-hash announce
+/// bookkeeping that keeps every torrent to one announce per interval,
+/// however often it pauses and resumes.
+#[derive(Debug, Default)]
+pub(crate) struct LsdHub {
+    lsd: Option<Lsd>,
+    interval: Duration,
+    state: Mutex<LsdState>,
+}
+
+impl LsdHub {
+    /// No LSD.
+    pub(crate) fn disabled() -> Self {
+        LsdHub::default()
+    }
+
+    /// Starts LSD as the settings say; the found peers arrive on the
+    /// returned receiver. Must run inside a tokio runtime. A failure is
+    /// logged and leaves LSD off.
+    pub(crate) fn start(settings: &Settings) -> (Self, Option<mpsc::Receiver<LsdPeer>>) {
+        if !settings.enable_lsd {
+            return (LsdHub::disabled(), None);
+        }
+        let (tx, rx) = mpsc::channel(LSD_FOUND_QUEUE);
+        let mut cfg = LsdConfig::default();
+        let started = match settings.lsd_bind {
+            Some(bind) => Lsd::spawn_unicast(cfg, bind, settings.lsd_groups.clone(), tx),
+            None => {
+                cfg.group_v4 = settings
+                    .lsd_groups
+                    .iter()
+                    .copied()
+                    .find(SocketAddr::is_ipv4);
+                cfg.group_v6 = settings
+                    .lsd_groups
+                    .iter()
+                    .copied()
+                    .find(SocketAddr::is_ipv6);
+                Lsd::spawn(cfg, tx)
+            }
+        };
+        match started {
+            Ok(lsd) => (
+                LsdHub {
+                    lsd: Some(lsd),
+                    interval: settings.lsd_announce_interval,
+                    state: Mutex::default(),
+                },
+                Some(rx),
+            ),
+            Err(e) => {
+                warn!(error = %e, "cannot start local service discovery; running without it");
+                (LsdHub::disabled(), None)
+            }
+        }
+    }
+
+    /// A public torrent is running: queues its announce unless it was
+    /// queued within the interval.
+    pub(crate) fn want(&self, wire_hash: [u8; 20], now: Instant) {
+        if self.lsd.is_none() {
+            return;
+        }
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st
+            .last
+            .get(&wire_hash)
+            .is_some_and(|t| now.saturating_duration_since(*t) < self.interval)
+        {
+            return;
+        }
+        st.last.insert(wire_hash, now);
+        st.pending.push(wire_hash);
+    }
+
+    /// Announces the queued hashes, with our listen `port`.
+    pub(crate) fn flush(&self, port: u16, now: Instant) {
+        let Some(lsd) = &self.lsd else {
+            return;
+        };
+        let hashes = {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let interval = self.interval;
+            st.last
+                .retain(|_, t| now.saturating_duration_since(*t) < interval);
+            std::mem::take(&mut st.pending)
+        };
+        if !hashes.is_empty() {
+            lsd.announce(port, &hashes);
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        if let Some(lsd) = &self.lsd {
+            lsd.shutdown().await;
+        }
+    }
+}
+
+/// The task that sends the queued announces every [`LSD_FLUSH`] and routes
+/// found peers to the torrent with their wire hash. Ends with the session.
+pub(crate) fn spawn_lsd_task(
+    mut found: mpsc::Receiver<LsdPeer>,
+    session: std::sync::Weak<crate::session::SessionInner>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(LSD_FLUSH);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                peer = found.recv() => {
+                    let Some(peer) = peer else { return };
+                    let Some(inner) = session.upgrade() else { return };
+                    let handle = {
+                        let reg = inner.registry();
+                        reg.by_wire
+                            .get(&peer.info_hash)
+                            .and_then(|ih| reg.torrents.get(ih))
+                            .map(|e| e.handle.clone())
+                    };
+                    if let Some(h) = handle {
+                        h.offer_found_peers(crate::event::PeerSource::Lsd, vec![peer.addr]);
+                    }
+                }
+                _ = tick.tick() => {
+                    let Some(inner) = session.upgrade() else { return };
+                    let shared = &inner.shared;
+                    shared.lsd.flush(shared.listen_port, Instant::now());
+                }
+            }
+        }
+    })
 }
 
 /// Decides which sources' uTP SYNs a socket answers.

@@ -1368,6 +1368,7 @@ pub(super) mod tests {
             cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
             holepunch: Default::default(),
+            lsd: crate::net::LsdHub::disabled(),
         });
         let add = AddTorrent::new(meta, PathBuf::from("unused"));
         let ih = add.source.info_hashes();

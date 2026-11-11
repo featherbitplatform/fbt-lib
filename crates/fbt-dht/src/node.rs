@@ -26,7 +26,7 @@ use tracing::{debug, info, trace, warn};
 use crate::id::{NodeId, bep42_id, canonical, canonical_addr, is_local};
 use crate::krpc::{Body, MAX_DATAGRAM, Message, NodeInfo, Query, QueryMsg, Response, Want};
 use crate::lookup::{self, Goal, PeerLookup};
-use crate::rate::{MAX_IPS, RateLimiter};
+use crate::rate::{IpRateLimiter, MAX_IPS, query_limiter};
 use crate::server::{Server, version};
 use crate::state::{DhtState, MAX_STATE_NODES};
 use crate::store::PeerStore;
@@ -652,8 +652,8 @@ struct Actor {
     table_v6: Option<RoutingTable>,
     tokens: Tokens,
     store: PeerStore,
-    rate: RateLimiter,
-    global_rate: RateLimiter,
+    rate: IpRateLimiter,
+    global_rate: IpRateLimiter,
     ext_v4: ExternalIpVotes,
     ext_v6: ExternalIpVotes,
     rng: StdRng,
@@ -770,8 +770,8 @@ impl Actor {
             table_v6,
             tokens: Tokens::new(&mut rng),
             store: PeerStore::new(cfg.max_stored_torrents, cfg.max_peers_per_torrent),
-            rate: RateLimiter::new(cfg.query_rate_per_ip, MAX_IPS),
-            global_rate: RateLimiter::new(GLOBAL_QUERY_RATE.max(cfg.query_rate_per_ip), 1),
+            rate: query_limiter(cfg.query_rate_per_ip, MAX_IPS),
+            global_rate: query_limiter(GLOBAL_QUERY_RATE.max(cfg.query_rate_per_ip), 1),
             ext_v4: ExternalIpVotes::new(),
             ext_v6: ExternalIpVotes::new(),
             rng,

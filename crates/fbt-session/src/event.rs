@@ -24,6 +24,8 @@ pub enum PeerSource {
     Pex,
     /// A magnet link's `x.pe` hints.
     Magnet,
+    /// Local service discovery (BEP 14).
+    Lsd,
 }
 
 /// Something that happened in the session.

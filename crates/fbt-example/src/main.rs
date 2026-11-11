@@ -55,6 +55,8 @@ fn host_port(s: &str) -> Result<String, String> {
 impl NetArgs {
     fn apply(&self, settings: &mut Settings) {
         settings.dht_enabled = !self.no_dht;
+        // LSD multicasts on the LAN: off until the `--lsd` flag exists.
+        settings.enable_lsd = false;
         settings.pex_enabled = !self.no_pex;
         if let Some(e) = self.encryption {
             settings.encryption = match e {
@@ -306,6 +308,7 @@ async fn dht_node(
 ) -> Result<ExitCode, Error> {
     let mut settings = Settings::default();
     settings.dht_enabled = true;
+    settings.enable_lsd = false;
     settings.dht_bootstrap_nodes = bootstrap;
     if let Some(port) = port {
         settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];
