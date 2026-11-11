@@ -135,14 +135,14 @@ impl Actor {
             }
             Err(e) => {
                 self.cache.release_clean(read.reserved);
-                if e.kind() == io::ErrorKind::NotFound
-                    && generation == self.generation
-                    && matches!(self.phase, Phase::Ready)
-                {
-                    self.piece_lost(piece, &e, read.waiting);
-                } else {
+                let current = generation == self.generation && matches!(self.phase, Phase::Ready);
+                if e.kind() != io::ErrorKind::NotFound {
                     self.fail(&e, "reading a block");
+                } else if current {
+                    self.piece_lost(piece, &e, read.waiting);
                 }
+                // A stale read (the torrent was rechecked or stopped since)
+                // says nothing about the piece now.
                 return;
             }
         };
@@ -206,46 +206,94 @@ impl Actor {
 
     /// A piece we have is gone from disk (BEP 54): it is wanted again, our
     /// peers are told, the requests waiting on it are rejected and
-    /// `FileError` reports the file; the torrent keeps running. A piece
-    /// already given up (a second read failing) is only rejected.
+    /// `FileError` reports the file; the torrent keeps running. Every piece
+    /// of the failing file we have is given up in the same pass (one
+    /// `FileError` per file, one batch of `DontHave`s, one refresh), not
+    /// one request at a time. A piece already given up (a second read
+    /// failing) is only rejected.
     fn piece_lost(&mut self, piece: u32, e: &io::Error, waiting: Vec<(PeerKey, BlockRef)>) {
-        let lost = self
-            .loaded
-            .as_mut()
-            .and_then(|l| l.picker.as_mut())
-            .is_some_and(|pk| {
-                let had = pk.have().get(piece);
-                pk.piece_lost(piece);
-                had
-            });
-        for (key, block) in waiting {
-            self.send(key, PeerCommand::Reject(block));
+        let path = error_path(e).map(Path::to_path_buf);
+        let range = self.file_pieces(path.as_deref(), piece);
+        let mut lost = Vec::new();
+        if let Some(pk) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) {
+            for i in range {
+                if pk.have().get(i) {
+                    pk.piece_lost(i);
+                    lost.push(i);
+                }
+            }
         }
-        if !lost {
-            return;
-        }
-        warn!(torrent = %self.name(), piece, error = %e, "piece lost on disk");
-        self.emit(Event::FileError {
-            path: error_path(e).map(Path::to_path_buf),
-            torrent: self.ih,
-            message: format!("reading a block: {e}"),
-        });
-        // Wanted again, so the torrent is no longer finished.
-        self.finished_emitted = false;
+        // Rejected after the `DontHave`s below, so the requester clears its
+        // bit before it asks again.
         let keys: Vec<PeerKey> = self
             .peers
             .iter()
             .filter(|(_, p)| p.connected && p.tx.is_some())
             .map(|(k, _)| *k)
             .collect();
-        for &key in &keys {
-            self.send(key, PeerCommand::DontHave(piece));
+        for &i in &lost {
+            self.lost_pieces.insert(i);
+            for &key in &keys {
+                // Optional: a peer whose queue is filling up keeps its
+                // stale belief, and its requests are rejected.
+                self.send_lossy(key, PeerCommand::DontHave(i));
+            }
         }
+        for (key, block) in waiting {
+            self.send(key, PeerCommand::Reject(block));
+        }
+        if lost.is_empty() {
+            return;
+        }
+        warn!(torrent = %self.name(), piece, count = lost.len(), error = %e, "pieces lost on disk");
+        if path
+            .as_ref()
+            .is_none_or(|p| self.lost_files.insert(p.clone()))
+        {
+            self.emit(Event::FileError {
+                path,
+                torrent: self.ih,
+                message: format!("reading a block: {e}"),
+            });
+        }
+        // Wanted again, so the torrent is no longer finished.
+        self.finished_emitted = false;
         self.refresh_state();
         for key in keys {
             self.update_interest(key);
         }
         self.top_up_all(None);
+    }
+
+    /// The pieces overlapping the torrent file that `path` names (the
+    /// longest matching entry), or just `piece` when it names none.
+    fn file_pieces(&self, path: Option<&Path>, piece: u32) -> std::ops::RangeInclusive<u32> {
+        let Some(l) = self.loaded.as_ref() else {
+            return piece..=piece;
+        };
+        let plen = u64::from(l.layout.piece_len());
+        let mut off = 0u64;
+        let mut best: Option<(usize, u64, u64)> = None;
+        for f in &l.meta.info.files {
+            let rel = f.path.to_path_buf();
+            if !f.pad
+                && f.len > 0
+                && path.is_some_and(|p| p.ends_with(&rel))
+                && best.is_none_or(|(n, _, _)| rel.components().count() > n)
+            {
+                best = Some((rel.components().count(), off, f.len));
+            }
+            off = off.saturating_add(f.len);
+        }
+        match best {
+            Some((_, start, len)) if plen > 0 => {
+                let first = u32::try_from(start / plen).unwrap_or(piece);
+                let last = u32::try_from((start + len - 1) / plen).unwrap_or(piece);
+                // Never smaller than the piece that failed.
+                first.min(piece)..=last.max(piece)
+            }
+            _ => piece..=piece,
+        }
     }
 }
 

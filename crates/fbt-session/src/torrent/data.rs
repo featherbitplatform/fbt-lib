@@ -226,6 +226,7 @@ impl Actor {
         self.cache
             .insert_dirty(piece, data.into(), Instant::now().into_std());
         picker.piece_passed(piece);
+        self.lost_pieces.remove(&piece);
         let finished = picker.is_finished();
         self.emit(Event::PieceFinished {
             torrent: self.ih,

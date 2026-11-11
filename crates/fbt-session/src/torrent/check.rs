@@ -30,6 +30,8 @@ impl Actor {
             return;
         }
         l.picker = None;
+        self.lost_files.clear();
+        self.lost_pieces.clear();
         self.check_seq = self.check_seq.wrapping_add(1);
         let seq = self.check_seq;
         let checks = self.shared.disk.check_permit();

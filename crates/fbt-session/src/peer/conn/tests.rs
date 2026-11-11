@@ -1044,6 +1044,18 @@ async fn upload_only_from_handshake_and_message() {
     )
     .await;
     assert_eq!(r.next().await, PeerEvent::UploadOnly { key: KEY, on: true });
+    // A repeated handshake without the key turns it off again.
+    let mut repeat = their_ext(None, None);
+    repeat.m.insert(UPLOAD_ONLY.to_owned(), 5);
+    send(&mut wire, ext_msg(0, repeat.encode())).await;
+    assert!(matches!(r.next().await, PeerEvent::ExtHandshake { .. }));
+    assert_eq!(
+        r.next().await,
+        PeerEvent::UploadOnly {
+            key: KEY,
+            on: false
+        }
+    );
 
     r.cmd(PeerCommand::UploadOnly(true)).await;
     match recv(&mut wire).await {

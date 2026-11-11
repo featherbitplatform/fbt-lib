@@ -170,6 +170,16 @@ pub(crate) struct Actor {
     /// We told our peers we are upload-only (BEP 21): the torrent is
     /// seeding, with every piece on disk.
     pub(super) upload_only_sent: bool,
+    /// Addresses of seeds and upload-only peers we closed (or that closed)
+    /// while `upload_only_sent`: not dialled again until we stop being
+    /// finished. At most `MAX_KNOWN`.
+    pub(super) seed_addrs: std::collections::HashSet<SocketAddr>,
+    /// Files whose loss `FileError` reported since the torrent last was
+    /// Seeding or rechecked.
+    pub(super) lost_files: std::collections::HashSet<std::path::PathBuf>,
+    /// Pieces lost on disk and not downloaded again yet, for peers whose
+    /// extension handshake comes late.
+    pub(super) lost_pieces: std::collections::BTreeSet<u32>,
     pub(super) rng: StdRng,
     /// What the tracker and DHT announcers are told.
     pub(super) signals: watch::Sender<Signals>,
@@ -325,6 +335,9 @@ impl Actor {
             last_state: TorrentState::CheckingFiles { progress: 0.0 },
             finished_emitted: false,
             upload_only_sent: false,
+            seed_addrs: Default::default(),
+            lost_files: Default::default(),
+            lost_pieces: Default::default(),
             rng: rand::make_rng(),
             signals,
             announcer,

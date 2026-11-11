@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fbt_metainfo::{Magnet, Metainfo};
-use fbt_session::storage::MemStorage;
 use fbt_session::{
     AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, PeerSource, Session, Settings,
     TorrentHandle, TorrentState, Transport,
@@ -73,11 +72,16 @@ async fn pex_counts_within(ev: &mut EventStream, d: Duration) -> Vec<usize> {
     out
 }
 
-/// A session seeding `m` from memory, waited until it seeds.
+/// A session seeding `m` from slow memory, waited until it seeds. The
+/// leechers stay unfinished for seconds: once finished they would part from
+/// the seeds (BEP 21), and these tests look at connected peers.
 async fn seed_session(s: Settings, m: &Metainfo, payload: &[u8]) -> (Session, TorrentHandle) {
     let session = Session::new(s).await.unwrap();
     let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
-    p.storage = Some(Arc::new(MemStorage::from_bytes(payload.to_vec())));
+    p.storage = Some(Arc::new(SlowStorage::new(
+        payload.to_vec(),
+        Duration::from_millis(700),
+    )));
     let h = session.add_torrent(p).await.unwrap();
     assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
     (session, h)

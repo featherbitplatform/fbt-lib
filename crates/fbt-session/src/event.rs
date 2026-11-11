@@ -130,6 +130,11 @@ pub enum Event {
     /// Reading or writing torrent data failed; the torrent stopped, except
     /// for a piece found missing on disk while serving a peer: that piece
     /// is downloaded again and the torrent keeps running.
+    /// That is reported once per file (until the torrent seeds again or is
+    /// rechecked), and every piece overlapping the file goes with it. On
+    /// Unix a file deleted while the torrent holds a read handle on it keeps
+    /// being served from the unlinked inode: the loss shows only once the
+    /// handle is closed or the file is truncated.
     FileError {
         /// The file involved, when known.
         path: Option<PathBuf>,

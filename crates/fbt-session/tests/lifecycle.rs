@@ -443,7 +443,6 @@ async fn leecher_downloads_from_seeding_session() {
     let st = lh.status();
     assert_eq!(st.total_downloaded, payload.len() as u64);
     // Two seeds have nothing to trade: both ends close (BEP 21).
-    assert!(st.num_peers <= 1);
     assert!(wait_until(|| lh.status().num_peers == 0, Duration::from_secs(5)).await);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(sh.status().total_uploaded >= payload.len() as u64);

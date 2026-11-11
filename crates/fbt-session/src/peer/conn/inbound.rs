@@ -162,12 +162,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 }
                 let upload_only = hs.upload_only == Some(true);
                 self.emit(PeerEvent::ExtHandshake { key, hs }).await?;
-                if upload_only {
-                    self.emit(PeerEvent::UploadOnly { key, on: true }).await?;
-                }
-                Ok(())
+                // Every handshake states it (a repeat without the key
+                // turns it off); only a change is reported.
+                self.report_upload_only(upload_only).await
             }
-            Incoming::UploadOnly(on) => self.emit(PeerEvent::UploadOnly { key, on }).await,
+            Incoming::UploadOnly(on) => self.report_upload_only(on).await,
             Incoming::DontHave(piece) => {
                 // Without metadata there is nothing to retract yet.
                 if self.pending.is_some() {
@@ -182,6 +181,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Incoming::Pex(msg) => self.emit(PeerEvent::Pex { key, msg }).await,
             Incoming::Unknown => Ok(()),
         }
+    }
+
+    /// Reports the remote's `upload_only` state when it changed.
+    async fn report_upload_only(&mut self, on: bool) -> Flow {
+        if on == self.remote_upload_only {
+            return Ok(());
+        }
+        self.remote_upload_only = on;
+        self.emit(PeerEvent::UploadOnly { key: self.key, on }).await
     }
 
     pub(super) fn require_fast(&self) -> Flow {

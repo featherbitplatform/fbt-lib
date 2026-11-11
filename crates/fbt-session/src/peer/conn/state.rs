@@ -66,6 +66,8 @@ pub(super) struct Conn<S> {
     pub(super) remote_reserved: Reserved,
     /// The remote's ids for our extensions.
     pub(super) remote_ids: RemoteIds,
+    /// The last `upload_only` state reported to the torrent.
+    pub(super) remote_upload_only: bool,
     /// A `Port` was reported already.
     pub(super) port_seen: bool,
     /// Both sides support BEP 6 (we always advertise it).
@@ -146,6 +148,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             remote_ip,
             remote_reserved: theirs.reserved,
             remote_ids: RemoteIds::default(),
+            remote_upload_only: false,
             port_seen: false,
             fast: theirs.reserved.supports_fast(),
             choked: true,

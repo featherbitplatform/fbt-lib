@@ -35,7 +35,7 @@ const MAX_ATTEMPTS: u32 = 3;
 const FIRST_RETRY_DIVISOR: u32 = 12;
 /// Most addresses a torrent remembers for connecting; beyond it the oldest
 /// address not in use is forgotten.
-const MAX_KNOWN: usize = 1000;
+pub(super) const MAX_KNOWN: usize = 1000;
 /// Most never-retry addresses kept; the oldest is forgotten beyond it.
 /// Also bounds the plaintext-only and TCP-only addresses and the pending
 /// transport fallbacks.
@@ -631,6 +631,10 @@ impl Actor {
         if self.retries.is_never(&addr) || self.retries.is_pending(&addr) {
             return;
         }
+        // Finished: a seed has nothing to trade (BEP 21).
+        if self.upload_only_sent && self.seed_addrs.contains(&addr) {
+            return;
+        }
         if !self.addr_busy(&addr) && !self.candidates.contains(&addr) {
             self.candidates.push_back(addr);
         }
@@ -823,6 +827,18 @@ impl Actor {
                 false
             }
         }
+    }
+
+    /// Sends an optional command only while the peer's queue has room to
+    /// spare (a whole file of `DontHave`s must not fill it: a full queue
+    /// closes the peer as stalled). Returns false when it was left out.
+    pub(super) fn send_lossy(&mut self, key: PeerKey, cmd: PeerCommand) -> bool {
+        let room = self
+            .peers
+            .get(&key)
+            .and_then(|p| p.tx.as_ref())
+            .is_some_and(|tx| tx.capacity() > 32);
+        room && self.send(key, cmd)
     }
 
     /// Closes a peer: it stays until its `Disconnected` event, but its

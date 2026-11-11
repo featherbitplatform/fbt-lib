@@ -1109,3 +1109,132 @@ async fn lost_piece_sends_donthave_and_is_redownloaded() {
     sb.shutdown().await;
     sa.shutdown().await;
 }
+
+/// BEP 21 and un-finishing: a torrent that is seeding (its other file
+/// skipped) closes a seed it knows; once the skipped file is wanted, the
+/// seed is dialled again without another `add_peer`, and the file arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeds_are_redialled_when_the_torrent_is_unfinished() {
+    let (m, payload) = make_torrent(&[("a", 2 * 65_536), ("b", 2 * 65_536)], 65_536);
+    let (sx, _hx) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+    let dir = tempfile::tempdir().unwrap();
+    write_payload(dir.path(), &m, &payload);
+    std::fs::remove_file(dir.path().join("torrent").join("b")).unwrap();
+    let sy = Session::new(settings()).await.unwrap();
+    let mut p = AddTorrent::new(m.clone(), dir.path().to_path_buf());
+    p.file_priorities = vec![Priority::Normal, Priority::Skip];
+    let hy = sy.add_torrent(p).await.unwrap();
+    assert!(wait_state(&hy, |s| *s == TorrentState::Seeding, T).await);
+    let mut ey = sy.subscribe(EventMask::ALL);
+    hy.add_peer(sx.local_addr()).await.unwrap();
+    let ev = next_matching(
+        &mut ey,
+        |e| matches!(e, Event::PeerDisconnected { .. }),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the seeds part");
+    assert!(
+        matches!(
+            ev,
+            Event::PeerDisconnected {
+                reason: DisconnectReason::UploadOnly,
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    assert!(wait_until(|| hy.status().num_peers == 0, T).await);
+    // It does not come back while we are finished.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(hy.status().num_peers, 0);
+
+    hy.set_file_priorities(vec![Priority::Normal, Priority::Normal])
+        .await
+        .unwrap();
+    assert!(wait_state(&hy, |s| *s == TorrentState::Seeding, T).await);
+    let b = std::fs::read(dir.path().join("torrent").join("b")).unwrap();
+    assert!(b == payload[2 * 65_536..]);
+    sy.shutdown().await;
+    sx.shutdown().await;
+}
+
+/// The whole-piece read path (a clean cache with room) reports a lost
+/// file once, and every piece of it at once: all of them are announced
+/// lost, then downloaded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whole_piece_read_loss_reports_the_file_once() {
+    let (m, payload) = make_torrent(&[("a", 3 * 65_536), ("b", 65_536)], 65_536);
+    let (sa, _ha) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+    let dir = tempfile::tempdir().unwrap();
+    write_payload(dir.path(), &m, &payload);
+    std::fs::remove_file(dir.path().join("torrent").join("b")).unwrap();
+    // The default cache size leaves room for a clean whole-piece read.
+    let sb = Session::new(settings()).await.unwrap();
+    let mut eb = sb.subscribe(EventMask::ALL);
+    let hb = sb
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_until(|| hb.status().wanted_done == 3 * 65_536, T).await);
+    let mut reserved = Reserved::default();
+    reserved.set_fast();
+    reserved.set_extended();
+    let mut observer =
+        ScriptedPeer::connect_with(sb.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    let mut hs = ExtHandshake::default();
+    hs.m.insert(LT_DONTHAVE.to_owned(), 9);
+    observer.send_ext_handshake(&hs).await;
+    observer.send(Message::HaveNone).await;
+    observer.send(Message::Interested).await;
+    observer
+        .next_matching(|m| *m == Message::Unchoke)
+        .await
+        .expect("Unchoke");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let a = dir.path().join("torrent").join("a");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&a)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    observer
+        .send(Message::Request(BlockRef {
+            piece: 1,
+            offset: 0,
+            len: 16_384,
+        }))
+        .await;
+    // All three pieces of `a` are announced lost from the one request.
+    let mut lost = std::collections::BTreeSet::new();
+    while lost.len() < 3 {
+        let note = observer.next_ext(9).await.expect("lt_donthave");
+        lost.insert(decode_donthave(&note).unwrap());
+    }
+    assert_eq!(lost.into_iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+    next_matching(&mut eb, |e| matches!(e, Event::FileError { .. }), T)
+        .await
+        .expect("FileError");
+    // A second request for another lost piece adds no second report.
+    observer
+        .send(Message::Request(BlockRef {
+            piece: 2,
+            offset: 0,
+            len: 16_384,
+        }))
+        .await;
+    let again = next_matching(
+        &mut eb,
+        |e| matches!(e, Event::FileError { .. }),
+        Duration::from_millis(700),
+    )
+    .await;
+    assert!(again.is_none(), "second FileError {again:?}");
+    assert!(hb.status().error.is_none());
+    hb.add_peer(sa.local_addr()).await.unwrap();
+    assert!(wait_state(&hb, |s| *s == TorrentState::Seeding, T).await);
+    assert!(std::fs::read(&a).unwrap() == payload[..3 * 65_536]);
+    sb.shutdown().await;
+    sa.shutdown().await;
+}

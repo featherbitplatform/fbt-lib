@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
 use fbt_metainfo::Metainfo;
-use fbt_wire::{ExtHandshake, MetadataMsg, UT_METADATA, UT_PEX};
+use fbt_wire::{ExtHandshake, LT_DONTHAVE, MetadataMsg, UPLOAD_ONLY, UT_METADATA, UT_PEX};
 use tokio::time::Instant;
 use tracing::debug;
 
@@ -217,10 +217,28 @@ impl Actor {
         if let Some(f) = p.fast_has.as_mut() {
             f.clear(piece);
         }
+        // Blocks asked of it for this piece will not come: back to the
+        // picker, and cancelled so the peer does not answer them.
+        let gone: Vec<BlockRef> = p
+            .requested
+            .iter()
+            .filter(|b| b.piece == piece)
+            .copied()
+            .collect();
+        for b in &gone {
+            p.requested.remove(b);
+        }
         if let Some(pk) = picker {
             pk.peer_lost(piece);
+            for b in &gone {
+                pk.release(key, *b);
+            }
+        }
+        for b in gone {
+            self.send(key, PeerCommand::Cancel(b));
         }
         self.update_interest(key);
+        self.top_up_all(None);
     }
 
     /// The remote is (no longer) upload-only (BEP 21).
@@ -258,6 +276,13 @@ impl Actor {
             return;
         }
         self.upload_only_sent = on;
+        if !on {
+            // No longer finished: seeds we turned away may have what we
+            // lack, so they are dialled again.
+            self.seed_addrs.clear();
+        } else {
+            self.lost_files.clear();
+        }
         let keys: Vec<PeerKey> = self
             .peers
             .iter()
@@ -271,6 +296,30 @@ impl Actor {
             for key in keys {
                 self.close_if_upload_only(key);
             }
+        } else {
+            self.requeue_known();
+            self.try_connect();
+        }
+    }
+
+    /// Remembers the address of a seed or upload-only peer that is gone
+    /// while we are finished, so it is not redialled in a loop.
+    fn note_seed_gone(&mut self, p: &super::swarm::Peer) {
+        if !self.upload_only_sent
+            || !p.connected
+            || !(p.upload_only || p.is_seed())
+            || self.seed_addrs.len() >= super::swarm::MAX_KNOWN
+        {
+            return;
+        }
+        // An incoming peer is dialled at its listen address, if it has one.
+        let addr = if p.outgoing {
+            Some(p.addr)
+        } else {
+            p.listen_port.map(|port| SocketAddr::new(p.addr.ip(), port))
+        };
+        if let Some(a) = addr {
+            self.seed_addrs.insert(a);
         }
     }
 
@@ -396,6 +445,7 @@ impl Actor {
         let Some((p, reason)) = self.on_disconnected(key, reason, connect_failed) else {
             return;
         };
+        self.note_seed_gone(&p);
         if let Some(m) = self.magnet.as_mut() {
             let sends = m.fetch.on_peer_gone(key);
             self.send_metadata(sends);
@@ -448,7 +498,25 @@ impl Actor {
         } else if p.pex.is_none() {
             p.pex = Some(PexPeer::default());
         }
+        let ids = (
+            hs.id_of(UPLOAD_ONLY).is_some(),
+            hs.id_of(LT_DONTHAVE).is_some(),
+        );
         p.ext = Some(hs);
+        // The handshake we sent may predate the end of our download, and
+        // commands sent before the remote's ids were known were dropped:
+        // say it again now (a repeat is harmless).
+        if self.upload_only_sent && ids.0 {
+            self.send(key, PeerCommand::UploadOnly(true));
+        }
+        if ids.1 {
+            let lost: Vec<u32> = self.lost_pieces.iter().copied().collect();
+            for piece in lost {
+                if !self.send_lossy(key, PeerCommand::DontHave(piece)) {
+                    break;
+                }
+            }
+        }
         let Some(m) = self.magnet.as_mut() else {
             return;
         };
