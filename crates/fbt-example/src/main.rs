@@ -392,6 +392,8 @@ async fn lsd_probe(port: u16, timeout_secs: u64) -> Result<ExitCode, Error> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let lsd = fbt_net::lsd::Lsd::spawn(fbt_net::lsd::LsdConfig::default(), tx)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    // Short-lived diagnostic bounded by `timeout_secs`, so it re-announces
+    // every 500 ms instead of the library's 5-minute cadence.
     let mut announce = interval(Duration::from_millis(500));
     announce.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let found = loop {
@@ -484,8 +486,9 @@ fn print_event(handle: &TorrentHandle, event: &Event) {
             addr, transport, ..
         } => {
             let via = match transport {
+                Transport::Tcp => "tcp",
                 Transport::Utp => "utp",
-                _ => "tcp",
+                _ => "other",
             };
             println!("peer connected {addr} via {via}");
         }
@@ -496,8 +499,9 @@ fn print_event(handle: &TorrentHandle, event: &Event) {
             ..
         } => {
             let proto = match protocol {
+                MapProtocol::Tcp => "tcp",
                 MapProtocol::Udp => "udp",
-                _ => "tcp",
+                _ => "other",
             };
             let via = match method {
                 MapMethod::Upnp => "upnp",
@@ -562,7 +566,50 @@ async fn watch(
 
 #[cfg(test)]
 mod tests {
-    use super::human_bytes;
+    use clap::Parser;
+
+    use super::{Cli, Command, human_bytes, parse_rate};
+
+    #[test]
+    fn parse_rate_accepts_numbers_and_suffixes() {
+        assert_eq!(parse_rate("0"), Ok(0));
+        assert_eq!(parse_rate("1048576"), Ok(1_048_576));
+        assert_eq!(parse_rate("512K"), Ok(512 * 1024));
+        assert_eq!(parse_rate("512k"), Ok(512 * 1024));
+        assert_eq!(parse_rate("1M"), Ok(1024 * 1024));
+        assert_eq!(parse_rate("3m"), Ok(3 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_rate_rejects_bad_input() {
+        for bad in ["", "K", "M", "12Q", "abc", "-1", "1.5M", "1 M", "1MM"] {
+            assert!(parse_rate(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(parse_rate("18446744073709551615").is_ok());
+        assert!(parse_rate("18446744073709551616").is_err());
+        assert!(parse_rate("18446744073709551615K").is_err());
+        assert!(parse_rate(&format!("{}M", u64::MAX / (1024 * 1024) + 1)).is_err());
+    }
+
+    #[test]
+    fn cache_mb_flag_sets_cache_size() {
+        let cli = Cli::try_parse_from([
+            "fbt-example",
+            "seed",
+            "t.torrent",
+            "--data",
+            "d",
+            "--cache-mb",
+            "8",
+        ])
+        .expect("parses");
+        let Command::Seed { net, .. } = cli.command else {
+            panic!("not seed");
+        };
+        let mut settings = fbt::Settings::default();
+        net.apply(&mut settings);
+        assert_eq!(settings.cache_size, 8 * 1024 * 1024);
+    }
 
     #[test]
     fn formats_bytes() {

@@ -147,8 +147,11 @@
 //! as peers ([`PeerSource::Lsd`]). Private torrents are never announced.
 //! [`Settings::enable_upnp`] and [`Settings::enable_natpmp`] (also on by
 //! default) ask the router to map the listen ports, with UPnP, PCP or
-//! NAT-PMP, and renew the mappings. They send SSDP, SOAP and NAT-PMP/PCP
-//! datagrams to the default gateway only. Results arrive as
+//! NAT-PMP, and renew the mappings. On the LAN this puts UPnP's SSDP
+//! `M-SEARCH` datagrams on the multicast group 239.255.255.250:1900 (at most
+//! three per discovery round), then HTTP and SOAP requests to the router
+//! that answered, and NAT-PMP and PCP datagrams to the default gateway
+//! only. Results arrive as
 //! [`Event::PortMapped`], [`Event::PortMappingFailed`] and
 //! [`Event::ExternalIpChanged`] under [`EventMask::NAT`].
 //!
@@ -156,8 +159,10 @@
 //!
 //! With [`Settings::enable_holepunch`] peers that cannot reach each other
 //! because of a NAT ask a common peer to relay a rendezvous (BEP 55) and
-//! then connect to each other at the same time, over uTP. The relay rides
-//! on peer exchange, so private torrents never use it.
+//! then connect to each other at the same time, over uTP. It takes effect
+//! only when both [`Settings::enable_outgoing_utp`] and
+//! [`Settings::enable_incoming_utp`] are on. The relay rides on peer
+//! exchange, so private torrents never use it.
 //!
 //! Limits, the cache and the NAT events together:
 //!
