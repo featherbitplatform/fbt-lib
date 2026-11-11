@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// The most body bytes (and the most head bytes) accepted from a device.
+/// The most bytes accepted from a device in one response: head plus framed body.
 pub const MAX_HTTP_RESPONSE: usize = 65_536;
 /// The bound on a whole request/response exchange.
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -20,8 +20,6 @@ const MAX_LINE: usize = 4096;
 const MAX_CHUNK_LINE: usize = 64;
 /// Bytes read from the socket per call.
 const READ_CHUNK: usize = 4096;
-/// Raw bytes read in total: head plus chunk framing plus body.
-const MAX_RAW: usize = MAX_HTTP_RESPONSE * 2 + MAX_HTTP_RESPONSE / 2;
 
 /// Why an HTTP exchange failed.
 #[derive(Debug, thiserror::Error)]
@@ -90,40 +88,119 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-enum Parsed {
-    Complete(HttpResponse),
-    Incomplete,
+#[derive(Clone, Copy)]
+enum Framing {
+    Length(usize),
+    Chunked,
+    UntilEof,
 }
 
-/// Parse a whole response. `bytes` is everything the device sent up to EOF.
+struct Head {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_start: usize,
+    framing: Framing,
+}
+
+/// Chunked-body progress: `pos` is the offset, from the body start, of the
+/// next chunk-size line, so re-scans never revisit finished chunks.
+#[derive(Default)]
+struct ChunkState {
+    pos: usize,
+    body: Vec<u8>,
+}
+
+/// An incremental response parser: feed it the bytes read so far; each call
+/// does work proportional to what is new (plus one partial line or chunk).
+#[derive(Default)]
+struct Parser {
+    search_from: usize,
+    head: Option<Head>,
+    chunks: ChunkState,
+}
+
+/// Parse a whole response. `bytes` is everything the device sent up to EOF,
+/// at most [`MAX_HTTP_RESPONSE`] of it.
 pub fn parse_response(bytes: &[u8]) -> Result<HttpResponse, HttpError> {
-    match parse(bytes, true)? {
-        Parsed::Complete(r) => Ok(r),
-        Parsed::Incomplete => Err(HttpError::Malformed("truncated response")),
+    Parser::default()
+        .advance(bytes, true)?
+        .ok_or(HttpError::Malformed("truncated response"))
+}
+
+/// The end of the head: `(index of the first terminating LF, body start)`.
+/// Accepts CRLF and bare-LF line endings.
+fn find_head_end(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while let Some(off) = bytes.get(i..)?.iter().position(|&b| b == b'\n') {
+        let at = i + off;
+        match (bytes.get(at + 1), bytes.get(at + 2)) {
+            (Some(b'\n'), _) => return Some((at, at + 2)),
+            (Some(b'\r'), Some(b'\n')) => return Some((at, at + 3)),
+            _ => {}
+        }
+        i = at + 1;
     }
+    None
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn parse(bytes: &[u8], eof: bool) -> Result<Parsed, HttpError> {
-    let Some(head_end) = find(bytes, b"\r\n\r\n") else {
-        if bytes.len() > MAX_HTTP_RESPONSE {
+impl Parser {
+    fn advance(&mut self, raw: &[u8], eof: bool) -> Result<Option<HttpResponse>, HttpError> {
+        if raw.len() > MAX_HTTP_RESPONSE {
             return Err(HttpError::TooLarge);
         }
-        return if eof {
-            Err(HttpError::Malformed("no end of headers"))
-        } else {
-            Ok(Parsed::Incomplete)
+        if self.head.is_none() {
+            match find_head_end(raw, self.search_from) {
+                None => {
+                    self.search_from = raw.len().saturating_sub(3);
+                    return if eof {
+                        Err(HttpError::Malformed("no end of headers"))
+                    } else {
+                        Ok(None)
+                    };
+                }
+                Some((end, body_start)) => {
+                    let head = raw.get(..end).unwrap_or_default();
+                    self.head = Some(parse_head(head, body_start)?);
+                }
+            }
+        }
+        let Some(head) = self.head.as_ref() else {
+            return Ok(None);
         };
-    };
-    if head_end > MAX_HTTP_RESPONSE {
-        return Err(HttpError::TooLarge);
+        let rest = raw.get(head.body_start..).unwrap_or_default();
+        let body = match head.framing {
+            Framing::Length(n) => match rest.get(..n) {
+                Some(b) => b.to_vec(),
+                None if eof => return Err(HttpError::Malformed("truncated body")),
+                None => return Ok(None),
+            },
+            Framing::Chunked => {
+                if !decode_chunked(rest, &mut self.chunks, eof)? {
+                    return Ok(None);
+                }
+                std::mem::take(&mut self.chunks.body)
+            }
+            Framing::UntilEof => {
+                if !eof {
+                    return Ok(None);
+                }
+                rest.to_vec()
+            }
+        };
+        let head = self.head.take().ok_or(HttpError::Malformed("no head"))?;
+        Ok(Some(HttpResponse {
+            status: head.status,
+            headers: head.headers,
+            body,
+        }))
     }
-    let head = bytes.get(..head_end).unwrap_or_default();
-    let rest = bytes.get(head_end + 4..).unwrap_or_default();
+}
 
+fn parse_head(head: &[u8], body_start: usize) -> Result<Head, HttpError> {
     let mut lines = head.split(|&b| b == b'\n').map(|l| match l.split_last() {
         Some((b'\r', t)) => t,
         _ => l,
@@ -161,38 +238,28 @@ fn parse(bytes: &[u8], eof: bool) -> Result<Parsed, HttpError> {
             .split(',')
             .any(|t| t.trim() == "chunked")
     });
-
-    let body = if chunked {
-        match decode_chunked(rest, eof)? {
-            Some(b) => b,
-            None => return Ok(Parsed::Incomplete),
-        }
+    let framing = if chunked {
+        Framing::Chunked
     } else if let Some(len) = header("content-length") {
+        if len.is_empty() || !len.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(HttpError::Malformed("bad content-length"));
+        }
         let len: usize = len
             .parse()
             .map_err(|_| HttpError::Malformed("bad content-length"))?;
         if len > MAX_HTTP_RESPONSE {
             return Err(HttpError::TooLarge);
         }
-        match rest.get(..len) {
-            Some(b) => b.to_vec(),
-            None if eof => return Err(HttpError::Malformed("truncated body")),
-            None => return Ok(Parsed::Incomplete),
-        }
+        Framing::Length(len)
     } else {
-        if rest.len() > MAX_HTTP_RESPONSE {
-            return Err(HttpError::TooLarge);
-        }
-        if !eof {
-            return Ok(Parsed::Incomplete);
-        }
-        rest.to_vec()
+        Framing::UntilEof
     };
-    Ok(Parsed::Complete(HttpResponse {
+    Ok(Head {
         status,
         headers,
-        body,
-    }))
+        body_start,
+        framing,
+    })
 }
 
 fn parse_status(line: &[u8]) -> Result<u16, HttpError> {
@@ -210,19 +277,21 @@ fn parse_status(line: &[u8]) -> Result<u16, HttpError> {
     code.parse().map_err(|_| bad())
 }
 
-/// Decode a chunked body. `Ok(None)` means more bytes are needed.
-fn decode_chunked(mut rest: &[u8], eof: bool) -> Result<Option<Vec<u8>>, HttpError> {
-    let mut body = Vec::new();
+/// Decode chunks from `rest` (the bytes after the head), resuming at
+/// `st.pos`. `Ok(true)` once the last chunk is seen; `Ok(false)` when more
+/// bytes are needed.
+fn decode_chunked(rest: &[u8], st: &mut ChunkState, eof: bool) -> Result<bool, HttpError> {
     let need_more = |eof: bool| {
         if eof {
             Err(HttpError::Malformed("truncated chunked body"))
         } else {
-            Ok(None)
+            Ok(false)
         }
     };
     loop {
-        let Some(nl) = find(rest, b"\r\n") else {
-            if rest.len() > MAX_CHUNK_LINE {
+        let cur = rest.get(st.pos..).unwrap_or_default();
+        let Some(nl) = find(cur, b"\r\n") else {
+            if cur.len() > MAX_CHUNK_LINE {
                 return Err(HttpError::Malformed("chunk size line too long"));
             }
             return need_more(eof);
@@ -230,20 +299,23 @@ fn decode_chunked(mut rest: &[u8], eof: bool) -> Result<Option<Vec<u8>>, HttpErr
         if nl > MAX_CHUNK_LINE {
             return Err(HttpError::Malformed("chunk size line too long"));
         }
-        let line = rest.get(..nl).unwrap_or_default();
+        let line = cur.get(..nl).unwrap_or_default();
         let size_part = line.split(|&b| b == b';').next().unwrap_or_default();
         let size_str = std::str::from_utf8(size_part)
             .map_err(|_| HttpError::Malformed("bad chunk size"))?
             .trim();
+        if size_str.is_empty() || !size_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(HttpError::Malformed("bad chunk size"));
+        }
         let size = usize::from_str_radix(size_str, 16)
             .map_err(|_| HttpError::Malformed("bad chunk size"))?;
-        let after = rest.get(nl + 2..).unwrap_or_default();
         if size == 0 {
-            return Ok(Some(body));
+            return Ok(true);
         }
-        if size > MAX_HTTP_RESPONSE.saturating_sub(body.len()) {
+        if size > MAX_HTTP_RESPONSE.saturating_sub(st.body.len()) {
             return Err(HttpError::TooLarge);
         }
+        let after = cur.get(nl + 2..).unwrap_or_default();
         let Some(data) = after.get(..size) else {
             return need_more(eof);
         };
@@ -254,9 +326,35 @@ fn decode_chunked(mut rest: &[u8], eof: bool) -> Result<Option<Vec<u8>>, HttpErr
         if !tail.starts_with(b"\r\n") {
             return Err(HttpError::Malformed("missing chunk terminator"));
         }
-        body.extend_from_slice(data);
-        rest = tail.get(2..).unwrap_or_default();
+        st.body.extend_from_slice(data);
+        st.pos += nl + 2 + size + 2;
     }
+}
+
+/// Reject anything that could split or smuggle a request.
+fn validate(req: &HttpRequest<'_>) -> Result<(), HttpError> {
+    let token = |s: &str, extra: &[char]| {
+        !s.is_empty()
+            && !s
+                .chars()
+                .any(|c| c.is_ascii_control() || c == ' ' || extra.contains(&c))
+    };
+    let value_ok = |s: &str| !s.chars().any(|c| c == '\r' || c == '\n' || c == '\0');
+    if !token(req.method, &[]) {
+        return Err(HttpError::Malformed("bad request method"));
+    }
+    if !token(req.path, &[]) {
+        return Err(HttpError::Malformed("bad request path"));
+    }
+    for (name, value) in req.headers {
+        if !token(name, &[':']) {
+            return Err(HttpError::Malformed("bad request header name"));
+        }
+        if !value_ok(value) {
+            return Err(HttpError::Malformed("bad request header value"));
+        }
+    }
+    Ok(())
 }
 
 /// Send `req` and read the reply, bounded by [`HTTP_TIMEOUT`] and
@@ -265,11 +363,14 @@ pub async fn request(req: &HttpRequest<'_>) -> Result<(HttpResponse, SocketAddr)
     request_with_timeout(req, HTTP_TIMEOUT).await
 }
 
-/// [`request`] with a caller-chosen bound for the whole exchange.
+/// [`request`] with a caller-chosen bound for the whole exchange. The request
+/// is validated (no CR, LF or space in method or path, no CR or LF in header
+/// names or values) before anything is sent.
 pub async fn request_with_timeout(
     req: &HttpRequest<'_>,
     timeout: Duration,
 ) -> Result<(HttpResponse, SocketAddr), HttpError> {
+    validate(req)?;
     tokio::time::timeout(timeout, exchange(req))
         .await
         .map_err(|_| HttpError::Timeout)?
@@ -280,17 +381,18 @@ async fn exchange(req: &HttpRequest<'_>) -> Result<(HttpResponse, SocketAddr), H
     let local = stream.local_addr()?;
     stream.write_all(&req.to_bytes()).await?;
     let mut raw: Vec<u8> = Vec::new();
+    let mut parser = Parser::default();
     let mut chunk = [0u8; READ_CHUNK];
     loop {
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
-            return Ok((parse_response(&raw)?, local));
+            return match parser.advance(&raw, true)? {
+                Some(resp) => Ok((resp, local)),
+                None => Err(HttpError::Malformed("truncated response")),
+            };
         }
         raw.extend_from_slice(chunk.get(..n).unwrap_or_default());
-        if raw.len() > MAX_RAW {
-            return Err(HttpError::TooLarge);
-        }
-        if let Parsed::Complete(resp) = parse(&raw, false)? {
+        if let Some(resp) = parser.advance(&raw, false)? {
             return Ok((resp, local));
         }
     }
@@ -321,8 +423,8 @@ mod tests {
 
         assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nhi").is_err());
         assert!(matches!(
-            parse(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nhi", false),
-            Ok(Parsed::Incomplete)
+            Parser::default().advance(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nhi", false),
+            Ok(None)
         ));
     }
 
@@ -359,8 +461,153 @@ mod tests {
         }
         let many = format!("HTTP/1.1 200 OK\r\n{}\r\n", "A: b\r\n".repeat(65));
         assert!(parse_response(many.as_bytes()).is_err());
-        let long = format!("HTTP/1.1 200 OK\r\nA: {}\r\n\r\n", "b".repeat(MAX_LINE));
+        let long = format!("HTTP/1.1 200 OK\r\nA: {}\r\n\r\n", "b".repeat(MAX_LINE - 2));
         assert!(parse_response(long.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn header_and_line_limits_are_exact() {
+        let ok = format!("HTTP/1.1 200 OK\r\n{}\r\n", "A: b\r\n".repeat(64));
+        assert_eq!(parse_response(ok.as_bytes()).unwrap().headers.len(), 64);
+        let bad = format!("HTTP/1.1 200 OK\r\n{}\r\n", "A: b\r\n".repeat(65));
+        assert!(parse_response(bad.as_bytes()).is_err());
+        // "A: " is 3 bytes, so 4093 value bytes make a 4096-byte line.
+        let ok = format!("HTTP/1.1 200 OK\r\nA: {}\r\n\r\n", "b".repeat(MAX_LINE - 3));
+        assert!(parse_response(ok.as_bytes()).is_ok());
+        let bad = format!("HTTP/1.1 200 OK\r\nA: {}\r\n\r\n", "b".repeat(MAX_LINE - 2));
+        assert!(parse_response(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn chunk_size_edge_cases_are_rejected() {
+        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for tail in [
+            "ffffffffffffffffffff\r\nx",
+            "+5\r\nhello\r\n0\r\n\r\n",
+            "-5\r\n",
+            "\r\n",
+        ] {
+            let r = parse_response(format!("{head}{tail}").as_bytes());
+            assert!(matches!(r, Err(HttpError::Malformed(_))), "{tail:?}: {r:?}");
+        }
+        let long_line = format!("{head}{}\r\n", "1".repeat(100));
+        assert!(matches!(
+            parse_response(long_line.as_bytes()),
+            Err(HttpError::Malformed(_))
+        ));
+        let no_crlf = format!("{head}{}", "1".repeat(100));
+        assert!(matches!(
+            parse_response(no_crlf.as_bytes()),
+            Err(HttpError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn plus_sign_content_length_is_rejected() {
+        let r = parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok");
+        assert!(matches!(r, Err(HttpError::Malformed(_))), "{r:?}");
+    }
+
+    #[test]
+    fn accepts_bare_lf_line_endings() {
+        let r = parse_response(b"HTTP/1.1 200 OK\nContent-Length: 2\nX: y\n\nok").unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
+        assert_eq!(r.headers.len(), 2);
+        let r = parse_response(b"HTTP/1.0 200 OK\nX: y\n\nrest").unwrap();
+        assert_eq!(r.body, b"rest");
+    }
+
+    #[test]
+    fn incremental_parse_matches_whole_parse() {
+        let msg: &[u8] =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\n wo\r\n0\r\n\r\n";
+        let mut p = Parser::default();
+        let mut done = None;
+        for n in 1..=msg.len() {
+            if let Some(r) = p.advance(msg.get(..n).unwrap(), false).unwrap() {
+                done = Some(r);
+                break;
+            }
+        }
+        assert_eq!(done.unwrap().body, b"hello wo");
+    }
+
+    #[tokio::test]
+    async fn rejects_header_injection_before_connecting() {
+        // Port 9 on loopback: validation must fail first, never connecting.
+        let host: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+        let cases: [Case<'_>; 7] = [
+            ("GET\r\nX: y", "/", &[]),
+            ("GET", "/ HTTP/1.1\r\nX: y", &[]),
+            ("GET", "/a\nb", &[]),
+            ("GE T", "/", &[]),
+            ("GET", "/", &[("A\r\nB", "c")]),
+            ("GET", "/", &[("A", "b\r\nC: d")]),
+            ("GET", "/", &[("A:B", "c")]),
+        ];
+        for (method, path, headers) in cases {
+            let req = HttpRequest {
+                method,
+                host,
+                path,
+                headers,
+                body: b"",
+            };
+            let r = request_with_timeout(&req, Duration::from_secs(1)).await;
+            assert!(
+                matches!(r, Err(HttpError::Malformed(_))),
+                "{method:?} {path:?} {headers:?}: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn head_plus_body_over_the_cap_is_too_large() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf).await;
+            // Body alone fits the cap; head plus body does not.
+            let mut msg = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_HTTP_RESPONSE - 10
+            )
+            .into_bytes();
+            msg.resize(msg.len() + MAX_HTTP_RESPONSE - 10, b'a');
+            let _ = s.write_all(&msg).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let req = HttpRequest {
+            method: "GET",
+            host,
+            path: "/",
+            headers: &[],
+            body: b"",
+        };
+        let r = request_with_timeout(&req, Duration::from_secs(3)).await;
+        assert!(matches!(r, Err(HttpError::TooLarge)), "{r:?}");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn parse_response_never_panics(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..600)) {
+            let _ = parse_response(&bytes);
+        }
+
+        #[test]
+        fn parse_response_never_panics_on_near_valid(
+            tail in "[0-9a-fA-F;+\\-:\\r\\n xX]{0,200}",
+            chunked in proptest::prelude::any::<bool>(),
+        ) {
+            let head = if chunked { "Transfer-Encoding: chunked" } else { "Content-Length: 5" };
+            let msg = format!("HTTP/1.1 200 OK\r\n{head}\r\n\r\n{tail}");
+            let _ = parse_response(msg.as_bytes());
+            let mut p = Parser::default();
+            let _ = p.advance(msg.as_bytes(), false);
+        }
     }
 
     #[test]
