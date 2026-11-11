@@ -351,6 +351,11 @@ async fn exchange(
         sock.send_to(request, gateway).await?;
         let deadline = Instant::now() + wait;
         loop {
+            // `timeout_at` polls the receive before the deadline, so a socket
+            // that keeps failing would never time out without this check.
+            if Instant::now() >= deadline {
+                break;
+            }
             let Ok(got) = tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await else {
                 break;
             };
