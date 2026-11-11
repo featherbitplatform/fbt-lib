@@ -131,11 +131,9 @@ impl Packet {
             if next == EXT_SACK {
                 // BEP 29 asks for a multiple of four bytes, but libtorrent
                 // sends only the bytes its bits need (`ceil(span / 8)`), so
-                // any non-empty length is taken.
-                if len == 0 {
-                    return Err(bad);
-                }
-                if sack.is_none() {
+                // any length is taken. An empty one acks nothing and is
+                // read as no SACK, so the packet's data and ack still count.
+                if sack.is_none() && len > 0 {
                     sack = Some(body.get(..MAX_SACK_LEN).unwrap_or(body).to_vec());
                 }
             }
@@ -271,7 +269,8 @@ mod tests {
         assert_eq!(Packet::decode(&v.into()), Err(PacketError::BadType));
         let mut v = syn_bytes();
         v[1] = 1;
-        v.extend([0, 0]);
+        // A SACK that claims four bytes but carries none.
+        v.extend([0, 4]);
         assert_eq!(Packet::decode(&v.into()), Err(PacketError::BadExtension));
         let mut v = syn_bytes();
         v[1] = 9;
@@ -336,6 +335,30 @@ mod tests {
             assert_eq!(p.sack.as_deref(), Some(&want[..]));
             assert_eq!(&p.payload[..], &[7, 7]);
         }
+    }
+
+    #[test]
+    fn empty_sack_is_read_as_none() {
+        let p = Packet {
+            ty: PacketType::Data,
+            conn_id: 7,
+            timestamp_us: 1,
+            timestamp_diff_us: 2,
+            wnd_size: 3,
+            seq_nr: 4,
+            ack_nr: 5,
+            sack: None,
+            payload: Bytes::from_static(b"data"),
+        };
+        let mut raw = Vec::new();
+        p.encode(&mut raw);
+        // Link an empty SACK extension in front of the payload.
+        raw[1] = EXT_SACK;
+        raw.splice(HEADER_LEN..HEADER_LEN, [0u8, 0u8]);
+        let got = Packet::decode(&Bytes::from(raw)).expect("decodes");
+        assert_eq!(got.sack, None);
+        assert_eq!(&got.payload[..], b"data");
+        assert_eq!(got.ack_nr, 5);
     }
 
     #[test]
