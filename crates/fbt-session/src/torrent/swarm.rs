@@ -3,6 +3,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fbt_core::{Bitfield, PeerId};
 use fbt_wire::{CryptoMethods, HolepunchMsg};
@@ -614,13 +615,18 @@ impl Actor {
         {
             // A peer that traded data and then went away (it closed, its
             // transport timed out, or it went idle): dialled again as the
-            // first retry of a series, a twelfth of `peer_retry_delay`.
+            // first retry of a series, a twelfth of `peer_retry_delay`, then ever later while it keeps
+            // dropping (`Retries::dropped`).
             // Otherwise only a tracker or PEX naming it again would, and a
             // lone seed lost mid-download stalls it for an announce
             // interval. One that never traded data is left alone, so a peer
             // that accepts and hangs up cannot keep us dialling it.
             debug!(addr = %p.addr, "productive peer dropped; redialling soon");
-            self.retries.failed(p.addr, Instant::now());
+            let now = Instant::now();
+            let connected_for = p
+                .connected_at
+                .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            self.retries.dropped(p.addr, now, connected_for);
         }
         match &reason {
             DisconnectReason::Protocol(msg) => {

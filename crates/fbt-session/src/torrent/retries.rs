@@ -21,6 +21,10 @@ const FIRST_RETRY_DIVISOR: u32 = 12;
 /// Also bounds the plaintext-only and TCP-only addresses and the pending
 /// transport fallbacks.
 const MAX_NEVER: usize = 1000;
+/// A connection that lasted this long resets its address's drop count.
+const STABLE_CONNECTION: Duration = Duration::from_secs(300);
+/// Longest wait before redialling a peer that keeps dropping.
+const MAX_REDIAL_DELAY: Duration = Duration::from_secs(30 * 60);
 
 /// What a failed attempt leads to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +72,11 @@ pub(super) struct Retries {
     tcp_only: HashSet<SocketAddr>,
     /// `tcp_only` in insertion order, to forget the oldest.
     tcp_only_order: VecDeque<SocketAddr>,
+    /// Drops of productive connections per address (the last
+    /// [`MAX_NEVER`]); not reset by a new connection, only by a stable one.
+    drops: HashMap<SocketAddr, u32>,
+    /// `drops` in insertion order, to forget the oldest.
+    drops_order: VecDeque<SocketAddr>,
 }
 
 impl Retries {
@@ -86,6 +95,8 @@ impl Retries {
             transport_failed_order: VecDeque::new(),
             tcp_only: HashSet::new(),
             tcp_only_order: VecDeque::new(),
+            drops: HashMap::new(),
+            drops_order: VecDeque::new(),
         }
     }
 
@@ -224,6 +235,47 @@ impl Retries {
             self.attempts.remove(&addr);
             AfterFailure::GiveUp
         }
+    }
+
+    /// A productive connection to `addr` that lasted `connected_for` was
+    /// dropped by the peer or its transport; schedules the redial. The
+    /// first drop redials after `delay / FIRST_RETRY_DIVISOR`, drop `n`
+    /// after `delay * (n - 1)`, at most [`MAX_REDIAL_DELAY`]; a connection
+    /// that lasted [`STABLE_CONNECTION`] starts the count over.
+    pub(super) fn dropped(&mut self, addr: SocketAddr, now: Instant, connected_for: Duration) {
+        if self.never.contains(&addr) {
+            return;
+        }
+        if connected_for >= STABLE_CONNECTION {
+            self.drops.remove(&addr);
+            self.drops_order.retain(|a| *a != addr);
+        }
+        let n = match self.drops.get_mut(&addr) {
+            Some(n) => {
+                *n = n.saturating_add(1);
+                *n
+            }
+            None => {
+                self.drops.insert(addr, 1);
+                self.drops_order.push_back(addr);
+                while self.drops_order.len() > MAX_NEVER {
+                    if let Some(old) = self.drops_order.pop_front() {
+                        self.drops.remove(&old);
+                    }
+                }
+                1
+            }
+        };
+        let wait = if n == 1 {
+            self.delay / FIRST_RETRY_DIVISOR
+        } else {
+            self.delay.saturating_mul(n - 1)
+        }
+        .min(MAX_REDIAL_DELAY);
+        let at = now
+            .checked_add(wait)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
+        self.pending.insert(addr, at);
     }
 
     /// The handshake over `transport` succeeded: the attempts start over.
@@ -411,5 +463,65 @@ mod tests {
         // The oldest were forgotten, the newest kept.
         assert!(!r.is_never(&addr(0)) && !r.is_never(&addr(9)));
         assert!(r.is_never(&addr(10)) && r.is_never(&addr(MAX_NEVER as u32 + 9)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_drops_back_off() {
+        let a = addr(1);
+        let mut r = Retries::new(DELAY);
+        for (i, secs) in [5u64, 60, 120, 180].into_iter().enumerate() {
+            let t = Instant::now();
+            r.dropped(a, t, Duration::from_secs(1));
+            assert!(r.is_pending(&a));
+            assert!(r.due(t + Duration::from_secs(secs - 1)).is_empty(), "{i}");
+            assert_eq!(r.due(t + Duration::from_secs(secs)), vec![a], "{i}");
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drops_are_capped_at_thirty_minutes() {
+        let a = addr(1);
+        let mut r = Retries::new(DELAY);
+        let t = Instant::now();
+        for _ in 0..100 {
+            r.dropped(a, t, Duration::from_secs(1));
+        }
+        assert!(
+            r.due(t + MAX_REDIAL_DELAY - Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(r.due(t + MAX_REDIAL_DELAY), vec![a]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stable_connection_resets_the_count() {
+        let a = addr(1);
+        let mut r = Retries::new(DELAY);
+        let t = Instant::now();
+        for _ in 0..4 {
+            r.dropped(a, t, Duration::from_secs(1));
+        }
+        r.dropped(a, t, STABLE_CONNECTION);
+        assert!(r.due(t + Duration::from_secs(4)).is_empty());
+        assert_eq!(r.due(t + Duration::from_secs(5)), vec![a]);
+        // A new connection alone does not reset the count.
+        r.connected(&a, Transport::Tcp);
+        r.dropped(a, t, Duration::from_secs(1));
+        assert!(r.due(t + Duration::from_secs(59)).is_empty());
+        assert_eq!(r.due(t + Duration::from_secs(60)), vec![a]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drop_map_is_bounded() {
+        let mut r = Retries::new(DELAY);
+        let t = Instant::now();
+        for i in 0..(MAX_NEVER as u32 + 10) {
+            r.dropped(addr(i), t, Duration::from_secs(1));
+        }
+        assert_eq!(r.drops.len(), MAX_NEVER);
+        assert_eq!(r.drops_order.len(), MAX_NEVER);
+        assert!(!r.drops.contains_key(&addr(0)));
+        assert!(r.drops.contains_key(&addr(MAX_NEVER as u32 + 9)));
     }
 }
