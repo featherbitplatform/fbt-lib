@@ -797,3 +797,219 @@ fn acceptor_ignores_packets_with_a_forged_ack() {
     b.on_packet(&p, t);
     assert_eq!(b.buffered_bytes(), 100);
 }
+
+fn checked(c: &Connection, what: &str) {
+    if let Err(e) = c.check_invariants() {
+        panic!("{what}: {e}");
+    }
+}
+
+/// A deterministic hostile link: drops every 7th datagram and swaps each
+/// remaining pair, with a fixed one-way `DELAY`.
+#[derive(Default)]
+struct BadLink {
+    sent: u64,
+    held: Option<Vec<u8>>,
+    q: std::collections::VecDeque<(Instant, Vec<u8>)>,
+}
+
+impl BadLink {
+    fn send(&mut self, now: Instant, d: Vec<u8>) {
+        self.sent += 1;
+        if self.sent.is_multiple_of(7) {
+            return;
+        }
+        match self.held.take() {
+            Some(h) => {
+                self.q.push_back((now + DELAY, d));
+                self.q.push_back((now + DELAY, h));
+            }
+            None => self.held = Some(d),
+        }
+    }
+
+    fn release(&mut self, now: Instant) {
+        if let Some(h) = self.held.take() {
+            self.q.push_back((now + DELAY, h));
+        }
+    }
+
+    fn next(&self) -> Option<Instant> {
+        self.q.front().map(|e| e.0)
+    }
+
+    fn pop_due(&mut self, now: Instant) -> Option<Packet> {
+        if self.q.front().is_some_and(|e| e.0 <= now) {
+            self.q.pop_front().map(|e| decode(e.1))
+        } else {
+            None
+        }
+    }
+}
+
+#[test]
+fn pending_index_matches_a_full_scan() {
+    const LEN: usize = 2 << 20;
+    let cfg = UtpConfig::default();
+    let p = pair(&cfg, &cfg);
+    let (mut a, mut b, mut t) = (p.a, p.b, p.t);
+    let src_a = pattern(LEN);
+    let src_b: Vec<u8> = pattern(LEN).iter().map(|x| x ^ 0x5a).collect();
+    let (mut wa, mut wb) = (0usize, 0usize);
+    let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+    let (mut ab, mut ba) = (BadLink::default(), BadLink::default());
+    let end = t + Duration::from_secs(600);
+    let mut steps = 0u64;
+    while got_a.len() < LEN || got_b.len() < LEN {
+        steps += 1;
+        assert!(steps < 5_000_000 && t < end, "transfer stalled");
+        wa += a.write(&src_a[wa..]);
+        wb += b.write(&src_b[wb..]);
+        checked(&a, "a write");
+        checked(&b, "b write");
+        while let Some(d) = a.poll_transmit(t) {
+            checked(&a, "a poll_transmit");
+            ab.send(t, d);
+        }
+        while let Some(d) = b.poll_transmit(t) {
+            checked(&b, "b poll_transmit");
+            ba.send(t, d);
+        }
+        read_all(&mut b, &mut got_b);
+        read_all(&mut a, &mut got_a);
+        checked(&a, "a read");
+        checked(&b, "b read");
+        let next = [ab.next(), ba.next(), a.next_deadline(), b.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        let idle = ab.next().is_none() && ba.next().is_none();
+        let holding = ab.held.is_some() || ba.held.is_some();
+        if idle && holding && next.is_none_or(|n| n > t + DELAY) {
+            // Nothing in the air: deliver what the link holds back first.
+            ab.release(t);
+            ba.release(t);
+            continue;
+        }
+        t = t.max(next.expect("nothing left to happen"));
+        while let Some(pk) = ab.pop_due(t) {
+            b.on_packet(&pk, t);
+            checked(&b, "b on_packet");
+        }
+        while let Some(pk) = ba.pop_due(t) {
+            a.on_packet(&pk, t);
+            checked(&a, "a on_packet");
+        }
+        if a.next_deadline().is_some_and(|d| d <= t) {
+            a.on_timer(t);
+            checked(&a, "a on_timer");
+        }
+        if b.next_deadline().is_some_and(|d| d <= t) {
+            b.on_timer(t);
+            checked(&b, "b on_timer");
+        }
+    }
+    assert_eq!(a.error(), None);
+    assert_eq!(b.error(), None);
+    assert!(got_b == src_a, "a to b corrupted");
+    assert!(got_a == src_b, "b to a corrupted");
+}
+
+fn data_with(seq_nr: u16, payload: Vec<u8>) -> Packet {
+    Packet {
+        payload: Bytes::from(payload),
+        ..data_pkt(100, seq_nr, 0)
+    }
+}
+
+#[test]
+fn read_spans_chunks() {
+    let cfg = UtpConfig::default();
+    let (mut a, t) = hand_connected(&cfg, 1 << 20);
+    let all = pattern(2401);
+    let (p1, rest) = all.split_at(1000);
+    let (p2, p3) = rest.split_at(1);
+    for (i, part) in [p1, p2, p3].into_iter().enumerate() {
+        a.on_packet(&data_with(500 + i as u16, part.to_vec()), t);
+        checked(&a, "on_packet");
+    }
+    assert_eq!(a.readable_bytes(), 2401);
+    let mut got = Vec::new();
+    for size in [1usize, 999, 5000, 4096] {
+        let mut buf = vec![0u8; size];
+        let n = a.read(&mut buf);
+        got.extend_from_slice(&buf[..n]);
+        checked(&a, "read");
+    }
+    assert_eq!(got, all);
+    assert_eq!(a.readable_bytes(), 0);
+}
+
+#[test]
+fn write_takes_at_most_send_room() {
+    let cfg = UtpConfig::default();
+    let (mut a, t) = hand_connected(&cfg, 1 << 20);
+    let src = pattern(2 * cfg.send_buffer);
+    assert_eq!(a.write(&src), cfg.send_buffer);
+    let sent = drain(&mut a, t);
+    assert!(!data_of(&sent).is_empty());
+    checked(&a, "after poll_transmit");
+    let mut queued: Vec<u8> = Vec::new();
+    for s in &a.outstanding {
+        queued.extend_from_slice(&s.payload);
+    }
+    queued.extend_from_slice(&a.unsent);
+    assert!(queued == src[..cfg.send_buffer], "queued bytes differ");
+}
+
+/// A DATA datagram whose 1-byte payload follows 8 extensions of 255 bytes.
+fn padded_datagram(seq_nr: u16, byte: u8) -> Bytes {
+    let mut out = Vec::new();
+    data_pkt(100, seq_nr, 0).encode(&mut out);
+    out[1] = 2; // first extension: an unknown type
+    for i in 0..crate::packet::MAX_EXTENSIONS {
+        let next = if i + 1 < crate::packet::MAX_EXTENSIONS {
+            2
+        } else {
+            0
+        };
+        out.push(next);
+        out.push(255);
+        out.extend_from_slice(&[0xee; 255]);
+    }
+    out.push(byte);
+    Bytes::from(out)
+}
+
+#[test]
+fn tiny_payloads_do_not_amplify_memory() {
+    const IN_ORDER: u16 = 20_000;
+    const OOO: u16 = 500;
+    let cfg = UtpConfig::default();
+    let (mut a, t) = hand_connected(&cfg, 1 << 20);
+    let byte = |i: u16| (i % 251) as u8;
+    for i in 0..IN_ORDER {
+        let p = Packet::decode(&padded_datagram(500 + i, byte(i))).unwrap();
+        assert_eq!(p.payload.len(), 1);
+        a.on_packet(&p, t);
+        checked(&a, "in order");
+        assert!(a.buffered_bytes() <= cfg.recv_buffer);
+    }
+    // A hole at IN_ORDER, then OOO packets past it.
+    for i in IN_ORDER + 1..=IN_ORDER + OOO {
+        let p = Packet::decode(&padded_datagram(500 + i, byte(i))).unwrap();
+        a.on_packet(&p, t);
+        checked(&a, "out of order");
+        assert!(a.buffered_bytes() <= cfg.recv_buffer);
+    }
+    assert_eq!(a.buffered_bytes(), usize::from(IN_ORDER + OOO));
+    let mut got = Vec::new();
+    read_all(&mut a, &mut got);
+    let p = Packet::decode(&padded_datagram(500 + IN_ORDER, byte(IN_ORDER))).unwrap();
+    a.on_packet(&p, t);
+    checked(&a, "hole filled");
+    read_all(&mut a, &mut got);
+    let want: Vec<u8> = (0..=IN_ORDER + OOO).map(byte).collect();
+    assert!(got == want, "bytes out of order");
+    assert_eq!(a.buffered_bytes(), 0);
+}

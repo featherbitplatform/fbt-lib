@@ -836,3 +836,27 @@ async fn spoofed_syn_flood_neither_reaches_accept_nor_fills_the_table() {
     assert!(server.num_connections() <= CAP + 2);
     acceptor.abort();
 }
+
+/// `poll_read` initialises only the bytes it delivers, not the reader's
+/// whole spare capacity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_read_initialises_only_what_it_fills() {
+    use std::mem::MaybeUninit;
+    use std::pin::Pin;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    let server = bind(UtpConfig::default()).await;
+    let client = bind(UtpConfig::default()).await;
+    let (mut c, mut s) = pair(&client, &server).await;
+    let message: Vec<u8> = (0..100u8).collect();
+    step(c.write_all(&message)).await.unwrap();
+    let mut storage = [MaybeUninit::<u8>::uninit(); 16384];
+    let mut buf = ReadBuf::uninit(&mut storage);
+    step(std::future::poll_fn(|cx| {
+        Pin::new(&mut s).poll_read(cx, &mut buf)
+    }))
+    .await
+    .unwrap();
+    assert_eq!(buf.initialized().len(), 100);
+    assert_eq!(buf.filled(), &message[..]);
+}

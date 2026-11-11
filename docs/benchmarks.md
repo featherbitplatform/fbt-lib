@@ -39,29 +39,45 @@ First row (0.2.0), against each target:
 - 1,000 idle torrents under 1 % CPU: missed, 1.2 %.
 - Memory per idle torrent: recorded, about 18 KiB RSS.
 
-### Known defects: uTP throughput and CPU
+### Fixed in 0.4.0: uTP hot-path defects (targets still missed)
 
-The uTP misses are known implementation costs in `fbt-utp`'s hot path, not
-open tuning targets:
+The three implementation costs recorded against 0.3.0 are gone from
+`fbt-utp`'s hot path:
 
-- **In-flight window scans per send.** Every packet sent, and every ack
-  processed, scans the whole in-flight window for packets to retransmit
-  (`transmit_outstanding`, `packetize`, `has_pending_send`). With a 1 MiB
-  send buffer that is about 750 packets, so CPU per packet grows with the
-  window and the faster the link, the worse it gets.
-- **Byte-wise `VecDeque` payload.** Send and receive payload sits in
-  `VecDeque<u8>` buffers and moves through byte iterators
-  (`extend(iter().take(n))`, `drain(..n)`), about three non-`memcpy` copies
-  per payload byte on each side.
-- **Zero-fill per read.** `UtpStream::poll_read` zero-fills the reader's
-  whole spare capacity (`initialize_unfilled`) on every call, often 8 to
-  16 KiB to deliver 1.4 to 3 KiB.
+- **No in-flight window scan to find the next packet to send.** Every
+  outstanding packet has an ordinal; the lost and not-yet-sent ones are kept
+  in an ordered set and a count of live packets is kept, so picking the next
+  packet, `has_pending_send` and re-arming the retransmission timer are
+  O(log n) or O(1). Only loss handling still walks the window (the SACK loss
+  loop, bounded by `MAX_IN_FLIGHT_PACKETS` and stopping early, and the RTO).
+- **No per-byte copies.** Send data sits in a `BytesMut` and is packetized
+  with `split_to(..).freeze()`; received payloads of 1024 bytes or more are
+  kept as slices of their datagram and read with `copy_from_slice`. Shorter
+  payloads are copied and merged so a tiny payload never pins a whole
+  datagram. The one copy left on the receive path is the datagram copy in the
+  socket's receive handler.
+- **No zero-fill per read.** `UtpStream::poll_read` initialises only the
+  bytes it is about to fill.
 
-They are scheduled for milestone 4: an O(1) path to the next unsent and
-lost packets, chunked or slice-copied payload buffers, and a read that
-initialises only what it fills. What remains after that is inherent to the
-design for now (one syscall per datagram, and one receive task per socket
-running all of its uTP processing) and is tuning work.
+Measured on the 0.3.0 host (Darwin arm64, `BENCH_NO_RECORD=1`, same day, same
+build settings), uTP moved from 582 Mbit/s at 41.9 % of a core per
+100 Mbit/s to 579 Mbit/s at 42.7 %: no change, within run-to-run noise. TCP
+measured 5107 and 5108 Mbit/s at 4.9 and 5.0 %. The 0.4.0 targets (uTP at
+least 1000 Mbit/s and at most 15 % of a core per 100 Mbit/s) are **missed**.
+
+Profile (`sample`, 10 s of a 2 GiB uTP run, on-CPU samples only): the
+system calls dominate both before and after the fix. `sendto` is 47 %,
+`kevent` 25 % and `recvfrom` 19 % of on-CPU samples; MSE's RC4 is 4 %. The
+uTP connection code itself (`transmit_outstanding`, `poll_transmit` and the
+`VecDeque<u8>` drains) was 2.4 % of on-CPU samples before the fix and is
+0.1 % after. The removed costs were real but small on this host; the
+remaining cost is inherent to the current design: one `sendto` per
+1.4 KiB datagram, one `recvfrom` per datagram, and a reactor wakeup
+(`kevent`) for most of them, with all of a socket's uTP processing on its
+single receive task. Closing the gap means batching datagrams (`sendmmsg`,
+`recvmmsg`, GSO/GRO), which needs platform FFI that the no-unsafe rule
+currently rules out. That work is deferred and is not a defect in the
+connection code.
 
 The transfer timer polls the torrent state every 20 ms, so a very fast run
 (TCP finishes in about 2 s) is accurate to roughly 1 %.
