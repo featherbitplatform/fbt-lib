@@ -57,7 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `fbt-session`: the first retry of a failed outgoing connection now comes after 5 s (a twelfth of the retry delay) instead of a full minute, so a peer that was not ready yet (starting, checking its files, briefly full) no longer stalls a download that has no other peer
+- `fbt-session`: the first retry of a failed outgoing connection now comes after 5 s (a twelfth of the retry delay) instead of a full minute, so a peer that was not ready yet (starting, checking its files, briefly full) no longer stalls a download that has no other peer ([#7](https://github.com/featherbitplatform/fbt-lib/pull/7))
 - `fbt-session`: upload is no longer counted for blocks the peer cancelled ([#8](https://github.com/featherbitplatform/fbt-lib/pull/8))
 - `fbt-wire`: MSE drain errors are surfaced instead of swallowed ([#8](https://github.com/featherbitplatform/fbt-lib/pull/8))
 - `fbt-session`: file-handle eviction no longer syncs the file on every eviction ([#8](https://github.com/featherbitplatform/fbt-lib/pull/8))
