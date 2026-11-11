@@ -1052,9 +1052,15 @@ async fn receive_loop(socket: UdpSocket, shared: Weak<Shared>, stop: Arc<Notify>
                 }
             }
             Err(e) => {
-                // Windows reports ICMP port-unreachable as ConnectionReset.
                 tracing::debug!("utp recv_from: {e}");
-                errors = errors.saturating_add(1);
+                // Windows reports an ICMP unreachable for an earlier send as
+                // an error on the next receive. That says nothing about this
+                // socket, and a burst of them (replies to spoofed or dead
+                // peers) must not stall the loop, so only other errors count
+                // toward the pause.
+                if !is_icmp_echo(&e) {
+                    errors = errors.saturating_add(1);
+                }
                 if errors >= ERROR_BURST {
                     tokio::time::sleep(ERROR_PAUSE).await;
                 }
@@ -1063,9 +1069,30 @@ async fn receive_loop(socket: UdpSocket, shared: Weak<Shared>, stop: Arc<Notify>
     }
 }
 
+/// An error that reports an ICMP message about an earlier send (Windows
+/// surfaces these on `recv_from`), not a fault of the socket.
+fn is_icmp_echo(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icmp_echoes_do_not_count_as_socket_errors() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_icmp_echo(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(is_icmp_echo(&Error::from(ErrorKind::HostUnreachable)));
+        assert!(!is_icmp_echo(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!is_icmp_echo(&Error::from(ErrorKind::Other)));
+    }
 
     fn syn(conn_id: u16, seq_nr: u16) -> Packet {
         Packet {
