@@ -1147,11 +1147,13 @@ async fn seeds_are_redialled_when_the_torrent_is_unfinished() {
     )
     .await
     .expect("the seeds part");
+    // Both sides are seeds, so either may close first: we see UploadOnly
+    // when we close, Closed when the remote seed beats us to it.
     assert!(
         matches!(
             ev,
             Event::PeerDisconnected {
-                reason: DisconnectReason::UploadOnly,
+                reason: DisconnectReason::UploadOnly | DisconnectReason::Closed,
                 ..
             }
         ),
