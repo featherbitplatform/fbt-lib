@@ -150,7 +150,7 @@ async fn pause_resume_state_events() {
 }
 
 #[tokio::test]
-async fn added_paused_stays_paused_after_checking() {
+async fn added_paused_stays_paused_afterchecking() {
     let s = Session::new(test_settings()).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let (m, _) = make_torrent(&[("a", 50_000)], 16_384);
@@ -296,6 +296,19 @@ async fn unwritable_save_path_puts_torrent_in_error() {
         .await
         .expect("FileError");
     assert!(matches!(fe, Event::FileError { torrent, .. } if torrent == m.info_hashes));
+    // The file that could not be written is named.
+    let Event::FileError { path, .. } = fe else {
+        unreachable!()
+    };
+    assert_eq!(
+        path.as_deref(),
+        Some(
+            bad_path
+                .path
+                .join(m.info.files[0].path.to_path_buf())
+                .as_path()
+        )
+    );
     assert!(wait_state(&bad, |s| *s == TorrentState::Error, T).await);
     assert!(bad.status().error.is_some());
     // The peer is disconnected.
@@ -429,8 +442,8 @@ async fn leecher_downloads_from_seeding_session() {
     assert!(got == payload, "downloaded bytes differ");
     let st = lh.status();
     assert_eq!(st.total_downloaded, payload.len() as u64);
-    assert_eq!(st.num_peers, 1);
-    assert_eq!(st.num_seeds, 1);
+    // Two seeds have nothing to trade: both ends close (BEP 21).
+    assert!(wait_until(|| lh.status().num_peers == 0, Duration::from_secs(5)).await);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(sh.status().total_uploaded >= payload.len() as u64);
     leecher.shutdown().await;
@@ -528,7 +541,7 @@ async fn resume_after_error_rechecks_and_finishes() {
 }
 
 /// A torrent whose check takes about 6.4 s (64 reads of 100 ms each).
-async fn slow_checking(s: &Session) -> fbt_session::TorrentHandle {
+async fn slowchecking(s: &Session) -> fbt_session::TorrentHandle {
     use std::sync::Arc;
     let (m, payload) = make_torrent(&[("a", 64 * 16_384)], 16_384);
     let mut p = AddTorrent::new(m, PathBuf::from("unused"));
@@ -537,10 +550,7 @@ async fn slow_checking(s: &Session) -> fbt_session::TorrentHandle {
         Duration::from_millis(100),
     )));
     let h = s.add_torrent(p).await.unwrap();
-    assert!(matches!(
-        h.status().state,
-        TorrentState::CheckingFiles { .. }
-    ));
+    assert!(wait_state(&h, |s| matches!(s, TorrentState::CheckingFiles { .. }), T).await);
     h
 }
 
@@ -549,7 +559,7 @@ async fn slow_checking(s: &Session) -> fbt_session::TorrentHandle {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_during_check_is_prompt() {
     let s = Session::new(test_settings()).await.unwrap();
-    let h = slow_checking(&s).await;
+    let h = slowchecking(&s).await;
     for _ in 0..3 {
         h.force_recheck().await.unwrap();
     }
@@ -560,7 +570,7 @@ async fn stop_during_check_is_prompt() {
     assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
 
     let s = Session::new(test_settings()).await.unwrap();
-    let h = slow_checking(&s).await;
+    let h = slowchecking(&s).await;
     let t0 = std::time::Instant::now();
     tokio::time::timeout(Duration::from_secs(5), h.remove(RemoveMode::KeepData))
         .await
@@ -600,7 +610,7 @@ async fn dropped_remove_future_still_unregisters() {
 #[tokio::test]
 async fn invalid_settings_are_rejected() {
     type Tweak = fn(&mut fbt_session::Settings);
-    let bad: [(&str, Tweak); 10] = [
+    let bad: [(&str, Tweak); 16] = [
         ("status_interval", |s| s.status_interval = Duration::ZERO),
         ("rechoke_interval", |s| s.rechoke_interval = Duration::ZERO),
         ("keepalive_interval", |s| {
@@ -619,6 +629,16 @@ async fn invalid_settings_are_rejected() {
             s.max_incoming_requests = usize::MAX
         }),
         ("max_incoming_requests", |s| s.max_incoming_requests = 0),
+        ("disk_threads", |s| s.disk_threads = 0),
+        ("disk_threads", |s| {
+            s.disk_threads = fbt_session::MAX_DISK_THREADS + 1
+        }),
+        ("max_active_checks", |s| s.max_active_checks = 0),
+        ("max_active_checks", |s| s.max_active_checks = 65),
+        ("snub_timeout", |s| s.snub_timeout = Duration::ZERO),
+        ("optimistic_unchoke_interval", |s| {
+            s.optimistic_unchoke_interval = s.rechoke_interval / 2
+        }),
     ];
     for (field, tweak) in bad {
         let mut st = test_settings();
@@ -635,7 +655,8 @@ async fn invalid_settings_are_rejected() {
 /// Extreme but meaningful settings work without panicking.
 #[tokio::test]
 async fn extreme_settings_do_not_panic() {
-    let mut st = test_settings();
+    // It dials a closed port below: over TCP alone, refused at once.
+    let mut st = dial_tcp(test_settings());
     st.max_peers_global = usize::MAX;
     st.max_peers_per_torrent = usize::MAX;
     st.max_half_open = usize::MAX;
@@ -643,6 +664,11 @@ async fn extreme_settings_do_not_panic() {
     st.max_outstanding_requests = usize::MAX;
     st.max_incoming_requests = 1 << 16;
     st.rechoke_interval = Duration::MAX;
+    st.optimistic_unchoke_interval = Duration::MAX;
+    st.optimistic_unchoke_slots = usize::MAX;
+    st.seeding_piece_quota = u32::MAX;
+    st.snub_timeout = Duration::MAX;
+    st.request_queue_time = Duration::MAX;
     st.keepalive_interval = Duration::MAX;
     st.peer_idle_timeout = Duration::MAX;
     st.request_timeout = Duration::MAX;
@@ -823,5 +849,378 @@ async fn incoming_valid_plaintext_handshake_is_routed() {
     next_matching(&mut ev, |e| matches!(e, Event::PeerConnected { .. }), T)
         .await
         .expect("PeerConnected");
+    s.shutdown().await;
+}
+
+/// True when the host can bind `[::1]`; IPv6 tests return early otherwise.
+fn ipv6_available() -> bool {
+    std::net::TcpListener::bind("[::1]:0").is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listens_on_every_address() {
+    if !ipv6_available() {
+        return;
+    }
+    let mut st = test_settings();
+    st.listen_addrs = vec![
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        "[::1]:0".parse().unwrap(),
+    ];
+    let s = Session::new(st).await.unwrap();
+    let addrs = s.local_addrs();
+    assert_eq!(addrs.len(), 2, "{addrs:?}");
+    assert!(addrs[0].is_ipv4() && addrs[1].is_ipv6(), "{addrs:?}");
+    assert_eq!(s.local_addr(), addrs[0]);
+    assert!(s.listen_errors().is_empty());
+    let (m, payload) = make_torrent(&[("a", 16_384)], 16_384);
+    let dir = tempfile::tempdir().unwrap();
+    write_payload(dir.path(), &m, &payload);
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    for addr in addrs {
+        let peer = ScriptedPeer::connect(addr, m.info_hashes.wire_hash()).await;
+        assert_eq!(peer.remote.info_hash, m.info_hashes.wire_hash(), "{addr}");
+    }
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ipv6_bind_failure_is_reported_and_skipped() {
+    let Ok(held) = std::net::TcpListener::bind("[::1]:0") else {
+        return;
+    };
+    let taken = held.local_addr().unwrap();
+    let mut st = test_settings();
+    st.listen_addrs = vec![std::net::SocketAddr::from(([127, 0, 0, 1], 0)), taken];
+    let s = Session::new(st).await.unwrap();
+    assert_eq!(s.local_addrs().len(), 1);
+    assert!(s.local_addrs()[0].is_ipv4());
+    let errors = s.listen_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].addr, taken);
+    assert!(!errors[0].udp_only);
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unspecified_v4_and_v6_share_a_port() {
+    if !ipv6_available() {
+        return;
+    }
+    // A port free for TCP and UDP on both families. Another process may
+    // take it before the session binds it, so a start that reports an
+    // error is retried with a new port.
+    let free_port = || {
+        (0..50).find_map(|_| {
+            let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            let free = std::net::UdpSocket::bind(("0.0.0.0", p)).is_ok()
+                && std::net::TcpListener::bind(("::", p)).is_ok()
+                && std::net::UdpSocket::bind(("::", p)).is_ok();
+            free.then_some(p)
+        })
+    };
+    let mut last_errors = Vec::new();
+    for _ in 0..5 {
+        let port = free_port().expect("a port free on both families in 50 tries");
+        let mut st = test_settings();
+        st.listen_addrs = vec![
+            std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+            std::net::SocketAddr::from(([0u16; 8], port)),
+        ];
+        let s = Session::new(st).await.unwrap();
+        last_errors = s.listen_errors();
+        if !last_errors.is_empty() {
+            s.shutdown().await;
+            continue;
+        }
+        assert_eq!(s.local_addrs().len(), 2);
+        assert!(s.local_addrs().iter().all(|a| a.port() == port));
+        s.shutdown().await;
+        return;
+    }
+    panic!("no start without listen errors in 5 tries: {last_errors:?}");
+}
+
+#[tokio::test]
+async fn empty_listen_addrs_is_invalid() {
+    let mut st = test_settings();
+    st.listen_addrs = Vec::new();
+    match Session::new(st).await {
+        Err(SessionError::InvalidSettings(msg)) => assert!(msg.contains("listen_addrs"), "{msg}"),
+        other => panic!("expected InvalidSettings, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn duplicate_listen_addrs_is_invalid() {
+    let mut st = test_settings();
+    let a = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    st.listen_addrs = vec![a, a];
+    match Session::new(st).await {
+        Err(SessionError::InvalidSettings(msg)) => assert!(msg.contains("listen_addrs"), "{msg}"),
+        other => panic!("expected InvalidSettings, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn nothing_binds_is_a_bind_error() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut st = test_settings();
+    st.listen_addrs = vec![held.local_addr().unwrap()];
+    assert!(matches!(Session::new(st).await, Err(SessionError::Bind(_))));
+}
+
+/// Concurrent `read` calls across every `CountingStorage` sharing it.
+#[derive(Debug, Default)]
+struct ReadCounter {
+    now: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    total: std::sync::atomic::AtomicUsize,
+}
+
+/// Memory storage whose reads take `delay` each and are counted (in
+/// flight, peak in flight, total) into a shared `ReadCounter`.
+#[derive(Debug)]
+struct CountingStorage {
+    inner: fbt_session::storage::MemStorage,
+    delay: Duration,
+    counter: std::sync::Arc<ReadCounter>,
+}
+
+impl fbt_session::storage::Storage for CountingStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.counter.now.fetch_add(1, SeqCst) + 1;
+        self.counter.peak.fetch_max(now, SeqCst);
+        self.counter.total.fetch_add(1, SeqCst);
+        std::thread::sleep(self.delay);
+        let r = self.inner.read(offset, buf);
+        self.counter.now.fetch_sub(1, SeqCst);
+        r
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> std::io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// A complete torrent of `pieces` 16 KiB pieces on a `CountingStorage`
+/// whose reads take `delay`.
+fn counted_torrent(
+    pieces: usize,
+    delay: Duration,
+    counter: &std::sync::Arc<ReadCounter>,
+) -> AddTorrent {
+    let (m, payload) = make_torrent(&[("a", pieces * 16_384)], 16_384);
+    let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+    p.storage = Some(std::sync::Arc::new(CountingStorage {
+        inner: fbt_session::storage::MemStorage::from_bytes(payload),
+        delay,
+        counter: std::sync::Arc::clone(counter),
+    }));
+    p
+}
+
+/// With `max_active_checks: 1` the checks of three torrents run one after
+/// the other: the others wait as `QueuedForChecking`, and all three seed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checks_run_one_at_a_time() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut st = test_settings();
+    st.max_active_checks = 1;
+    let s = Session::new(st).await.unwrap();
+    let mut ev = s.subscribe(EventMask::STATUS);
+    let counter = std::sync::Arc::new(ReadCounter::default());
+    let mut hs = Vec::new();
+    for _ in 0..3 {
+        // 0.8 s per check: wide enough to observe on a loaded runner.
+        let p = counted_torrent(8, Duration::from_millis(100), &counter);
+        hs.push(s.add_torrent(p).await.unwrap());
+    }
+    let onechecking_two_queued = || {
+        let states: Vec<TorrentState> = hs.iter().map(|h| h.status().state).collect();
+        let checking = states
+            .iter()
+            .filter(|s| matches!(s, TorrentState::CheckingFiles { .. }))
+            .count();
+        let queued = states
+            .iter()
+            .filter(|s| **s == TorrentState::QueuedForChecking)
+            .count();
+        checking == 1 && queued == 2
+    };
+    assert!(
+        wait_until(onechecking_two_queued, T).await,
+        "one checking, two queued"
+    );
+    next_matching(
+        &mut ev,
+        |e| is_state(e, |s| *s == TorrentState::QueuedForChecking),
+        T,
+    )
+    .await
+    .expect("QueuedForChecking event");
+    for h in &hs {
+        assert!(wait_state(h, |s| *s == TorrentState::Seeding, T).await);
+    }
+    assert_eq!(counter.total.load(SeqCst), 24);
+    assert_eq!(counter.peak.load(SeqCst), 1, "checks overlapped");
+    s.shutdown().await;
+}
+
+/// A torrent waiting for its check: pause keeps its place in the queue, a
+/// recheck re-queues it at the tail, and once the running check ends it is
+/// checked (no lost wakeup). One removed while queued never reads its data,
+/// and shutdown does not wait for a queued check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_check_can_be_removed() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut st = test_settings();
+    st.max_active_checks = 1;
+    let s = Session::new(st).await.unwrap();
+    let mut ev = s.subscribe(EventMask::ALL);
+    let slow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let first = {
+        let (m, payload) = make_torrent(&[("a", 64 * 16_384)], 16_384);
+        let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+        p.storage = Some(std::sync::Arc::new(ToggleStorage::new(
+            payload,
+            Duration::from_millis(100),
+            slow.clone(),
+        )));
+        let h = s.add_torrent(p).await.unwrap();
+        assert!(wait_state(&h, |s| matches!(s, TorrentState::CheckingFiles { .. }), T).await);
+        h
+    };
+    let counter = std::sync::Arc::new(ReadCounter::default());
+    let queued = s
+        .add_torrent(counted_torrent(4, Duration::ZERO, &counter))
+        .await
+        .unwrap();
+    assert!(wait_state(&queued, |s| *s == TorrentState::QueuedForChecking, T).await);
+
+    queued.pause().await.unwrap();
+    assert_eq!(queued.status().state, TorrentState::QueuedForChecking);
+    queued.force_recheck().await.unwrap();
+    queued.resume().await.unwrap();
+    assert_eq!(queued.status().state, TorrentState::QueuedForChecking);
+    assert_eq!(counter.total.load(SeqCst), 0);
+    // `first`'s check, slow until now, may end and hand the slot on.
+    slow.store(false, SeqCst);
+    assert!(wait_state(&first, |s| *s == TorrentState::Seeding, T).await);
+    assert!(wait_state(&queued, |s| *s == TorrentState::Seeding, T).await);
+    assert_eq!(counter.total.load(SeqCst), 4, "one check of four pieces");
+
+    // A recheck of `first` takes the slot again; a new torrent queues and
+    // is removed while it waits.
+    slow.store(true, SeqCst);
+    first.force_recheck().await.unwrap();
+    assert!(
+        wait_state(
+            &first,
+            |s| matches!(s, TorrentState::CheckingFiles { .. }),
+            T
+        )
+        .await
+    );
+    let unread = std::sync::Arc::new(ReadCounter::default());
+    let removed = s
+        .add_torrent(counted_torrent(4, Duration::ZERO, &unread))
+        .await
+        .unwrap();
+    let ih = removed.info_hashes();
+    assert!(wait_state(&removed, |s| *s == TorrentState::QueuedForChecking, T).await);
+    let t0 = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), removed.remove(RemoveMode::KeepData))
+        .await
+        .expect("remove in time")
+        .unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::TorrentRemoved { torrent } if *torrent == ih),
+        T,
+    )
+    .await
+    .expect("TorrentRemoved");
+    assert!(s.torrent(&ih).is_none());
+    assert!(matches!(
+        first.status().state,
+        TorrentState::CheckingFiles { .. }
+    ));
+
+    // Shutdown with one torrent checking and another queued is prompt.
+    let waiting = s
+        .add_torrent(counted_torrent(4, Duration::ZERO, &unread))
+        .await
+        .unwrap();
+    assert!(wait_state(&waiting, |s| *s == TorrentState::QueuedForChecking, T).await);
+    let t0 = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), s.shutdown())
+        .await
+        .expect("shutdown in time");
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    assert_eq!(unread.total.load(SeqCst), 0, "a queued torrent read");
+}
+
+/// With a single disk thread, a seeding torrent still serves blocks while
+/// another torrent's long check runs: checks never hold a disk thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_run_while_another_torrent_checks() {
+    let mut st = test_settings();
+    st.disk_threads = 1;
+    let s = Session::new(st).await.unwrap();
+    let (m, payload) = make_torrent(&[("a", 40_000)], 16_384);
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(std::sync::Arc::new(
+        fbt_session::storage::MemStorage::from_bytes(payload.clone()),
+    ));
+    let seed = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&seed, |s| *s == TorrentState::Seeding, T).await);
+    let checking = slowchecking(&s).await;
+
+    let mut peer = ScriptedPeer::connect_fast(s.local_addr(), m.info_hashes.wire_hash()).await;
+    peer.send(Message::HaveNone).await;
+    peer.send(Message::Interested).await;
+    peer.next_matching(|m| *m == Message::Unchoke)
+        .await
+        .expect("Unchoke");
+    let block = fbt_core::BlockRef {
+        piece: 1,
+        offset: 0,
+        len: 16_384,
+    };
+    peer.send(Message::Request(block)).await;
+    let got = tokio::time::timeout(
+        Duration::from_secs(2),
+        peer.next_matching(|m| matches!(m, Message::Piece { .. })),
+    )
+    .await
+    .expect("block served during the other torrent's check");
+    let Some(Message::Piece {
+        piece,
+        offset,
+        data,
+    }) = got
+    else {
+        panic!("no block");
+    };
+    assert_eq!((piece, offset), (1, 0));
+    assert_eq!(&data[..], &payload[16_384..32_768]);
+    assert!(matches!(
+        checking.status().state,
+        TorrentState::CheckingFiles { .. }
+    ));
     s.shutdown().await;
 }

@@ -1,8 +1,10 @@
 //! Loopback swarms of real nodes. Nothing here contacts a public DHT node.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_dht::{Body, Dht, DhtConfig, MAX_STATE_NODES, Message, Query, QueryMsg};
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, sleep, timeout};
@@ -257,5 +259,123 @@ async fn malformed_bootstrap_entries_are_skipped() {
         Message::decode(&buf[..n]).unwrap().body,
         Body::Response(_)
     ));
+    dht.shutdown().await;
+}
+
+/// A loopback socket the way a shared-socket owner sees it.
+#[derive(Debug)]
+struct Shared(std::net::UdpSocket);
+
+impl DatagramSender for Shared {
+    fn local_addr(&self) -> SocketAddr {
+        self.0.local_addr().unwrap()
+    }
+
+    fn send_to(&self, data: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.0.send_to(data, to)
+    }
+}
+
+async fn spawn_shared(c: DhtConfig) -> Dht {
+    let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    std_sock.set_nonblocking(true).unwrap();
+    let send = std_sock.try_clone().unwrap();
+    let (dht, input) = Dht::spawn_on(c, vec![Arc::new(Shared(send))])
+        .await
+        .unwrap();
+    let recv = UdpSocket::from_std(std_sock).unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        while let Ok((n, from)) = recv.recv_from(&mut buf).await {
+            input.handle(from, &buf[..n]);
+        }
+    });
+    dht
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_standalone_and_shared_nodes_converge() {
+    let first = Dht::spawn(cfg("127.0.0.1:0")).await.unwrap();
+    let seed = first.local_addrs()[0].to_string();
+    let mut nodes = vec![first];
+    for k in 1..10 {
+        let mut c = cfg("127.0.0.1:0");
+        c.bootstrap = vec![seed.clone()];
+        nodes.push(if k % 2 == 0 {
+            spawn_shared(c).await
+        } else {
+            Dht::spawn(c).await.unwrap()
+        });
+    }
+    assert!(
+        wait_until(Duration::from_secs(15), || nodes
+            .iter()
+            .all(|n| n.stats().nodes_v4 >= 5))
+        .await,
+        "{:?}",
+        nodes.iter().map(|n| n.stats().nodes_v4).collect::<Vec<_>>()
+    );
+    let ih = [7u8; 20];
+    // node 4 is on a shared socket, node 9 on a standalone one
+    let mut announce = nodes[4].announce(ih, Some(4242));
+    while announce.next().await.is_some() {}
+    let want: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+    let found = timeout(Duration::from_secs(5), find(&nodes[9], ih, want)).await;
+    assert_eq!(found, Ok(true));
+    shutdown(&nodes).await;
+}
+
+/// A bootstrap node that answers each `find_node` after 300 ms: attempts
+/// last that long, and the next one is due a backoff after the last ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_bootstrap_attempts_are_spaced_from_their_end() {
+    let slow = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let mut c = cfg("127.0.0.1:0");
+    c.bootstrap = vec![slow.local_addr().unwrap().to_string()];
+    c.bootstrap_retry_base = Duration::from_millis(50);
+    c.bootstrap_retry_max = Duration::from_millis(400);
+    c.query_timeout = Duration::from_secs(2);
+    let dht = Dht::spawn(c).await.unwrap();
+    let mut arrivals = Vec::new();
+    let mut ends = Vec::new();
+    let mut buf = [0u8; 1500];
+    let end = Instant::now() + Duration::from_millis(3500);
+    while let Ok(Ok((n, from))) = tokio::time::timeout_at(end, slow.recv_from(&mut buf)).await {
+        let Ok(Message {
+            tid,
+            body:
+                Body::Query(QueryMsg {
+                    query: Query::FindNode { .. },
+                    ..
+                }),
+            ..
+        }) = Message::decode(&buf[..n])
+        else {
+            continue;
+        };
+        arrivals.push(Instant::now());
+        sleep(Duration::from_millis(300)).await;
+        let reply = Message {
+            tid,
+            ip: None,
+            version: None,
+            body: Body::Error {
+                code: fbt_dht::ERR_SERVER,
+                message: "busy".into(),
+            },
+        };
+        slow.send_to(&reply.encode(), from).await.unwrap();
+        ends.push(Instant::now());
+    }
+    assert!(arrivals.len() >= 3, "{} attempts", arrivals.len());
+    // expected backoff after the first, second, ... attempts: 50, 100, 200 ms
+    for (k, next) in arrivals.iter().enumerate().skip(1) {
+        let gap = *next - ends[k - 1];
+        let backoff = Duration::from_millis(50 << (k - 1).min(3)).min(Duration::from_millis(400));
+        assert!(
+            gap + Duration::from_millis(20) >= backoff,
+            "attempt {k}: {gap:?} after the last ended, backoff {backoff:?}"
+        );
+    }
     dht.shutdown().await;
 }

@@ -20,6 +20,8 @@ fn request() -> AnnounceRequest {
         info_hash: [0xaa; 20],
         peer_id: PeerId([b'x'; 20]),
         port: 6881,
+        port_v4: None,
+        port_v6: None,
         uploaded: 1,
         downloaded: 2,
         left: 3,

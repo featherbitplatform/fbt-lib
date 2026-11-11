@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fbt::{
-    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, Magnet, Metainfo, PeerSource,
-    Session, Settings, TorrentHandle, TorrentState, TorrentStatus,
+    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, Magnet, MapMethod, MapProtocol,
+    Metainfo, PeerSource, RateLimit, Session, Settings, TorrentHandle, TorrentState, TorrentStatus,
+    Transport,
 };
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
@@ -36,6 +37,64 @@ struct NetArgs {
     /// Do not exchange peers with other peers (PEX).
     #[arg(long)]
     no_pex: bool,
+    /// Which transports to use, in both directions.
+    #[arg(long, value_enum, default_value = "both")]
+    transport: TransportChoice,
+    /// Address to listen on (TCP and uTP); may be repeated. Replaces
+    /// `--port` when given.
+    #[arg(long, value_name = "ADDR")]
+    listen: Vec<SocketAddr>,
+    /// Download limit in bytes per second (suffixes K and M); also applies
+    /// to peers on the local network.
+    #[arg(long, value_name = "BYTES/S", value_parser = parse_rate)]
+    download_limit: Option<u64>,
+    /// Upload limit in bytes per second (suffixes K and M); also applies
+    /// to peers on the local network.
+    #[arg(long, value_name = "BYTES/S", value_parser = parse_rate)]
+    upload_limit: Option<u64>,
+    /// Find peers on the local network (LSD, multicast).
+    #[arg(long)]
+    lsd: bool,
+    /// Ask the router for port mappings (UPnP and NAT-PMP).
+    #[arg(long)]
+    nat: bool,
+    /// Disk cache size in MiB.
+    #[arg(long, value_name = "N")]
+    cache_mb: Option<u64>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TransportChoice {
+    Both,
+    Tcp,
+    Utp,
+}
+
+impl TransportChoice {
+    /// Enables exactly the chosen transports, in both directions.
+    fn apply(self, settings: &mut Settings) {
+        let (tcp, utp) = match self {
+            TransportChoice::Both => (true, true),
+            TransportChoice::Tcp => (true, false),
+            TransportChoice::Utp => (false, true),
+        };
+        settings.enable_outgoing_tcp = tcp;
+        settings.enable_incoming_tcp = tcp;
+        settings.enable_outgoing_utp = utp;
+        settings.enable_incoming_utp = utp;
+    }
+}
+
+/// Parses `1048576`, `512K` or `1M` (powers of 1024) into bytes per second.
+fn parse_rate(s: &str) -> Result<u64, String> {
+    let bad = || format!("invalid rate {s:?}: expected a number with an optional K or M suffix");
+    let (digits, mult) = match s.chars().last() {
+        Some('k' | 'K') => (s.get(..s.len() - 1), 1024),
+        Some('m' | 'M') => (s.get(..s.len() - 1), 1024 * 1024),
+        _ => (Some(s), 1),
+    };
+    let n: u64 = digits.and_then(|d| d.parse().ok()).ok_or_else(bad)?;
+    n.checked_mul(mult).ok_or_else(bad)
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -55,6 +114,25 @@ fn host_port(s: &str) -> Result<String, String> {
 impl NetArgs {
     fn apply(&self, settings: &mut Settings) {
         settings.dht_enabled = !self.no_dht;
+        // LSD multicasts on the LAN and UPnP/NAT-PMP talk to the router:
+        // all off unless asked for.
+        settings.enable_lsd = self.lsd;
+        settings.enable_upnp = self.nat;
+        settings.enable_natpmp = self.nat;
+        self.transport.apply(settings);
+        if self.download_limit.is_some() || self.upload_limit.is_some() {
+            settings.rate_limit = RateLimit::new(
+                self.download_limit.unwrap_or(0),
+                self.upload_limit.unwrap_or(0),
+            );
+            settings.rate_limit_local_peers = true;
+        }
+        if let Some(mb) = self.cache_mb {
+            settings.cache_size = mb.saturating_mul(1024 * 1024);
+        }
+        if !self.listen.is_empty() {
+            settings.listen_addrs = self.listen.clone();
+        }
         settings.pex_enabled = !self.no_pex;
         if let Some(e) = self.encryption {
             settings.encryption = match e {
@@ -118,6 +196,34 @@ enum Command {
         #[arg(long, value_name = "SECS")]
         run_for: Option<u64>,
     },
+    /// Announce a fixed probe hash on the LAN and wait for another probe
+    /// (used by the interop scripts).
+    #[command(hide = true)]
+    LsdProbe {
+        /// Port to announce.
+        #[arg(long)]
+        port: u16,
+        /// Give up after this many seconds.
+        #[arg(long, value_name = "S", default_value_t = 3)]
+        timeout_secs: u64,
+    },
+    /// Loopback throughput and idle-torrent benchmark (used by
+    /// `dev/bench.sh`); sends nothing off this machine.
+    #[command(hide = true)]
+    Bench {
+        /// Payload to move from the seed to the leech, in MiB (0: skip).
+        #[arg(long, value_name = "MiB", default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=65536))]
+        size: u64,
+        /// Transport both sessions use.
+        #[arg(long, value_enum, default_value = "tcp")]
+        transport: TransportChoice,
+        /// Seed this many small torrents idle (0: skip).
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        torrents: u32,
+        /// How long the idle torrents run.
+        #[arg(long, value_name = "S", default_value_t = 60)]
+        idle_secs: u64,
+    },
     /// Print what a .torrent file contains.
     Info {
         /// The .torrent file.
@@ -177,6 +283,13 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             let source = Source::File(load(&torrent)?);
             transfer(source, data, port, seed_for, &[], false, &net).await
         }
+        Command::Bench {
+            size,
+            transport,
+            torrents,
+            idle_secs,
+        } => bench(size, transport, torrents, idle_secs).await,
+        Command::LsdProbe { port, timeout_secs } => lsd_probe(port, timeout_secs).await,
         Command::DhtNode {
             port,
             dht_bootstrap,
@@ -234,6 +347,7 @@ fn human_bytes(n: u64) -> String {
 fn state_name(state: TorrentState) -> &'static str {
     match state {
         TorrentState::DownloadingMetadata => "metadata",
+        TorrentState::QueuedForChecking => "queued",
         TorrentState::CheckingFiles { .. } => "checking",
         TorrentState::Downloading => "downloading",
         TorrentState::Seeding => "seeding",
@@ -272,12 +386,14 @@ async fn transfer(
 ) -> Result<ExitCode, Error> {
     let mut settings = Settings::default();
     net.apply(&mut settings);
-    if let Some(port) = port {
-        settings.listen_addr.set_port(port);
+    if let Some(port) = port
+        && net.listen.is_empty()
+    {
+        settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];
     }
     let session = Session::new(settings).await?;
     println!("listening on {}", session.local_addr());
-    let mut events = session.subscribe(EventMask::STATUS | EventMask::PEER);
+    let mut events = session.subscribe(EventMask::STATUS | EventMask::PEER | EventMask::NAT);
     let params = match source {
         Source::File(m) => AddTorrent::new(m, dir),
         Source::Magnet(m) => AddTorrent::magnet(m, dir),
@@ -297,6 +413,257 @@ async fn transfer(
     Ok(code)
 }
 
+/// Piece length of the benchmark torrents.
+const BENCH_PIECE_LEN: u32 = 256 * 1024;
+/// How long `bench` stays alive after each measurement line so that
+/// `dev/bench.sh` can take its closing `ps` sample.
+const BENCH_SETTLE: Duration = Duration::from_secs(2);
+
+/// Deterministic payload that takes no memory: byte `i` is derived from `i`
+/// alone, so the seed reads it back on demand and the leech can discard what
+/// it receives (the session verifies every piece against the torrent's
+/// hashes before it writes it; the leech's reads report "not found").
+#[derive(Debug)]
+struct BenchStorage {
+    discard: bool,
+}
+
+/// SplitMix64 of `n`: the payload's 8-byte word number `n`.
+fn pattern_word(n: u64) -> u64 {
+    let mut z = n.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn fill_pattern(offset: u64, buf: &mut [u8]) {
+    let mut pos = offset;
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let word = pattern_word(pos / 8).to_le_bytes();
+        let skip = (pos % 8) as usize;
+        let n = (8 - skip).min(rest.len());
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(n);
+        if let Some(src) = word.get(skip..skip + n) {
+            head.copy_from_slice(src);
+        }
+        rest = tail;
+        pos += n as u64;
+    }
+}
+
+impl fbt::Storage for BenchStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        if self.discard {
+            // Like a file that does not exist yet: the initial check counts
+            // every piece as missing.
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+        fill_pattern(offset, buf);
+        Ok(())
+    }
+
+    fn write(&self, _offset: u64, _data: &[u8]) -> std::io::Result<()> {
+        if self.discard {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("bench seed storage is read-only"))
+        }
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn delete_files(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A one-file torrent `name` of `len` bytes over the benchmark pattern.
+fn bench_torrent(name: &str, len: u64, piece_len: u32) -> Result<Metainfo, Error> {
+    use sha1::{Digest, Sha1};
+    let mut pieces = Vec::new();
+    let mut buf = vec![0u8; piece_len as usize];
+    let mut off = 0u64;
+    while off < len {
+        let n = (len - off).min(u64::from(piece_len)) as usize;
+        let chunk = buf.get_mut(..n).ok_or("piece buffer")?;
+        fill_pattern(off, chunk);
+        pieces.extend_from_slice(&Sha1::digest(&*chunk));
+        off += n as u64;
+    }
+    let mut info = fbt_bencode::DictBuilder::new();
+    info.insert(b"length", len as i64);
+    info.insert(b"name", name);
+    info.insert(b"piece length", i64::from(piece_len));
+    info.insert(b"pieces", pieces);
+    let mut root = fbt_bencode::DictBuilder::new();
+    root.insert(b"info", info.build());
+    Ok(Metainfo::from_bytes(&fbt_bencode::encode(&root.build()))?)
+}
+
+/// Settings for a benchmark session: loopback only, and no DHT, LSD, UPnP,
+/// NAT-PMP, PEX or holepunching, so nothing leaves this machine.
+fn bench_settings(transport: TransportChoice) -> Settings {
+    let mut s = Settings::default();
+    s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
+    s.dht_enabled = false;
+    s.dht_bootstrap_nodes = Vec::new();
+    s.enable_lsd = false;
+    s.enable_upnp = false;
+    s.enable_natpmp = false;
+    s.pex_enabled = false;
+    s.enable_holepunch = false;
+    transport.apply(&mut s);
+    s
+}
+
+/// Polls until every handle is seeding; fails on error or after `limit`.
+async fn wait_seeding(handles: &[TorrentHandle], limit: Duration) -> Result<(), Error> {
+    let end = Instant::now() + limit;
+    loop {
+        let mut done = true;
+        for h in handles {
+            let st = h.status();
+            match st.state {
+                TorrentState::Seeding => {}
+                TorrentState::Error => {
+                    return Err(st.error.unwrap_or_else(|| "torrent stopped".into()).into());
+                }
+                _ => done = false,
+            }
+        }
+        if done {
+            return Ok(());
+        }
+        if Instant::now() >= end {
+            return Err("timed out waiting for the torrents to seed".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Seeds and leeches `size_mib` MiB in this process over loopback.
+async fn bench_transfer(size_mib: u64, transport: TransportChoice) -> Result<(), Error> {
+    let len = size_mib.saturating_mul(1024 * 1024);
+    let m = bench_torrent("bench", len, BENCH_PIECE_LEN)?;
+    let seed = Session::new(bench_settings(transport)).await?;
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(std::sync::Arc::new(BenchStorage { discard: false }));
+    let seed_handle = seed.add_torrent(p).await?;
+    wait_seeding(&[seed_handle], Duration::from_secs(300)).await?;
+    let leech = Session::new(bench_settings(transport)).await?;
+    let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+    p.storage = Some(std::sync::Arc::new(BenchStorage { discard: true }));
+    let handle = leech.add_torrent(p).await?;
+    println!("bench: start");
+    let t0 = Instant::now();
+    handle.add_peer(seed.local_addr()).await?;
+    wait_seeding(&[handle], Duration::from_secs(3600)).await?;
+    let secs = t0.elapsed().as_secs_f64();
+    let mbit = len as f64 * 8.0 / 1e6 / secs;
+    let name = match transport {
+        TransportChoice::Utp => "utp",
+        TransportChoice::Tcp => "tcp",
+        TransportChoice::Both => "both",
+    };
+    println!("bench: {name} {size_mib} MiB in {secs:.2} s = {mbit:.0} Mbit/s");
+    tokio::time::sleep(BENCH_SETTLE).await;
+    leech.shutdown().await;
+    seed.shutdown().await;
+    Ok(())
+}
+
+/// Seeds `count` small torrents with no peers for `idle_secs`.
+async fn bench_idle(count: u32, idle_secs: u64) -> Result<(), Error> {
+    let session = Session::new(bench_settings(TransportChoice::Both)).await?;
+    let mut handles = Vec::new();
+    for i in 0..count {
+        let m = bench_torrent(&format!("idle-{i}"), 16 * 1024, 16 * 1024)?;
+        let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+        p.storage = Some(std::sync::Arc::new(BenchStorage { discard: false }));
+        handles.push(session.add_torrent(p).await?);
+    }
+    wait_seeding(&handles, Duration::from_secs(600)).await?;
+    println!("bench: idle start");
+    tokio::time::sleep(Duration::from_secs(idle_secs)).await;
+    println!("bench: idle {count} torrents for {idle_secs} s");
+    tokio::time::sleep(BENCH_SETTLE).await;
+    session.shutdown().await;
+    Ok(())
+}
+
+/// The `bench` subcommand: see `dev/bench.sh`.
+async fn bench(
+    size_mib: u64,
+    transport: TransportChoice,
+    torrents: u32,
+    idle_secs: u64,
+) -> Result<ExitCode, Error> {
+    println!("bench: pid {}", std::process::id());
+    if size_mib > 0 {
+        bench_transfer(size_mib, transport).await?;
+    }
+    if torrents > 0 {
+        bench_idle(torrents, idle_secs).await?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The info hash `lsd-probe` announces and waits for.
+const LSD_PROBE_HASH: [u8; 20] = *b"fbt-lsd-probe-hash-1";
+
+/// Announces [`LSD_PROBE_HASH`] with `port` on the real LSD group and exits 0
+/// once another process announces it too (answering it once first), 1 after
+/// `timeout_secs`.
+async fn lsd_probe(port: u16, timeout_secs: u64) -> Result<ExitCode, Error> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let lsd = fbt_net::lsd::Lsd::spawn(fbt_net::lsd::LsdConfig::default(), tx)?;
+    let found = probe_lsd(&lsd, &mut rx, port, Duration::from_secs(timeout_secs)).await;
+    lsd.shutdown().await;
+    Ok(match found {
+        Some(addr) => {
+            println!("lsd probe: found {addr}");
+            ExitCode::SUCCESS
+        }
+        None => {
+            println!("lsd probe: nothing within {timeout_secs} s");
+            ExitCode::FAILURE
+        }
+    })
+}
+
+/// The probe itself: announces [`LSD_PROBE_HASH`] with `port` on `lsd` and
+/// returns the first other prober heard on `rx`, or `None` after `timeout`.
+async fn probe_lsd(
+    lsd: &fbt_net::lsd::Lsd,
+    rx: &mut tokio::sync::mpsc::Receiver<fbt_net::lsd::LsdPeer>,
+    port: u16,
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    let deadline = Instant::now() + timeout;
+    // Short-lived diagnostic bounded by `timeout`, so it re-announces every
+    // 500 ms instead of the library's 5-minute cadence.
+    let mut announce = interval(Duration::from_millis(500));
+    announce.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = announce.tick() => lsd.announce(port, &[LSD_PROBE_HASH]),
+            Some(peer) = rx.recv() => {
+                if peer.info_hash == LSD_PROBE_HASH {
+                    // The other prober may have joined after our last
+                    // announce; it keeps listening until it hears one, so
+                    // answer once before leaving.
+                    lsd.announce(port, &[LSD_PROBE_HASH]);
+                    return Some(peer.addr);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => return None,
+        }
+    }
+}
+
 /// Runs a session with only the DHT until `run_for` elapses or Ctrl-C.
 async fn dht_node(
     port: Option<u16>,
@@ -305,9 +672,12 @@ async fn dht_node(
 ) -> Result<ExitCode, Error> {
     let mut settings = Settings::default();
     settings.dht_enabled = true;
+    settings.enable_lsd = false;
+    settings.enable_upnp = false;
+    settings.enable_natpmp = false;
     settings.dht_bootstrap_nodes = bootstrap;
     if let Some(port) = port {
-        settings.listen_addr.set_port(port);
+        settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];
     }
     let session = Session::new(settings).await?;
     println!("dht node listening on {}", session.local_addr());
@@ -345,6 +715,7 @@ fn source_name(source: PeerSource) -> &'static str {
         PeerSource::Dht => "dht",
         PeerSource::Pex => "pex",
         PeerSource::Magnet => "magnet",
+        PeerSource::Lsd => "lsd",
         _ => "other",
     }
 }
@@ -355,7 +726,35 @@ fn print_event(handle: &TorrentHandle, event: &Event) {
         Event::PeersFound { source, count, .. } => {
             println!("found {count} peers via {}", source_name(*source));
         }
-        Event::PeerConnected { addr, .. } => println!("peer connected {addr}"),
+        Event::PeerConnected {
+            addr, transport, ..
+        } => {
+            let via = match transport {
+                Transport::Tcp => "tcp",
+                Transport::Utp => "utp",
+                _ => "other",
+            };
+            println!("peer connected {addr} via {via}");
+        }
+        Event::PortMapped {
+            protocol,
+            method,
+            external,
+            ..
+        } => {
+            let proto = match protocol {
+                MapProtocol::Tcp => "tcp",
+                MapProtocol::Udp => "udp",
+                _ => "other",
+            };
+            let via = match method {
+                MapMethod::Upnp => "upnp",
+                MapMethod::NatPmp => "natpmp",
+                MapMethod::Pcp => "pcp",
+                _ => "other",
+            };
+            println!("port mapped {proto} {external} via {via}");
+        }
         _ => {}
     }
 }
@@ -411,11 +810,133 @@ async fn watch(
 
 #[cfg(test)]
 mod tests {
-    use super::human_bytes;
+    use clap::Parser;
+
+    use super::{Cli, Command, fill_pattern, human_bytes, parse_rate, probe_lsd};
+
+    #[test]
+    fn parse_rate_accepts_numbers_and_suffixes() {
+        assert_eq!(parse_rate("0"), Ok(0));
+        assert_eq!(parse_rate("1048576"), Ok(1_048_576));
+        assert_eq!(parse_rate("512K"), Ok(512 * 1024));
+        assert_eq!(parse_rate("512k"), Ok(512 * 1024));
+        assert_eq!(parse_rate("1M"), Ok(1024 * 1024));
+        assert_eq!(parse_rate("3m"), Ok(3 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_rate_rejects_bad_input() {
+        for bad in ["", "K", "M", "12Q", "abc", "-1", "1.5M", "1 M", "1MM"] {
+            assert!(parse_rate(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(parse_rate("18446744073709551615").is_ok());
+        assert!(parse_rate("18446744073709551616").is_err());
+        assert!(parse_rate("18446744073709551615K").is_err());
+        assert!(parse_rate(&format!("{}M", u64::MAX / (1024 * 1024) + 1)).is_err());
+    }
+
+    #[test]
+    fn cache_mb_flag_sets_cache_size() {
+        let cli = Cli::try_parse_from([
+            "fbt-example",
+            "seed",
+            "t.torrent",
+            "--data",
+            "d",
+            "--cache-mb",
+            "8",
+        ])
+        .expect("parses");
+        let Command::Seed { net, .. } = cli.command else {
+            panic!("not seed");
+        };
+        let mut settings = fbt::Settings::default();
+        net.apply(&mut settings);
+        assert_eq!(settings.cache_size, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bench_pattern_is_offset_independent() {
+        let mut whole = [0u8; 64];
+        fill_pattern(5, &mut whole);
+        for start in 0..whole.len() {
+            let mut part = vec![0u8; whole.len() - start];
+            fill_pattern(5 + start as u64, &mut part);
+            assert_eq!(part, whole[start..]);
+        }
+        assert_ne!(whole[..8], whole[8..16]);
+    }
+
+    #[test]
+    fn bench_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "fbt-example",
+            "bench",
+            "--size",
+            "8",
+            "--transport",
+            "utp",
+            "--torrents",
+            "3",
+            "--idle-secs",
+            "1",
+        ])
+        .expect("parses");
+        let Command::Bench {
+            size,
+            torrents,
+            idle_secs,
+            ..
+        } = cli.command
+        else {
+            panic!("not bench");
+        };
+        assert_eq!((size, torrents, idle_secs), (8, 3, 1));
+    }
 
     #[test]
     fn formats_bytes() {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1_258_291), "1.2 MiB");
+    }
+
+    /// Two probes that do not start together: the early one hears the late
+    /// one's first announce at once, and the late one must still hear the
+    /// early one (unicast on loopback stands in for the multicast group).
+    #[tokio::test]
+    async fn lsd_probe_late_starter_hears_the_early_one() {
+        use fbt_net::lsd::{Lsd, LsdConfig};
+        use std::net::UdpSocket;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let free = || {
+            UdpSocket::bind("127.0.0.1:0")
+                .and_then(|s| s.local_addr())
+                .expect("free port")
+        };
+        let (early_addr, late_addr) = (free(), free());
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let early = Lsd::spawn_unicast(LsdConfig::default(), early_addr, vec![late_addr], tx)
+            .expect("early probe");
+        let early_task = tokio::spawn(async move {
+            let found = probe_lsd(&early, &mut rx, 7001, Duration::from_secs(5)).await;
+            early.shutdown().await;
+            found
+        });
+        // The early probe announces at 0, 500 and 1000 ms to a port nobody
+        // has bound yet; the late one starts between two of its announces.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let late = Lsd::spawn_unicast(LsdConfig::default(), late_addr, vec![early_addr], tx)
+            .expect("late probe");
+        let late_found = probe_lsd(&late, &mut rx, 7002, Duration::from_secs(2)).await;
+        late.shutdown().await;
+
+        let early_found = early_task.await.expect("early probe task");
+        assert_eq!(early_found.map(|a| a.port()), Some(7002));
+        assert_eq!(late_found.map(|a| a.port()), Some(7001));
     }
 }

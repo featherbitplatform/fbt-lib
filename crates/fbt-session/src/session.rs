@@ -3,23 +3,34 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_core::{InfoHashes, PeerId};
-use fbt_dht::{Dht, DhtConfig, DhtError, DhtState, DhtStats};
+use fbt_dht::{Dht, DhtConfig, DhtState, DhtStats};
 use fbt_metainfo::{Magnet, Metainfo};
+use fbt_net::PortMapper;
+use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
 use fbt_tracker::TrackerClient;
+use fbt_utp::UtpSocket;
 use fbt_wire::req2_hash;
-use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::bandwidth::{Bandwidth, PeerClassLimits, RateLimit};
+use crate::disk::DiskPool;
 use crate::error::SessionError;
-use crate::event::{Event, EventMask, EventStream};
+use crate::event::{Event, EventMask, EventStream, ExternalIpSource};
+use crate::listener::ListenerState;
+use crate::net::{
+    Endpoint, ExternalIp, ListenError, LsdHub, bind_all, spawn_lsd_task, spawn_nat_task,
+    start_port_mapping, utp_for, utp_sockets,
+};
 use crate::settings::Settings;
 use crate::status::TorrentStatus;
+use crate::storage::cache::{CacheBudget, CacheStats};
 use crate::storage::{FsStorage, Storage};
 use crate::torrent::{self, TorrentHandle};
 
@@ -98,6 +109,11 @@ pub struct AddTorrent {
     pub file_priorities: Vec<Priority>,
     /// Custom storage; `None` uses the filesystem below `save_path`.
     pub storage: Option<Arc<dyn Storage>>,
+    /// The torrent's own limit (0: unlimited), within the session's. Like
+    /// the global limit it applies to local-network peers only with
+    /// [`Settings::rate_limit_local_peers`]. Changed at runtime with
+    /// [`TorrentHandle::set_rate_limit`].
+    pub rate_limit: RateLimit,
 }
 
 impl AddTorrent {
@@ -121,6 +137,7 @@ impl AddTorrent {
             sequential: false,
             file_priorities: Vec::new(),
             storage: None,
+            rate_limit: RateLimit::default(),
         }
     }
 }
@@ -130,8 +147,13 @@ impl AddTorrent {
 pub(crate) struct Shared {
     pub settings: Arc<Settings>,
     pub peer_id: PeerId,
-    /// Port of the peer listener, as announced to trackers.
+    /// Port of the first peer listener: announced over HTTP and to the DHT.
     pub listen_port: u16,
+    /// Port of the first IPv4 listener, `None` without one: UDP announces
+    /// over IPv4 and IPv4 peers' extension handshakes carry it.
+    pub listen_port_v4: Option<u16>,
+    /// Port of the first IPv6 listener, likewise for IPv6.
+    pub listen_port_v6: Option<u16>,
     /// Shared by every torrent's announcer.
     pub tracker: TrackerClient,
     pub events: broadcast::Sender<Event>,
@@ -145,6 +167,41 @@ pub(crate) struct Shared {
     /// The DHT's UDP sockets; `Port` messages carry the port of the one
     /// matching the peer's address family ([`dht_port_for`]).
     pub dht_addrs: Vec<SocketAddr>,
+    /// One uTP socket per shared UDP socket, in the same order (the
+    /// endpoints', then the per-family fallbacks).
+    pub utp: Vec<UtpSocket>,
+    /// Runs every storage job and bounds the concurrent checks.
+    pub disk: DiskPool,
+    /// The byte budget every torrent's write-back cache draws from.
+    pub cache: Arc<CacheBudget>,
+    /// The global and class rate limits.
+    pub bandwidth: Arc<Bandwidth>,
+    /// BEP 55 holepunch activity, for [`Session::holepunch_stats`].
+    pub holepunch: HolepunchCounters,
+    /// Local service discovery (BEP 14): the instance and its announce
+    /// bookkeeping.
+    pub lsd: LsdHub,
+    /// UPnP and PCP/NAT-PMP port mapping; `None` with both off.
+    pub portmap: Option<PortMapper>,
+    /// The external address as the router and peers report it.
+    pub external_ip: Arc<ExternalIp>,
+}
+
+/// BEP 55 holepunch messages handled, over every torrent of the session.
+#[derive(Debug, Default)]
+pub(crate) struct HolepunchCounters {
+    /// `Rendezvous` messages we sent to a relay.
+    pub rendezvous_sent: AtomicU64,
+    /// Rendezvous we relayed (`Connect` sent to both peers).
+    pub relayed: AtomicU64,
+    /// `Connect` messages we accepted and acted on.
+    pub connects_received: AtomicU64,
+}
+
+impl HolepunchCounters {
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The DHT port to send a peer at `peer` in `Port`: that of our DHT socket
@@ -159,6 +216,24 @@ pub(crate) fn dht_port_for(dht_addrs: &[SocketAddr], peer: &SocketAddr) -> Optio
 }
 
 impl Shared {
+    /// The listen port of `peer`'s address family (an IPv4-mapped IPv6
+    /// peer counts as IPv4): the port our listener of the family the
+    /// connection runs over has, else the first listener's.
+    pub(crate) fn listen_port_for(&self, peer: &SocketAddr) -> u16 {
+        let family = if peer.ip().to_canonical().is_ipv4() {
+            self.listen_port_v4
+        } else {
+            self.listen_port_v6
+        };
+        family.unwrap_or(self.listen_port)
+    }
+
+    /// The uTP socket to dial `peer` from: the first of its address family,
+    /// as for the DHT and UDP trackers. `None` without one.
+    pub(crate) fn utp_for(&self, peer: &SocketAddr) -> Option<&UtpSocket> {
+        utp_for(&self.utp, peer)
+    }
+
     pub(crate) fn emit(&self, ev: Event) {
         // No subscribers is fine.
         let _ = self.events.send(ev);
@@ -202,9 +277,18 @@ pub(crate) struct Registry {
 #[derive(Debug)]
 pub(crate) struct SessionInner {
     pub shared: Arc<Shared>,
-    local_addr: SocketAddr,
+    /// The TCP listeners' addresses, in settings order.
+    local_addrs: Vec<SocketAddr>,
+    listen_errors: Vec<ListenError>,
+    /// Every shared UDP socket (the endpoints', then the per-family
+    /// fallbacks), closed at shutdown.
+    udp: Vec<SharedUdpSocket>,
+    /// Shared by every accept loop of the session.
+    listener_state: Arc<ListenerState>,
     registry: Mutex<Registry>,
-    listener: Mutex<Option<JoinHandle<()>>>,
+    /// One TCP accept loop per listener (with `enable_incoming_tcp`) and
+    /// one uTP accept loop per uTP socket (with `enable_incoming_utp`).
+    listeners: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl SessionInner {
@@ -224,22 +308,39 @@ impl SessionInner {
             None => false,
         }
     }
-}
 
-impl Drop for SessionInner {
-    fn drop(&mut self) {
-        if let Some(l) = self
-            .listener
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            l.abort();
+    /// Stops every accept loop (dropping its listener).
+    fn stop_listeners(&self) {
+        let tasks = std::mem::take(&mut *self.listeners.lock().unwrap_or_else(|e| e.into_inner()));
+        for t in tasks {
+            t.abort();
+        }
+    }
+
+    /// Resets every uTP connection and stops the uTP sockets' tasks.
+    fn shutdown_utp(&self) {
+        for u in &self.shared.utp {
+            u.shutdown_now();
+        }
+    }
+
+    /// Closes every shared UDP socket, freeing its port.
+    fn close_udp(&self) {
+        for u in &self.udp {
+            u.close();
         }
     }
 }
 
-/// A BitTorrent session: a set of torrents sharing one listener, one peer
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        self.stop_listeners();
+        self.shutdown_utp();
+        self.close_udp();
+    }
+}
+
+/// A BitTorrent session: a set of torrents sharing the listeners, one peer
 /// id, connection limits and an event stream.
 ///
 /// Cheap to clone; every clone is the same session.
@@ -249,30 +350,70 @@ pub struct Session {
 }
 
 impl Session {
-    /// Starts a session and binds its peer listener on
-    /// `settings.listen_addr`.
+    /// Starts a session and binds every address of
+    /// [`Settings::listen_addrs`]: a TCP peer listener and, on the same
+    /// port, a UDP socket that the DHT and UDP tracker announces share.
+    /// Addresses that cannot be bound are skipped and reported by
+    /// [`listen_errors`](Self::listen_errors).
     ///
     /// Fails with [`SessionError::InvalidSettings`] for settings it cannot
-    /// work with (see [`Settings`]).
+    /// work with (see [`Settings`]) and with [`SessionError::Bind`] (the
+    /// first error) when no address binds.
     pub async fn new(settings: Settings) -> Result<Session, SessionError> {
         settings.validate().map_err(SessionError::InvalidSettings)?;
-        let listener = TcpListener::bind(settings.listen_addr)
-            .await
-            .map_err(SessionError::Bind)?;
-        let local_addr = listener.local_addr().map_err(SessionError::Bind)?;
-        let tracker =
-            TrackerClient::new(settings.tracker.clone()).map_err(SessionError::Tracker)?;
+        let (endpoints, listen_errors) = bind_all(&settings).await?;
+        let local_addrs: Vec<SocketAddr> = endpoints.iter().map(|e| e.addr).collect();
+        let mut udp: Vec<SharedUdpSocket> =
+            endpoints.iter().filter_map(|e| e.udp.clone()).collect();
+        udp.extend(fallback_udp(&endpoints));
+        let utp = utp_sockets(&settings, &udp);
+        let senders: Vec<Arc<dyn DatagramSender>> =
+            udp.iter().map(SharedUdpSocket::sender).collect();
+        let tracker = match TrackerClient::with_udp_sockets(settings.tracker.clone(), senders) {
+            Ok(t) => t,
+            Err(e) => {
+                for u in &utp {
+                    u.shutdown_now();
+                }
+                udp.iter().for_each(SharedUdpSocket::close);
+                return Err(SessionError::Tracker(e));
+            }
+        };
+        let tracker_input = tracker.udp_handler();
+        for u in &udp {
+            u.set_handler(PacketKind::Tracker, Arc::clone(&tracker_input));
+        }
         let (events, _) = broadcast::channel(settings.event_queue);
         let dht = if settings.dht_enabled {
-            start_dht(&settings, local_addr).await
+            start_dht(&settings, &udp).await
         } else {
             None
         };
         let dht_addrs = dht.as_ref().map(Dht::local_addrs).unwrap_or_default();
+        let listen_port = local_addrs.first().map_or(0, SocketAddr::port);
+        let first_port = |v4: bool| {
+            local_addrs
+                .iter()
+                .find(|a| a.is_ipv4() == v4)
+                .map(SocketAddr::port)
+        };
+        let (listen_port_v4, listen_port_v6) = (first_port(true), first_port(false));
+        // One for every accept loop, so all of them together allow only
+        // `max_peers_global` pending handshakes.
+        let listener_state = Arc::new(ListenerState::new(settings.max_peers_global));
+        let disk = DiskPool::new(settings.disk_threads, settings.max_active_checks);
+        let cache = Arc::new(CacheBudget::new(settings.cache_size));
+        let bandwidth = Arc::new(Bandwidth::new(&settings));
+        bandwidth.spawn_rebalance();
+        let (lsd, lsd_found) = LsdHub::start(&settings);
+        let (portmap, map_events) = start_port_mapping(&settings, &local_addrs).unzip();
+        let external_ip = Arc::new(ExternalIp::new(events.clone()));
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
-            listen_port: local_addr.port(),
+            listen_port,
+            listen_port_v4,
+            listen_port_v6,
             tracker,
             events,
             shutdown: AtomicBool::new(false),
@@ -280,24 +421,91 @@ impl Session {
             half_open: AtomicUsize::new(0),
             dht,
             dht_addrs,
+            utp,
+            disk,
+            cache,
+            bandwidth,
+            holepunch: HolepunchCounters::default(),
+            lsd,
+            portmap,
+            external_ip,
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
+            watch_dht_external_ip(dht, Arc::downgrade(&shared));
         }
         let inner = Arc::new(SessionInner {
             shared: Arc::clone(&shared),
-            local_addr,
+            local_addrs,
+            listen_errors,
+            udp,
+            listener_state,
             registry: Mutex::new(Registry::default()),
-            listener: Mutex::new(None),
+            listeners: Mutex::new(Vec::new()),
         });
-        let task = crate::listener::spawn(listener, Arc::downgrade(&inner), shared);
-        *inner.listener.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        // No TCP listeners with `enable_incoming_tcp` off.
+        let mut tasks: Vec<JoinHandle<()>> = endpoints
+            .into_iter()
+            .filter_map(|e| e.tcp)
+            .map(|tcp| {
+                crate::listener::spawn(
+                    tcp,
+                    Arc::clone(&inner.listener_state),
+                    Arc::downgrade(&inner),
+                    Arc::clone(&shared),
+                )
+            })
+            .collect();
+        if shared.settings.enable_incoming_utp {
+            tasks.extend(shared.utp.iter().map(|u| {
+                crate::listener::spawn_utp(
+                    u.clone(),
+                    Arc::clone(&inner.listener_state),
+                    Arc::downgrade(&inner),
+                    Arc::clone(&shared),
+                )
+            }));
+        }
+        if let Some(found) = lsd_found {
+            tasks.push(spawn_lsd_task(found, Arc::downgrade(&inner)));
+        }
+        if let Some(rx) = map_events {
+            tasks.push(spawn_nat_task(rx, Arc::downgrade(&shared)));
+        }
+        *inner.listeners.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
         Ok(Session { inner })
+    }
+
+    /// BEP 55 holepunch activity so far, over every torrent: `Rendezvous`
+    /// messages sent, rendezvous relayed and `Connect` messages acted on.
+    /// Internal (tests observe the exchange with it); not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub fn holepunch_stats(&self) -> (u64, u64, u64) {
+        let h = &self.inner.shared.holepunch;
+        (
+            h.rendezvous_sent.load(Ordering::Relaxed),
+            h.relayed.load(Ordering::Relaxed),
+            h.connects_received.load(Ordering::Relaxed),
+        )
     }
 
     /// The session's DHT node, `None` with [`Settings::dht_enabled`] off.
     pub fn dht_stats(&self) -> Option<DhtStats> {
         self.inner.shared.dht.as_ref().map(Dht::stats)
+    }
+
+    /// The best estimate of our external address: what the router reported
+    /// through port mapping, else what the DHT nodes' votes agree on, else
+    /// what three or more peers' `yourip` agree on. `None` until one of
+    /// them knows. [`Event::ExternalIpChanged`] reports each source's news.
+    pub fn external_ip(&self) -> Option<std::net::IpAddr> {
+        let shared = &self.inner.shared;
+        shared
+            .external_ip
+            .mapped()
+            .or_else(|| shared.dht.as_ref().and_then(|d| d.stats().external_ip))
+            .or_else(|| shared.external_ip.peers_estimate())
     }
 
     /// The DHT's state (node ids and known nodes) for
@@ -315,9 +523,57 @@ impl Session {
         Ok(Some(state.to_bytes()))
     }
 
-    /// The address the peer listener is bound to.
+    /// Bytes held by the write-back cache of every torrent, against
+    /// [`Settings::cache_size`].
+    pub fn cache_stats(&self) -> CacheStats {
+        self.inner.shared.cache.stats()
+    }
+
+    /// Sets the session-wide rate limit ([`Settings::rate_limit`]); it
+    /// applies at once, and to waiting connections within a second.
+    pub fn set_rate_limit(&self, limit: RateLimit) {
+        self.inner.shared.bandwidth.set_global(limit);
+    }
+
+    /// Sets the peer class limits ([`Settings::peer_class_limits`]); they
+    /// apply at once, and to waiting connections within a second.
+    pub fn set_peer_class_limits(&self, limits: PeerClassLimits) {
+        self.inner.shared.bandwidth.set_classes(limits);
+    }
+
+    /// The address of the first peer listener (the first of
+    /// [`local_addrs`](Self::local_addrs)).
     pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr
+        // `Session::new` fails unless at least one listener bound.
+        self.inner
+            .local_addrs
+            .first()
+            .copied()
+            .unwrap_or_else(|| SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)))
+    }
+
+    /// The addresses the peer listeners are bound to, in
+    /// [`Settings::listen_addrs`] order, without the ones that failed.
+    pub fn local_addrs(&self) -> Vec<SocketAddr> {
+        self.inner.local_addrs.clone()
+    }
+
+    /// The listen addresses that could not be bound, fully or only on
+    /// their UDP side, when the session started. They are not events:
+    /// binding happens in [`Session::new`], before anyone can subscribe.
+    pub fn listen_errors(&self) -> Vec<ListenError> {
+        self.inner.listen_errors.clone()
+    }
+
+    /// Datagram counts of each shared UDP socket, by its address. For
+    /// tests; not part of the stable API.
+    #[doc(hidden)]
+    pub fn demux_stats(&self) -> Vec<(SocketAddr, DemuxStats)> {
+        self.inner
+            .udp
+            .iter()
+            .map(|u| (u.local_addr(), u.stats()))
+            .collect()
     }
 
     /// Adds a torrent and starts checking its existing data. A magnet
@@ -414,23 +670,17 @@ impl Session {
         EventStream::new(self.inner.shared.events.subscribe(), mask)
     }
 
-    /// Stops the listener and every torrent, waiting for pending writes and
-    /// for up to 5 s for the `stopped` announces (sent in parallel).
+    /// Stops the listeners and every torrent, waiting for pending writes
+    /// and for up to 5 s for the `stopped` announces (sent in parallel),
+    /// then the DHT and the uTP sockets, and closes the shared UDP sockets,
+    /// freeing every port.
     /// Idempotent; afterwards every command returns
     /// [`SessionError::Shutdown`].
     pub async fn shutdown(&self) {
         if self.inner.shared.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(l) = self
-            .inner
-            .listener
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            l.abort();
-        }
+        self.inner.stop_listeners();
         let handles: Vec<TorrentHandle> = {
             let mut reg = self.inner.registry();
             reg.by_wire.clear();
@@ -446,16 +696,59 @@ impl Session {
         for rx in waits {
             let _ = rx.await;
         }
+        self.inner.shared.lsd.shutdown().await;
+        // Bounded (2 s in all): an unreachable router never holds us up.
+        if let Some(pm) = &self.inner.shared.portmap {
+            pm.shutdown().await;
+        }
         if let Some(dht) = &self.inner.shared.dht {
             dht.shutdown().await;
         }
+        // The peers are gone; the uTP sockets stop before the UDP sockets
+        // under them close.
+        for u in &self.inner.shared.utp {
+            u.shutdown().await;
+        }
+        // Last: the `stopped` announces and the DHT used these sockets.
+        self.inner.close_udp();
     }
 }
 
-/// Starts the session's DHT on the listener's IP and port (plus `[::]` on
-/// that port with `dht_ipv6`), on port 0 when that UDP port is taken. A
-/// DHT that cannot start at all is logged and left out.
-async fn start_dht(settings: &Settings, listener: SocketAddr) -> Option<Dht> {
+/// A UDP socket on a free port for each address family that has a
+/// listener but no shared UDP socket (its port was taken), on the IP of the
+/// family's first listener, so the DHT and UDP trackers still run over that
+/// family. One that cannot be bound is logged and left out.
+fn fallback_udp(endpoints: &[Endpoint]) -> Vec<SharedUdpSocket> {
+    let mut out = Vec::new();
+    for v4 in [true, false] {
+        let mut family = endpoints.iter().filter(|e| e.addr.is_ipv4() == v4);
+        let Some(first) = family.clone().next() else {
+            continue;
+        };
+        if family.any(|e| e.udp.is_some()) {
+            continue;
+        }
+        let addr = SocketAddr::new(first.addr.ip(), 0);
+        match SharedUdpSocket::bind(addr) {
+            Ok(u) => {
+                warn!(
+                    listener = %first.addr,
+                    udp = %u.local_addr(),
+                    "UDP port taken; the DHT and UDP trackers use a free port"
+                );
+                out.push(u);
+            }
+            Err(e) => warn!(%addr, error = %e, "cannot bind a UDP socket for this family"),
+        }
+    }
+    out
+}
+
+/// Starts the session's DHT on the shared UDP sockets, the first one of
+/// each address family, and registers it as their DHT handler (so replies
+/// leave from the address a query reached). A DHT that cannot start at all
+/// (no socket, say) is logged and left out.
+async fn start_dht(settings: &Settings, udp: &[SharedUdpSocket]) -> Option<Dht> {
     let state = settings
         .dht_state
         .as_deref()
@@ -466,35 +759,30 @@ async fn start_dht(settings: &Settings, listener: SocketAddr) -> Option<Dht> {
                 None
             }
         });
-    let config = |port: u16| {
-        let mut c = DhtConfig::default();
-        if listener.is_ipv4() {
-            c.bind_v4 = Some(SocketAddr::new(listener.ip(), port));
-            c.bind_v6 = settings
-                .dht_ipv6
-                .then(|| SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)));
-        } else {
-            c.bind_v4 = None;
-            c.bind_v6 = Some(SocketAddr::new(listener.ip(), port));
+    let mut c = DhtConfig::default();
+    c.bootstrap = settings.dht_bootstrap_nodes.clone();
+    c.read_only = settings.dht_read_only;
+    c.state = state;
+    c.query_timeout = settings.dht_query_timeout;
+    c.query_rate_per_ip = settings.dht_query_rate_per_ip;
+    // At most one socket per family: the first one wins.
+    let mut sockets: Vec<&SharedUdpSocket> = Vec::new();
+    for u in udp {
+        if !sockets
+            .iter()
+            .any(|s| s.local_addr().is_ipv4() == u.local_addr().is_ipv4())
+        {
+            sockets.push(u);
         }
-        c.bootstrap = settings.dht_bootstrap_nodes.clone();
-        c.read_only = settings.dht_read_only;
-        c.state = state.clone();
-        c.query_timeout = settings.dht_query_timeout;
-        c.query_rate_per_ip = settings.dht_query_rate_per_ip;
-        c
-    };
-    let first = Dht::spawn(config(listener.port())).await;
-    let r = match first {
-        Err(DhtError::Bind(_) | DhtError::NoSocket) if listener.port() != 0 => {
-            warn!(
-                port = listener.port(),
-                "DHT port taken; binding the DHT to a free port"
-            );
-            Dht::spawn(config(0)).await
+    }
+    let senders = sockets.iter().map(|s| s.sender()).collect();
+    let r = Dht::spawn_on(c, senders).await.map(|(dht, input)| {
+        let input: Arc<dyn DatagramHandler> = Arc::new(input);
+        for s in &sockets {
+            s.set_handler(PacketKind::Dht, Arc::clone(&input));
         }
-        r => r,
-    };
+        dht
+    });
     match r {
         Ok(d) => Some(d),
         Err(e) => {
@@ -520,9 +808,69 @@ fn watch_bootstrap(dht: &Dht, shared: std::sync::Weak<Shared>) {
     });
 }
 
+/// Emits [`Event::ExternalIpChanged`] with [`ExternalIpSource::Dht`] each
+/// time the DHT's votes settle on a new address; ends with the DHT or the
+/// session.
+fn watch_dht_external_ip(dht: &Dht, shared: std::sync::Weak<Shared>) {
+    let mut stats = dht.subscribe_stats();
+    tokio::spawn(async move {
+        let mut last = None;
+        while stats.changed().await.is_ok() {
+            let ip = stats.borrow_and_update().external_ip;
+            if ip.is_none() || ip == last {
+                continue;
+            }
+            last = ip;
+            let (Some(shared), Some(ip)) = (shared.upgrade(), ip) else {
+                return;
+            };
+            shared.emit(Event::ExternalIpChanged {
+                ip,
+                source: ExternalIpSource::Dht,
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_port_follows_the_peers_family() {
+        let shared = |v4: Option<u16>, v6: Option<u16>| Shared {
+            settings: Arc::new(Settings::default()),
+            peer_id: PeerId::generate(),
+            listen_port: 7000,
+            listen_port_v4: v4,
+            listen_port_v6: v6,
+            tracker: TrackerClient::new(Default::default()).unwrap(),
+            events: broadcast::channel(1).0,
+            shutdown: AtomicBool::new(false),
+            global_peers: AtomicUsize::new(0),
+            half_open: AtomicUsize::new(0),
+            dht: None,
+            dht_addrs: Vec::new(),
+            utp: Vec::new(),
+            disk: crate::disk::DiskPool::new(1, 1),
+            cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
+            bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
+            holepunch: HolepunchCounters::default(),
+            lsd: LsdHub::disabled(),
+            portmap: None,
+            external_ip: Arc::new(ExternalIp::new(broadcast::channel(1).0)),
+        };
+        let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();
+        let peer6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        let both = shared(Some(7000), Some(7001));
+        assert_eq!(both.listen_port_for(&peer4), 7000);
+        assert_eq!(both.listen_port_for(&mapped), 7000);
+        assert_eq!(both.listen_port_for(&peer6), 7001);
+        // No listener of the family: the first listener's port.
+        let v6_only = shared(None, Some(7000));
+        assert_eq!(v6_only.listen_port_for(&peer4), 7000);
+    }
 
     #[test]
     fn port_message_carries_the_dht_port_of_the_peers_family() {

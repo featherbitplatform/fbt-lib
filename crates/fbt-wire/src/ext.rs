@@ -20,6 +20,26 @@ pub const UT_PEX: &str = "ut_pex";
 pub const OUR_UT_PEX_ID: u8 = 1;
 /// Our local id for `ut_metadata` (libtorrent's numbering).
 pub const OUR_UT_METADATA_ID: u8 = 2;
+/// Extension name of BEP 21.
+pub const UPLOAD_ONLY: &str = "upload_only";
+/// Our local id for `upload_only` (libtorrent's numbering).
+pub const OUR_UPLOAD_ONLY_ID: u8 = 3;
+/// Extension name of BEP 55.
+pub const UT_HOLEPUNCH: &str = "ut_holepunch";
+/// Our local id for `ut_holepunch` (libtorrent's numbering).
+pub const OUR_UT_HOLEPUNCH_ID: u8 = 4;
+/// Extension name of BEP 54.
+pub const LT_DONTHAVE: &str = "lt_donthave";
+/// Our local id for `lt_donthave` (libtorrent's numbering).
+pub const OUR_LT_DONTHAVE_ID: u8 = 7;
+/// BEP 55 error: the target peer is unknown to the rendezvous peer.
+pub const HP_NO_SUCH_PEER: u32 = 1;
+/// BEP 55 error: the target peer is not connected to the rendezvous peer.
+pub const HP_NOT_CONNECTED: u32 = 2;
+/// BEP 55 error: the target peer does not support hole punching.
+pub const HP_NO_SUPPORT: u32 = 3;
+/// BEP 55 error: the target is the rendezvous peer's own requester.
+pub const HP_NO_SELF: u32 = 4;
 /// Size of one metadata piece.
 pub const METADATA_PIECE_LEN: usize = 16_384;
 /// Largest extended handshake payload accepted.
@@ -70,6 +90,9 @@ pub struct ExtHandshake {
     pub metadata_size: Option<u32>,
     /// Our address as the peer sees it (`yourip`).
     pub your_ip: Option<IpAddr>,
+    /// BEP 21 `upload_only` flag; a non-zero value is true, encoded only
+    /// when `Some(true)`.
+    pub upload_only: Option<bool>,
 }
 
 fn cut_str(s: &str, max: usize) -> &str {
@@ -121,6 +144,9 @@ impl ExtHandshake {
             }
             None => {}
         }
+        if self.upload_only == Some(true) {
+            d.insert(b"upload_only", 1i64);
+        }
         Bytes::from(encode(&d.build()))
     }
 
@@ -170,6 +196,10 @@ impl ExtHandshake {
                     .map(|a| IpAddr::V6(Ipv6Addr::from(a))),
                 _ => None,
             });
+        out.upload_only = d
+            .get(b"upload_only")
+            .and_then(Value::as_int)
+            .map(|i| i != 0);
         Ok(out)
     }
 
@@ -343,5 +373,118 @@ impl PexMsg {
             out.dropped.extend(list);
         }
         Ok(out)
+    }
+}
+
+/// Encodes a BEP 21 `upload_only` message payload (one byte, 0 or 1).
+pub fn encode_upload_only(on: bool) -> Bytes {
+    Bytes::from_static(if on { &[1] } else { &[0] })
+}
+
+/// Decodes a BEP 21 `upload_only` payload; extra bytes are ignored.
+pub fn decode_upload_only(payload: &[u8]) -> Result<bool, ExtError> {
+    payload
+        .first()
+        .map(|b| *b != 0)
+        .ok_or(ExtError::InvalidField("upload_only"))
+}
+
+/// Encodes a BEP 54 `lt_donthave` payload (piece index, big-endian).
+pub fn encode_donthave(piece: u32) -> Bytes {
+    Bytes::copy_from_slice(&piece.to_be_bytes())
+}
+
+/// Decodes a BEP 54 `lt_donthave` payload; it must be exactly 4 bytes.
+pub fn decode_donthave(payload: &[u8]) -> Result<u32, ExtError> {
+    <[u8; 4]>::try_from(payload)
+        .map(u32::from_be_bytes)
+        .map_err(|_| ExtError::InvalidField("donthave"))
+}
+
+/// A BEP 55 `ut_holepunch` message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolepunchMsg {
+    /// Ask the receiver to introduce us to the given peer.
+    Rendezvous(SocketAddr),
+    /// Connect to the given peer now.
+    Connect(SocketAddr),
+    /// The rendezvous failed.
+    Error {
+        /// The peer the request was about.
+        addr: SocketAddr,
+        /// One of the `HP_*` codes.
+        code: u32,
+    },
+}
+
+impl HolepunchMsg {
+    /// Encodes the message payload (without the extended id byte).
+    pub fn encode(&self) -> Bytes {
+        let (ty, addr, code) = match self {
+            HolepunchMsg::Rendezvous(a) => (0u8, *a, None),
+            HolepunchMsg::Connect(a) => (1, *a, None),
+            HolepunchMsg::Error { addr, code } => (2, *addr, Some(*code)),
+        };
+        let mut out = vec![ty];
+        match addr.ip() {
+            IpAddr::V4(ip) => {
+                out.push(0);
+                out.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                out.push(1);
+                out.extend_from_slice(&ip.octets());
+            }
+        }
+        out.extend_from_slice(&addr.port().to_be_bytes());
+        if let Some(code) = code {
+            out.extend_from_slice(&code.to_be_bytes());
+        }
+        Bytes::from(out)
+    }
+
+    /// Decodes a payload from a peer; trailing bytes are ignored.
+    pub fn decode(payload: &[u8]) -> Result<HolepunchMsg, ExtError> {
+        const SHORT: ExtError = ExtError::InvalidField("holepunch");
+        let ty = *payload.first().ok_or(SHORT)?;
+        if ty > 2 {
+            return Err(ExtError::InvalidField("msg_type"));
+        }
+        let addr_len = match payload.get(1).ok_or(SHORT)? {
+            0 => 4,
+            1 => 16,
+            _ => return Err(ExtError::InvalidField("addr_type")),
+        };
+        let ip_bytes = payload.get(2..2 + addr_len).ok_or(SHORT)?;
+        let ip = match <[u8; 4]>::try_from(ip_bytes) {
+            Ok(a) => IpAddr::V4(Ipv4Addr::from(a)),
+            Err(_) => IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(ip_bytes).map_err(|_| SHORT)?,
+            )),
+        };
+        let port_at = 2 + addr_len;
+        let port = u16::from_be_bytes(
+            payload
+                .get(port_at..port_at + 2)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .ok_or(SHORT)?,
+        );
+        if port == 0 {
+            return Err(ExtError::InvalidField("port"));
+        }
+        let addr = SocketAddr::new(ip, port);
+        match ty {
+            0 => Ok(HolepunchMsg::Rendezvous(addr)),
+            1 => Ok(HolepunchMsg::Connect(addr)),
+            _ => {
+                let at = port_at + 2;
+                let code = payload
+                    .get(at..at + 4)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(u32::from_be_bytes)
+                    .ok_or(SHORT)?;
+                Ok(HolepunchMsg::Error { addr, code })
+            }
+        }
     }
 }

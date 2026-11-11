@@ -52,6 +52,11 @@ pub struct MseStream<S> {
     /// Encrypted bytes accepted by `poll_write` but not yet written.
     out: Vec<u8>,
     out_pos: usize,
+    /// A transport error hit while draining `out`, not yet returned.
+    pending_err: Option<io::Error>,
+    /// The stored error was returned once; every later write-side call
+    /// fails with `BrokenPipe`.
+    broken: bool,
 }
 
 impl<S> MseStream<S> {
@@ -69,6 +74,8 @@ impl<S> MseStream<S> {
             dec,
             out: Vec::new(),
             out_pos: 0,
+            pending_err: None,
+            broken: false,
         }
     }
 
@@ -84,18 +91,47 @@ impl<S> MseStream<S> {
 }
 
 impl<S: AsyncWrite + Unpin> MseStream<S> {
-    /// Writes out every buffered encrypted byte.
-    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    /// Writes out every buffered encrypted byte. A transport error is
+    /// stored in `pending_err` (and the buffer dropped); the caller returns
+    /// it through [`Self::check_err`].
+    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         while let Some(pending) = self.out.get(self.out_pos..).filter(|p| !p.is_empty()) {
-            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, pending))?;
-            if n == 0 {
-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-            }
+            let n = match ready!(Pin::new(&mut self.inner).poll_write(cx, pending)) {
+                Ok(0) => {
+                    self.fail(io::ErrorKind::WriteZero.into());
+                    return Poll::Ready(());
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    self.fail(e);
+                    return Poll::Ready(());
+                }
+            };
             self.out_pos += n;
         }
         self.out.clear();
         self.out_pos = 0;
-        Poll::Ready(Ok(()))
+        Poll::Ready(())
+    }
+
+    fn fail(&mut self, e: io::Error) {
+        self.out.clear();
+        self.out_pos = 0;
+        if self.pending_err.is_none() && !self.broken {
+            self.pending_err = Some(e);
+        }
+    }
+
+    /// The stored error once, then `BrokenPipe` forever.
+    fn check_err(&mut self) -> io::Result<()> {
+        if let Some(e) = self.pending_err.take() {
+            self.broken = true;
+            return Err(e);
+        }
+        if self.broken {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        Ok(())
     }
 }
 
@@ -134,13 +170,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MseStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        this.check_err()?;
         if this.enc.is_none() {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
         // Accept nothing new until the previous chunk is on the wire, so
         // every byte is encrypted exactly once.
         if this.out_pos < this.out.len() {
-            ready!(this.poll_drain(cx))?;
+            ready!(this.poll_drain(cx));
+            this.check_err()?;
         }
         let n = buf.len().min(MSE_WRITE_CHUNK);
         this.out.clear();
@@ -150,20 +188,27 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MseStream<S> {
             enc.apply(&mut this.out);
         }
         // Start writing now; whatever is left goes out on the next
-        // write/flush. A transport error here resurfaces on that call.
-        let _ = this.poll_drain(cx);
+        // write/flush. A drain error ends this call: nothing of it counts
+        // as written. One that shows up later is returned by that call.
+        if this.poll_drain(cx).is_ready() {
+            this.check_err()?;
+        }
         Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        ready!(this.poll_drain(cx))?;
+        this.check_err()?;
+        ready!(this.poll_drain(cx));
+        this.check_err()?;
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        ready!(this.poll_drain(cx))?;
+        this.check_err()?;
+        ready!(this.poll_drain(cx));
+        this.check_err()?;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
@@ -230,5 +275,72 @@ mod tests {
         assert_eq!(wire.len(), msg.len());
         Cipher::new(&key).unwrap().apply(&mut wire);
         assert_eq!(wire, msg);
+    }
+
+    /// Accepts `ok` bytes in total, then (optionally after one `Pending`)
+    /// fails with `ConnectionReset`.
+    struct Failing {
+        ok: usize,
+        pend_first: bool,
+        pended: bool,
+    }
+
+    impl AsyncWrite for Failing {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pend_first && !self.pended {
+                self.pended = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if self.ok == 0 {
+                return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+            }
+            let n = buf.len().min(self.ok);
+            self.ok -= n;
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn rc4_stream(w: Failing) -> MseStream<Failing> {
+        MseStream::new(w, Vec::new(), Some(Cipher::new(&[3; 20]).unwrap()), None)
+    }
+
+    #[tokio::test]
+    async fn drain_error_resurfaces_once_then_broken_pipe() {
+        // The drain inside the write itself fails: that write reports it.
+        let mut s = rc4_stream(Failing {
+            ok: 3,
+            pend_first: false,
+            pended: false,
+        });
+        let e = s.write_all(b"hello").await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+        let e = s.write(b"x").await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+
+        // The drain is Pending at write time and fails later: the next
+        // flush returns the error once, then BrokenPipe.
+        let mut s = rc4_stream(Failing {
+            ok: 0,
+            pend_first: true,
+            pended: false,
+        });
+        assert_eq!(s.write(b"hi").await.unwrap(), 2);
+        let e = s.flush().await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+        let e = s.flush().await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+        let e = s.shutdown().await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
     }
 }

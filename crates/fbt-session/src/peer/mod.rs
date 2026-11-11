@@ -4,5 +4,7 @@
 pub(crate) mod conn;
 pub(crate) mod ext;
 pub(crate) mod messages;
+pub(crate) mod transport;
 
 pub use messages::DisconnectReason;
+pub use transport::Transport;

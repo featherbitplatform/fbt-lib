@@ -1,0 +1,7 @@
+BT-SEARCH * HTTP/1.1
+Host: [ff15::efc0:988f]:6771
+Port: 51413
+Infohash: 0123456789abcdef0123456789abcdef01234567
+Infohash: fedcba9876543210fedcba9876543210fedcba98
+
+

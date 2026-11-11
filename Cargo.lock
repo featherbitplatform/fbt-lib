@@ -563,6 +563,7 @@ dependencies = [
  "clap",
  "fbt",
  "fbt-bencode",
+ "fbt-net",
  "sha1",
  "tempfile",
  "tokio",
@@ -582,6 +583,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-net"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "fbt-core",
+ "proptest",
+ "rand",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-session"
 version = "0.2.0"
 dependencies = [
@@ -591,12 +606,15 @@ dependencies = [
  "fbt-core",
  "fbt-dht",
  "fbt-metainfo",
+ "fbt-net",
  "fbt-tracker",
+ "fbt-utp",
  "fbt-wire",
  "futures-core",
  "futures-util",
  "rand",
  "sha1",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -621,6 +639,21 @@ dependencies = [
  "thiserror",
  "tokio",
  "webpki-roots",
+]
+
+[[package]]
+name = "fbt-utp"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "fbt-core",
+ "fbt-net",
+ "proptest",
+ "rand",
+ "sha1",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

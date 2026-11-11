@@ -1,14 +1,16 @@
 //! Torrent data storage: the [`Storage`] trait, a filesystem implementation,
 //! an in-memory one for tests, and piece checking.
 
+pub(crate) mod cache;
 mod check;
 mod fs;
 mod mem;
 
 use std::io;
 
+pub use cache::CacheStats;
 pub use check::{check_pieces, sha1_piece};
-pub use fs::FsStorage;
+pub use fs::{FsStorage, StorageError, error_path};
 pub use mem::MemStorage;
 
 /// Random-access storage for the concatenated torrent content.
@@ -23,6 +25,19 @@ pub trait Storage: Send + Sync + std::fmt::Debug + 'static {
     fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
     /// Writes `data` at `offset`.
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()>;
+    /// Writes `bufs` back to back from `offset`, as one contiguous range
+    /// (the write-back cache's coalesced runs). The default writes each
+    /// slice at its running offset with [`write`](Self::write).
+    fn write_vectored(&self, offset: u64, bufs: &[&[u8]]) -> io::Result<()> {
+        let mut at = offset;
+        for b in bufs {
+            self.write(at, b)?;
+            at = at
+                .checked_add(b.len() as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+        }
+        Ok(())
+    }
     /// Flushes buffered data to the medium.
     fn flush(&self) -> io::Result<()>;
     /// Removes the torrent's data.
@@ -44,7 +59,7 @@ mod tests {
     }
 
     /// Builds a multi-file torrent: (path components, len, pad).
-    fn torrent(name: &str, files: &[(&[&str], u64, bool)], piece_len: u32) -> Metainfo {
+    pub(super) fn torrent(name: &str, files: &[(&[&str], u64, bool)], piece_len: u32) -> Metainfo {
         let total: u64 = files.iter().map(|f| f.1).sum();
         let n = total.div_ceil(u64::from(piece_len)) as usize;
         let mut b = b"d4:infod5:filesl".to_vec();

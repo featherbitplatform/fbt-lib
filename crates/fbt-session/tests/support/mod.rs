@@ -6,8 +6,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,14 +25,27 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 /// Settings for tests: loopback listener on a free port, fast status
-/// updates, and no DHT (so no test ever contacts a public DHT node; the DHT
-/// tests bootstrap from a loopback node).
+/// updates, and no DHT, LSD, UPnP or NAT-PMP (so no test ever contacts a public DHT node
+/// or a real router; the DHT
+/// tests bootstrap from a loopback node). Transports as by default: uTP
+/// first, TCP fallback.
 pub fn test_settings() -> Settings {
     let mut s = Settings::default();
-    s.listen_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
     s.status_interval = Duration::from_millis(50);
     s.dht_enabled = false;
     s.dht_bootstrap_nodes = Vec::new();
+    s.enable_lsd = false;
+    s.enable_upnp = false;
+    s.enable_natpmp = false;
+    s
+}
+
+/// `s` dialling over TCP only: for a session whose test makes it dial a
+/// scripted peer that listens on TCP alone (nothing answers on its UDP
+/// port, so a uTP attempt would only wait out `utp_connect_timeout`).
+pub fn dial_tcp(mut s: Settings) -> Settings {
+    s.enable_outgoing_utp = false;
     s
 }
 
@@ -364,6 +377,44 @@ impl Storage for SlowStorage {
     }
 }
 
+/// Memory storage whose reads take `delay` each while `slow` is set and are
+/// instant otherwise: a test decides when a check or an upload is slow and
+/// when it may end, so no assertion depends on wall-clock durations.
+#[derive(Debug)]
+pub struct ToggleStorage {
+    inner: MemStorage,
+    delay: Duration,
+    slow: Arc<AtomicBool>,
+}
+
+impl ToggleStorage {
+    pub fn new(data: Vec<u8>, delay: Duration, slow: Arc<AtomicBool>) -> Self {
+        ToggleStorage {
+            inner: MemStorage::from_bytes(data),
+            delay,
+            slow,
+        }
+    }
+}
+
+impl Storage for ToggleStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if self.slow.load(Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
 /// Memory storage that, once `armed`, returns flipped bytes for reads
 /// overlapping `bad`. Armed after the initial check, it passes the check and
 /// then serves corrupt data.
@@ -419,6 +470,8 @@ pub struct Announce {
     pub event: String,
     /// The `left` the announcer reported.
     pub left: u64,
+    /// Where the announce came from.
+    pub source: SocketAddr,
 }
 
 /// How a fake tracker answers.
@@ -495,8 +548,8 @@ impl FakeTracker {
         let state = std::sync::Arc::new(Mutex::new(TrackerState::default()));
         let st = state.clone();
         let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(http_conn(stream, st.clone(), reply.clone()));
+            while let Ok((stream, from)) = listener.accept().await {
+                tokio::spawn(http_conn(stream, from, st.clone(), reply.clone()));
             }
         });
         FakeTracker {
@@ -558,6 +611,7 @@ fn percent_decode(s: &str) -> Vec<u8> {
 
 async fn http_conn(
     mut stream: TcpStream,
+    source: SocketAddr,
     state: std::sync::Arc<Mutex<TrackerState>>,
     reply: Reply,
 ) {
@@ -595,6 +649,7 @@ async fn http_conn(
             port,
             event: event.clone(),
             left,
+            source,
         });
     let first_completed = event == "completed"
         && state
@@ -675,6 +730,7 @@ async fn udp_loop(
                     port: u16::from_be_bytes([b[96], b[97]]),
                     event: event.to_owned(),
                     left: u64::from_be_bytes(b[64..72].try_into().unwrap()),
+                    source: from,
                 });
             match &reply {
                 Reply::Failure(msg) => {

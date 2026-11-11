@@ -79,7 +79,7 @@ jobs:
   interop:
     name: interop
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - run: bash dev/interop/run.sh
@@ -88,6 +88,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: interop-logs
+          # logs/ holds every fbt-example log (the uTP ones, fbt-lsd-*.log and
+          # lsd-probe-*.log included) and containers.log.
           path: |
             target/interop/logs/
             target/interop/qbt-config/qBittorrent/data/logs/

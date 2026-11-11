@@ -50,8 +50,14 @@ pub struct AnnounceRequest {
     pub info_hash: [u8; 20],
     /// Our peer id.
     pub peer_id: PeerId,
-    /// The port we listen on.
+    /// The port we listen on. HTTP announces always carry it (the
+    /// tracker's address family is not known before the request).
     pub port: u16,
+    /// The port UDP announces over IPv4 carry instead of `port`, for a
+    /// client listening on another port over IPv4.
+    pub port_v4: Option<u16>,
+    /// The port UDP announces over IPv6 carry instead of `port`.
+    pub port_v6: Option<u16>,
     /// Bytes uploaded so far.
     pub uploaded: u64,
     /// Bytes downloaded so far.
@@ -66,6 +72,15 @@ pub struct AnnounceRequest {
     pub key: u32,
     /// The tracker id from a previous response.
     pub tracker_id: Option<Vec<u8>>,
+}
+
+impl AnnounceRequest {
+    /// The port to announce over IPv6 (`ipv6`) or IPv4: that family's
+    /// override, else [`port`](Self::port).
+    pub fn port_for(&self, ipv6: bool) -> u16 {
+        let family = if ipv6 { self.port_v6 } else { self.port_v4 };
+        family.unwrap_or(self.port)
+    }
 }
 
 /// What the tracker tells us. Tracker-supplied text is cut to 1 KiB and a

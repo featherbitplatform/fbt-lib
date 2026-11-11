@@ -14,8 +14,12 @@
 
 mod actor;
 mod announcer;
+mod check;
+mod commands;
 mod data;
 mod dht;
+mod holepunch;
+mod magnet;
 mod metadata;
 mod peers;
 mod pex;
@@ -31,7 +35,9 @@ use fbt_metainfo::Metainfo;
 use fbt_wire::Handshake;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::bandwidth::RateLimit;
 use crate::error::SessionError;
+use crate::event::PeerSource;
 use crate::peer::conn::PeerStream;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
@@ -51,6 +57,9 @@ pub(crate) enum Cmd {
     SetPriorities(Vec<Priority>, oneshot::Sender<()>),
     AddPeer(SocketAddr, oneshot::Sender<()>),
     Pieces(oneshot::Sender<Bitfield>),
+    SetRateLimit(RateLimit, oneshot::Sender<()>),
+    /// Peers discovered outside the torrent (local service discovery).
+    FoundPeers(PeerSource, Vec<SocketAddr>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -224,6 +233,12 @@ impl TorrentHandle {
         self.call(Cmd::Pieces).await
     }
 
+    /// Sets the torrent's own rate limit ([`AddTorrent::rate_limit`]); it
+    /// applies at once, and to waiting connections within a second.
+    pub async fn set_rate_limit(&self, limit: RateLimit) -> Result<(), SessionError> {
+        self.call(|tx| Cmd::SetRateLimit(limit, tx)).await
+    }
+
     fn gone(&self) -> SessionError {
         if self.inner.shared.is_shutdown() {
             SessionError::Shutdown
@@ -263,6 +278,15 @@ impl TorrentHandle {
                 handshake,
                 addr,
             })
+            .is_ok()
+    }
+
+    /// Hands discovered peers to the actor without waiting; false if its
+    /// queue is full or it is gone.
+    pub(crate) fn offer_found_peers(&self, source: PeerSource, peers: Vec<SocketAddr>) -> bool {
+        self.inner
+            .cmds
+            .try_send(Cmd::FoundPeers(source, peers))
             .is_ok()
     }
 

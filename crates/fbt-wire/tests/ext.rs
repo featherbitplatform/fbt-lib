@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use fbt_bencode::{DictBuilder, encode};
 use fbt_wire::{
-    ExtError, ExtHandshake, MAX_EXT_HANDSHAKE_LEN, MAX_PEX_ENTRIES, MetadataMsg, PexFlags, PexMsg,
-    Reserved, UT_METADATA, UT_PEX,
+    ExtError, ExtHandshake, HP_NOT_CONNECTED, HolepunchMsg, MAX_EXT_HANDSHAKE_LEN, MAX_PEX_ENTRIES,
+    MetadataMsg, PexFlags, PexMsg, Reserved, UT_METADATA, UT_PEX, decode_donthave,
+    decode_upload_only, encode_donthave, encode_upload_only,
 };
 use proptest::prelude::*;
 
@@ -125,5 +126,56 @@ proptest! {
         let _ = ExtHandshake::decode(&b);
         let _ = MetadataMsg::decode(&Bytes::from(b.clone()));
         let _ = PexMsg::decode(&b);
+        let _ = HolepunchMsg::decode(&b);
+        let _ = decode_donthave(&b);
+        let _ = decode_upload_only(&b);
     }
+}
+
+#[test]
+fn holepunch_bep55_layout() {
+    let m = HolepunchMsg::Rendezvous("10.0.0.1:6881".parse().unwrap());
+    assert_eq!(&m.encode()[..], &[0, 0, 10, 0, 0, 1, 0x1a, 0xe1]);
+    let e = HolepunchMsg::Error {
+        addr: "[::1]:80".parse().unwrap(),
+        code: HP_NOT_CONNECTED,
+    };
+    let wire = e.encode();
+    assert_eq!(wire.len(), 1 + 1 + 16 + 2 + 4);
+    assert_eq!(HolepunchMsg::decode(&wire).unwrap(), e);
+    assert!(matches!(
+        HolepunchMsg::decode(&[9, 0, 1, 2, 3, 4, 0, 1]),
+        Err(ExtError::InvalidField("msg_type"))
+    ));
+    assert!(matches!(
+        HolepunchMsg::decode(&[1, 2, 1, 2, 3, 4, 0, 1]),
+        Err(ExtError::InvalidField("addr_type"))
+    ));
+    assert!(matches!(
+        HolepunchMsg::decode(&[1, 0, 1, 2, 3, 4, 0, 0]),
+        Err(ExtError::InvalidField("port"))
+    ));
+    assert!(matches!(
+        HolepunchMsg::decode(&[2, 0, 1, 2, 3, 4, 0, 1]),
+        Err(ExtError::InvalidField("holepunch"))
+    ));
+}
+
+#[test]
+fn donthave_and_upload_only() {
+    assert_eq!(
+        decode_donthave(&encode_donthave(0xdead_beef)).unwrap(),
+        0xdead_beef
+    );
+    assert!(decode_donthave(&[1, 2, 3]).is_err());
+    assert!(decode_upload_only(&encode_upload_only(true)).unwrap());
+    assert!(decode_upload_only(&[]).is_err());
+    let h = ExtHandshake {
+        upload_only: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        ExtHandshake::decode(&h.encode()).unwrap().upload_only,
+        Some(true)
+    );
 }

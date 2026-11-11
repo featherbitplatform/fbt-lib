@@ -217,6 +217,14 @@ impl PiecePicker {
         }
     }
 
+    /// A peer retracted `piece` (BEP 54 `lt_donthave`); mirrors
+    /// [`peer_has`](Self::peer_has). Out of range is ignored.
+    pub fn peer_lost(&mut self, piece: u32) {
+        if piece < self.layout.num_pieces() {
+            self.change_avail(piece, false);
+        }
+    }
+
     /// Number of known peers that have `piece` (seeds included).
     pub fn availability(&self, piece: u32) -> u32 {
         self.avail
@@ -348,6 +356,23 @@ impl PiecePicker {
         self.enqueue(piece);
     }
 
+    /// A passed piece is gone from disk: it is wanted again (queued like a
+    /// failed one). No effect on a piece we do not have or out of range.
+    pub fn piece_lost(&mut self, piece: u32) {
+        if piece >= self.layout.num_pieces() || !self.have.get(piece) {
+            return;
+        }
+        self.have.clear(piece);
+        self.set_state(piece, PieceState::Unrequested);
+        if self.prio_of(piece) > 0 {
+            self.wanted_left_pieces = self.wanted_left_pieces.saturating_add(1);
+            self.wanted_left_bytes = self
+                .wanted_left_bytes
+                .saturating_add(u64::from(self.layout.piece_size(piece)));
+        }
+        self.enqueue(piece);
+    }
+
     /// Pieces whose hash check passed.
     pub fn have(&self) -> &Bitfield {
         &self.have
@@ -380,6 +405,11 @@ impl PiecePicker {
     /// their hash check).
     pub fn num_in_progress(&self) -> usize {
         self.downloading.len()
+    }
+
+    /// `piece` is started and not yet passed or failed.
+    pub fn is_in_progress(&self, piece: u32) -> bool {
+        self.downloading.contains_key(&piece)
     }
 
     fn prio_of(&self, piece: u32) -> u8 {
@@ -708,6 +738,57 @@ mod tests {
     fn picker(pieces: u32, blocks: u32) -> PiecePicker {
         let l = PieceLayout::new(u64::from(pieces * blocks * B), blocks * B).unwrap();
         PiecePicker::new(l, &Bitfield::new(pieces))
+    }
+
+    #[test]
+    fn peer_lost_decrements_availability() {
+        let mut p = picker(3, 1);
+        p.add_peer_pieces(PeerPieces::Some(&bf(&[1, 1, 0])));
+        p.peer_has(2);
+        check_invariants(&p, &[1, 1, 1], 0);
+        p.peer_lost(1);
+        assert_eq!(p.availability(1), 0);
+        check_invariants(&p, &[1, 0, 1], 0);
+        // Never below zero; out of range ignored.
+        p.peer_lost(1);
+        p.peer_lost(99);
+        check_invariants(&p, &[1, 0, 1], 0);
+        // A seed is materialised the way the actor does it.
+        p.add_peer_pieces(PeerPieces::All);
+        p.remove_peer_pieces(PeerPieces::All);
+        p.add_peer_pieces(PeerPieces::Some(&bf(&[1, 1, 1])));
+        p.peer_lost(0);
+        check_invariants(&p, &[1, 1, 2], 0);
+    }
+
+    #[test]
+    fn piece_lost_is_wanted_again() {
+        let l = PieceLayout::new(3 * u64::from(B), B).unwrap();
+        let mut have = Bitfield::new(3);
+        have.set(0);
+        have.set(1);
+        let mut p = PiecePicker::new(l, &have);
+        p.add_peer_pieces(PeerPieces::All);
+        check_invariants(&p, &[0, 0, 0], 1);
+        // A piece we lack or out of range: no effect.
+        p.piece_lost(2);
+        p.piece_lost(99);
+        check_invariants(&p, &[0, 0, 0], 1);
+        assert_eq!(p.wanted_left_bytes(), u64::from(B));
+        p.piece_lost(1);
+        check_invariants(&p, &[0, 0, 0], 1);
+        assert!(!p.have().get(1));
+        assert!(!p.is_finished());
+        assert_eq!(p.wanted_left_bytes(), 2 * u64::from(B));
+        let got = p.pick(PeerKey(1), PeerPieces::All, 2, &mut rng());
+        assert!(got.contains(&blk(1, 0)));
+        for b in got {
+            assert!(p.on_block(PeerKey(1), b).accepted);
+        }
+        p.piece_passed(1);
+        p.piece_passed(2);
+        assert!(p.is_finished());
+        check_invariants(&p, &[0, 0, 0], 1);
     }
 
     #[test]

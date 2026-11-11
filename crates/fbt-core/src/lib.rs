@@ -7,6 +7,8 @@ pub mod compact;
 mod info_hash;
 mod layout;
 mod peer_id;
+pub mod rate;
+pub mod udp;
 
 pub use bitfield::{Bitfield, BitfieldError};
 pub use info_hash::{InfoHashV1, InfoHashV2, InfoHashes, ParseInfoHashError};

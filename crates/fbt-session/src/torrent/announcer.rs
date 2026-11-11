@@ -325,6 +325,8 @@ impl Task {
             info_hash: self.info_hash,
             peer_id: self.shared.peer_id,
             port: self.shared.listen_port,
+            port_v4: self.shared.listen_port_v4,
+            port_v6: self.shared.listen_port_v6,
             uploaded: st.total_uploaded,
             downloaded: st.total_downloaded,
             left,
@@ -367,7 +369,10 @@ impl Task {
 fn announce_left(st: &TorrentStatus, checking_left: u64) -> u64 {
     if !st.has_metadata {
         NO_METADATA_LEFT
-    } else if matches!(st.state, TorrentState::CheckingFiles { .. }) {
+    } else if matches!(
+        st.state,
+        TorrentState::CheckingFiles { .. } | TorrentState::QueuedForChecking
+    ) {
         checking_left
     } else {
         st.total_wanted.saturating_sub(st.wanted_done)
@@ -614,6 +619,8 @@ mod tests {
         assert_eq!(announce_left(&st, 7), 600);
         st.state = TorrentState::CheckingFiles { progress: 0.5 };
         assert_eq!(announce_left(&st, 7), 7);
+        st.state = TorrentState::QueuedForChecking;
+        assert_eq!(announce_left(&st, 7), 7);
     }
 
     #[test]
@@ -622,6 +629,8 @@ mod tests {
             info_hash: [0; 20],
             peer_id: fbt_core::PeerId([0; 20]),
             port: 1,
+            port_v4: None,
+            port_v6: None,
             uploaded: 0,
             downloaded: 0,
             left: 0,
