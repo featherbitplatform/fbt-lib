@@ -7,6 +7,7 @@
 //! HTTP timeout cannot fire in one jump while a loopback exchange runs.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use fbt_net::portmap::{MapEvent, PortMapConfig, PortMapper};
@@ -145,6 +146,12 @@ async fn maps_with_both_methods_and_renews_at_half_lease() {
             .filter(|(t, ..)| t.duration_since(t0) > Duration::from_secs(10))
             .collect();
         let (t1, n1, l1) = later.first().expect("a PCP renewal");
+        // Only the first attempt's own retries come before the renewal.
+        assert!(
+            maps.iter()
+                .all(|(t, ..)| t.duration_since(t0) <= Duration::from_secs(5) || t >= t1),
+            "PCP request between map and renewal"
+        );
         assert_eq!(*n1, nonce, "renewal keeps the nonce");
         assert_eq!(*l1, 120);
         assert_near(
@@ -165,6 +172,12 @@ async fn maps_with_both_methods_and_renews_at_half_lease() {
             .iter()
             .find(|r| r.at.duration_since(first.at) > Duration::from_secs(10))
             .expect("a UPnP renewal");
+        assert!(
+            adds.iter()
+                .all(|r| r.at.duration_since(first.at) <= Duration::from_secs(5)
+                    || r.at >= renewal.at),
+            "UPnP request between map and renewal"
+        );
         assert_eq!(renewal.arg("NewExternalPort"), first.arg("NewExternalPort"));
         assert_near(
             renewal.at.duration_since(first.at),
@@ -272,4 +285,105 @@ async fn shutdown_is_bounded_with_a_silent_gateway() {
     mapper.shutdown().await;
     let took = started.elapsed();
     assert!(took < Duration::from_millis(2500), "{took:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn renews_at_half_the_granted_lifetime_floored_at_a_minute() {
+    let _tick = ticker();
+    // Asked for an hour; granted 300 s (renew at 150 s) and 100 s (renew at
+    // max(50 s, 60 s) = 60 s).
+    for (grant, renew_after) in [(300, 150), (100, 60)] {
+        let gw = FakeGateway::start_granting(Mode::Pcp, grant).await;
+        let igd = FakeIgd::start(Script::default()).await;
+        let mut cfg = config(&gw, &igd, 3600);
+        cfg.upnp = false;
+        let (tx, mut rx) = mpsc::channel(64);
+        let mapper = PortMapper::spawn(cfg, tx);
+        mapper.map(MapProtocol::Tcp, PORT);
+        wait_mapped(&mut rx, &[(MapProtocol::Tcp, MapMethod::Pcp)]).await;
+        tokio::time::sleep(Duration::from_secs(renew_after + 15)).await;
+
+        let maps = pcp_maps(&gw, 6);
+        let (t0, nonce, asked) = maps.first().cloned().expect("a PCP map");
+        assert_eq!(asked, 3600);
+        let (t1, n1, _) = maps
+            .iter()
+            .find(|(t, ..)| t.duration_since(t0) > Duration::from_secs(10))
+            .cloned()
+            .expect("a renewal");
+        assert_eq!(n1, nonce);
+        assert_near(
+            t1.duration_since(t0),
+            Duration::from_secs(renew_after),
+            &format!("renewal of a {grant} s grant"),
+        );
+        mapper.shutdown().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn backoff_resets_after_a_success() {
+    let _tick = ticker();
+    let gw = FakeGateway::start(Mode::Pcp, false, 0).await;
+    let igd = FakeIgd::start(Script::default()).await;
+    let mut cfg = config(&gw, &igd, 120);
+    cfg.upnp = false;
+    gw.mute.store(true, Ordering::SeqCst);
+    let (tx, mut rx) = mpsc::channel(256);
+    let mapper = PortMapper::spawn(cfg, tx);
+    mapper.map(MapProtocol::Tcp, PORT);
+
+    // Fails at 0 and 60; answered at 180 (renewal due at 240).
+    tokio::time::sleep(Duration::from_secs(170)).await;
+    gw.mute.store(false, Ordering::SeqCst);
+    wait_mapped(&mut rx, &[(MapProtocol::Tcp, MapMethod::Pcp)]).await;
+    // The renewal at 240 fails: the retry comes 60 s later, not 240 s.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    gw.mute.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(120)).await;
+
+    let times: Vec<Instant> = gw.timed_requests().into_iter().map(|(t, _)| t).collect();
+    let starts = round_starts(&times);
+    assert!(starts.len() >= 5, "rounds: {starts:?}");
+    let t0 = starts[0];
+    for (k, want) in [60, 180, 240, 300].into_iter().enumerate() {
+        assert_near(
+            starts[k + 1].duration_since(t0),
+            Duration::from_secs(want),
+            &format!("round {}", k + 1),
+        );
+    }
+    mapper.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn upnp_mappings_are_removed_after_a_failed_renewal() {
+    let _tick = ticker();
+    let gw = FakeGateway::start(Mode::Pcp, false, 0).await;
+    let igd = FakeIgd::start(Script::default()).await;
+    let mut cfg = config(&gw, &igd, 120);
+    cfg.natpmp = false;
+    let (tx, mut rx) = mpsc::channel(64);
+    let mapper = PortMapper::spawn(cfg, tx);
+    mapper.map(MapProtocol::Tcp, PORT);
+    wait_mapped(&mut rx, &[(MapProtocol::Tcp, MapMethod::Upnp)]).await;
+
+    // The renewal at 60 s fails: the IGD is looked up again next round, yet
+    // the mapping it holds must still be removed at shutdown.
+    igd.fail_add.store(true, Ordering::SeqCst);
+    let failed = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            if let Some(MapEvent::Failed { method, .. }) = rx.recv().await {
+                break method;
+            }
+        }
+    })
+    .await
+    .expect("the renewal failed");
+    assert_eq!(failed, MapMethod::Upnp);
+
+    mapper.shutdown().await;
+    let dels = igd.recorded("DeletePortMapping");
+    assert_eq!(dels.len(), 1, "the held mapping was removed");
+    assert_eq!(dels[0].arg("NewExternalPort"), PORT.to_string());
 }

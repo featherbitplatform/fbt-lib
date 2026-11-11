@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -65,6 +65,9 @@ pub struct FakeIgd {
     /// When each M-SEARCH arrived (tokio's clock).
     pub searches: Arc<Mutex<Vec<tokio::time::Instant>>>,
     pub http_connections: Arc<AtomicUsize>,
+    /// Every AddPortMapping fails with 501 while set (starts as
+    /// `Script::fail_add`).
+    pub fail_add: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -108,11 +111,12 @@ impl FakeIgd {
             }
         });
 
-        let (acts, conns) = (actions.clone(), http_connections.clone());
+        let fail_add = Arc::new(AtomicBool::new(script.fail_add));
+        let (acts, conns, fail) = (actions.clone(), http_connections.clone(), fail_add.clone());
         let http_task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 conns.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(serve(stream, script.clone(), acts.clone()));
+                tokio::spawn(serve(stream, script.clone(), acts.clone(), fail.clone()));
             }
         });
         FakeIgd {
@@ -121,6 +125,7 @@ impl FakeIgd {
             actions,
             searches,
             http_connections,
+            fail_add,
             tasks: vec![ssdp_task, http_task],
         }
     }
@@ -177,7 +182,12 @@ fn fault(code: u32) -> String {
     )
 }
 
-async fn serve(mut stream: TcpStream, script: Script, actions: Arc<Mutex<Vec<Recorded>>>) {
+async fn serve(
+    mut stream: TcpStream,
+    script: Script,
+    actions: Arc<Mutex<Vec<Recorded>>>,
+    fail_add: Arc<AtomicBool>,
+) {
     let Some((head, body)) = read_request(&mut stream).await else {
         return;
     };
@@ -223,7 +233,7 @@ async fn serve(mut stream: TcpStream, script: Script, actions: Arc<Mutex<Vec<Rec
         let lease: u32 = rec.arg("NewLeaseDuration").parse().unwrap_or(0);
         actions.lock().unwrap().push(rec);
         match action.as_str() {
-            "AddPortMapping" if script.fail_add => {
+            "AddPortMapping" if fail_add.load(Ordering::SeqCst) => {
                 respond(&mut stream, "500 Internal Server Error", &fault(501)).await;
             }
             "AddPortMapping" if script.conflict_ports.contains(&ext) => {

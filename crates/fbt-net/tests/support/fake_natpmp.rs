@@ -1,6 +1,7 @@
 //! A loopback gateway that speaks NAT-PMP only, PCP, or nothing.
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
@@ -23,6 +24,8 @@ pub struct FakeGateway {
     pub requests: Arc<Mutex<Vec<Vec<u8>>>>,
     /// When each request in `requests` arrived (tokio's clock).
     pub times: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    /// While set, requests are recorded but never answered.
+    pub mute: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 
@@ -36,16 +39,28 @@ impl FakeGateway {
     /// `from_other_socket` sends every answer from a second socket; `code` is
     /// the result code of every answer.
     pub async fn start(mode: Mode, from_other_socket: bool, code: u16) -> FakeGateway {
-        Self::spawn(mode, from_other_socket, code, false).await
+        Self::spawn(mode, from_other_socket, code, false, None).await
+    }
+
+    /// Like `start` (answering, code 0), but every mapping is granted at
+    /// most `lifetime` seconds, whatever was asked.
+    pub async fn start_granting(mode: Mode, lifetime: u32) -> FakeGateway {
+        Self::spawn(mode, false, 0, false, Some(lifetime)).await
     }
 
     /// Like `start`, but every NAT-PMP map request is first answered with a
     /// stale 8-byte "unsupported version" reply.
     pub async fn start_stale(mode: Mode) -> FakeGateway {
-        Self::spawn(mode, false, 0, true).await
+        Self::spawn(mode, false, 0, true, None).await
     }
 
-    async fn spawn(mode: Mode, from_other_socket: bool, code: u16, stale: bool) -> FakeGateway {
+    async fn spawn(
+        mode: Mode,
+        from_other_socket: bool,
+        code: u16,
+        stale: bool,
+        grant: Option<u32>,
+    ) -> FakeGateway {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = sock.local_addr().unwrap().port();
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -53,18 +68,26 @@ impl FakeGateway {
         let log = requests.clone();
         let times = Arc::new(Mutex::new(Vec::new()));
         let stamps = times.clone();
+        let mute = Arc::new(AtomicBool::new(false));
+        let muted = mute.clone();
         let task = tokio::spawn(async move {
             let mut buf = [0u8; 1100];
             while let Ok((n, src)) = sock.recv_from(&mut buf).await {
                 let req = buf[..n].to_vec();
                 log.lock().unwrap().push(req.clone());
                 stamps.lock().unwrap().push(tokio::time::Instant::now());
+                if muted.load(Ordering::SeqCst) {
+                    continue;
+                }
                 if stale && req.first() == Some(&0) && matches!(req.get(1), Some(1 | 2)) {
                     let _ = sock.send_to(&[0, 129, 0, 1, 0, 0, 0, 5], src).await;
                 }
-                let Some(reply) = answer(mode, &req, code) else {
+                let Some(mut reply) = answer(mode, &req, code) else {
                     continue;
                 };
+                if let Some(g) = grant {
+                    cap_lifetime(&mut reply, g);
+                }
                 let _ = if from_other_socket {
                     other.send_to(&reply, src).await
                 } else {
@@ -76,6 +99,7 @@ impl FakeGateway {
             port,
             requests,
             times,
+            mute,
             task,
         }
     }
@@ -128,6 +152,19 @@ fn answer(mode: Mode, req: &[u8], code: u16) -> Option<Vec<u8>> {
             Some(r)
         }
         _ => None,
+    }
+}
+
+/// Lowers a non-zero lifetime in a map reply to `max`.
+fn cap_lifetime(reply: &mut [u8], max: u32) {
+    let at = match (reply.first(), reply.len()) {
+        (Some(2), 60) => 4,
+        (Some(0), 16) => 12,
+        _ => return,
+    };
+    let life = u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
+    if life != 0 {
+        reply[at..at + 4].copy_from_slice(&life.min(max).to_be_bytes());
     }
 }
 

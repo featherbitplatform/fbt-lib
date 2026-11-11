@@ -138,7 +138,9 @@ impl PortMapper {
                 entries: Vec::new(),
                 gateway: cfg.gateway,
                 igd: None,
+                last_igd: None,
                 external: None,
+                reported_ip: None,
                 epoch: None,
             };
             workers.push(tokio::spawn(w.run(rx, stop.subscribe())));
@@ -235,8 +237,13 @@ struct Worker {
     gateway: Option<Ipv4Addr>,
     /// The discovered IGD; dropped after a failure, so it is found again.
     igd: Option<Igd>,
-    /// The external address last reported.
+    /// The IGD of the last successful UPnP mapping: it removes the held
+    /// mappings at shutdown even while `igd` is being looked up again.
+    last_igd: Option<Igd>,
+    /// The gateway's external address as last learned.
     external: Option<Ipv4Addr>,
+    /// The external address an `ExternalIp` event last went out for.
+    reported_ip: Option<Ipv4Addr>,
     /// The PCP/NAT-PMP gateway's last epoch.
     epoch: Option<u32>,
 }
@@ -286,10 +293,14 @@ impl Worker {
         });
     }
 
-    fn emit(&self, ev: MapEvent) {
-        if self.events.try_send(ev).is_err() {
+    /// Sends `ev`; false when the channel was full (or closed), so the
+    /// caller reports it again later.
+    fn emit(&self, ev: MapEvent) -> bool {
+        let sent = self.events.try_send(ev).is_ok();
+        if !sent {
             debug!("port mapping event dropped");
         }
+        sent
     }
 
     /// One pass over the due entries. Delays count from the round's start,
@@ -349,11 +360,16 @@ impl Worker {
         }
     }
 
+    /// Records the gateway's external address and reports it unless the
+    /// last report already carried it. A report the channel dropped is
+    /// retried at the next answer.
     fn note_external(&mut self, ip: Ipv4Addr, method: MapMethod) {
         if self.external != Some(ip) {
-            self.external = Some(ip);
             info!(%ip, ?method, "gateway external address");
-            self.emit(MapEvent::ExternalIp { ip, method });
+        }
+        self.external = Some(ip);
+        if self.reported_ip != Some(ip) && self.emit(MapEvent::ExternalIp { ip, method }) {
+            self.reported_ip = Some(ip);
         }
     }
 
@@ -370,6 +386,11 @@ impl Worker {
                     .add_mapping(want.protocol, want.internal, self.cfg.lease)
                     .await
                     .map_err(|e| e.to_string())?;
+                self.last_igd = Some(igd);
+                // Retries an `ExternalIp` report the channel dropped.
+                if let Some(ip) = self.external {
+                    self.note_external(ip, MapMethod::Upnp);
+                }
                 Ok((Held::Upnp { external }, self.cfg.lease))
             }
             Method::NatPmp => {
@@ -446,7 +467,6 @@ impl Worker {
                     Held::NatPmp(m) => (m.method, m.external),
                 };
                 if e.reported != Some(external) {
-                    e.reported = Some(external);
                     let ev = MapEvent::Mapped {
                         protocol: e.want.protocol,
                         method,
@@ -454,7 +474,12 @@ impl Worker {
                         external,
                     };
                     info!(?ev, "port mapped");
-                    self.emit(ev);
+                    // A dropped report goes out again at the next renewal.
+                    if self.emit(ev)
+                        && let Some(e) = self.entries.get_mut(i)
+                    {
+                        e.reported = Some(external);
+                    }
                 }
             }
             Err(message) => {
@@ -484,7 +509,7 @@ impl Worker {
             let (p, internal) = (e.want.protocol, e.want.internal);
             match e.held {
                 Some(Held::Upnp { external }) => {
-                    if let Some(igd) = self.igd.clone() {
+                    if let Some(igd) = self.igd.clone().or_else(|| self.last_igd.clone()) {
                         jobs.spawn(async move {
                             if let Err(e) = igd.delete_mapping(p, external).await {
                                 debug!(error = %e, "UPnP unmap failed");

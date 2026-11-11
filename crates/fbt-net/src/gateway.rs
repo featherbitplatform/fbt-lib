@@ -119,34 +119,43 @@ async fn read_capped(path: &'static str) -> Option<String> {
 async fn run_capped(exe: PathBuf, args: &'static [&'static str]) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    use std::sync::{Arc, Mutex};
 
     if !exe.is_absolute() {
         return None;
     }
-    let child = Command::new(&exe)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let child = Arc::new(Mutex::new(child));
-    let stdout = child.lock().ok()?.stdout.take()?;
+    // Spawning forks and execs: off the runtime, and within the budget too.
+    let spawn = tokio::task::spawn_blocking(move || {
+        let mut child = Command::new(&exe)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take();
+        Some((child, stdout))
+    });
+    let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
+    // A spawn still running at the deadline is abandoned: the blocking
+    // thread finishes it and drops the handle (`route` exits on its own).
+    let (mut child, stdout) = tokio::time::timeout_at(deadline, spawn)
+        .await
+        .ok()?
+        .ok()??;
     let reader = tokio::task::spawn_blocking(move || {
         let mut buf = Vec::new();
         // An error mid-read keeps what arrived; the parser decides.
-        let _ = stdout.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
+        if let Some(out) = stdout {
+            let _ = out.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
+        }
         buf
     });
-    let out = tokio::time::timeout(COMMAND_TIMEOUT, reader).await;
+    let out = tokio::time::timeout_at(deadline, reader).await;
     // Killing closes the pipe, which also ends a reader still blocked on it;
     // reaping happens off the runtime.
     tokio::task::spawn_blocking(move || {
-        if let Ok(mut c) = child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        let _ = child.kill();
+        let _ = child.wait();
     });
     let bytes = out.ok()?.ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
