@@ -122,6 +122,18 @@ hashes() {
     fbt sh -c "cd '$1' && find '$2' -type f | sort | xargs sha256sum"
 }
 
+# same_data <dir_a> <dir_b> <name>: both copies hash the same.
+same_data() {
+    [ "$(hashes "$1" "$3")" = "$(hashes "$2" "$3")" ]
+}
+
+# other_client_data <payload_dir> <dir> <name> <what>: another client may
+# report a torrent complete before its disk cache has written every piece, so
+# give its copy in <dir> up to 120 s to match the payload.
+other_client_data() {
+    wait_for "$4 to write data matching the payload" 120 same_data "$1" "$2" "$3"
+}
+
 info_hash() {
     fbt fbt-example info "$1" | sed -n 's/^info hash: //p'
 }
@@ -361,8 +373,7 @@ start_seed /interop/fixture2.torrent /interop/payload2 6891 "$logs/fbt-seed.log"
 echo "interop: Transmission downloads fixture2 from fbt-example"
 trc transmission-remote -a /interop/fixture2.torrent -w /interop/tr-dl >/dev/null
 wait_for "Transmission to complete fixture2" 300 tr_complete "$hash2"
-[ "$(hashes /interop/payload2 fixture2)" = "$(hashes /interop/tr-dl fixture2)" ] ||
-    fail "data Transmission downloaded differs from the payload"
+other_client_data /interop/payload2 /interop/tr-dl fixture2 Transmission
 stop_seed
 echo "interop: seed OK (transmission)"
 
@@ -391,8 +402,7 @@ mkdir -p "$INTEROP_DIR/tr-dl-enc"
 start_seed /interop/fixture2.torrent /interop/payload2 6895 "$logs/fbt-seed-enc.log" --encryption forced
 trc transmission-remote -a /interop/fixture2.torrent -w /interop/tr-dl-enc >/dev/null
 wait_for "Transmission to complete fixture2 from the encrypted seed" 300 tr_complete "$hash2"
-[ "$(hashes /interop/payload2 fixture2)" = "$(hashes /interop/tr-dl-enc fixture2)" ] ||
-    fail "data Transmission downloaded from the encrypted seed differs from the payload"
+other_client_data /interop/payload2 /interop/tr-dl-enc fixture2 Transmission
 grep -q "^peer connected $tr_ip:" "$logs/fbt-seed-enc.log" ||
     fail "Transmission never connected to the encrypted seed (see $logs/fbt-seed-enc.log)"
 stop_seed
@@ -514,8 +524,7 @@ qbt_api torrents/add -F torrents=@/interop/fixture2.torrent -F savepath=/interop
 wait_for "qBittorrent to add fixture2" 30 qbt_has "$hash2"
 qbt_api torrents/addPeers --data-urlencode "hashes=$hash2" --data-urlencode "peers=$fbt_ip:6896" >/dev/null
 wait_for "qBittorrent to complete fixture2 from the uTP seed" 300 qbt_complete "$hash2"
-[ "$(hashes /interop/payload2 fixture2)" = "$(hashes /interop/qbt-utp fixture2)" ] ||
-    fail "data qBittorrent downloaded over uTP differs from the payload"
+other_client_data /interop/payload2 /interop/qbt-utp fixture2 qBittorrent
 grep -Eq "^peer connected $qbt_ip:[0-9]+ via utp$" "$logs/fbt-seed-utp.log" ||
     fail "qBittorrent never connected to the uTP seed (see $logs/fbt-seed-utp.log)"
 stop_seed
