@@ -116,10 +116,10 @@ pub use fbt_core::{
 pub use fbt_metainfo::{FileEntry, Info, Magnet, MagnetError, Metainfo, MetainfoError, RelPath};
 pub use fbt_session::storage::{FsStorage, MemStorage, Storage};
 pub use fbt_session::{
-    AddTorrent, DEFAULT_DHT_BOOTSTRAP, DhtStats, DisconnectReason, EncryptionPolicy, Event,
-    EventMask, EventStream, ListenError, MAX_METADATA_SIZE, PeerSource, Priority, RemoveMode,
-    Session, SessionError, Settings, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
-    Transport,
+    AddTorrent, CacheStats, DEFAULT_DHT_BOOTSTRAP, DhtStats, DisconnectReason, EncryptionPolicy,
+    Event, EventMask, EventStream, ListenError, MAX_METADATA_SIZE, PeerSource, Priority,
+    RemoveMode, Session, SessionError, Settings, TorrentHandle, TorrentSource, TorrentState,
+    TorrentStatus, Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

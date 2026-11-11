@@ -34,7 +34,9 @@ use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
 use crate::session::{AddTorrent, Priority, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
+use crate::storage::cache::{FlushReason, PieceCache};
 use crate::storage::{Storage, error_path};
+use fbt_core::BlockRef;
 
 /// Capacity of the channel carrying every peer's events into the actor.
 const PEER_EVENT_QUEUE: usize = 1024;
@@ -187,6 +189,20 @@ pub(crate) struct Actor {
     /// when a peer was never sent to or the peer set changed (scan).
     pub(super) next_pex_due: Option<Instant>,
     /// Unit tests: how often the live list was built.
+    /// Verified pieces not yet written, and pieces kept to serve peers;
+    /// also the budget reservations of `Loaded.bufs`.
+    pub(super) cache: PieceCache,
+    /// Hash jobs running; pause waits for them, as for writes.
+    pub(super) hashing: usize,
+    /// The torrent finished: `TorrentFinished` follows once every piece is
+    /// written and the storage flushed.
+    pub(super) finish_pending: bool,
+    /// The flush before `TorrentFinished` is running.
+    pub(super) finish_flush: bool,
+    /// Whole-piece reads in flight for peers' requests, with the requests
+    /// waiting on each.
+    /// Keyed by piece, with the generation the read was started in.
+    pub(super) piece_reads: HashMap<u32, (u64, Vec<(PeerKey, BlockRef)>)>,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -266,6 +282,7 @@ impl Actor {
                 })
             })
             .unzip();
+        let cache = PieceCache::new(Arc::clone(&shared.cache), shared.settings.cache_expiry);
         let mut actor = Actor {
             ih,
             loaded,
@@ -302,6 +319,11 @@ impl Actor {
             pex_live: None,
             peers_epoch: 0,
             next_pex_due: None,
+            cache,
+            hashing: 0,
+            finish_pending: false,
+            finish_flush: false,
+            piece_reads: HashMap::new(),
             #[cfg(test)]
             pex_live_builds: 0,
             #[cfg(test)]
@@ -367,6 +389,8 @@ impl Actor {
                 },
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
+                    self.flush(FlushReason::Expired);
+                    self.top_up_all(None);
                     self.metadata_tick();
                     self.pex_tick();
                     self.queue_retries();
@@ -397,11 +421,13 @@ impl Actor {
         self.storage = Some(storage);
     }
 
-    /// Drops every partially downloaded piece.
+    /// Drops every partially downloaded piece and its budget reservation.
     pub(super) fn clear_bufs(&mut self) {
         if let Some(l) = self.loaded.as_mut() {
             l.bufs.clear();
         }
+        self.cache.release_partials();
+        self.piece_reads.clear();
     }
 
     pub(super) fn emit(&self, ev: Event) {
@@ -626,6 +652,9 @@ impl Actor {
         });
         self.close_all();
         self.clear_bufs();
+        // The pieces not written yet are lost; the next resume rechecks.
+        self.cache.discard_all();
+        self.finish_pending = false;
         self.refresh_state();
     }
 

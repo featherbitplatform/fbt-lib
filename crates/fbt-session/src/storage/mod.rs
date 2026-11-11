@@ -1,12 +1,14 @@
 //! Torrent data storage: the [`Storage`] trait, a filesystem implementation,
 //! an in-memory one for tests, and piece checking.
 
+pub(crate) mod cache;
 mod check;
 mod fs;
 mod mem;
 
 use std::io;
 
+pub use cache::CacheStats;
 pub use check::{check_pieces, sha1_piece};
 pub use fs::{FsStorage, StorageError, error_path};
 pub use mem::MemStorage;

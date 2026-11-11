@@ -1,6 +1,7 @@
 //! Downloaded data: blocks are buffered per piece in memory, a complete
-//! piece is hashed in `spawn_blocking` and then written through the
-//! session's disk pool, and only a written piece counts as ours.
+//! piece is hashed in `spawn_blocking`, and a verified piece counts as ours
+//! at once: it is held dirty in the write-back cache (served from there)
+//! and written later through the session's disk pool, in contiguous runs.
 
 use std::io;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use fbt_core::{Bitfield, BlockRef};
 use fbt_metainfo::{Metainfo, MetainfoError};
+use tokio::time::Instant;
 use tracing::debug;
 
 use super::actor::{Actor, Phase};
@@ -15,6 +17,7 @@ use super::swarm::BanTarget;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
+use crate::storage::cache::FlushReason;
 use crate::storage::sha1_piece;
 
 /// Result of a blocking job, fed back into the actor loop.
@@ -38,10 +41,11 @@ pub(crate) enum Job {
         ok: bool,
         data: Vec<u8>,
     },
-    /// A verified piece was written.
-    Written {
+    /// A run of `count` verified pieces from `first` was written.
+    WroteRun {
         generation: u64,
-        piece: u32,
+        first: u32,
+        count: u32,
         result: io::Result<()>,
     },
     /// Storage was flushed.
@@ -52,6 +56,13 @@ pub(crate) enum Job {
         /// Banned if the buffer fails the hash, even if the peer is gone.
         ban: Option<BanTarget>,
         result: Result<Box<Metainfo>, MetainfoError>,
+    },
+    /// A whole piece was read to serve the requests waiting on it (and to
+    /// keep in the read cache).
+    ReadPiece {
+        generation: u64,
+        piece: u32,
+        result: io::Result<Vec<u8>>,
     },
     /// A block requested by a peer was read.
     Read {
@@ -72,22 +83,35 @@ impl Actor {
                 piece,
                 ok,
                 data,
-            } => self.on_hashed(generation, piece, ok, data),
-            Job::Written {
+            } => {
+                self.hashing = self.hashing.saturating_sub(1);
+                self.on_hashed(generation, piece, ok, data);
+            }
+            Job::WroteRun {
+                generation,
+                first,
+                count,
+                result,
+            } => self.on_wrote_run(generation, first, count, result),
+            Job::ReadPiece {
                 generation,
                 piece,
                 result,
-            } => self.on_written(generation, piece, result),
+            } => self.on_read_piece(generation, piece, result),
             Job::Read {
                 generation,
                 key,
                 block,
                 result,
             } => self.on_read(generation, key, block, result),
-            Job::Flushed(Err(e)) => {
-                tracing::warn!(torrent = %self.name(), error = %e, "flush failed");
+            Job::Flushed(result) => {
+                if let Err(e) = result {
+                    // The pieces were written; a failing sync is logged, the
+                    // next write would surface a real storage problem.
+                    tracing::warn!(torrent = %self.name(), error = %e, "flush failed");
+                }
+                self.on_flushed();
             }
-            Job::Flushed(Ok(())) => {}
             Job::Metadata { key, ban, result } => self.on_metadata_job(key, ban, result),
         }
     }
@@ -159,6 +183,7 @@ impl Actor {
         };
         let meta = Arc::clone(&l.meta);
         let generation = self.generation;
+        self.hashing = self.hashing.saturating_add(1);
         self.jobs.spawn_blocking(move || {
             let ok = meta.info.pieces.get(piece as usize) == Some(&sha1_piece(&data));
             Job::Hashed {
@@ -177,45 +202,27 @@ impl Actor {
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
-        if ok {
-            let Some(storage) = self.storage.as_ref() else {
-                return;
-            };
-            let storage = Arc::clone(storage);
-            let offset = l.layout.piece_offset(piece);
-            self.shared
-                .disk
-                .spawn(&mut self.jobs, move || Job::Written {
-                    generation,
-                    piece,
-                    result: storage.write(offset, &data),
-                });
+        if !ok {
+            debug!(torrent = %l.meta.info.name, piece, "piece failed its hash check");
+            if let Some(picker) = l.picker.as_mut() {
+                picker.piece_failed(piece);
+            }
+            self.cache.release_partial(piece);
+            let size = u64::from(l.layout.piece_size(piece));
+            self.counters.wasted = self.counters.wasted.saturating_add(size);
+            self.emit(Event::HashFailed {
+                torrent: self.ih,
+                piece,
+            });
+            self.top_up_all(None);
             return;
         }
-        debug!(torrent = %l.meta.info.name, piece, "piece failed its hash check");
-        if let Some(picker) = l.picker.as_mut() {
-            picker.piece_failed(piece);
-        }
-        let size = u64::from(l.layout.piece_size(piece));
-        self.counters.wasted = self.counters.wasted.saturating_add(size);
-        self.emit(Event::HashFailed {
-            torrent: self.ih,
-            piece,
-        });
-        self.top_up_all(None);
-    }
-
-    fn on_written(&mut self, generation: u64, piece: u32, result: io::Result<()>) {
-        if generation != self.generation || !matches!(self.phase, Phase::Ready) {
-            return;
-        }
-        if let Err(e) = result {
-            self.fail(&e, "writing a piece");
-            return;
-        }
-        let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) else {
+        let Some(picker) = l.picker.as_mut() else {
             return;
         };
+        // Verified: ours from now on, served from memory until written.
+        self.cache
+            .insert_dirty(piece, data.into(), Instant::now().into_std());
         picker.piece_passed(piece);
         let finished = picker.is_finished();
         self.emit(Event::PieceFinished {
@@ -239,21 +246,120 @@ impl Actor {
         let just_finished = finished && !self.finished_emitted;
         if just_finished {
             self.finished_emitted = true;
-            // Whoever reacts to the event reads the final counters and state.
-            self.publish();
-            self.emit(Event::TorrentFinished { torrent: self.ih });
-            // Durability point; a failure here is logged, the next write
-            // would surface a real storage problem.
-            if let Some(storage) = self.storage.clone() {
-                self.shared
-                    .disk
-                    .spawn(&mut self.jobs, move || Job::Flushed(storage.flush()));
-            }
+            self.finish_pending = true;
         }
+        if just_finished || !self.active() {
+            // Finished, or paused while the hash ran: nothing more is coming
+            // soon, so nothing waits in memory.
+            self.flush(FlushReason::All);
+        } else {
+            self.flush(FlushReason::Pressure);
+        }
+        self.maybe_finish();
         self.refresh_state();
-        if just_finished {
-            // After `refresh_state`, so the announce reads `left` = 0.
-            self.signal(|s| !std::mem::replace(&mut s.completed, true));
+    }
+
+    /// Hands the dirty pieces `reason` selects to writes on the disk pool.
+    pub(super) fn flush(&mut self, reason: FlushReason) {
+        let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
+            return;
+        };
+        let runs = self.cache.take_flush(reason, Instant::now().into_std());
+        for run in runs {
+            let storage = Arc::clone(storage);
+            let offset = l.layout.piece_offset(run.first);
+            let generation = self.generation;
+            let first = run.first;
+            let count = u32::try_from(run.pieces.len()).unwrap_or(u32::MAX);
+            self.shared.disk.spawn(&mut self.jobs, move || {
+                let result = match run.pieces.as_slice() {
+                    [(_, one)] => storage.write(offset, one),
+                    pieces => {
+                        let len = usize::try_from(run.len_bytes()).unwrap_or(0);
+                        let mut buf = Vec::with_capacity(len);
+                        for (_, d) in pieces {
+                            buf.extend_from_slice(d);
+                        }
+                        storage.write(offset, &buf)
+                    }
+                };
+                Job::WroteRun {
+                    generation,
+                    first,
+                    count,
+                    result,
+                }
+            });
+        }
+    }
+
+    fn on_wrote_run(&mut self, generation: u64, first: u32, count: u32, result: io::Result<()>) {
+        if let Err(e) = result {
+            if generation == self.generation {
+                // Drops every unwritten piece; the next resume rechecks.
+                self.fail(&e, "writing pieces");
+            }
+            return;
+        }
+        self.cache.written(first, count);
+        self.maybe_finish();
+        // A landed write may make room for new pieces.
+        self.top_up_all(None);
+    }
+
+    /// Once a finished torrent's pieces are all written, the storage is
+    /// flushed; `TorrentFinished` follows the flush.
+    fn maybe_finish(&mut self) {
+        if !self.finish_pending || !self.cache.is_idle() {
+            return;
+        }
+        self.finish_pending = false;
+        self.finish_flush = true;
+        match self.storage.clone() {
+            Some(storage) => self
+                .shared
+                .disk
+                .spawn(&mut self.jobs, move || Job::Flushed(storage.flush())),
+            None => self.on_flushed(),
+        }
+    }
+
+    /// The flush after the last write: the torrent is finished.
+    fn on_flushed(&mut self) {
+        if !std::mem::take(&mut self.finish_flush) {
+            return;
+        }
+        let finished = matches!(self.phase, Phase::Ready)
+            && self
+                .loaded
+                .as_ref()
+                .and_then(|l| l.picker.as_ref())
+                .is_some_and(crate::picker::PiecePicker::is_finished);
+        if !finished {
+            return;
+        }
+        // Whoever reacts to the event reads the final counters and state.
+        self.publish();
+        self.emit(Event::TorrentFinished { torrent: self.ih });
+        // The announce reads `left` = 0: the state was refreshed when the
+        // last piece passed.
+        self.signal(|s| !std::mem::replace(&mut s.completed, true));
+    }
+
+    /// Flushes every dirty piece and waits until the writes land, or until
+    /// a failure drops them, together with any hash still running (its
+    /// piece is then flushed too). Other job results are handled
+    /// meanwhile, so nothing the writes depend on can stall.
+    pub(super) async fn flush_and_wait(&mut self) {
+        loop {
+            self.flush(FlushReason::All);
+            if self.hashing == 0 && !self.cache.writes_in_flight() {
+                return;
+            }
+            match self.jobs.join_next().await {
+                Some(r) => self.on_job_result(r),
+                None => return,
+            }
         }
     }
 }
@@ -311,6 +417,7 @@ mod tests {
             dht_addrs: Vec::new(),
             utp: Vec::new(),
             disk: crate::disk::DiskPool::new(1, 1),
+            cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
         });
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(LEN as u64));
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
@@ -354,7 +461,7 @@ mod tests {
             let end = start + b.len as usize;
             actor.on_block(key, b, Bytes::copy_from_slice(&payload[start..end]));
         }
-        // Hashed, then Written (which finishes), then Flushed.
+        // Hashed (which finishes), then WroteRun, then Flushed.
         while let Some(r) = actor.jobs.join_next().await {
             actor.on_job_result(r);
         }

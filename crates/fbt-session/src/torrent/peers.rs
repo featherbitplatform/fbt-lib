@@ -533,13 +533,25 @@ impl Actor {
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
-        let cap = partial_cap(l.layout.piece_len());
         let (Some(picker), Some(p)) = (l.picker.as_mut(), self.peers.get(&key)) else {
             return;
         };
+        // Pieces that left the picker without their buffer (their requests
+        // all came back) give their reservation back.
+        self.cache.retain_partials(|i| picker.is_in_progress(i));
+        let cap = partial_cap(
+            picker.num_in_progress(),
+            self.cache.partial_room(u64::from(l.layout.piece_len())),
+        );
         let evicted = evict_orphans(picker, cap, &mut l.bufs);
-        if evicted > 0 {
-            debug!(evicted, "dropped partial pieces no connected peer has");
+        if !evicted.is_empty() {
+            debug!(
+                evicted = evicted.len(),
+                "dropped partial pieces no connected peer has"
+            );
+            for piece in evicted {
+                self.cache.release_partial(piece);
+            }
         }
         if !p.connected || p.tx.is_none() || p.generation != generation {
             return;
@@ -548,7 +560,7 @@ impl Actor {
         if room == 0 {
             return;
         }
-        let blocks = if p.choked_us {
+        let mut blocks = if p.choked_us {
             let (true, Some(fast)) = (p.can_request_fast(), p.fast_has.as_ref()) else {
                 return;
             };
@@ -563,6 +575,28 @@ impl Actor {
         } else {
             pick_capped(picker, key, p.pieces(), room, cap, &mut self.rng)
         };
+        // Every piece started here reserves its buffer from the cache
+        // budget; one that cannot (the budget moved since `partial_room`)
+        // goes back to the picker.
+        let mut refused: Vec<u32> = Vec::new();
+        for b in &blocks {
+            if refused.contains(&b.piece) || self.cache.has_partial(b.piece) {
+                continue;
+            }
+            let size = u64::from(l.layout.piece_size(b.piece));
+            if !self.cache.reserve_partial(b.piece, size) {
+                refused.push(b.piece);
+            }
+        }
+        if !refused.is_empty() {
+            blocks.retain(|b| {
+                let keep = !refused.contains(&b.piece);
+                if !keep {
+                    picker.release(key, *b);
+                }
+                keep
+            });
+        }
         if blocks.is_empty() {
             return;
         }
@@ -587,17 +621,11 @@ impl Actor {
     }
 }
 
-/// Memory budget for pieces being downloaded (buffered in memory).
-const PARTIAL_BYTES: u64 = 64 * 1024 * 1024;
-/// Pieces in progress are never fewer than this, whatever the piece size.
-const MIN_PARTIAL_PIECES: usize = 8;
-
-/// Most pieces a torrent downloads at once: `max(8, 64 MiB / piece_len)`.
-pub(super) fn partial_cap(piece_len: u32) -> usize {
-    let by_bytes = PARTIAL_BYTES / u64::from(piece_len.max(1));
-    usize::try_from(by_bytes)
-        .unwrap_or(usize::MAX)
-        .max(MIN_PARTIAL_PIECES)
+/// Most pieces a torrent downloads at once: those already in progress
+/// plus the new buffers the cache budget has `room` for (see
+/// [`PieceCache::partial_room`](crate::storage::cache::PieceCache::partial_room)).
+pub(super) fn partial_cap(in_progress: usize, room: usize) -> usize {
+    in_progress.saturating_add(room)
 }
 
 fn peer_has(has: PeerPieces, piece: u32) -> bool {
@@ -644,14 +672,15 @@ pub(super) fn pick_capped(
 
 /// At the cap, partial pieces no connected peer has (availability 0) can
 /// never complete and would block every new piece: they are failed back to
-/// unrequested and their buffers freed. Returns how many were evicted.
+/// unrequested and their buffers freed. Returns the evicted pieces, whose
+/// budget reservations the caller gives back.
 pub(super) fn evict_orphans(
     picker: &mut PiecePicker,
     cap: usize,
     bufs: &mut HashMap<u32, Vec<u8>>,
-) -> usize {
+) -> Vec<u32> {
     if picker.num_in_progress() < cap {
-        return 0;
+        return Vec::new();
     }
     let orphans: Vec<u32> = picker
         .partial_pieces()
@@ -661,7 +690,7 @@ pub(super) fn evict_orphans(
         picker.piece_failed(piece);
         bufs.remove(&piece);
     }
-    orphans.len()
+    orphans
 }
 
 fn has_len(picker: &PiecePicker) -> u32 {
@@ -723,22 +752,21 @@ mod tests {
         p.remove_peer_pieces(PeerPieces::Some(&a_has));
         // The cap is full of stranded partials: B gets nothing.
         assert!(pick_capped(&mut p, b, PeerPieces::Some(&b_has), 8, 3, &mut rng).is_empty());
-        assert_eq!(evict_orphans(&mut p, 3, &mut bufs), 3);
+        assert_eq!(evict_orphans(&mut p, 3, &mut bufs).len(), 3);
         assert!(bufs.is_empty());
         assert_eq!(p.num_in_progress(), 0);
         let blocks = pick_capped(&mut p, b, PeerPieces::Some(&b_has), 8, 3, &mut rng);
         assert_eq!(blocks.len(), 8);
         assert!(blocks.iter().all(|blk| blk.piece >= 10));
         // Below the cap nothing is evicted.
-        assert_eq!(evict_orphans(&mut p, 3, &mut bufs), 0);
+        assert!(evict_orphans(&mut p, 3, &mut bufs).is_empty());
     }
 
     #[test]
-    fn partial_cap_by_piece_size() {
-        assert_eq!(partial_cap(16_384), 4096);
-        assert_eq!(partial_cap(1 << 20), 64);
-        assert_eq!(partial_cap(16 << 20), 8);
-        assert_eq!(partial_cap(0), 64 * 1024 * 1024);
+    fn partial_cap_reads_the_budget_room() {
+        assert_eq!(partial_cap(3, 0), 3);
+        assert_eq!(partial_cap(3, 5), 8);
+        assert_eq!(partial_cap(usize::MAX, 5), usize::MAX);
     }
 
     #[test]

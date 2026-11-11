@@ -382,6 +382,11 @@ impl PiecePicker {
         self.downloading.len()
     }
 
+    /// `piece` is started and not yet passed or failed.
+    pub fn is_in_progress(&self, piece: u32) -> bool {
+        self.downloading.contains_key(&piece)
+    }
+
     fn prio_of(&self, piece: u32) -> u8 {
         self.prio.get(piece as usize).copied().unwrap_or(0)
     }

@@ -195,6 +195,28 @@ pub struct Settings {
     /// 64; libtorrent's `active_checking`). The others wait as
     /// [`TorrentState::QueuedForChecking`](crate::TorrentState::QueuedForChecking).
     pub max_active_checks: usize,
+    /// Bytes of piece data the session keeps in memory across all its
+    /// torrents (64 MiB): verified pieces not yet written (*dirty*, served
+    /// to peers at once and written later in coalesced runs), written
+    /// pieces kept to serve peers (*clean*, least recently used go first)
+    /// and the buffers of pieces being downloaded (*partial*). Dirty pieces
+    /// are written once they pass half of this, once they are older than
+    /// [`cache_expiry`](Self::cache_expiry), and always when a torrent
+    /// finishes, pauses, is removed, rechecks or the session shuts down.
+    ///
+    /// The one exception to the bound is a progress floor: each
+    /// downloading torrent may hold up to 4 partial buffers beyond it, so
+    /// it never stalls behind other torrents' cached data, but only while
+    /// the session's dirty bytes (writes in flight included) are within
+    /// `cache_size`. Above that no new partial buffer is created for any
+    /// torrent until a write lands, so a slow disk cannot grow memory
+    /// without bound.
+    ///
+    /// 0 means write-through: every verified piece is written at once and
+    /// there is no read cache.
+    pub cache_size: u64,
+    /// How long a verified piece may stay unwritten (30 s). Non-zero.
+    pub cache_expiry: Duration,
 }
 
 impl Settings {
@@ -212,6 +234,7 @@ impl Settings {
             ("dht_query_timeout", self.dht_query_timeout),
             ("pex_interval", self.pex_interval),
             ("utp_connect_timeout", self.utp_connect_timeout),
+            ("cache_expiry", self.cache_expiry),
         ];
         for (name, d) in non_zero {
             if d.is_zero() {
@@ -345,6 +368,8 @@ impl Default for Settings {
             utp_connect_timeout: Duration::from_secs(3),
             disk_threads: 8,
             max_active_checks: 1,
+            cache_size: 64 * 1024 * 1024,
+            cache_expiry: Duration::from_secs(30),
         }
     }
 }

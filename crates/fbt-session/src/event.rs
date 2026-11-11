@@ -47,7 +47,9 @@ pub enum Event {
         /// The new state.
         state: TorrentState,
     },
-    /// A piece passed its hash check and was written.
+    /// A piece passed its hash check. It may not be on disk yet: the
+    /// write-back cache serves it from memory and writes it later (see
+    /// [`Settings::cache_size`](crate::Settings::cache_size)).
     PieceFinished {
         /// The torrent.
         torrent: InfoHashes,
@@ -66,7 +68,7 @@ pub enum Event {
         /// The torrent.
         torrent: InfoHashes,
     },
-    /// Every wanted piece was downloaded.
+    /// Every wanted piece was downloaded, verified and written to storage.
     TorrentFinished {
         /// The torrent.
         torrent: InfoHashes,

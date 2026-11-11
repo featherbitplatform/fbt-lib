@@ -25,6 +25,7 @@ use crate::listener::ListenerState;
 use crate::net::{Endpoint, ListenError, bind_all, utp_for, utp_sockets};
 use crate::settings::Settings;
 use crate::status::TorrentStatus;
+use crate::storage::cache::{CacheBudget, CacheStats};
 use crate::storage::{FsStorage, Storage};
 use crate::torrent::{self, TorrentHandle};
 
@@ -160,6 +161,8 @@ pub(crate) struct Shared {
     pub utp: Vec<UtpSocket>,
     /// Runs every storage job and bounds the concurrent checks.
     pub disk: DiskPool,
+    /// The byte budget every torrent's write-back cache draws from.
+    pub cache: Arc<CacheBudget>,
 }
 
 /// The DHT port to send a peer at `peer` in `Port`: that of our DHT socket
@@ -360,6 +363,7 @@ impl Session {
         // `max_peers_global` pending handshakes.
         let listener_state = Arc::new(ListenerState::new(settings.max_peers_global));
         let disk = DiskPool::new(settings.disk_threads, settings.max_active_checks);
+        let cache = Arc::new(CacheBudget::new(settings.cache_size));
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -375,6 +379,7 @@ impl Session {
             dht_addrs,
             utp,
             disk,
+            cache,
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -433,6 +438,12 @@ impl Session {
         };
         let state = dht.state().await.map_err(|_| SessionError::Shutdown)?;
         Ok(Some(state.to_bytes()))
+    }
+
+    /// Bytes held by the write-back cache of every torrent, against
+    /// [`Settings::cache_size`].
+    pub fn cache_stats(&self) -> CacheStats {
+        self.inner.shared.cache.stats()
     }
 
     /// The address of the first peer listener (the first of
@@ -718,6 +729,7 @@ mod tests {
             dht_addrs: Vec::new(),
             utp: Vec::new(),
             disk: crate::disk::DiskPool::new(1, 1),
+            cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();

@@ -9,12 +9,14 @@ use tracing::warn;
 
 use super::actor::{Actor, Flow, PEER_DRAIN_TIMEOUT, Phase, wanted_bytes};
 use super::announcer::STOPPED_TIMEOUT;
+use super::data::Job;
 use super::{Cmd, piece_priorities};
 use crate::error::SessionError;
 use crate::event::Event;
 use crate::peer::messages::PeerEvent;
 use crate::picker::PeerKey;
 use crate::session::{Priority, RemoveMode, release};
+use crate::storage::cache::FlushReason;
 
 impl Actor {
     pub(super) async fn on_cmd(&mut self, cmd: Cmd) -> Flow {
@@ -26,6 +28,8 @@ impl Actor {
                     self.close_all();
                     self.refresh_state();
                 }
+                // Every verified piece is on disk before the reply.
+                self.flush_and_wait().await;
                 let _ = tx.send(());
             }
             Cmd::Resume(tx) => {
@@ -33,6 +37,8 @@ impl Actor {
                 let _ = tx.send(());
             }
             Cmd::Recheck(tx) => {
+                // The check reads the disk: everything verified is there first.
+                self.flush_and_wait().await;
                 self.recheck();
                 let _ = tx.send(());
             }
@@ -161,6 +167,7 @@ impl Actor {
             for piece in skipped {
                 picker.piece_failed(piece);
                 l.bufs.remove(&piece);
+                self.cache.release_partial(piece);
             }
             if !picker.is_finished() {
                 self.finished_emitted = false;
@@ -174,11 +181,13 @@ impl Actor {
         self.refresh_state();
     }
 
-    /// Closes every peer, waits for running jobs, flushes and optionally
+    /// Closes every peer, writes every verified piece (or, deleting,
+    /// discards them), waits for running jobs, flushes and optionally
     /// deletes the data. The actor exits afterwards.
     /// On shutdown (`remove` is `None`) it also waits up to
     /// [`STOPPED_TIMEOUT`] for the `stopped` announce; on remove that
-    /// announce finishes on its own.
+    /// announce finishes on its own. The timeout never cuts the writes
+    /// short: data comes first.
     pub(super) async fn stop(&mut self, remove: Option<RemoveMode>) -> Result<(), SessionError> {
         let announce_deadline = Instant::now() + STOPPED_TIMEOUT;
         self.signal(|s| {
@@ -208,9 +217,24 @@ impl Actor {
             }
             release(&self.shared.global_peers);
         }
-        // Pending writes finish before files are flushed or deleted.
-        while self.jobs.join_next().await.is_some() {}
         let delete = remove == Some(RemoveMode::DeleteData);
+        if delete {
+            // Nothing more reaches the files; hashes still running are stale.
+            self.cache.discard_all();
+            self.generation = self.generation.wrapping_add(1);
+        } else {
+            self.flush(FlushReason::All);
+        }
+        // Pending jobs finish before files are flushed or deleted. A hash
+        // that passes meanwhile is written too; reads and checks are moot.
+        while let Some(r) = self.jobs.join_next().await {
+            if let Ok(job @ (Job::Hashed { .. } | Job::WroteRun { .. })) = r {
+                self.on_job(job);
+            }
+            if !delete {
+                self.flush(FlushReason::All);
+            }
+        }
         let r = match self.storage.clone() {
             Some(storage) => {
                 let mut job = JoinSet::new();

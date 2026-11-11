@@ -63,7 +63,7 @@ pub use settings::{
     DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, Settings,
 };
 pub use status::{TorrentState, TorrentStatus};
-pub use storage::StorageError;
+pub use storage::{CacheStats, StorageError};
 pub use torrent::TorrentHandle;
 
 #[cfg(test)]
