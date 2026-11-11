@@ -71,8 +71,9 @@ join and the total time. CI runs it as the `interop` job (55-minute timeout).
 
 ## Layout
 
-Everything runs under Docker Compose on one bridge network (`swarm`); services
-reach each other by name, so it works the same on Linux and on Docker Desktop
+Everything runs under Docker Compose on a bridge network (`swarm`) that every
+service joins (the two fbt containers that run LSD also join `lan`, below);
+services reach each other by name, so it works the same on Linux and on Docker Desktop
 for macOS or Windows (no host networking). Only Docker with Compose v2 is
 needed on the host.
 

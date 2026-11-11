@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**fbt-lib**: a from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent and an idiomatic async API. It is the engine for featherbittorrent (`../featherbittorrent`). Cargo workspace under `crates/`: `fbt-bencode`, `fbt-core`, `fbt-metainfo`, `fbt-wire`, `fbt-tracker`, `fbt-dht`, `fbt-session`, `fbt` (public facade) and `fbt-example`.
+**fbt-lib**: a from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent and an idiomatic async API. It is the engine for featherbittorrent (`../featherbittorrent`). Cargo workspace under `crates/`: `fbt-bencode`, `fbt-core`, `fbt-metainfo`, `fbt-wire`, `fbt-tracker`, `fbt-dht`, `fbt-utp`, `fbt-net`, `fbt-session`, `fbt` (public facade) and `fbt-example`.
 
 Binding design: `docs/superpowers/specs/2026-11-10-fbt-lib-design.md`. Read it before any feature work; it records which decisions are the owner's and which are the builder's calls. Plans live next to it under `docs/superpowers/plans/`.
 
@@ -12,12 +12,12 @@ Binding design: `docs/superpowers/specs/2026-11-10-fbt-lib-design.md`. Read it b
 
 - **From scratch.** Every BitTorrent component (bencode, metainfo, wire protocol, trackers, DHT, uTP, ...) is written here. No BitTorrent crates (librqbit, `mainline`, uTP crates, bencode crates such as `serde_bencode` or `bendy`). General-purpose crates (tokio, tracing, thiserror, sha1, ...) are fine.
 - **No unsafe.** `#![forbid(unsafe_code)]` at the top of every crate; the workspace lint forbids it too.
-- **Remote input never panics, hangs or allocates without bound.** Peers, trackers and `.torrent` bytes are hostile. `unwrap`, `expect`, indexing and `panic!` on remote-derived values are rejected; clippy denies them in non-test code of `fbt-bencode`, `fbt-metainfo`, `fbt-wire`, `fbt-tracker` and `fbt-dht`.
+- **Remote input never panics, hangs or allocates without bound.** Peers, trackers and `.torrent` bytes are hostile. `unwrap`, `expect`, indexing and `panic!` on remote-derived values are rejected; clippy denies them in non-test code of `fbt-bencode`, `fbt-metainfo`, `fbt-wire`, `fbt-tracker`, `fbt-dht`, `fbt-utp` and `fbt-net`.
 - **`pure-rust` feature.** `cargo tree -e normal,build --no-default-features --features pure-rust -p fbt` (normal and build edges) must contain neither `ring` nor `cc` (nor `cmake`, `aws-lc*` or `*-sys` crates; `windows-sys` is bindings only); the default build may need a C toolchain only for `ring`.
 - **Naming other clients is allowed.** libtorrent, qBittorrent, Transmission and opentracker may be named in code, docs and commits.
 - **Logging and errors:** `tracing` for logs (the library never installs a subscriber), `thiserror` for errors. Public enums and config structs of `fbt-session` and `fbt` are `#[non_exhaustive]`; config structs implement `Default`.
 - **Dependencies** are declared once in the root `[workspace.dependencies]`; crates inherit them, never pin their own versions. All crates are `publish = false` for now.
-- **Tests never contact public DHT nodes.** `test_settings()` disables the DHT; tests that need one run their own nodes on loopback. `Settings::default()` bootstraps from the public routers, so never build a session from it in a test.
+- **Tests never contact the public internet, the public DHT or a real router.** `test_settings()` disables the DHT, LSD, UPnP and NAT-PMP; tests that need a DHT run their own nodes on loopback, and NAT tests use the fakes in `crates/fbt-net/tests/support/`. `Settings::default()` bootstraps from the public routers and turns LSD, UPnP and NAT-PMP on, so never build a session from it in a test.
 - **Cross-platform.** Builds and tests must pass on macOS, Linux and Windows.
 
 ## Conventions
@@ -48,6 +48,9 @@ bash dev/release-version.sh --notes   # the current version's CHANGELOG section
 # Local security scans via Docker (semgrep, deny, grype, gitleaks, sbom)
 bash dev/sast.sh              # everything
 bash dev/sast.sh semgrep      # one tool
+
+# Loopback throughput and idle-torrent benchmark; appends a row to docs/benchmarks.md
+bash dev/bench.sh
 
 # Live interop vs qBittorrent-nox and Transmission via opentracker, plus magnet via DHT, forced
 # encryption, PEX, uTP with qBittorrent and LSD between two fbt-example containers, on isolated

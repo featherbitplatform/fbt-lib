@@ -3,7 +3,8 @@
 # fbt-example (`fbt-lsd`) for LSD. Driven by run.sh, which
 # exports INTEROP_DIR (target/interop, shared by every container as /interop)
 # and HOST_UID/HOST_GID (so files written there stay owned by the caller).
-# All services share one bridge network and reach each other by service name;
+# Every service is on the `swarm` bridge network and reaches the others by service
+# name; `fbt` and `fbt-lsd` are also on the `lan` network (multicast for LSD);
 # `dht-node` (our own bare DHT node) is the only DHT bootstrap for fbt-example
 # and qBittorrent; Transmission also lists the helper nodes.
 
