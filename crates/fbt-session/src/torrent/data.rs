@@ -48,8 +48,11 @@ pub(crate) enum Job {
         count: u32,
         result: io::Result<()>,
     },
-    /// Storage was flushed.
-    Flushed(io::Result<()>),
+    /// Storage was flushed after a finished torrent's last write.
+    Flushed {
+        generation: u64,
+        result: io::Result<()>,
+    },
     /// A complete metadata buffer from `key` was verified and parsed.
     Metadata {
         key: PeerKey,
@@ -104,7 +107,12 @@ impl Actor {
                 block,
                 result,
             } => self.on_read(generation, key, block, result),
-            Job::Flushed(result) => self.on_flushed(result),
+            Job::Flushed { generation, result } => {
+                // A check since then starts its own finish.
+                if generation == self.generation {
+                    self.on_flushed(result);
+                }
+            }
             Job::Metadata { key, ban, result } => self.on_metadata_job(key, ban, result),
         }
     }
@@ -297,23 +305,28 @@ impl Actor {
         }
         self.cache.written(first, count);
         self.maybe_finish();
+        self.refresh_state();
         // A landed write may make room for new pieces.
         self.top_up_all(None);
     }
 
     /// Once a finished torrent's pieces are all written, the storage is
     /// flushed; `TorrentFinished` follows the flush.
-    fn maybe_finish(&mut self) {
+    pub(super) fn maybe_finish(&mut self) {
         if !self.finish_pending || !self.cache.is_idle() {
             return;
         }
         self.finish_pending = false;
         self.finish_flush = true;
+        let generation = self.generation;
         match self.storage.clone() {
             Some(storage) => self
                 .shared
                 .disk
-                .spawn(&mut self.jobs, move || Job::Flushed(storage.flush())),
+                .spawn(&mut self.jobs, move || Job::Flushed {
+                    generation,
+                    result: storage.flush(),
+                }),
             None => self.on_flushed(Ok(())),
         }
     }

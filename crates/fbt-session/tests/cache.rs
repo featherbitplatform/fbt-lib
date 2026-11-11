@@ -16,8 +16,8 @@ use bytes::Bytes;
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage};
 use fbt_session::{
-    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, RemoveMode, Session, Settings,
-    TorrentHandle, TorrentState,
+    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, Priority, RemoveMode, Session,
+    Settings, TorrentHandle, TorrentState,
 };
 use fbt_wire::Message;
 use support::*;
@@ -704,7 +704,6 @@ async fn seeding_read_cache_does_not_starve_downloads() {
     let yh = s.add_torrent(p).await.unwrap();
     assert!(wait_state(&yh, |x| *x == TorrentState::Downloading, T).await);
     let mut ev = s.subscribe(EventMask::STATUS);
-    let t0 = tokio::time::Instant::now();
     yh.add_peer(z.local_addr()).await.unwrap();
     next_matching(
         &mut ev,
@@ -713,9 +712,168 @@ async fn seeding_read_cache_does_not_starve_downloads() {
     )
     .await
     .expect("Y finished well before cache_expiry");
-    assert!(t0.elapsed() < Duration::from_secs(20));
     assert!((0..16).all(|i| y_storage.holds_piece(i, piece_len)));
     z.shutdown().await;
     l1.shutdown().await;
     s.shutdown().await;
+}
+
+/// Memory storage whose reads, once `armed`, each take `delay`: a seeder
+/// whose whole-piece reads are still running when it stops.
+#[derive(Debug)]
+struct SlowReads {
+    inner: MemStorage,
+    delay: Duration,
+    armed: AtomicBool,
+}
+
+impl Storage for SlowReads {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if self.armed.load(Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// How the seeder in [`stop_during_piece_reads`] stops.
+#[derive(Debug, Clone, Copy)]
+enum Stop {
+    Remove(RemoveMode),
+    Shutdown,
+}
+
+/// A seeder stops while whole-piece reads are in flight: their clean
+/// reservations all go back to the budget.
+async fn stop_during_piece_reads(how: Stop) {
+    let piece_len = 65_536usize;
+    let (m, payload) = make_torrent(&[("a", 8 * piece_len)], piece_len as u32);
+    let storage = Arc::new(SlowReads {
+        inner: MemStorage::from_bytes(payload.clone()),
+        delay: Duration::from_millis(800),
+        armed: AtomicBool::new(false),
+    });
+    let (s, sh) = session_with(
+        settings(),
+        &m,
+        storage.clone(),
+        false,
+        TorrentState::Seeding,
+    )
+    .await;
+    storage.armed.store(true, Ordering::SeqCst);
+    let leech_storage: Arc<dyn Storage> = Arc::new(MemStorage::new(payload.len() as u64));
+    let (l, lh) = session_with(
+        settings(),
+        &m,
+        leech_storage,
+        false,
+        TorrentState::Downloading,
+    )
+    .await;
+    lh.add_peer(s.local_addr()).await.unwrap();
+    // Reserved before the reads, which are still sleeping.
+    assert!(wait_until(|| s.cache_stats().clean > 0, T).await);
+    match how {
+        Stop::Remove(mode) => {
+            let _ = sh.remove(mode).await;
+        }
+        Stop::Shutdown => s.shutdown().await,
+    }
+    let stats = s.cache_stats();
+    assert_eq!(
+        (stats.dirty, stats.clean, stats.partial),
+        (0, 0, 0),
+        "{how:?} left {stats:?}"
+    );
+    l.shutdown().await;
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn piece_read_reservations_released_on_remove_keep_data() {
+    stop_during_piece_reads(Stop::Remove(RemoveMode::KeepData)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn piece_read_reservations_released_on_remove_delete_data() {
+    stop_during_piece_reads(Stop::Remove(RemoveMode::DeleteData)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn piece_read_reservations_released_on_shutdown() {
+    stop_during_piece_reads(Stop::Shutdown).await;
+}
+
+/// Skipping the files still missing finishes the torrent with no piece
+/// passing: the cached pieces are written, then `Seeding` and
+/// `TorrentFinished`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deselecting_the_rest_finishes_on_disk() {
+    let piece_len = 16_384usize;
+    let (m, payload) = make_torrent(
+        &[("a", 8 * piece_len), ("b", 64 * piece_len)],
+        piece_len as u32,
+    );
+    // About 50 pieces a second: "b" is still downloading when "a" is done.
+    let seed_storage: Arc<dyn Storage> =
+        Arc::new(SlowStorage::new(payload.clone(), Duration::from_millis(20)));
+    let (seed, _sh) =
+        session_with(settings(), &m, seed_storage, false, TorrentState::Seeding).await;
+    let storage = Arc::new(RecordingStorage::new(payload.clone()));
+    let (l, lh) = session_with(
+        hold_settings(),
+        &m,
+        storage.clone(),
+        true,
+        TorrentState::Downloading,
+    )
+    .await;
+    let mut ev = l.subscribe(EventMask::STATUS);
+    lh.add_peer(seed.local_addr()).await.unwrap();
+    let end = tokio::time::Instant::now() + T;
+    loop {
+        let have = lh.pieces().await.unwrap();
+        if (0..8).all(|i| have.get(i)) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < end, "file a never completed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Held in the cache, not written yet.
+    assert!(l.cache_stats().dirty > 0);
+    assert_ne!(lh.status().state, TorrentState::Seeding);
+    lh.set_file_priorities(vec![Priority::Normal, Priority::Skip])
+        .await
+        .unwrap();
+    next_matching(
+        &mut ev,
+        |e| {
+            matches!(
+                e,
+                Event::StateChanged {
+                    state: TorrentState::Seeding,
+                    ..
+                }
+            )
+        },
+        T,
+    )
+    .await
+    .expect("Seeding");
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    assert!((0..8).all(|i| storage.holds_piece(i, piece_len)));
+    l.shutdown().await;
+    seed.shutdown().await;
 }

@@ -171,7 +171,17 @@ impl Actor {
             }
             if !picker.is_finished() {
                 self.finished_emitted = false;
+            } else if !self.finished_emitted && matches!(self.phase, Phase::Ready) {
+                // Skipping the rest finished it with no piece passing: the
+                // same path as the last piece, so it seeds and reports
+                // `TorrentFinished` once everything is on disk.
+                self.finished_emitted = true;
+                self.finish_pending = true;
             }
+        }
+        if self.finish_pending {
+            self.flush(FlushReason::All);
+            self.maybe_finish();
         }
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
@@ -221,8 +231,10 @@ impl Actor {
         }
         let delete = remove == Some(RemoveMode::DeleteData);
         if delete {
-            // Nothing more reaches the files; hashes still running are stale.
+            // Nothing more reaches the files; hashes and reads still running
+            // are stale.
             self.cache.discard_all();
+            self.drop_piece_reads();
             self.generation = self.generation.wrapping_add(1);
         } else {
             self.flush(FlushReason::All);
@@ -237,6 +249,8 @@ impl Actor {
                 self.flush(FlushReason::All);
             }
         }
+        // Whole-piece reads answered no one: their reservations go back.
+        self.drop_piece_reads();
         let r = match self.storage.clone() {
             Some(storage) => {
                 let mut job = JoinSet::new();

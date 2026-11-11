@@ -25,7 +25,7 @@ use super::data::Job;
 use super::dht::{self, DhtAnnouncer, DhtParams};
 use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
-use super::serve::PieceRead;
+use super::serve::PieceReads;
 use super::swarm::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
@@ -205,7 +205,7 @@ pub(crate) struct Actor {
     /// Whole-piece reads in flight for peers' requests, with the requests
     /// waiting on each.
     /// Keyed by piece, with the generation the read was started in.
-    pub(super) piece_reads: HashMap<u32, PieceRead>,
+    pub(super) piece_reads: PieceReads,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -286,6 +286,7 @@ impl Actor {
             })
             .unzip();
         let cache = PieceCache::new(Arc::clone(&shared.cache), shared.settings.cache_expiry);
+        let piece_reads = PieceReads::new(Arc::clone(&shared.cache));
         let mut actor = Actor {
             ih,
             loaded,
@@ -326,7 +327,7 @@ impl Actor {
             hashing: 0,
             finish_pending: false,
             finish_flush: false,
-            piece_reads: HashMap::new(),
+            piece_reads,
             write_error: None,
             #[cfg(test)]
             pex_live_builds: 0,

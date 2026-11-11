@@ -114,11 +114,17 @@ impl Actor {
                 // Peers still connected (a magnet keeps those it fetched
                 // the metadata through) count toward availability.
                 add_availability(&mut picker, &self.peers, self.generation);
-                // Finishing during this session is what `TorrentFinished` reports.
+                // Finishing during this session is what `TorrentFinished`
+                // reports; a finish under way before the check (its final
+                // flush not back yet) completes after it.
+                let finishing = std::mem::take(&mut self.finish_pending)
+                    | std::mem::take(&mut self.finish_flush);
                 self.finished_emitted = picker.is_finished();
+                self.finish_pending = finishing && picker.is_finished();
                 l.picker = Some(picker);
                 self.phase = Phase::Ready;
                 self.metadata_check = false;
+                self.maybe_finish();
                 self.refresh_state();
                 self.catch_up_peers();
                 self.requeue_known();

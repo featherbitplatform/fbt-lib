@@ -80,10 +80,13 @@ impl CleanLru {
         t
     }
 
-    fn insert(&mut self, key: CleanKey, data: Arc<[u8]>) -> bool {
+    /// `evictable` (the budget's mirror of the bytes in here) changes
+    /// under the same lock as the entries.
+    fn insert(&mut self, key: CleanKey, data: Arc<[u8]>, evictable: &AtomicU64) -> bool {
         if self.entries.contains_key(&key) {
             return false;
         }
+        evictable.fetch_add(data.len() as u64, Ordering::AcqRel);
         let used = self.tick();
         self.order.insert(used, key);
         self.by_torrent.entry(key.0).or_default().insert(key.1);
@@ -91,8 +94,9 @@ impl CleanLru {
         true
     }
 
-    fn remove(&mut self, key: CleanKey) -> Option<Arc<[u8]>> {
+    fn remove(&mut self, key: CleanKey, evictable: &AtomicU64) -> Option<Arc<[u8]>> {
         let (data, used) = self.entries.remove(&key)?;
+        sub(evictable, data.len() as u64);
         self.order.remove(&used);
         if let Some(set) = self.by_torrent.get_mut(&key.0) {
             set.remove(&key.1);
@@ -103,10 +107,10 @@ impl CleanLru {
         Some(data)
     }
 
-    fn pop_oldest(&mut self) -> Option<Arc<[u8]>> {
+    fn pop_oldest(&mut self, evictable: &AtomicU64) -> Option<Arc<[u8]>> {
         let (_, key) = self.order.first_key_value()?;
         let key = *key;
-        self.remove(key)
+        self.remove(key, evictable)
     }
 }
 
@@ -240,16 +244,17 @@ impl CacheBudget {
     /// Evicts the session's least recently used clean entry; false with
     /// none.
     fn evict_oldest(&self) -> bool {
-        let Some(data) = self.lru().pop_oldest() else {
+        let popped = self.lru().pop_oldest(&self.evictable);
+        let Some(data) = popped else {
             return false;
         };
         self.forget_clean(data.len() as u64);
         true
     }
 
-    /// An entry of `n` bytes left the LRU.
+    /// An entry of `n` bytes left the LRU (`evictable` already went down
+    /// under the lock).
     fn forget_clean(&self, n: u64) {
-        sub(&self.evictable, n);
         self.release(CacheKind::Clean, n);
     }
 
@@ -268,16 +273,15 @@ impl CacheBudget {
     /// duplicate gives them back.
     fn clean_insert_reserved(&self, key: CleanKey, data: Arc<[u8]>) {
         let n = data.len() as u64;
-        if self.lru().insert(key, data) {
-            self.evictable.fetch_add(n, Ordering::AcqRel);
-        } else {
+        let inserted = self.lru().insert(key, data, &self.evictable);
+        if !inserted {
             self.release(CacheKind::Clean, n);
         }
         self.trim();
     }
 
     fn clean_remove(&self, key: CleanKey) {
-        let removed = self.lru().remove(key);
+        let removed = self.lru().remove(key, &self.evictable);
         if let Some(data) = removed {
             self.forget_clean(data.len() as u64);
         }
@@ -290,7 +294,7 @@ impl CacheBudget {
             let pieces = lru.by_torrent.remove(&id).unwrap_or_default();
             pieces
                 .into_iter()
-                .filter_map(|p| lru.remove((id, p)))
+                .filter_map(|p| lru.remove((id, p), &self.evictable))
                 .collect()
         };
         for data in removed {

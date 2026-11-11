@@ -4,6 +4,7 @@
 //! `SendBlock`. A miss reads the whole piece and keeps it clean when the
 //! budget allows.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use super::actor::{Actor, Phase};
 use super::data::Job;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
+use crate::storage::cache::{CacheBudget, CacheKind};
 
 impl Actor {
     /// A peer requests `block`: served only if we have the piece, the block
@@ -203,13 +205,70 @@ pub(super) struct PieceRead {
     pub waiting: Vec<(PeerKey, BlockRef)>,
 }
 
+/// The whole-piece reads of one torrent, by piece. Each holds a clean
+/// reservation in the session budget, given back when the entry goes:
+/// answered, cleared, or at the latest when the actor is dropped.
+#[derive(Debug)]
+pub(super) struct PieceReads {
+    reads: HashMap<u32, PieceRead>,
+    budget: Arc<CacheBudget>,
+}
+
+impl PieceReads {
+    pub(super) fn new(budget: Arc<CacheBudget>) -> Self {
+        PieceReads {
+            reads: HashMap::new(),
+            budget,
+        }
+    }
+
+    pub(super) fn get(&self, piece: &u32) -> Option<&PieceRead> {
+        self.reads.get(piece)
+    }
+
+    pub(super) fn get_mut(&mut self, piece: &u32) -> Option<&mut PieceRead> {
+        self.reads.get_mut(piece)
+    }
+
+    pub(super) fn contains_key(&self, piece: &u32) -> bool {
+        self.reads.contains_key(piece)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.reads.len()
+    }
+
+    pub(super) fn insert(&mut self, piece: u32, read: PieceRead) {
+        if let Some(old) = self.reads.insert(piece, read) {
+            self.budget.release(CacheKind::Clean, old.reserved);
+        }
+    }
+
+    /// Takes the entry out; its reservation is the caller's now.
+    pub(super) fn remove(&mut self, piece: &u32) -> Option<PieceRead> {
+        self.reads.remove(piece)
+    }
+
+    /// Forgets every read, giving their reservations back; their results
+    /// are then ignored.
+    pub(super) fn clear(&mut self) {
+        for (_, r) in self.reads.drain() {
+            self.budget.release(CacheKind::Clean, r.reserved);
+        }
+    }
+}
+
+impl Drop for PieceReads {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 impl Actor {
     /// Forgets every whole-piece read in flight, giving their reservations
     /// back; their results are then ignored.
     pub(super) fn drop_piece_reads(&mut self) {
-        for (_, r) in self.piece_reads.drain() {
-            self.cache.release_clean(r.reserved);
-        }
+        self.piece_reads.clear();
     }
 }
 
