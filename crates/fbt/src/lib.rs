@@ -148,10 +148,10 @@
 //! [`Settings::enable_upnp`] and [`Settings::enable_natpmp`] (also on by
 //! default) ask the router to map the listen ports, with UPnP, PCP or
 //! NAT-PMP, and renew the mappings. On the LAN this puts UPnP's SSDP
-//! `M-SEARCH` datagrams on the multicast group 239.255.255.250:1900 (at most
-//! three per discovery round), then HTTP and SOAP requests to the router
-//! that answered, and NAT-PMP and PCP datagrams to the default gateway
-//! only. Results arrive as
+//! `M-SEARCH` datagrams on the multicast group 239.255.255.250:1900 (two
+//! search targets, three rounds 500 ms apart, per discovery), then HTTP
+//! and SOAP requests to the router that answered, and NAT-PMP and PCP
+//! datagrams to the default gateway only. Results arrive as
 //! [`Event::PortMapped`], [`Event::PortMappingFailed`] and
 //! [`Event::ExternalIpChanged`] under [`EventMask::NAT`].
 //!
