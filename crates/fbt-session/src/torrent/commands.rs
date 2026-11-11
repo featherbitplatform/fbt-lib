@@ -190,6 +190,8 @@ impl Actor {
     /// short: data comes first.
     pub(super) async fn stop(&mut self, remove: Option<RemoveMode>) -> Result<(), SessionError> {
         let announce_deadline = Instant::now() + STOPPED_TIMEOUT;
+        // Only a write that fails from here on is this stop's error.
+        self.write_error = None;
         self.signal(|s| {
             s.exit = true;
             true
@@ -262,6 +264,10 @@ impl Actor {
             {
                 task.abort();
             }
+        }
+        if let Some(e) = self.write_error.take() {
+            // Verified pieces were lost (`FileError` was emitted).
+            return Err(SessionError::Storage(e));
         }
         match r {
             Ok(()) => Ok(()),

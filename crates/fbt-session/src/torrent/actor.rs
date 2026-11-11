@@ -25,6 +25,7 @@ use super::data::Job;
 use super::dht::{self, DhtAnnouncer, DhtParams};
 use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
+use super::serve::PieceRead;
 use super::swarm::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::choker::Choker;
@@ -36,7 +37,6 @@ use crate::session::{AddTorrent, Priority, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::cache::{FlushReason, PieceCache};
 use crate::storage::{Storage, error_path};
-use fbt_core::BlockRef;
 
 /// Capacity of the channel carrying every peer's events into the actor.
 const PEER_EVENT_QUEUE: usize = 1024;
@@ -199,10 +199,13 @@ pub(crate) struct Actor {
     pub(super) finish_pending: bool,
     /// The flush before `TorrentFinished` is running.
     pub(super) finish_flush: bool,
+    /// The first write error since the last `stop` began: `stop` reports
+    /// it, since its data was lost.
+    pub(super) write_error: Option<io::Error>,
     /// Whole-piece reads in flight for peers' requests, with the requests
     /// waiting on each.
     /// Keyed by piece, with the generation the read was started in.
-    pub(super) piece_reads: HashMap<u32, (u64, Vec<(PeerKey, BlockRef)>)>,
+    pub(super) piece_reads: HashMap<u32, PieceRead>,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -324,6 +327,7 @@ impl Actor {
             finish_pending: false,
             finish_flush: false,
             piece_reads: HashMap::new(),
+            write_error: None,
             #[cfg(test)]
             pex_live_builds: 0,
             #[cfg(test)]
@@ -390,6 +394,7 @@ impl Actor {
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
                     self.flush(FlushReason::Expired);
+                    self.release_stale_partials();
                     self.top_up_all(None);
                     self.metadata_tick();
                     self.pex_tick();
@@ -427,7 +432,17 @@ impl Actor {
             l.bufs.clear();
         }
         self.cache.release_partials();
-        self.piece_reads.clear();
+        self.drop_piece_reads();
+    }
+
+    /// Pieces that left the picker without their buffer (every request
+    /// came back unanswered) give their reservation back; on the status
+    /// tick, so `fill` stays cheap.
+    fn release_stale_partials(&mut self) {
+        let Some(picker) = self.loaded.as_ref().and_then(|l| l.picker.as_ref()) else {
+            return;
+        };
+        self.cache.retain_partials(|i| picker.is_in_progress(i));
     }
 
     pub(super) fn emit(&self, ev: Event) {
@@ -485,7 +500,11 @@ impl Actor {
                     .as_ref()
                     .and_then(|l| l.picker.as_ref())
                     .is_some_and(PiecePicker::is_finished)
+                    && self.cache.is_idle()
+                    && !self.finish_pending
+                    && !self.finish_flush
                 {
+                    // Complete on disk, not only in the cache.
                     TorrentState::Seeding
                 } else {
                     TorrentState::Downloading

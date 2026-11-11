@@ -536,9 +536,6 @@ impl Actor {
         let (Some(picker), Some(p)) = (l.picker.as_mut(), self.peers.get(&key)) else {
             return;
         };
-        // Pieces that left the picker without their buffer (their requests
-        // all came back) give their reservation back.
-        self.cache.retain_partials(|i| picker.is_in_progress(i));
         let cap = partial_cap(
             picker.num_in_progress(),
             self.cache.partial_room(u64::from(l.layout.piece_len())),

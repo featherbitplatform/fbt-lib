@@ -49,8 +49,10 @@ impl Actor {
             }
             return;
         }
-        if let Some((_, waiting)) = self.piece_reads.get_mut(&block.piece) {
-            waiting.push((key, block));
+        if let Some(read) = self.piece_reads.get_mut(&block.piece)
+            && read.waiting.len() < MAX_PIECE_READ_WAITERS
+        {
+            read.waiting.push((key, block));
             return;
         }
         let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
@@ -59,11 +61,23 @@ impl Actor {
         let storage = Arc::clone(storage);
         let generation = self.generation;
         let size = l.layout.piece_size(block.piece);
-        if size <= WHOLE_PIECE_READ_MAX && self.cache.can_hold_clean(u64::from(size)) {
+        // The whole piece is read when its bytes fit the budget now: they
+        // are reserved before the read, so the buffer counts from the start.
+        if size <= WHOLE_PIECE_READ_MAX
+            && self.piece_reads.len() < MAX_PIECE_READS
+            && !self.piece_reads.contains_key(&block.piece)
+            && self.cache.reserve_clean(u64::from(size))
+        {
             let offset = l.layout.piece_offset(block.piece);
             let piece = block.piece;
-            self.piece_reads
-                .insert(piece, (generation, vec![(key, block)]));
+            self.piece_reads.insert(
+                piece,
+                PieceRead {
+                    generation,
+                    reserved: u64::from(size),
+                    waiting: vec![(key, block)],
+                },
+            );
             self.shared.disk.spawn(&mut self.jobs, move || {
                 let mut buf = vec![0u8; size as usize];
                 let result = storage.read(offset, &mut buf).map(|()| buf);
@@ -97,30 +111,35 @@ impl Actor {
         result: io::Result<Vec<u8>>,
     ) {
         // Only the read the entry waits on answers it (the entry goes with
-        // every generation change).
+        // every generation change, its reservation given back).
         if self
             .piece_reads
             .get(&piece)
-            .is_none_or(|(g, _)| *g != generation)
+            .is_none_or(|r| r.generation != generation)
         {
             return;
         }
-        let (_, waiting) = self.piece_reads.remove(&piece).unwrap_or_default();
-        if generation != self.generation || !matches!(self.phase, Phase::Ready) {
+        let Some(read) = self.piece_reads.remove(&piece) else {
             return;
-        }
+        };
         let data: Arc<[u8]> = match result {
-            Ok(buf) => buf.into(),
+            Ok(buf) if buf.len() as u64 == read.reserved => buf.into(),
+            Ok(_) => {
+                self.cache.release_clean(read.reserved);
+                return;
+            }
             Err(e) => {
+                self.cache.release_clean(read.reserved);
                 self.fail(&e, "reading a block");
                 return;
             }
         };
-        self.cache.insert_clean(
-            piece,
-            Arc::clone(&data),
-            tokio::time::Instant::now().into_std(),
-        );
+        if generation != self.generation || !matches!(self.phase, Phase::Ready) {
+            self.cache.release_clean(read.reserved);
+            return;
+        }
+        self.cache.insert_reserved_clean(piece, Arc::clone(&data));
+        let waiting = read.waiting;
         for (key, block) in waiting {
             if let Some(bytes) = block_of(&data, block) {
                 self.deliver(key, block, bytes);
@@ -168,6 +187,31 @@ impl Actor {
 /// Pieces up to this size are read whole on a cache miss; larger ones only
 /// the requested block.
 const WHOLE_PIECE_READ_MAX: u32 = 4 * 1024 * 1024;
+/// Whole-piece reads one torrent runs at once; further misses read only
+/// their block.
+pub(super) const MAX_PIECE_READS: usize = 4;
+/// Requests waiting on one whole-piece read; further ones read their block.
+pub(super) const MAX_PIECE_READ_WAITERS: usize = 256;
+
+/// A whole-piece read in flight and the requests waiting on it.
+#[derive(Debug)]
+pub(super) struct PieceRead {
+    /// The generation it was started in.
+    pub generation: u64,
+    /// Clean bytes reserved for the piece before the read.
+    pub reserved: u64,
+    pub waiting: Vec<(PeerKey, BlockRef)>,
+}
+
+impl Actor {
+    /// Forgets every whole-piece read in flight, giving their reservations
+    /// back; their results are then ignored.
+    pub(super) fn drop_piece_reads(&mut self) {
+        for (_, r) in self.piece_reads.drain() {
+            self.cache.release_clean(r.reserved);
+        }
+    }
+}
 
 /// The bytes of `block` within its piece's `data`.
 fn block_of(data: &[u8], block: BlockRef) -> Option<Bytes> {

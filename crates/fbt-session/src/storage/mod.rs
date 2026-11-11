@@ -25,6 +25,19 @@ pub trait Storage: Send + Sync + std::fmt::Debug + 'static {
     fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
     /// Writes `data` at `offset`.
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()>;
+    /// Writes `bufs` back to back from `offset`, as one contiguous range
+    /// (the write-back cache's coalesced runs). The default writes each
+    /// slice at its running offset with [`write`](Self::write).
+    fn write_vectored(&self, offset: u64, bufs: &[&[u8]]) -> io::Result<()> {
+        let mut at = offset;
+        for b in bufs {
+            self.write(at, b)?;
+            at = at
+                .checked_add(b.len() as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+        }
+        Ok(())
+    }
     /// Flushes buffered data to the medium.
     fn flush(&self) -> io::Result<()>;
     /// Removes the torrent's data.

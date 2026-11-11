@@ -205,15 +205,20 @@ pub struct Settings {
     /// finishes, pauses, is removed, rechecks or the session shuts down.
     ///
     /// The one exception to the bound is a progress floor: each
-    /// downloading torrent may hold up to 4 partial buffers beyond it, so
-    /// it never stalls behind other torrents' cached data, but only while
-    /// the session's dirty bytes (writes in flight included) are within
-    /// `cache_size`. Above that no new partial buffer is created for any
-    /// torrent until a write lands, so a slow disk cannot grow memory
-    /// without bound.
+    /// downloading torrent may hold up to 4 pieces beyond it (counted from
+    /// the buffer until the piece is written, and written at once), so it
+    /// never stalls behind other torrents' cached data. Memory stays within
+    /// `cache_size + 4 * piece_length` per downloading torrent. The floor
+    /// grants a buffer only while the session's dirty bytes (writes in
+    /// flight included) are within `cache_size`: above that no new partial
+    /// buffer is created for any torrent until a write lands, so a slow
+    /// disk cannot grow memory without bound.
     ///
     /// 0 means write-through: every verified piece is written at once and
-    /// there is no read cache.
+    /// there is no read cache. A download then runs on the floor alone (4
+    /// pieces in progress per torrent, and none while a write is in
+    /// flight), so its speed is bounded by the disk's write latency; keep
+    /// it for testing or memory-starved hosts.
     pub cache_size: u64,
     /// How long a verified piece may stay unwritten (30 s). Non-zero.
     pub cache_expiry: Duration,

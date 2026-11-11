@@ -104,14 +104,7 @@ impl Actor {
                 block,
                 result,
             } => self.on_read(generation, key, block, result),
-            Job::Flushed(result) => {
-                if let Err(e) = result {
-                    // The pieces were written; a failing sync is logged, the
-                    // next write would surface a real storage problem.
-                    tracing::warn!(torrent = %self.name(), error = %e, "flush failed");
-                }
-                self.on_flushed();
-            }
+            Job::Flushed(result) => self.on_flushed(result),
             Job::Metadata { key, ban, result } => self.on_metadata_job(key, ban, result),
         }
     }
@@ -221,6 +214,7 @@ impl Actor {
             return;
         };
         // Verified: ours from now on, served from memory until written.
+        let on_floor = self.cache.holds_floor(piece);
         self.cache
             .insert_dirty(piece, data.into(), Instant::now().into_std());
         picker.piece_passed(piece);
@@ -252,6 +246,10 @@ impl Actor {
             // Finished, or paused while the hash ran: nothing more is coming
             // soon, so nothing waits in memory.
             self.flush(FlushReason::All);
+        } else if on_floor || self.cache.over_budget() {
+            // Running on the floor: written at once, so the floor comes
+            // back after one write rather than at `cache_expiry`.
+            self.flush(FlushReason::Floor);
         } else {
             self.flush(FlushReason::Pressure);
         }
@@ -272,17 +270,8 @@ impl Actor {
             let first = run.first;
             let count = u32::try_from(run.pieces.len()).unwrap_or(u32::MAX);
             self.shared.disk.spawn(&mut self.jobs, move || {
-                let result = match run.pieces.as_slice() {
-                    [(_, one)] => storage.write(offset, one),
-                    pieces => {
-                        let len = usize::try_from(run.len_bytes()).unwrap_or(0);
-                        let mut buf = Vec::with_capacity(len);
-                        for (_, d) in pieces {
-                            buf.extend_from_slice(d);
-                        }
-                        storage.write(offset, &buf)
-                    }
-                };
+                let bufs: Vec<&[u8]> = run.pieces.iter().map(|(_, d)| &d[..]).collect();
+                let result = storage.write_vectored(offset, &bufs);
                 Job::WroteRun {
                     generation,
                     first,
@@ -294,11 +283,16 @@ impl Actor {
     }
 
     fn on_wrote_run(&mut self, generation: u64, first: u32, count: u32, result: io::Result<()>) {
+        // Discarded pieces the write held are given back whatever happened.
+        self.cache.landed(first, count);
+        if generation != self.generation {
+            return;
+        }
         if let Err(e) = result {
-            if generation == self.generation {
-                // Drops every unwritten piece; the next resume rechecks.
-                self.fail(&e, "writing pieces");
-            }
+            self.cache.write_failed(first, count);
+            // Drops every unwritten piece; the next resume rechecks.
+            self.fail(&e, "writing pieces");
+            self.write_error.get_or_insert(e);
             return;
         }
         self.cache.written(first, count);
@@ -320,13 +314,18 @@ impl Actor {
                 .shared
                 .disk
                 .spawn(&mut self.jobs, move || Job::Flushed(storage.flush())),
-            None => self.on_flushed(),
+            None => self.on_flushed(Ok(())),
         }
     }
 
-    /// The flush after the last write: the torrent is finished.
-    fn on_flushed(&mut self) {
+    /// The flush after the last write returned: the torrent is complete on
+    /// disk, so it is seeding and finished. A failing flush stops it.
+    fn on_flushed(&mut self, result: io::Result<()>) {
         if !std::mem::take(&mut self.finish_flush) {
+            return;
+        }
+        if let Err(e) = result {
+            self.fail(&e, "flushing the finished torrent");
             return;
         }
         let finished = matches!(self.phase, Phase::Ready)
@@ -335,14 +334,15 @@ impl Actor {
                 .as_ref()
                 .and_then(|l| l.picker.as_ref())
                 .is_some_and(crate::picker::PiecePicker::is_finished);
+        // Seeding now (unless paused).
+        self.refresh_state();
         if !finished {
             return;
         }
         // Whoever reacts to the event reads the final counters and state.
         self.publish();
         self.emit(Event::TorrentFinished { torrent: self.ih });
-        // The announce reads `left` = 0: the state was refreshed when the
-        // last piece passed.
+        // After `refresh_state`, so the announce reads `left` = 0.
         self.signal(|s| !std::mem::replace(&mut s.completed, true));
     }
 

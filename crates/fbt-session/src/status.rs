@@ -17,9 +17,12 @@ pub enum TorrentState {
         /// Fraction of pieces checked.
         progress: f64,
     },
-    /// Some wanted pieces are missing.
+    /// Some wanted pieces are missing, or the last ones are verified but
+    /// not yet on disk (progress 100 %, still served from the cache).
     Downloading,
-    /// Every wanted piece is present.
+    /// Every wanted piece is verified and on disk: the final writes and the
+    /// storage flush completed (reached together with
+    /// [`Event::TorrentFinished`](crate::Event::TorrentFinished)).
     Seeding,
     /// Stopped by the user: no peers, no announces.
     Paused,

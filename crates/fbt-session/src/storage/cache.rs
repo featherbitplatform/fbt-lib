@@ -1,32 +1,36 @@
-//! The write-back cache: a session-wide byte budget ([`CacheBudget`]) and
-//! one [`PieceCache`] per torrent.
+//! The write-back cache: a session-wide byte budget ([`CacheBudget`], which
+//! also holds the session's clean read cache) and one [`PieceCache`] per
+//! torrent.
 //!
 //! Only verified pieces enter the cache. A piece that passed its hash check
 //! is held *dirty* (served to peers from memory, not yet on disk) and later
-//! written in contiguous runs ([`WriteRun`]); once written it stays as a
-//! *clean* read-cache entry until the budget needs the room. Pieces being
+//! written in contiguous runs ([`WriteRun`]); once written it becomes a
+//! *clean* read-cache entry until the budget needs the room. Clean entries
+//! of every torrent share one least-recently-used order, so whichever
+//! torrent needs room evicts the session's oldest entry. Pieces being
 //! downloaded hold a *partial* reservation for their buffer. The budget
 //! covers all three kinds together; the only bytes beyond it are each
-//! torrent's [`PROGRESS_FLOOR_PIECES`] floor (see
+//! downloading torrent's [`PROGRESS_FLOOR_PIECES`] floor (see
 //! [`Settings::cache_size`](crate::Settings::cache_size)).
 //!
 //! [`PieceCache`] is pure bookkeeping: it plans the writes and the torrent
 //! actor runs them through the disk pool.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Partial-piece buffers a downloading torrent may hold beyond the budget,
-/// so it keeps making progress while other torrents fill the cache; granted
-/// only while the session's dirty bytes (in-flight writes included) are
-/// within `cache_size`.
+/// so it keeps making progress while the cache is full; granted only while
+/// the session's dirty bytes (in-flight writes included) are within
+/// `cache_size`. A floor piece counts against its torrent's floor until it
+/// is written.
 pub(crate) const PROGRESS_FLOOR_PIECES: usize = 4;
 
 /// Longest coalesced write: a run stops growing at this many bytes (it
-/// always holds at least one piece), which bounds the buffer the write job
-/// copies the run into.
+/// always holds at least one piece), so one write never holds a disk thread
+/// for long.
 const MAX_RUN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// What a cached byte is.
@@ -36,7 +40,8 @@ pub(crate) enum CacheKind {
     Partial,
     /// A verified piece not yet on disk (being written included).
     Dirty,
-    /// A verified piece that is on disk too.
+    /// A verified piece that is on disk too, or a whole-piece read in
+    /// flight that will become one.
     Clean,
 }
 
@@ -47,7 +52,7 @@ pub(crate) enum CacheKind {
 pub struct CacheStats {
     /// Verified pieces not yet on disk, writes in flight included.
     pub dirty: u64,
-    /// Written pieces kept to serve peers.
+    /// Written pieces kept to serve peers (and whole-piece reads in flight).
     pub clean: u64,
     /// Buffers of pieces being downloaded.
     pub partial: u64,
@@ -55,9 +60,61 @@ pub struct CacheStats {
     pub limit: u64,
 }
 
-/// The session-wide byte budget of every torrent's cache. Lock-free: each
-/// counter is atomic and `total` (the sum of the three kinds) is what
-/// [`try_reserve`](Self::try_reserve) checks against the limit.
+/// A clean entry's key: the torrent's cache id and the piece.
+type CleanKey = (u64, u32);
+
+/// The session's clean entries, least recently used first.
+#[derive(Debug, Default)]
+struct CleanLru {
+    entries: HashMap<CleanKey, (Arc<[u8]>, u64)>,
+    /// Last use -> key.
+    order: BTreeMap<u64, CleanKey>,
+    by_torrent: HashMap<u64, HashSet<u32>>,
+    next_use: u64,
+}
+
+impl CleanLru {
+    fn tick(&mut self) -> u64 {
+        let t = self.next_use;
+        self.next_use = self.next_use.wrapping_add(1);
+        t
+    }
+
+    fn insert(&mut self, key: CleanKey, data: Arc<[u8]>) -> bool {
+        if self.entries.contains_key(&key) {
+            return false;
+        }
+        let used = self.tick();
+        self.order.insert(used, key);
+        self.by_torrent.entry(key.0).or_default().insert(key.1);
+        self.entries.insert(key, (data, used));
+        true
+    }
+
+    fn remove(&mut self, key: CleanKey) -> Option<Arc<[u8]>> {
+        let (data, used) = self.entries.remove(&key)?;
+        self.order.remove(&used);
+        if let Some(set) = self.by_torrent.get_mut(&key.0) {
+            set.remove(&key.1);
+            if set.is_empty() {
+                self.by_torrent.remove(&key.0);
+            }
+        }
+        Some(data)
+    }
+
+    fn pop_oldest(&mut self) -> Option<Arc<[u8]>> {
+        let (_, key) = self.order.first_key_value()?;
+        let key = *key;
+        self.remove(key)
+    }
+}
+
+/// The session-wide byte budget of every torrent's cache, and the session's
+/// clean read cache. The counters are atomic and `total` (the sum of the
+/// three kinds) is what [`try_reserve`](Self::try_reserve) checks against
+/// the limit. The clean entries sit behind one mutex, held only for map
+/// updates: never across I/O or another lock.
 #[derive(Debug)]
 pub(crate) struct CacheBudget {
     limit: u64,
@@ -67,6 +124,11 @@ pub(crate) struct CacheBudget {
     clean: AtomicU64,
     /// Dirty bytes whose write is in flight (part of `dirty`).
     writing: AtomicU64,
+    /// Bytes of the entries in `lru` (part of `clean`): what eviction can
+    /// free.
+    evictable: AtomicU64,
+    lru: Mutex<CleanLru>,
+    next_id: AtomicU64,
 }
 
 impl CacheBudget {
@@ -78,6 +140,9 @@ impl CacheBudget {
             dirty: AtomicU64::new(0),
             clean: AtomicU64::new(0),
             writing: AtomicU64::new(0),
+            evictable: AtomicU64::new(0),
+            lru: Mutex::new(CleanLru::default()),
+            next_id: AtomicU64::new(0),
         }
     }
 
@@ -89,27 +154,36 @@ impl CacheBudget {
         }
     }
 
+    fn lru(&self) -> MutexGuard<'_, CleanLru> {
+        self.lru.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(crate) fn limit(&self) -> u64 {
         self.limit
     }
 
-    /// Takes `n` bytes of `kind` if the total stays within the limit.
+    /// Takes `n` bytes of `kind` if the total stays within the limit,
+    /// evicting the session's least recently used clean entries for room;
+    /// none is evicted when even all of them would not make enough.
     pub(crate) fn try_reserve(&self, kind: CacheKind, n: u64) -> bool {
-        self.try_reserve_within(kind, n, self.limit)
-    }
-
-    /// Takes `n` bytes of `kind` if the total stays within `max`.
-    fn try_reserve_within(&self, kind: CacheKind, n: u64, max: u64) -> bool {
-        let ok = self
-            .total
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |t| {
-                t.checked_add(n).filter(|&new| new <= max)
-            })
-            .is_ok();
-        if ok {
-            self.counter(kind).fetch_add(n, Ordering::AcqRel);
+        loop {
+            let ok = self
+                .total
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |t| {
+                    t.checked_add(n).filter(|&new| new <= self.limit)
+                })
+                .is_ok();
+            if ok {
+                self.counter(kind).fetch_add(n, Ordering::AcqRel);
+                return true;
+            }
+            let fixed = self
+                .total()
+                .saturating_sub(self.evictable.load(Ordering::Acquire));
+            if self.limit.saturating_sub(fixed) < n || !self.evict_oldest() {
+                return false;
+            }
         }
-        ok
     }
 
     /// Takes `n` bytes of `kind` whatever the limit.
@@ -144,6 +218,14 @@ impl CacheBudget {
             .saturating_sub(self.writing.load(Ordering::Acquire))
     }
 
+    /// Bytes a new reservation could get now, evicting clean entries.
+    fn room(&self) -> u64 {
+        let fixed = self
+            .total()
+            .saturating_sub(self.evictable.load(Ordering::Acquire));
+        self.limit.saturating_sub(fixed)
+    }
+
     pub(crate) fn stats(&self) -> CacheStats {
         CacheStats {
             dirty: self.dirty(),
@@ -151,6 +233,74 @@ impl CacheBudget {
             partial: self.partial.load(Ordering::Acquire),
             limit: self.limit,
         }
+    }
+
+    // ----- clean entries --------------------------------------------------
+
+    /// Evicts the session's least recently used clean entry; false with
+    /// none.
+    fn evict_oldest(&self) -> bool {
+        let Some(data) = self.lru().pop_oldest() else {
+            return false;
+        };
+        self.forget_clean(data.len() as u64);
+        true
+    }
+
+    /// An entry of `n` bytes left the LRU.
+    fn forget_clean(&self, n: u64) {
+        sub(&self.evictable, n);
+        self.release(CacheKind::Clean, n);
+    }
+
+    fn clean_get(&self, key: CleanKey) -> Option<Arc<[u8]>> {
+        let mut lru = self.lru();
+        let used = lru.tick();
+        let (data, at) = lru.entries.get_mut(&key)?;
+        let old = std::mem::replace(at, used);
+        let data = Arc::clone(data);
+        lru.order.remove(&old);
+        lru.order.insert(used, key);
+        Some(data)
+    }
+
+    /// Adds an entry whose bytes are already reserved as `Clean`; a
+    /// duplicate gives them back.
+    fn clean_insert_reserved(&self, key: CleanKey, data: Arc<[u8]>) {
+        let n = data.len() as u64;
+        if self.lru().insert(key, data) {
+            self.evictable.fetch_add(n, Ordering::AcqRel);
+        } else {
+            self.release(CacheKind::Clean, n);
+        }
+        self.trim();
+    }
+
+    fn clean_remove(&self, key: CleanKey) {
+        let removed = self.lru().remove(key);
+        if let Some(data) = removed {
+            self.forget_clean(data.len() as u64);
+        }
+    }
+
+    /// Drops every clean entry of torrent `id`.
+    fn purge(&self, id: u64) {
+        let removed: Vec<Arc<[u8]>> = {
+            let mut lru = self.lru();
+            let pieces = lru.by_torrent.remove(&id).unwrap_or_default();
+            pieces
+                .into_iter()
+                .filter_map(|p| lru.remove((id, p)))
+                .collect()
+        };
+        for data in removed {
+            self.forget_clean(data.len() as u64);
+        }
+    }
+
+    /// Evicts clean entries while the total is above the limit.
+    fn trim(&self) {
+        while self.total() > self.limit && self.evict_oldest() {}
     }
 }
 
@@ -176,32 +326,22 @@ pub(crate) enum FlushReason {
     Pressure,
     /// Pieces dirty for longer than `cache_expiry`.
     Expired,
+    /// The torrent runs on its progress floor (or the budget is over):
+    /// every dirty piece, so the floor comes back after one write.
+    Floor,
 }
 
-/// Contiguous dirty pieces written by one `Storage::write`.
+/// Contiguous dirty pieces written by one `Storage::write_vectored`.
 #[derive(Debug)]
 pub(crate) struct WriteRun {
     pub first: u32,
     pub pieces: Vec<(u32, Arc<[u8]>)>,
 }
 
-impl WriteRun {
-    pub(crate) fn len_bytes(&self) -> u64 {
-        self.pieces.iter().map(|(_, d)| d.len() as u64).sum()
-    }
-}
-
 #[derive(Debug)]
 struct Dirty {
     data: Arc<[u8]>,
     since: Instant,
-}
-
-#[derive(Debug)]
-struct Clean {
-    data: Arc<[u8]>,
-    /// Key into `PieceCache::lru`.
-    used: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,45 +356,61 @@ struct Reservation {
 /// when the cache is dropped.
 #[derive(Debug)]
 pub(crate) struct PieceCache {
+    /// Key of this torrent's clean entries in the session LRU.
+    id: u64,
     budget: Arc<CacheBudget>,
     expiry: Duration,
     /// Verified, not yet handed to a write.
     dirty: BTreeMap<u32, Dirty>,
     /// Verified, its write in flight: still served from here.
     writing: BTreeMap<u32, Arc<[u8]>>,
-    clean: HashMap<u32, Clean>,
-    /// Clean pieces by last use, oldest first.
-    lru: BTreeMap<u64, u32>,
-    next_use: u64,
+    /// Bytes of discarded pieces whose write is still in flight: counted
+    /// as dirty until it lands, since the write job still holds them.
+    orphaned: HashMap<u32, u64>,
     partial: HashMap<u32, Reservation>,
+    /// Pieces granted from the floor: partial, dirty or being written.
+    floor: HashSet<u32>,
 }
 
 impl PieceCache {
     pub(crate) fn new(budget: Arc<CacheBudget>, expiry: Duration) -> Self {
+        let id = budget.next_id.fetch_add(1, Ordering::Relaxed);
         PieceCache {
+            id,
             budget,
             expiry,
             dirty: BTreeMap::new(),
             writing: BTreeMap::new(),
-            clean: HashMap::new(),
-            lru: BTreeMap::new(),
-            next_use: 0,
+            orphaned: HashMap::new(),
             partial: HashMap::new(),
+            floor: HashSet::new(),
         }
     }
 
     /// A verified piece: held dirty until written. Its partial reservation,
-    /// if any, becomes the dirty bytes; clean entries make room if the
-    /// budget is over.
+    /// if any, becomes the dirty bytes (a floor piece stays on the floor
+    /// until written); clean entries make room if the budget is over.
     pub(crate) fn insert_dirty(&mut self, piece: u32, data: Arc<[u8]>, now: Instant) {
-        self.release_partial(piece);
+        if let Some(r) = self.partial.remove(&piece) {
+            self.budget.release(CacheKind::Partial, r.bytes);
+        }
         if self.dirty.contains_key(&piece) || self.writing.contains_key(&piece) {
             return;
         }
-        self.remove_clean(piece);
+        self.budget.clean_remove((self.id, piece));
         self.budget.force(CacheKind::Dirty, data.len() as u64);
         self.dirty.insert(piece, Dirty { data, since: now });
-        self.trim_clean(self.budget.limit());
+        self.budget.trim();
+    }
+
+    /// `piece` was granted from the progress floor and is not written yet.
+    pub(crate) fn holds_floor(&self, piece: u32) -> bool {
+        self.floor.contains(&piece)
+    }
+
+    /// The session's cache is over its budget (floors in use).
+    pub(crate) fn over_budget(&self) -> bool {
+        self.budget.total() > self.budget.limit()
     }
 
     /// The piece's verified bytes, dirty or clean.
@@ -265,47 +421,56 @@ impl PieceCache {
         if let Some(d) = self.writing.get(&piece) {
             return Some(Arc::clone(d));
         }
-        let used = self.next_use;
-        let c = self.clean.get_mut(&piece)?;
-        self.lru.remove(&c.used);
-        c.used = used;
-        self.lru.insert(used, piece);
-        self.next_use = self.next_use.wrapping_add(1);
-        Some(Arc::clone(&c.data))
+        self.budget.clean_get((self.id, piece))
     }
 
-    /// Whether a piece read from disk would be kept: the budget has room
-    /// for `n` bytes, counting this torrent's clean entries as room.
-    pub(crate) fn can_hold_clean(&self, n: u64) -> bool {
-        let own: u64 = self.clean.values().map(|c| c.data.len() as u64).sum();
-        self.budget.limit() > 0
-            && self.budget.total().saturating_sub(own).saturating_add(n) <= self.budget.limit()
-    }
-
-    /// A piece read from disk, kept to serve peers: least recently used
-    /// clean entries of this torrent make room; nothing is kept if the
-    /// budget still has none.
+    /// A piece read from disk, kept to serve peers if the budget has room
+    /// (the session's least recently used clean entries make it).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the actor reserves before its reads (reserve_clean)"
+        )
+    )]
     pub(crate) fn insert_clean(&mut self, piece: u32, data: Arc<[u8]>, _now: Instant) {
         if self.dirty.contains_key(&piece)
             || self.writing.contains_key(&piece)
-            || self.clean.contains_key(&piece)
+            || !self.reserve_clean(data.len() as u64)
         {
             return;
         }
-        let n = data.len() as u64;
-        while !self.budget.try_reserve(CacheKind::Clean, n) {
-            if !self.evict_lru() {
-                return;
-            }
+        self.budget.clean_insert_reserved((self.id, piece), data);
+    }
+
+    /// Reserves `n` clean bytes for a whole-piece read; nothing with a
+    /// zero `cache_size`.
+    pub(crate) fn reserve_clean(&self, n: u64) -> bool {
+        self.budget.limit() > 0 && self.budget.try_reserve(CacheKind::Clean, n)
+    }
+
+    /// Gives back a [`reserve_clean`](Self::reserve_clean) reservation.
+    pub(crate) fn release_clean(&self, n: u64) {
+        self.budget.release(CacheKind::Clean, n);
+    }
+
+    /// Keeps a piece read under a [`reserve_clean`](Self::reserve_clean)
+    /// reservation of exactly its size.
+    pub(crate) fn insert_reserved_clean(&mut self, piece: u32, data: Arc<[u8]>) {
+        if self.dirty.contains_key(&piece) || self.writing.contains_key(&piece) {
+            self.release_clean(data.len() as u64);
+            return;
         }
-        self.push_clean(piece, data);
+        self.budget.clean_insert_reserved((self.id, piece), data);
     }
 
     /// Hands dirty pieces to writes, in contiguous runs, oldest run first.
     /// They stay readable until [`written`](Self::written).
     pub(crate) fn take_flush(&mut self, reason: FlushReason, now: Instant) -> Vec<WriteRun> {
         let pieces: Vec<u32> = match reason {
-            FlushReason::All | FlushReason::Pressure => self.dirty.keys().copied().collect(),
+            FlushReason::All | FlushReason::Pressure | FlushReason::Floor => {
+                self.dirty.keys().copied().collect()
+            }
             FlushReason::Expired => self
                 .dirty
                 .iter()
@@ -317,9 +482,9 @@ impl PieceCache {
         if reason == FlushReason::Pressure && self.budget.pending_dirty() <= limit / 2 {
             return Vec::new();
         }
-        let mut runs = self.runs_of(&pieces);
+        let runs = self.runs_of(&pieces);
         let mut out = Vec::new();
-        for (first, members, _) in runs.drain(..) {
+        for (first, members, _) in runs {
             if reason == FlushReason::Pressure && self.budget.pending_dirty() <= limit / 4 {
                 break;
             }
@@ -370,36 +535,64 @@ impl PieceCache {
         runs
     }
 
-    /// The write of `count` pieces from `first` landed: they become clean
-    /// (and are trimmed if the budget is over). Pieces no longer tracked
-    /// (discarded meanwhile) are skipped.
+    /// A write of `count` pieces from `first` returned, whatever its
+    /// result or generation: discarded pieces it held are given back.
+    pub(crate) fn landed(&mut self, first: u32, count: u32) {
+        if self.orphaned.is_empty() {
+            return;
+        }
+        for i in (0..count).filter_map(|k| first.checked_add(k)) {
+            if let Some(n) = self.orphaned.remove(&i) {
+                sub(&self.budget.writing, n);
+                self.budget.release(CacheKind::Dirty, n);
+            }
+        }
+    }
+
+    /// The write of `count` pieces from `first` failed: its pieces are
+    /// dropped (the write job no longer holds them).
+    pub(crate) fn write_failed(&mut self, first: u32, count: u32) {
+        for i in (0..count).filter_map(|k| first.checked_add(k)) {
+            if let Some(data) = self.writing.remove(&i) {
+                self.floor.remove(&i);
+                let n = data.len() as u64;
+                sub(&self.budget.writing, n);
+                self.budget.release(CacheKind::Dirty, n);
+            }
+        }
+    }
+
+    /// The write of `count` pieces from `first` succeeded: they become
+    /// clean (trimmed if the budget is over) and leave the floor. Pieces no
+    /// longer tracked (discarded meanwhile) are skipped.
     pub(crate) fn written(&mut self, first: u32, count: u32) {
         for i in (0..count).filter_map(|k| first.checked_add(k)) {
             let Some(data) = self.writing.remove(&i) else {
                 continue;
             };
+            self.floor.remove(&i);
             let n = data.len() as u64;
             sub(&self.budget.writing, n);
             self.budget.convert(CacheKind::Dirty, CacheKind::Clean, n);
-            self.push_clean(i, data);
+            self.budget.clean_insert_reserved((self.id, i), data);
         }
-        self.trim_clean(self.budget.limit());
     }
 
-    /// Drops every piece and reservation without writing anything, giving
-    /// all of its bytes back to the budget. Writes in flight still land;
+    /// Drops every piece and reservation without writing anything. Writes
+    /// in flight still land: their bytes stay counted (the jobs hold them)
+    /// until [`landed`](Self::landed) reports them, and
     /// [`written`](Self::written) then ignores them.
     pub(crate) fn discard_all(&mut self) {
         for (_, d) in std::mem::take(&mut self.dirty) {
             self.budget.release(CacheKind::Dirty, d.data.len() as u64);
         }
-        for (_, d) in std::mem::take(&mut self.writing) {
+        for (i, d) in std::mem::take(&mut self.writing) {
             let n = d.len() as u64;
-            sub(&self.budget.writing, n);
-            self.budget.release(CacheKind::Dirty, n);
+            *self.orphaned.entry(i).or_default() += n;
         }
-        while self.evict_lru() {}
+        self.budget.purge(self.id);
         self.release_partials();
+        self.floor.clear();
     }
 
     /// Nothing dirty and no write in flight.
@@ -416,39 +609,27 @@ impl PieceCache {
     // ----- partial buffers ------------------------------------------------
 
     /// Reserves `n` bytes for the buffer of `piece`, about to be
-    /// downloaded: from the budget (this torrent's clean entries make room
-    /// first), else from the progress floor. The floor grants at most
-    /// [`PROGRESS_FLOOR_PIECES`] buffers, never more than that many pieces
-    /// beyond the budget, and only while the session's dirty bytes (writes
-    /// in flight included) are within the budget: a slow disk stops it.
+    /// downloaded: from the budget (the session's oldest clean entries make
+    /// room), else from this torrent's progress floor. The floor holds at
+    /// most [`PROGRESS_FLOOR_PIECES`] pieces until they are written, and
+    /// grants one only while the session's dirty bytes (writes in flight
+    /// included) are within the budget: a slow disk stops it.
     pub(crate) fn reserve_partial(&mut self, piece: u32, n: u64) -> bool {
         if self.partial.contains_key(&piece) {
             return true;
         }
-        loop {
-            if self.budget.try_reserve(CacheKind::Partial, n) {
-                self.partial.insert(
-                    piece,
-                    Reservation {
-                        bytes: n,
-                        floor: false,
-                    },
-                );
-                return true;
-            }
-            if !self.evict_lru() {
-                break;
-            }
+        if self.budget.try_reserve(CacheKind::Partial, n) {
+            self.partial.insert(
+                piece,
+                Reservation {
+                    bytes: n,
+                    floor: false,
+                },
+            );
+            return true;
         }
-        let floor_used = self.partial.values().filter(|r| r.floor).count();
-        let limit = self.budget.limit();
-        let floor_max = limit.saturating_add(n.saturating_mul(PROGRESS_FLOOR_PIECES as u64));
-        if floor_used < PROGRESS_FLOOR_PIECES
-            && self.budget.dirty() <= limit
-            && self
-                .budget
-                .try_reserve_within(CacheKind::Partial, n, floor_max)
-        {
+        if self.floor_open() {
+            self.budget.force(CacheKind::Partial, n);
             self.partial.insert(
                 piece,
                 Reservation {
@@ -456,15 +637,32 @@ impl PieceCache {
                     floor: true,
                 },
             );
+            self.floor.insert(piece);
             return true;
         }
         false
     }
 
-    /// The buffer of `piece` is gone (verified, failed or dropped).
+    /// Floor buffers this torrent may still be granted now.
+    fn floor_left(&self) -> usize {
+        if self.budget.dirty() <= self.budget.limit() {
+            PROGRESS_FLOOR_PIECES.saturating_sub(self.floor.len())
+        } else {
+            0
+        }
+    }
+
+    fn floor_open(&self) -> bool {
+        self.floor_left() > 0
+    }
+
+    /// The buffer of `piece` is gone (failed or dropped).
     pub(crate) fn release_partial(&mut self, piece: u32) {
         if let Some(r) = self.partial.remove(&piece) {
             self.budget.release(CacheKind::Partial, r.bytes);
+            if r.floor {
+                self.floor.remove(&piece);
+            }
         }
     }
 
@@ -482,68 +680,35 @@ impl PieceCache {
 
     /// Drops every partial reservation.
     pub(crate) fn release_partials(&mut self) {
-        for (_, r) in self.partial.drain() {
+        for (piece, r) in self.partial.drain() {
             self.budget.release(CacheKind::Partial, r.bytes);
+            if r.floor {
+                self.floor.remove(&piece);
+            }
         }
     }
 
-    /// About how many more partial buffers of `n` bytes this torrent could
-    /// reserve now (budget room, its own clean entries and the floor).
+    /// How many more partial buffers of `n` bytes this torrent could
+    /// reserve now, by the rule of [`reserve_partial`](Self::reserve_partial):
+    /// budget room (clean entries count as room) plus what is left of the
+    /// floor.
     pub(crate) fn partial_room(&self, n: u64) -> usize {
-        let n = n.max(1);
-        let limit = self.budget.limit();
-        let own: u64 = self.clean.values().map(|c| c.data.len() as u64).sum();
-        let free = limit
-            .saturating_sub(self.budget.total())
-            .saturating_add(own);
-        let floor_used = self.partial.values().filter(|r| r.floor).count();
-        let floor = if self.budget.dirty() <= limit {
-            PROGRESS_FLOOR_PIECES.saturating_sub(floor_used)
-        } else {
-            0
-        };
-        usize::try_from(free / n)
+        let by_budget = self.budget.room() / n.max(1);
+        usize::try_from(by_budget)
             .unwrap_or(usize::MAX)
-            .saturating_add(floor)
-    }
-
-    // ----- clean entries --------------------------------------------------
-
-    fn push_clean(&mut self, piece: u32, data: Arc<[u8]>) {
-        let used = self.next_use;
-        self.next_use = self.next_use.wrapping_add(1);
-        self.lru.insert(used, piece);
-        self.clean.insert(piece, Clean { data, used });
-    }
-
-    fn remove_clean(&mut self, piece: u32) {
-        if let Some(c) = self.clean.remove(&piece) {
-            self.lru.remove(&c.used);
-            self.budget.release(CacheKind::Clean, c.data.len() as u64);
-        }
-    }
-
-    /// Evicts the least recently used clean entry; false with none.
-    fn evict_lru(&mut self) -> bool {
-        let Some((_, piece)) = self.lru.pop_first() else {
-            return false;
-        };
-        if let Some(c) = self.clean.remove(&piece) {
-            self.budget.release(CacheKind::Clean, c.data.len() as u64);
-        }
-        true
-    }
-
-    /// Evicts clean entries while the budget's total is above `max`.
-    fn trim_clean(&mut self, max: u64) {
-        while self.budget.total() > max && self.evict_lru() {}
+            .saturating_add(self.floor_left())
     }
 }
 
 impl Drop for PieceCache {
-    /// Whatever the torrent still holds goes back to the session's budget.
+    /// Whatever the torrent still holds goes back to the session's budget,
+    /// writes in flight included: nobody will report them any more.
     fn drop(&mut self) {
         self.discard_all();
+        for (_, n) in self.orphaned.drain() {
+            sub(&self.budget.writing, n);
+            self.budget.release(CacheKind::Dirty, n);
+        }
     }
 }
 
@@ -563,10 +728,21 @@ mod tests {
         (budget, c)
     }
 
+    fn other(budget: &Arc<CacheBudget>) -> PieceCache {
+        PieceCache::new(Arc::clone(budget), Duration::from_secs(30))
+    }
+
     fn shape(runs: &[WriteRun]) -> Vec<Vec<u32>> {
         runs.iter()
             .map(|r| r.pieces.iter().map(|(i, _)| *i).collect())
             .collect()
+    }
+
+    fn empty(limit: u64) -> CacheStats {
+        CacheStats {
+            limit,
+            ..CacheStats::default()
+        }
     }
 
     #[test]
@@ -623,7 +799,7 @@ mod tests {
             c.insert_clean(i, piece(i), t0);
         }
         assert_eq!(budget.stats().clean, 3 * P);
-        // Piece 11 was used last: 10 is the oldest.
+        // Piece 11 was used last: 12 is the oldest.
         assert!(c.get(10).is_some());
         assert!(c.get(11).is_some());
         c.insert_dirty(1, piece(1), t0);
@@ -641,6 +817,35 @@ mod tests {
         assert_eq!(budget.stats().clean + budget.stats().dirty, 4 * P);
     }
 
+    /// One torrent's clean entries make room for another's downloads,
+    /// oldest first across the session.
+    #[test]
+    fn clean_lru_is_session_wide() {
+        let (budget, mut seeding) = cache(4 * P);
+        let mut downloading = other(&budget);
+        let t0 = Instant::now();
+        for i in 0..4 {
+            seeding.insert_clean(i, piece(i), t0);
+        }
+        assert!(seeding.get(0).is_some());
+        assert_eq!(downloading.partial_room(P), 4 + PROGRESS_FLOOR_PIECES);
+        // Piece 1 is the session's oldest entry.
+        assert!(downloading.reserve_partial(100, P));
+        assert!(!downloading.holds_floor(100));
+        assert!(seeding.get(1).is_none());
+        assert!(seeding.get(0).is_some());
+        // A clean entry that cannot fit even after evicting everything
+        // evicts nothing.
+        let big: Arc<[u8]> = vec![0u8; (5 * P) as usize].into();
+        seeding.insert_clean(50, big, t0);
+        assert_eq!(budget.stats().clean, 3 * P);
+        // Dropping a torrent purges its entries.
+        drop(seeding);
+        assert_eq!(budget.stats().clean, 0);
+        downloading.release_partials();
+        assert_eq!(budget.stats(), empty(4 * P));
+    }
+
     #[test]
     fn zero_size_is_write_through() {
         let (budget, mut c) = cache(0);
@@ -655,10 +860,11 @@ mod tests {
         assert!(c.get(3).is_none());
         c.insert_clean(4, piece(4), t0);
         assert!(c.get(4).is_none());
-        assert!(!c.can_hold_clean(P));
+        assert!(!c.reserve_clean(P));
         assert_eq!(budget.stats(), CacheStats::default());
         // Downloads still progress on the floor.
         assert!(c.reserve_partial(5, P));
+        assert!(c.holds_floor(5));
         assert_eq!(budget.stats().partial, P);
     }
 
@@ -678,10 +884,12 @@ mod tests {
                 limit: 4 * P,
             }
         );
-        // One piece of room left.
+        // One piece of room left, or two by evicting the clean entry.
         assert!(budget.try_reserve(CacheKind::Partial, P));
+        assert!(budget.try_reserve(CacheKind::Partial, P));
+        assert!(c.get(3).is_none());
         assert!(!budget.try_reserve(CacheKind::Partial, 1));
-        budget.release(CacheKind::Partial, P);
+        budget.release(CacheKind::Partial, 2 * P);
         // The partial buffer becomes the dirty piece.
         c.insert_dirty(1, piece(1), t0);
         assert_eq!(budget.stats().partial, 0);
@@ -690,22 +898,50 @@ mod tests {
         assert_eq!(shape(&runs), [vec![1, 2]]);
         c.written(1, 2);
         assert_eq!(budget.stats().dirty, 0);
+        assert_eq!(budget.stats().clean, 2 * P);
+        // A whole-piece read reserves first, then keeps its piece.
+        assert!(c.reserve_clean(P));
+        c.insert_reserved_clean(7, piece(7));
         assert_eq!(budget.stats().clean, 3 * P);
         // Everything goes back, by discard or by drop.
         assert!(c.reserve_partial(9, P));
         c.discard_all();
-        assert_eq!(budget.stats().dirty + budget.stats().clean, 0);
-        assert_eq!(budget.stats().partial, 0);
+        assert_eq!(budget.stats(), empty(4 * P));
         assert!(c.reserve_partial(9, P));
         c.insert_dirty(8, piece(8), t0);
+        let _ = c.take_flush(FlushReason::All, t0);
         drop(c);
-        assert_eq!(
-            budget.stats(),
-            CacheStats {
-                limit: 4 * P,
-                ..CacheStats::default()
-            }
-        );
+        assert_eq!(budget.stats(), empty(4 * P));
+    }
+
+    /// A discarded piece whose write is in flight stays counted until the
+    /// write returns.
+    #[test]
+    fn discarded_writes_count_until_they_land() {
+        let (budget, mut c) = cache(4 * P);
+        let t0 = Instant::now();
+        c.insert_dirty(1, piece(1), t0);
+        c.insert_dirty(2, piece(2), t0);
+        let runs = c.take_flush(FlushReason::All, t0);
+        assert_eq!(shape(&runs), [vec![1, 2]]);
+        c.insert_dirty(5, piece(5), t0);
+        c.discard_all();
+        assert!(c.get(1).is_none() && c.get(5).is_none());
+        assert!(c.is_idle());
+        assert_eq!(budget.stats().dirty, 2 * P);
+        // A stale success is not a written piece.
+        c.landed(1, 2);
+        c.written(1, 2);
+        assert_eq!(budget.stats(), empty(4 * P));
+        assert!(c.get(1).is_none());
+        // A failed write's pieces go at once, before the discard that
+        // follows the failure.
+        c.insert_dirty(3, piece(3), t0);
+        let _ = c.take_flush(FlushReason::All, t0);
+        c.landed(3, 1);
+        c.write_failed(3, 1);
+        c.discard_all();
+        assert_eq!(budget.stats(), empty(4 * P));
     }
 
     #[test]
@@ -726,20 +962,36 @@ mod tests {
         assert!(c.reserve_partial(10, P));
         assert!(c.has_partial(10));
 
-        // The floor: four buffers beyond a full budget, no more.
+        // The floor: four pieces per torrent beyond a full budget, counted
+        // until written.
         let (budget, mut c) = cache(2 * P);
-        let mut other = PieceCache::new(Arc::clone(&budget), Duration::from_secs(30));
+        let mut other = other(&budget);
         assert!(other.reserve_partial(0, P) && other.reserve_partial(1, P));
+        assert_eq!(c.partial_room(P), PROGRESS_FLOOR_PIECES);
         for i in 0..4 {
             assert!(c.reserve_partial(i, P), "floor buffer {i}");
+            assert!(c.holds_floor(i));
         }
         assert!(!c.reserve_partial(4, P));
-        let s = budget.stats();
-        assert_eq!(s.partial, 2 * P + 4 * P);
-        c.release_partial(0);
+        assert_eq!(c.partial_room(P), 0);
+        assert_eq!(budget.stats().partial, 6 * P);
+        assert!(c.over_budget());
+        // A verified floor piece still holds its floor slot.
+        c.insert_dirty(0, piece(0), t0);
+        assert!(c.holds_floor(0));
+        assert!(!c.reserve_partial(4, P));
+        let runs = c.take_flush(FlushReason::Floor, t0);
+        assert_eq!(shape(&runs), [vec![0]]);
+        assert!(!c.reserve_partial(4, P));
+        c.written(0, 1);
+        assert!(!c.holds_floor(0));
         assert!(c.reserve_partial(4, P));
+        // A dropped floor buffer frees its slot too.
+        c.release_partial(1);
+        assert!(c.reserve_partial(5, P));
         c.retain_partials(|_| false);
         other.release_partials();
-        assert_eq!(budget.stats().partial, 0);
+        drop(c);
+        assert_eq!(budget.stats(), empty(2 * P));
     }
 }

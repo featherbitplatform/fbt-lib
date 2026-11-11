@@ -40,21 +40,34 @@ fn hold_settings() -> Settings {
     s
 }
 
-/// Memory storage that logs every completed `write`, can delay writes and
-/// fail the first one, and checks every write against the payload.
+/// What a [`RecordingStorage`] saw, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    /// A completed write: (offset, len).
+    Write(u64, usize),
+    DeleteFiles,
+}
+
+/// Memory storage that logs every completed write and `delete_files`, can
+/// delay writes and fail the next one, and checks every write against the
+/// payload. A coalesced run is one `write_vectored` call, logged as one
+/// write.
 #[derive(Debug)]
 struct RecordingStorage {
     inner: MemStorage,
     expected: Vec<u8>,
-    /// (offset, len) of every completed write.
-    writes: Mutex<Vec<(u64, usize)>>,
+    ops: Mutex<Vec<Op>>,
     /// Writes whose bytes differ from the payload.
     mismatches: AtomicUsize,
     delay: Duration,
     /// Writes still to be delayed by `delay`.
     slow_writes: AtomicUsize,
     fail_next: AtomicBool,
+    /// Writes begun (before their delay).
+    started: AtomicUsize,
     written_bytes: AtomicU64,
+    /// `write_vectored` calls.
+    vectored_calls: AtomicUsize,
 }
 
 impl RecordingStorage {
@@ -62,12 +75,14 @@ impl RecordingStorage {
         RecordingStorage {
             inner: MemStorage::new(expected.len() as u64),
             expected,
-            writes: Mutex::new(Vec::new()),
+            ops: Mutex::new(Vec::new()),
             mismatches: AtomicUsize::new(0),
             delay: Duration::ZERO,
             slow_writes: AtomicUsize::new(0),
             fail_next: AtomicBool::new(false),
+            started: AtomicUsize::new(0),
             written_bytes: AtomicU64::new(0),
+            vectored_calls: AtomicUsize::new(0),
         }
     }
 
@@ -84,8 +99,18 @@ impl RecordingStorage {
         s
     }
 
+    fn ops(&self) -> Vec<Op> {
+        self.ops.lock().unwrap().clone()
+    }
+
     fn writes(&self) -> Vec<(u64, usize)> {
-        self.writes.lock().unwrap().clone()
+        self.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Write(o, l) => Some((o, l)),
+                Op::DeleteFiles => None,
+            })
+            .collect()
     }
 
     /// Whether piece `i` (of `piece_len`) reads back as the payload.
@@ -95,13 +120,9 @@ impl RecordingStorage {
         let mut buf = vec![0u8; end - start];
         self.inner.read(start as u64, &mut buf).is_ok() && buf == self.expected[start..end]
     }
-}
 
-impl Storage for RecordingStorage {
-    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.inner.read(offset, buf)
-    }
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+    fn record_write(&self, offset: u64, bufs: &[&[u8]]) -> io::Result<()> {
+        self.started.fetch_add(1, Ordering::SeqCst);
         let slow = self
             .slow_writes
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -112,20 +133,38 @@ impl Storage for RecordingStorage {
         if self.fail_next.swap(false, Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"));
         }
-        let start = offset as usize;
-        if self.expected.get(start..start + data.len()) != Some(data) {
-            self.mismatches.fetch_add(1, Ordering::SeqCst);
+        let mut at = offset;
+        for data in bufs {
+            let start = at as usize;
+            if self.expected.get(start..start + data.len()) != Some(*data) {
+                self.mismatches.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.write(at, data)?;
+            at += data.len() as u64;
         }
-        self.inner.write(offset, data)?;
-        self.written_bytes
-            .fetch_add(data.len() as u64, Ordering::SeqCst);
-        self.writes.lock().unwrap().push((offset, data.len()));
+        let len = (at - offset) as usize;
+        self.written_bytes.fetch_add(len as u64, Ordering::SeqCst);
+        self.ops.lock().unwrap().push(Op::Write(offset, len));
         Ok(())
+    }
+}
+
+impl Storage for RecordingStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.record_write(offset, &[data])
+    }
+    fn write_vectored(&self, offset: u64, bufs: &[&[u8]]) -> io::Result<()> {
+        self.vectored_calls.fetch_add(1, Ordering::SeqCst);
+        self.record_write(offset, bufs)
     }
     fn flush(&self) -> io::Result<()> {
         Ok(())
     }
     fn delete_files(&self) -> io::Result<()> {
+        self.ops.lock().unwrap().push(Op::DeleteFiles);
         self.inner.delete_files()
     }
 }
@@ -184,10 +223,7 @@ async fn cached_piece_is_served_before_it_is_written() {
     let piece_len = 65_536usize;
     let (m, payload) = make_torrent(&[("a", 4 * piece_len)], piece_len as u32);
     let seed = partial_seeder(&m, &payload, piece_len, 2).await;
-    let a_storage = Arc::new(RecordingStorage::delayed(
-        payload.clone(),
-        Duration::from_secs(2),
-    ));
+    let a_storage = Arc::new(RecordingStorage::new(payload.clone()));
     let (a, ah) = session_with(
         hold_settings(),
         &m,
@@ -243,11 +279,9 @@ async fn writes_are_coalesced() {
         .await
         .expect("TorrentFinished");
     let writes = storage.writes();
-    assert!(
-        writes.len() < pieces,
-        "{} writes for {pieces} pieces",
-        writes.len()
-    );
+    let calls = storage.vectored_calls.load(Ordering::SeqCst);
+    assert_eq!(calls, writes.len(), "every run is one vectored write");
+    assert!(calls < pieces, "{calls} writes for {pieces} pieces");
     assert_eq!(
         storage.written_bytes.load(Ordering::SeqCst),
         payload.len() as u64
@@ -384,7 +418,9 @@ async fn flush_failure_stops_the_torrent() {
     };
     assert!(message.contains("disk full"), "{message}");
     assert!(wait_state(&lh, |s| *s == TorrentState::Error, T).await);
-    assert_eq!(l.cache_stats().dirty, 0);
+    // The dropped pieces leave the budget once the writes still in flight
+    // return.
+    assert!(wait_until(|| l.cache_stats().dirty == 0, T).await);
 
     lh.resume().await.unwrap();
     next_matching(
@@ -440,6 +476,8 @@ async fn memory_stays_within_budget() {
         tokio::select! {
             e = ev.recv() => {
                 if matches!(e, Some(Event::TorrentFinished { .. })) {
+                    // The slow phase was part of the download.
+                    assert_eq!(storage.slow_writes.load(Ordering::SeqCst), 0);
                     break true;
                 }
             }
@@ -456,7 +494,8 @@ async fn memory_stays_within_budget() {
         }
     };
     assert!(finished, "download did not finish");
-    assert!(peak > 0);
+    // The budget was actually filled while the disk lagged.
+    assert!(peak >= 4 * MIB, "peak {peak}");
     assert_eq!(storage.mismatches.load(Ordering::SeqCst), 0);
     assert_eq!(
         storage.written_bytes.load(Ordering::SeqCst),
@@ -530,4 +569,153 @@ async fn no_unverified_bytes_reach_storage() {
     assert!(!lh.pieces().await.unwrap().get(0));
     serve.abort();
     l.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_with_delete_waits_for_writes_in_flight() {
+    let piece_len = 65_536usize;
+    let (m, payload) = make_torrent(&[("a", 4 * piece_len)], piece_len as u32);
+    let seed = partial_seeder(&m, &payload, piece_len, 2).await;
+    let mut st = settings();
+    // Write-through, so a verified piece's write starts at once.
+    st.cache_size = 0;
+    let storage = Arc::new(RecordingStorage::delayed(
+        payload.clone(),
+        Duration::from_millis(500),
+    ));
+    let (l, lh) = session_with(st, &m, storage.clone(), false, TorrentState::Downloading).await;
+    lh.add_peer(seed.local_addr()).await.unwrap();
+    assert!(wait_until(|| storage.started.load(Ordering::SeqCst) > 0, T).await);
+    assert!(
+        storage.writes().is_empty(),
+        "the first write is still running"
+    );
+    lh.remove(RemoveMode::DeleteData).await.unwrap();
+    let ops = storage.ops();
+    let started = storage.started.load(Ordering::SeqCst);
+    assert_eq!(ops.last(), Some(&Op::DeleteFiles), "{ops:?}");
+    // Every write that started completed, before the delete.
+    assert_eq!(storage.writes().len(), started, "{ops:?}");
+    let stats = l.cache_stats();
+    assert_eq!((stats.dirty, stats.clean, stats.partial), (0, 0, 0));
+    l.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// `Seeding` means complete on disk: with slow writes the torrent stays
+/// `Downloading` at 100 % until the last write and the flush are done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeding_comes_after_the_last_write() {
+    let piece_len = 65_536usize;
+    let pieces = 8;
+    let (m, payload) = make_torrent(&[("a", pieces * piece_len)], piece_len as u32);
+    let seed_storage: Arc<dyn Storage> = Arc::new(MemStorage::from_bytes(payload.clone()));
+    let (seed, _sh) =
+        session_with(settings(), &m, seed_storage, false, TorrentState::Seeding).await;
+    let storage = Arc::new(RecordingStorage::delayed(
+        payload.clone(),
+        Duration::from_millis(300),
+    ));
+    let (l, lh) = session_with(
+        settings(),
+        &m,
+        storage.clone(),
+        false,
+        TorrentState::Downloading,
+    )
+    .await;
+    lh.add_peer(seed.local_addr()).await.unwrap();
+    let mut saw_complete_in_memory = false;
+    let end = tokio::time::Instant::now() + T;
+    loop {
+        let s = lh.status();
+        if s.state == TorrentState::Seeding {
+            break;
+        }
+        if s.state == TorrentState::Downloading && s.wanted_done == s.total_wanted {
+            saw_complete_in_memory = true;
+        }
+        assert!(tokio::time::Instant::now() < end, "never seeding");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        storage.written_bytes.load(Ordering::SeqCst),
+        payload.len() as u64
+    );
+    assert!((0..pieces as u32).all(|i| storage.holds_piece(i, piece_len)));
+    assert!(
+        saw_complete_in_memory,
+        "100 % while the writes ran is still Downloading"
+    );
+    l.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// One torrent's full read cache does not starve another torrent's
+/// download: the clean entries are one session-wide LRU, so the download
+/// evicts them, and floor pieces are written at once instead of at
+/// `cache_expiry`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeding_read_cache_does_not_starve_downloads() {
+    let piece_len = 256 * 1024usize;
+    let mut st = settings();
+    st.cache_size = 2 * MIB;
+    st.cache_expiry = Duration::from_secs(600);
+    let (mx, px) = make_torrent(&[("x", 4 * MIB as usize)], piece_len as u32);
+    let (my, py) = make_torrent(&[("y", 4 * MIB as usize)], piece_len as u32);
+    // Session S seeds X; a leecher fills S's read cache with X's pieces.
+    let x_storage: Arc<dyn Storage> = Arc::new(MemStorage::from_bytes(px.clone()));
+    let (s, _xh) = session_with(st, &mx, x_storage, false, TorrentState::Seeding).await;
+    let l1_storage: Arc<dyn Storage> = Arc::new(MemStorage::new(px.len() as u64));
+    let (l1, l1h) = session_with(
+        settings(),
+        &mx,
+        l1_storage,
+        false,
+        TorrentState::Downloading,
+    )
+    .await;
+    let mut l1_ev = l1.subscribe(EventMask::STATUS);
+    l1h.add_peer(s.local_addr()).await.unwrap();
+    next_matching(
+        &mut l1_ev,
+        |e| matches!(e, Event::TorrentFinished { .. }),
+        T,
+    )
+    .await
+    .expect("X downloaded");
+    let full = s.cache_stats();
+    assert!(full.clean >= 3 * MIB / 2, "read cache not full: {full:?}");
+
+    // Now S downloads Y from another seeder while X's entries fill its
+    // cache.
+    let y_seed_storage: Arc<dyn Storage> = Arc::new(MemStorage::from_bytes(py.clone()));
+    let (z, _zh) = session_with(
+        settings(),
+        &my,
+        y_seed_storage,
+        false,
+        TorrentState::Seeding,
+    )
+    .await;
+    let y_storage = Arc::new(RecordingStorage::new(py.clone()));
+    let mut p = AddTorrent::new(my.clone(), PathBuf::from("unused"));
+    p.storage = Some(y_storage.clone());
+    let yh = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&yh, |x| *x == TorrentState::Downloading, T).await);
+    let mut ev = s.subscribe(EventMask::STATUS);
+    let t0 = tokio::time::Instant::now();
+    yh.add_peer(z.local_addr()).await.unwrap();
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::TorrentFinished { torrent } if *torrent == my.info_hashes),
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("Y finished well before cache_expiry");
+    assert!(t0.elapsed() < Duration::from_secs(20));
+    assert!((0..16).all(|i| y_storage.holds_piece(i, piece_len)));
+    z.shutdown().await;
+    l1.shutdown().await;
+    s.shutdown().await;
 }
