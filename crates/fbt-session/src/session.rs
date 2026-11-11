@@ -10,6 +10,7 @@ use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_core::{InfoHashes, PeerId};
 use fbt_dht::{Dht, DhtConfig, DhtState, DhtStats};
 use fbt_metainfo::{Magnet, Metainfo};
+use fbt_net::PortMapper;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
 use fbt_tracker::TrackerClient;
 use fbt_utp::UtpSocket;
@@ -21,9 +22,12 @@ use tracing::warn;
 use crate::bandwidth::{Bandwidth, PeerClassLimits, RateLimit};
 use crate::disk::DiskPool;
 use crate::error::SessionError;
-use crate::event::{Event, EventMask, EventStream};
+use crate::event::{Event, EventMask, EventStream, ExternalIpSource};
 use crate::listener::ListenerState;
-use crate::net::{Endpoint, ListenError, LsdHub, bind_all, spawn_lsd_task, utp_for, utp_sockets};
+use crate::net::{
+    Endpoint, ExternalIp, ListenError, LsdHub, bind_all, spawn_lsd_task, spawn_nat_task,
+    start_port_mapping, utp_for, utp_sockets,
+};
 use crate::settings::Settings;
 use crate::status::TorrentStatus;
 use crate::storage::cache::{CacheBudget, CacheStats};
@@ -177,6 +181,10 @@ pub(crate) struct Shared {
     /// Local service discovery (BEP 14): the instance and its announce
     /// bookkeeping.
     pub lsd: LsdHub,
+    /// UPnP and PCP/NAT-PMP port mapping; `None` with both off.
+    pub portmap: Option<PortMapper>,
+    /// The external address as the router and peers report it.
+    pub external_ip: Arc<ExternalIp>,
 }
 
 /// BEP 55 holepunch messages handled, over every torrent of the session.
@@ -398,6 +406,8 @@ impl Session {
         let bandwidth = Arc::new(Bandwidth::new(&settings));
         bandwidth.spawn_rebalance();
         let (lsd, lsd_found) = LsdHub::start(&settings);
+        let (portmap, map_events) = start_port_mapping(&settings, &local_addrs).unzip();
+        let external_ip = Arc::new(ExternalIp::new(events.clone()));
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -417,9 +427,12 @@ impl Session {
             bandwidth,
             holepunch: HolepunchCounters::default(),
             lsd,
+            portmap,
+            external_ip,
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
+            watch_dht_external_ip(dht, Arc::downgrade(&shared));
         }
         let inner = Arc::new(SessionInner {
             shared: Arc::clone(&shared),
@@ -456,6 +469,9 @@ impl Session {
         if let Some(found) = lsd_found {
             tasks.push(spawn_lsd_task(found, Arc::downgrade(&inner)));
         }
+        if let Some(rx) = map_events {
+            tasks.push(spawn_nat_task(rx, Arc::downgrade(&shared)));
+        }
         *inner.listeners.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
         Ok(Session { inner })
     }
@@ -477,6 +493,19 @@ impl Session {
     /// The session's DHT node, `None` with [`Settings::dht_enabled`] off.
     pub fn dht_stats(&self) -> Option<DhtStats> {
         self.inner.shared.dht.as_ref().map(Dht::stats)
+    }
+
+    /// The best estimate of our external address: what the router reported
+    /// through port mapping, else what the DHT nodes' votes agree on, else
+    /// what three or more peers' `yourip` agree on. `None` until one of
+    /// them knows. [`Event::ExternalIpChanged`] reports each source's news.
+    pub fn external_ip(&self) -> Option<std::net::IpAddr> {
+        let shared = &self.inner.shared;
+        shared
+            .external_ip
+            .mapped()
+            .or_else(|| shared.dht.as_ref().and_then(|d| d.stats().external_ip))
+            .or_else(|| shared.external_ip.peers_estimate())
     }
 
     /// The DHT's state (node ids and known nodes) for
@@ -668,6 +697,10 @@ impl Session {
             let _ = rx.await;
         }
         self.inner.shared.lsd.shutdown().await;
+        // Bounded (2 s in all): an unreachable router never holds us up.
+        if let Some(pm) = &self.inner.shared.portmap {
+            pm.shutdown().await;
+        }
         if let Some(dht) = &self.inner.shared.dht {
             dht.shutdown().await;
         }
@@ -775,6 +808,30 @@ fn watch_bootstrap(dht: &Dht, shared: std::sync::Weak<Shared>) {
     });
 }
 
+/// Emits [`Event::ExternalIpChanged`] with [`ExternalIpSource::Dht`] each
+/// time the DHT's votes settle on a new address; ends with the DHT or the
+/// session.
+fn watch_dht_external_ip(dht: &Dht, shared: std::sync::Weak<Shared>) {
+    let mut stats = dht.subscribe_stats();
+    tokio::spawn(async move {
+        let mut last = None;
+        while stats.changed().await.is_ok() {
+            let ip = stats.borrow_and_update().external_ip;
+            if ip.is_none() || ip == last {
+                continue;
+            }
+            last = ip;
+            let (Some(shared), Some(ip)) = (shared.upgrade(), ip) else {
+                return;
+            };
+            shared.emit(Event::ExternalIpChanged {
+                ip,
+                source: ExternalIpSource::Dht,
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +857,8 @@ mod tests {
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
             holepunch: HolepunchCounters::default(),
             lsd: LsdHub::disabled(),
+            portmap: None,
+            external_ip: Arc::new(ExternalIp::new(broadcast::channel(1).0)),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();

@@ -21,6 +21,8 @@ pub enum Mode {
 pub struct FakeGateway {
     pub port: u16,
     pub requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// When each request in `requests` arrived (tokio's clock).
+    pub times: Arc<Mutex<Vec<tokio::time::Instant>>>,
     task: JoinHandle<()>,
 }
 
@@ -49,11 +51,14 @@ impl FakeGateway {
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let log = requests.clone();
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let stamps = times.clone();
         let task = tokio::spawn(async move {
             let mut buf = [0u8; 1100];
             while let Ok((n, src)) = sock.recv_from(&mut buf).await {
                 let req = buf[..n].to_vec();
                 log.lock().unwrap().push(req.clone());
+                stamps.lock().unwrap().push(tokio::time::Instant::now());
                 if stale && req.first() == Some(&0) && matches!(req.get(1), Some(1 | 2)) {
                     let _ = sock.send_to(&[0, 129, 0, 1, 0, 0, 0, 5], src).await;
                 }
@@ -70,12 +75,20 @@ impl FakeGateway {
         FakeGateway {
             port,
             requests,
+            times,
             task,
         }
     }
 
     pub fn request_count(&self) -> usize {
         self.requests.lock().unwrap().len()
+    }
+
+    /// Every request with its arrival time.
+    pub fn timed_requests(&self) -> Vec<(tokio::time::Instant, Vec<u8>)> {
+        let times = self.times.lock().unwrap();
+        let reqs = self.requests.lock().unwrap();
+        times.iter().copied().zip(reqs.iter().cloned()).collect()
     }
 
     pub fn last_request(&self) -> Vec<u8> {

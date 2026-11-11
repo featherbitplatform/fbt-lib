@@ -160,6 +160,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 if hs.reqq.is_some() {
                     self.remote_reqq = hs.reqq;
                 }
+                if let Some(ip) = hs.your_ip {
+                    self.external_ip.peer_vote(self.remote_ip, ip);
+                }
                 let upload_only = hs.upload_only == Some(true);
                 self.emit(PeerEvent::ExtHandshake { key, hs }).await?;
                 // Every handshake states it (a repeat without the key

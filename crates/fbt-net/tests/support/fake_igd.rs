@@ -10,7 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 
-pub const EXTERNAL_IP: &str = "203.0.113.9";
+/// The same public address as the NAT-PMP fake reports.
+pub const EXTERNAL_IP: &str = "203.0.113.7";
 pub const SERVICE: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -34,12 +35,16 @@ pub struct Script {
     /// connection count. Callers check that `[::1]` is bindable first.
     pub foreign_location: bool,
     pub description: Description,
+    /// Every AddPortMapping fails with 501.
+    pub fail_add: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
     pub action: String,
     pub body: String,
+    /// When the call arrived (tokio's clock).
+    pub at: tokio::time::Instant,
 }
 
 impl Recorded {
@@ -57,6 +62,8 @@ pub struct FakeIgd {
     pub ssdp: SocketAddr,
     pub http: SocketAddr,
     pub actions: Arc<Mutex<Vec<Recorded>>>,
+    /// When each M-SEARCH arrived (tokio's clock).
+    pub searches: Arc<Mutex<Vec<tokio::time::Instant>>>,
     pub http_connections: Arc<AtomicUsize>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -89,10 +96,13 @@ impl FakeIgd {
             "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nLOCATION: http://{location_host}:{}/rootDesc.xml\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n",
             http.port()
         );
+        let searches = Arc::new(Mutex::new(Vec::new()));
+        let search_log = searches.clone();
         let ssdp_task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             while let Ok((n, from)) = udp.recv_from(&mut buf).await {
                 if buf.get(..n).is_some_and(|d| d.starts_with(b"M-SEARCH")) {
+                    search_log.lock().unwrap().push(tokio::time::Instant::now());
                     let _ = udp.send_to(reply.as_bytes(), from).await;
                 }
             }
@@ -109,6 +119,7 @@ impl FakeIgd {
             ssdp,
             http,
             actions,
+            searches,
             http_connections,
             tasks: vec![ssdp_task, http_task],
         }
@@ -206,11 +217,15 @@ async fn serve(mut stream: TcpStream, script: Script, actions: Arc<Mutex<Vec<Rec
         let rec = Recorded {
             action: action.clone(),
             body,
+            at: tokio::time::Instant::now(),
         };
         let ext: u16 = rec.arg("NewExternalPort").parse().unwrap_or(0);
         let lease: u32 = rec.arg("NewLeaseDuration").parse().unwrap_or(0);
         actions.lock().unwrap().push(rec);
         match action.as_str() {
+            "AddPortMapping" if script.fail_add => {
+                respond(&mut stream, "500 Internal Server Error", &fault(501)).await;
+            }
             "AddPortMapping" if script.conflict_ports.contains(&ext) => {
                 respond(&mut stream, "500 Internal Server Error", &fault(718)).await;
             }

@@ -40,6 +40,7 @@ use super::ext::ExtConfig;
 use super::messages::{DisconnectReason, PeerCommand, PeerEvent};
 use super::transport::{PeerTransport, Transport};
 use crate::bandwidth::{Bandwidth, BucketPair};
+use crate::net::ExternalIp;
 use crate::picker::PeerKey;
 use crate::settings::Settings;
 use state::Conn;
@@ -100,6 +101,8 @@ pub(crate) struct PeerCtx {
     pub bandwidth: Arc<Bandwidth>,
     /// The torrent's own rate limit buckets.
     pub torrent_rate: BucketPair,
+    /// The session's external address votes; the peer's `yourip` goes in.
+    pub external_ip: Arc<ExternalIp>,
 }
 
 /// A peer connection's stream: MSE (RC4 or plaintext after the MSE

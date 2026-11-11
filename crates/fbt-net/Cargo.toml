@@ -22,4 +22,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "time", "sync", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["net", "rt", "time", "sync", "rt-multi-thread", "macros", "test-util"] }

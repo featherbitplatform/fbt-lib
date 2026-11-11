@@ -3,20 +3,23 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use fbt_core::udp::DatagramSender;
+use fbt_dht::ExternalIpVotes;
 use fbt_net::demux::{PacketKind, SharedUdpSocket};
 use fbt_net::lsd::{LSD_HASHES_PER_MESSAGE, Lsd, LsdConfig, LsdPeer};
+use fbt_net::{MapEvent, MapProtocol, PortMapConfig, PortMapper};
 use fbt_utp::{UtpConfig, UtpSocket};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::error::SessionError;
+use crate::event::{Event, ExternalIpSource};
 use crate::settings::Settings;
 
 /// Tries per port-0 address to find a port free for both TCP and UDP.
@@ -376,6 +379,146 @@ pub(crate) fn spawn_lsd_task(
                     let shared = &inner.shared;
                     shared.lsd.flush(shared.listen_port, Instant::now());
                 }
+            }
+        }
+    })
+}
+
+/// Capacity of the channel the port mapper reports on.
+const MAP_EVENT_QUEUE: usize = 64;
+
+/// The session's external address as the router and peers report it (the
+/// DHT keeps its own votes).
+#[derive(Debug)]
+pub(crate) struct ExternalIp {
+    events: broadcast::Sender<Event>,
+    state: Mutex<ExternalState>,
+}
+
+#[derive(Debug, Default)]
+struct ExternalState {
+    /// The router's answer (UPnP, PCP or NAT-PMP).
+    mapped: Option<IpAddr>,
+    /// Peers' `yourip` (BEP 10), one vote per peer IP.
+    votes: ExternalIpVotes,
+}
+
+impl ExternalIp {
+    pub(crate) fn new(events: broadcast::Sender<Event>) -> Self {
+        ExternalIp {
+            events,
+            state: Mutex::new(ExternalState::default()),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ExternalState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What the router reported last.
+    pub(crate) fn mapped(&self) -> Option<IpAddr> {
+        self.state().mapped
+    }
+
+    /// What a majority of peers reported, once three agree.
+    pub(crate) fn peers_estimate(&self) -> Option<IpAddr> {
+        self.state().votes.current()
+    }
+
+    /// The router reported `ip`.
+    pub(crate) fn set_mapped(&self, ip: IpAddr) {
+        let changed = self.state().mapped.replace(ip) != Some(ip);
+        if changed {
+            self.emit(ip, ExternalIpSource::PortMapping);
+        }
+    }
+
+    /// The peer at `reporter` says we are `ip` (its `yourip`). Only a peer
+    /// of the same address family can see that address.
+    pub(crate) fn peer_vote(&self, reporter: IpAddr, ip: IpAddr) {
+        if reporter.to_canonical().is_ipv4() != ip.to_canonical().is_ipv4() {
+            return;
+        }
+        let new = self.state().votes.vote(reporter, ip);
+        if let Some(ip) = new {
+            self.emit(ip, ExternalIpSource::Peers);
+        }
+    }
+
+    fn emit(&self, ip: IpAddr, source: ExternalIpSource) {
+        let _ = self.events.send(Event::ExternalIpChanged { ip, source });
+    }
+}
+
+/// Starts port mapping as the settings say, for the IPv4 listen addresses
+/// in `local_addrs` (TCP and UDP share each port). Loopback addresses are
+/// mapped only when [`Settings::nat_gateway`] is a loopback address (the
+/// tests' fake gateway). `None` with UPnP and NAT-PMP both off.
+pub(crate) fn start_port_mapping(
+    settings: &Settings,
+    local_addrs: &[SocketAddr],
+) -> Option<(PortMapper, mpsc::Receiver<MapEvent>)> {
+    if !(settings.enable_upnp || settings.enable_natpmp) {
+        return None;
+    }
+    let mut cfg = PortMapConfig::default();
+    cfg.upnp = settings.enable_upnp;
+    cfg.natpmp = settings.enable_natpmp;
+    cfg.gateway = settings.nat_gateway;
+    cfg.ssdp = settings.upnp_ssdp_addr;
+    cfg.natpmp_port = settings.natpmp_port;
+    cfg.retry_base = settings.nat_retry_base;
+    cfg.retry_max = cfg.retry_max.max(cfg.retry_base);
+    let loopback_gateway = settings.nat_gateway.is_some_and(|g| g.is_loopback());
+    let (tx, rx) = mpsc::channel(MAP_EVENT_QUEUE);
+    let mapper = PortMapper::spawn(cfg, tx);
+    let mut ports = HashSet::new();
+    for a in local_addrs {
+        let IpAddr::V4(ip) = a.ip() else { continue };
+        if ip.is_loopback() && !loopback_gateway {
+            continue;
+        }
+        if ports.insert(a.port()) {
+            mapper.map(MapProtocol::Tcp, a.port());
+            mapper.map(MapProtocol::Udp, a.port());
+        }
+    }
+    Some((mapper, rx))
+}
+
+/// Turns the port mapper's reports into session events and external
+/// address updates. Ends with the mapper or the session.
+pub(crate) fn spawn_nat_task(
+    mut rx: mpsc::Receiver<MapEvent>,
+    shared: std::sync::Weak<crate::session::Shared>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            match ev {
+                MapEvent::Mapped {
+                    protocol,
+                    method,
+                    external,
+                    ..
+                } => shared.emit(Event::PortMapped {
+                    protocol,
+                    method,
+                    external,
+                }),
+                MapEvent::Failed {
+                    protocol,
+                    method,
+                    message,
+                } => shared.emit(Event::PortMappingFailed {
+                    protocol,
+                    method,
+                    message,
+                }),
+                MapEvent::ExternalIp { ip, .. } => shared.external_ip.set_mapped(IpAddr::V4(ip)),
+                _ => {}
             }
         }
     })

@@ -4,6 +4,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use fbt_net::lsd::{LSD_V4, LSD_V6};
+use fbt_net::natpmp::NATPMP_PORT;
+use fbt_net::upnp::SSDP_V4;
 use fbt_tracker::TrackerConfig;
 
 use crate::bandwidth::{MixedMode, PeerClassLimits, RateLimit};
@@ -255,6 +257,28 @@ pub struct Settings {
     /// stable API.
     #[doc(hidden)]
     pub lsd_bind: Option<SocketAddr>,
+    /// Map the listen port (TCP and UDP) on the router with UPnP IGD, and
+    /// renew the mapping while the session runs. Shutdown removes it.
+    pub enable_upnp: bool,
+    /// Map the listen port with PCP, falling back to NAT-PMP, likewise.
+    pub enable_natpmp: bool,
+    /// The PCP/NAT-PMP gateway; `None` finds the default IPv4 gateway (from
+    /// `/proc/net/route` on Linux, the `route` command elsewhere). Listen
+    /// addresses on loopback are mapped only when this is a loopback
+    /// address.
+    pub nat_gateway: Option<Ipv4Addr>,
+    /// Where UPnP's SSDP searches go. Internal tunable (tests point it at a
+    /// loopback fake); not part of the stable API.
+    #[doc(hidden)]
+    pub upnp_ssdp_addr: SocketAddr,
+    /// The gateway's PCP/NAT-PMP port. Internal tunable; not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub natpmp_port: u16,
+    /// First retry delay after a failed port mapping, doubling up to 30
+    /// minutes. Internal tunable; not part of the stable API. Non-zero.
+    #[doc(hidden)]
+    pub nat_retry_base: Duration,
     /// Emulates an endpoint-dependent NAT in front of the session, for
     /// tests: incoming TCP is refused, and a uTP SYN is accepted only from
     /// an address the session sent a uTP datagram to in the last 30 s.
@@ -333,6 +357,7 @@ impl Settings {
             ("utp_connect_timeout", self.utp_connect_timeout),
             ("cache_expiry", self.cache_expiry),
             ("snub_timeout", self.snub_timeout),
+            ("nat_retry_base", self.nat_retry_base),
         ];
         for (name, d) in non_zero {
             if d.is_zero() {
@@ -479,6 +504,12 @@ impl Default for Settings {
             lsd_groups: vec![LSD_V4, LSD_V6],
             lsd_announce_interval: Duration::from_secs(5 * 60),
             lsd_bind: None,
+            enable_upnp: true,
+            enable_natpmp: true,
+            nat_gateway: None,
+            upnp_ssdp_addr: SSDP_V4,
+            natpmp_port: NATPMP_PORT,
+            nat_retry_base: Duration::from_secs(60),
             nat_emulation: false,
             disk_threads: 8,
             max_active_checks: 1,

@@ -631,6 +631,7 @@ impl Actor {
             transport: Transport::Tcp,
             bandwidth: Arc::clone(&self.shared.bandwidth),
             torrent_rate: self.rate.clone(),
+            external_ip: Arc::clone(&self.shared.external_ip),
         }
     }
 
@@ -1370,6 +1371,8 @@ pub(super) mod tests {
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
             holepunch: Default::default(),
             lsd: crate::net::LsdHub::disabled(),
+            portmap: None,
+            external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
         });
         let add = AddTorrent::new(meta, PathBuf::from("unused"));
         let ih = add.source.info_hashes();

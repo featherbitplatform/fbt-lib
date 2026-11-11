@@ -63,6 +63,8 @@ pub(super) struct Conn<S> {
     pub(super) pending: Option<Pending>,
     pub(super) ext: ExtConfig,
     pub(super) remote_ip: IpAddr,
+    /// The session's external address votes (the remote's `yourip`).
+    pub(super) external_ip: Arc<crate::net::ExternalIp>,
     pub(super) remote_reserved: Reserved,
     /// The remote's ids for our extensions.
     pub(super) remote_ids: RemoteIds,
@@ -146,6 +148,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             pending: num_pieces.is_none().then(Pending::default),
             ext: ctx.ext,
             remote_ip,
+            external_ip: Arc::clone(&ctx.external_ip),
             remote_reserved: theirs.reserved,
             remote_ids: RemoteIds::default(),
             remote_upload_only: false,

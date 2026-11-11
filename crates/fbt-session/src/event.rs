@@ -1,11 +1,12 @@
 //! Session events and filtered subscriptions.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use fbt_core::InfoHashes;
+use fbt_net::{MapMethod, MapProtocol};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::sync::ReusableBoxFuture;
 
@@ -26,6 +27,18 @@ pub enum PeerSource {
     Magnet,
     /// Local service discovery (BEP 14).
     Lsd,
+}
+
+/// Where an external address estimate came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExternalIpSource {
+    /// The router, through UPnP, PCP or NAT-PMP.
+    PortMapping,
+    /// The DHT nodes' `ip` votes (BEP 42).
+    Dht,
+    /// Peers' `yourip` (BEP 10), once three of them agree.
+    Peers,
 }
 
 /// Something that happened in the session.
@@ -152,6 +165,37 @@ pub enum Event {
         /// The error.
         message: String,
     },
+    /// The router mapped a listen port (UPnP, PCP or NAT-PMP), or the
+    /// mapping's external address changed.
+    #[non_exhaustive]
+    PortMapped {
+        /// Transport protocol.
+        protocol: MapProtocol,
+        /// The method that made it.
+        method: MapMethod,
+        /// The public address and port (`0.0.0.0` when UPnP could not tell
+        /// the address).
+        external: SocketAddr,
+    },
+    /// Mapping or renewing a listen port failed; it is retried with a
+    /// backoff from 60 s up to 30 minutes.
+    PortMappingFailed {
+        /// Transport protocol.
+        protocol: MapProtocol,
+        /// The method that failed.
+        method: MapMethod,
+        /// Why.
+        message: String,
+    },
+    /// A source learned our external address, or a new one. See
+    /// [`Session::external_ip`](crate::Session::external_ip) for the best
+    /// estimate across sources.
+    ExternalIpChanged {
+        /// The address.
+        ip: IpAddr,
+        /// Who reported it.
+        source: ExternalIpSource,
+    },
     /// The subscriber fell behind and `missed` events were dropped.
     Lagged {
         /// Number of events dropped.
@@ -176,13 +220,16 @@ bitflags::bitflags! {
         const STORAGE = 1 << 4;
         /// The session's DHT node.
         const DHT = 1 << 5;
+        /// Port mapping and the external address.
+        const NAT = 1 << 6;
         /// Every category.
         const ALL = Self::STATUS.bits()
             | Self::PIECE.bits()
             | Self::TRACKER.bits()
             | Self::PEER.bits()
             | Self::STORAGE.bits()
-            | Self::DHT.bits();
+            | Self::DHT.bits()
+            | Self::NAT.bits();
     }
 }
 
@@ -202,6 +249,9 @@ impl Event {
             | Event::PeersFound { .. } => EventMask::PEER,
             Event::DhtBootstrapped { .. } => EventMask::DHT,
             Event::FileError { .. } => EventMask::STORAGE,
+            Event::PortMapped { .. }
+            | Event::PortMappingFailed { .. }
+            | Event::ExternalIpChanged { .. } => EventMask::NAT,
             Event::Lagged { .. } => EventMask::ALL,
         }
     }

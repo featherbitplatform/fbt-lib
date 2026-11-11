@@ -25,7 +25,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 /// Settings for tests: loopback listener on a free port, fast status
-/// updates, and no DHT and no LSD (so no test ever contacts a public DHT node; the DHT
+/// updates, and no DHT, LSD, UPnP or NAT-PMP (so no test ever contacts a public DHT node
+/// or a real router; the DHT
 /// tests bootstrap from a loopback node). Transports as by default: uTP
 /// first, TCP fallback.
 pub fn test_settings() -> Settings {
@@ -35,6 +36,8 @@ pub fn test_settings() -> Settings {
     s.dht_enabled = false;
     s.dht_bootstrap_nodes = Vec::new();
     s.enable_lsd = false;
+    s.enable_upnp = false;
+    s.enable_natpmp = false;
     s
 }
 

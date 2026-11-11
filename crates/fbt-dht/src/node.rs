@@ -140,6 +140,9 @@ pub struct DhtStats {
     pub bootstrapped: bool,
     /// The bound socket addresses.
     pub local_addrs: Vec<SocketAddr>,
+    /// Our external address as the nodes' `ip` votes (BEP 42) see it:
+    /// IPv4 first, `None` until a quorum agrees.
+    pub external_ip: Option<IpAddr>,
 }
 
 /// DHT failures.
@@ -291,6 +294,11 @@ impl ExternalIpVotes {
         }
         self.current = Some(leader);
         Some(leader)
+    }
+
+    /// The address the votes last settled on, `None` before any did.
+    pub fn current(&self) -> Option<IpAddr> {
+        self.current
     }
 
     /// The address with at least three (`EXTERNAL_IP_QUORUM`) votes and strictly
@@ -1352,6 +1360,7 @@ impl Actor {
             stored_info_hashes: self.store.torrents(),
             bootstrapped: self.tables().any(|t| t.len() >= K),
             local_addrs: self.local.clone(),
+            external_ip: self.ext_v4.current().or(self.ext_v6.current()),
         }
     }
 

@@ -435,6 +435,8 @@ mod tests {
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
             holepunch: Default::default(),
             lsd: crate::net::LsdHub::disabled(),
+            portmap: None,
+            external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
         });
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(LEN as u64));
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));

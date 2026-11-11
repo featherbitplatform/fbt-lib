@@ -57,6 +57,9 @@ impl NetArgs {
         settings.dht_enabled = !self.no_dht;
         // LSD multicasts on the LAN: off until the `--lsd` flag exists.
         settings.enable_lsd = false;
+        // UPnP and NAT-PMP talk to the real router: off until the `--nat` flag exists.
+        settings.enable_upnp = false;
+        settings.enable_natpmp = false;
         settings.pex_enabled = !self.no_pex;
         if let Some(e) = self.encryption {
             settings.encryption = match e {
@@ -309,6 +312,8 @@ async fn dht_node(
     let mut settings = Settings::default();
     settings.dht_enabled = true;
     settings.enable_lsd = false;
+    settings.enable_upnp = false;
+    settings.enable_natpmp = false;
     settings.dht_bootstrap_nodes = bootstrap;
     if let Some(port) = port {
         settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];

@@ -98,6 +98,9 @@ fn start_full(
         transport: crate::peer::transport::Transport::Tcp,
         bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
         torrent_rate: crate::bandwidth::BucketPair::new(Default::default()),
+        external_ip: Arc::new(crate::net::ExternalIp::new(
+            tokio::sync::broadcast::channel(1).0,
+        )),
     };
     tokio::spawn(run_peer(ours, None, addr(), ctx, crx));
     Harness {
@@ -1293,6 +1296,9 @@ fn direct(settings: Settings, down: u64, up: u64) -> Direct {
         transport: Transport::Tcp,
         bandwidth: Arc::clone(&bandwidth),
         torrent_rate: BucketPair::new(RateLimit::default()),
+        external_ip: Arc::new(crate::net::ExternalIp::new(
+            tokio::sync::broadcast::channel(1).0,
+        )),
     };
     let theirs = Handshake {
         reserved: reserved(true, false, false),

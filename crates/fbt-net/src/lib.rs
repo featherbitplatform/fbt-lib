@@ -1,4 +1,5 @@
-//! fbt-net: the shared UDP socket and, in later tasks, the LAN and NAT helpers.
+//! fbt-net: the shared UDP socket, local service discovery and port mapping
+//! (UPnP IGD, PCP and NAT-PMP).
 //!
 //! Everything here receives datagrams from untrusted hosts: no panics, no
 //! unbounded allocation.
@@ -15,8 +16,11 @@
 )]
 
 pub mod demux;
+pub mod gateway;
 pub mod lsd;
 pub mod natpmp;
+pub mod portmap;
 pub mod upnp;
 
 pub use natpmp::{MapMethod, MapProtocol};
+pub use portmap::{MapEvent, PortMapConfig, PortMapper};
