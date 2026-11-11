@@ -50,7 +50,10 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(p) = Packet::decode(&Bytes::copy_from_slice(dgram)) {
             c.on_packet(&p, now);
         }
+        // Before any read: unread inbox plus out-of-order data stay bounded.
+        assert!(c.buffered_bytes() <= cfg.recv_buffer);
         c.on_timer(now);
+        assert!(c.buffered_bytes() <= cfg.recv_buffer);
         let mut sent = 0;
         while c.poll_transmit(now).is_some() {
             sent += 1;
