@@ -69,3 +69,4 @@ The transfer timer polls the torrent state every 20 ms, so a very fast run
 | Date | Version | Host | TCP Mbit/s | TCP CPU % per 100 Mbit/s | uTP Mbit/s | uTP CPU % per 100 Mbit/s | Idle torrents | Idle CPU % | RSS per idle torrent | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
 | 2026-11-11 | 0.2.0 | Darwin arm64 | 4249 | 5.0 | 607 | 39.3 | 1000 | 1.18 | 18.3 KiB | seed and leech in one process |
+| 2026-11-11 | 0.3.0 | Darwin arm64 | 5238 | 4.9 | 603 | 39.9 | 1000 | 1.13 | 18.5 KiB | seed and leech in one process |
