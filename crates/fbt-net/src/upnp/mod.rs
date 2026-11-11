@@ -150,17 +150,26 @@ impl Igd {
 
     /// The router's external IPv4 address.
     pub async fn external_ip(&self) -> Result<Ipv4Addr, UpnpError> {
-        self.call(soap::get_external_ip(&self.service_type))
+        let text = self
+            .call(soap::get_external_ip(&self.service_type))
             .await?
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or(UpnpError::Http(HttpError::Malformed(
-                "no external ip address",
-            )))
+            .ok_or(UpnpError::NoService)?;
+        let ip: Ipv4Addr = text
+            .trim()
+            .parse()
+            .map_err(|_| HttpError::Malformed("bad external ip address"))?;
+        // A disconnected WAN reports 0.0.0.0.
+        if ip.is_unspecified() {
+            return Err(UpnpError::NoService);
+        }
+        Ok(ip)
     }
 }
 
 /// Find an IGD by sending SSDP searches to `ssdp` (normally [`SSDP_V4`]) and
-/// fetching the first description whose `LOCATION` names the responder.
+/// fetching the first description whose `LOCATION` names the responder. If
+/// every reply was rejected, the last rejection is returned instead of a
+/// timeout.
 pub async fn discover(ssdp: SocketAddr, timeout: Duration) -> Result<Igd, UpnpError> {
     discover_with(ssdp, timeout, HTTP_TIMEOUT).await
 }
@@ -185,6 +194,7 @@ async fn search(ssdp: SocketAddr, http_timeout: Duration) -> Result<Igd, UpnpErr
     };
     let sock = UdpSocket::bind(bind).await.map_err(HttpError::Io)?;
     let mut buf = vec![0u8; ssdp::MAX_DATAGRAM + 1];
+    let mut last_rejection = None;
     for _ in 0..SEARCH_ROUNDS {
         for st in SEARCH_TARGETS {
             if let Err(e) = sock.send_to(&ssdp::search_request(st), ssdp).await {
@@ -202,6 +212,7 @@ async fn search(ssdp: SocketAddr, http_timeout: Duration) -> Result<Igd, UpnpErr
                 Ok(loc) => loc,
                 Err(e) => {
                     tracing::debug!("ignoring ssdp reply from {from}: {e}");
+                    last_rejection = Some(e);
                     continue;
                 }
             };
@@ -211,7 +222,7 @@ async fn search(ssdp: SocketAddr, http_timeout: Duration) -> Result<Igd, UpnpErr
             return describe(&loc, http_timeout).await;
         }
     }
-    Err(UpnpError::Timeout)
+    Err(last_rejection.map_or(UpnpError::Timeout, UpnpError::Ssdp))
 }
 
 /// Fetch the description at `loc` and pick the WAN connection service.

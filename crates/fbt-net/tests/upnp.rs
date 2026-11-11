@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use fbt_net::MapProtocol;
-use fbt_net::upnp::{HttpError, UpnpError, discover, discover_with};
+use fbt_net::upnp::{HttpError, SsdpError, UpnpError, discover, discover_with};
 
 #[path = "support/fake_igd.rs"]
 mod fake_igd;
@@ -28,6 +28,9 @@ async fn discover_and_map_tcp_and_udp() {
     assert_eq!(adds[0].arg("NewInternalPort"), "6881");
     assert_eq!(adds[0].arg("NewInternalClient"), "127.0.0.1");
     assert_eq!(adds[0].arg("NewLeaseDuration"), "3600");
+    assert_eq!(adds[0].arg("NewRemoteHost"), "");
+    assert_eq!(adds[0].arg("NewEnabled"), "1");
+    assert_eq!(adds[0].arg("NewPortMappingDescription"), "fbt-lib");
 }
 
 #[tokio::test]
@@ -111,13 +114,21 @@ async fn oversized_or_slow_description_is_cut() {
 
 #[tokio::test]
 async fn foreign_location_is_ignored() {
+    if tokio::net::UdpSocket::bind("[::1]:0").await.is_err() {
+        return; // no IPv6 loopback on this host
+    }
+    // The reply comes from [::1] but names 127.0.0.1, where the fake counts
+    // connections: only the foreign-host check keeps us away from it.
     let igd = FakeIgd::start(Script {
         foreign_location: true,
         ..Script::default()
     })
     .await;
-    let r = discover(igd.ssdp, Duration::from_secs(2)).await;
-    assert!(matches!(r, Err(UpnpError::Timeout)), "{r:?}");
+    let r = discover_with(igd.ssdp, Duration::from_secs(2), Duration::from_millis(50)).await;
+    assert!(
+        matches!(r, Err(UpnpError::Ssdp(SsdpError::Foreign))),
+        "{r:?}"
+    );
     assert_eq!(
         igd.http_connections
             .load(std::sync::atomic::Ordering::SeqCst),

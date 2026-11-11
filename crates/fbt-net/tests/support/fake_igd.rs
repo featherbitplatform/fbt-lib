@@ -29,7 +29,9 @@ pub struct Script {
     pub conflict_ports: Vec<u16>,
     /// AddPortMapping with a non-zero lease fails with 725.
     pub permanent_only: bool,
-    /// SSDP replies carry a LOCATION naming another host.
+    /// SSDP is answered from `[::1]` while LOCATION names the fake's HTTP
+    /// listener on 127.0.0.1: a client that connects anyway is caught by the
+    /// connection count. Callers check that `[::1]` is bindable first.
     pub foreign_location: bool,
     pub description: Description,
 }
@@ -71,16 +73,18 @@ impl FakeIgd {
     pub async fn start(script: Script) -> FakeIgd {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http = listener.local_addr().unwrap();
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = UdpSocket::bind(if script.foreign_location {
+            "[::1]:0"
+        } else {
+            "127.0.0.1:0"
+        })
+        .await
+        .unwrap();
         let ssdp = udp.local_addr().unwrap();
         let actions = Arc::new(Mutex::new(Vec::new()));
         let http_connections = Arc::new(AtomicUsize::new(0));
 
-        let location_host = if script.foreign_location {
-            "10.9.9.9".to_owned()
-        } else {
-            http.ip().to_string()
-        };
+        let location_host = http.ip().to_string();
         let reply = format!(
             "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nLOCATION: http://{location_host}:{}/rootDesc.xml\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n",
             http.port()
