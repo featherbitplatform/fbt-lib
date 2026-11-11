@@ -18,6 +18,7 @@ mod check;
 mod commands;
 mod data;
 mod dht;
+mod holepunch;
 mod magnet;
 mod metadata;
 mod peers;

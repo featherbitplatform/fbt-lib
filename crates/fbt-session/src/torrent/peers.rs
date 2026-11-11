@@ -6,15 +6,19 @@ use std::net::SocketAddr;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
 use fbt_metainfo::Metainfo;
-use fbt_wire::{ExtHandshake, LT_DONTHAVE, MetadataMsg, UPLOAD_ONLY, UT_METADATA, UT_PEX};
+use fbt_wire::{
+    ExtHandshake, HolepunchMsg, LT_DONTHAVE, MetadataMsg, UPLOAD_ONLY, UT_METADATA, UT_PEX,
+};
 use tokio::time::Instant;
 use tracing::debug;
 
 use super::actor::Actor;
 use super::data::Job;
+use super::holepunch::{RelayAction, relay};
 use super::metadata::{FetchStep, MAX_METADATA_REQUESTS_PER_PEER, serve_metadata};
-use super::pex::PexPeer;
-use super::swarm::BanTarget;
+use super::pex::{PexPeer, connectable_addr};
+use super::swarm::dialable;
+use super::swarm::{BanTarget, ConnectOutcome};
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
@@ -93,6 +97,7 @@ impl Actor {
             PeerEvent::ExtHandshake { key, hs } => self.on_ext_handshake(key, hs),
             PeerEvent::Metadata { key, msg } => self.on_metadata_msg(key, msg),
             PeerEvent::Pex { key, msg } => self.on_pex(key, msg),
+            PeerEvent::Holepunch { key, msg } => self.on_holepunch(key, msg),
             PeerEvent::DhtPort { key, port } => self.on_dht_port(key, port),
             PeerEvent::Disconnected {
                 key,
@@ -113,7 +118,8 @@ impl Actor {
         encrypted: bool,
         transport: Transport,
     ) {
-        if !self.on_connected(key, peer_id, addr, encrypted, transport) {
+        let outcome = self.on_connected(key, peer_id, addr, encrypted, transport);
+        if outcome == ConnectOutcome::Dropped {
             return;
         }
         let Some(p) = self.peers.get_mut(&key) else {
@@ -135,6 +141,11 @@ impl Actor {
             }
         }
         debug!(%addr, encrypted, ?transport, "peer connected");
+        if outcome == ConnectOutcome::Replaced {
+            // Reported when its first connection came up; the swap of
+            // connections is not a new peer.
+            return;
+        }
         self.emit(Event::PeerConnected {
             torrent: self.ih,
             addr,
@@ -446,6 +457,7 @@ impl Actor {
             return;
         };
         self.note_seed_gone(&p);
+        self.hp_limiter.forget(key);
         if let Some(m) = self.magnet.as_mut() {
             let sends = m.fetch.on_peer_gone(key);
             self.send_metadata(sends);
@@ -459,13 +471,108 @@ impl Actor {
             picker.release_peer(key);
             picker.remove_peer_pieces(p.pieces());
         }
-        self.emit(Event::PeerDisconnected {
-            torrent: self.ih,
-            addr: p.addr,
-            reason,
-        });
+        // A connection replaced by a newer one to the same peer: the peer
+        // is still connected, as reported.
+        if !p.replaced {
+            self.emit(Event::PeerDisconnected {
+                torrent: self.ih,
+                addr: p.addr,
+                reason,
+            });
+        }
         self.top_up_all(None);
         self.try_connect();
+    }
+
+    // ----- holepunch (BEP 55) ---------------------------------------------------
+
+    /// A `ut_holepunch` message from `key` (decoded only while we advertise
+    /// the extension). Ignored once holepunch no longer applies (a magnet
+    /// turned out private).
+    fn on_holepunch(&mut self, key: PeerKey, msg: HolepunchMsg) {
+        if !self.holepunch_active() || !self.peers.get(&key).is_some_and(|p| p.live()) {
+            return;
+        }
+        let now = Instant::now();
+        match msg {
+            HolepunchMsg::Rendezvous(target) => {
+                if !self.hp_limiter.allow(key, now) {
+                    debug!(key = key.0, "rendezvous over the rate limit; ignored");
+                    return;
+                }
+                self.relay_rendezvous(key, target);
+            }
+            HolepunchMsg::Connect(addr) => {
+                // Our own request's answer, or an introduction a relay
+                // makes for another peer's request (rate-limited).
+                if !dialable(&addr) {
+                    return;
+                }
+                if !self.hp_pending.take(&addr, now) && !self.hp_limiter.allow(key, now) {
+                    debug!(
+                        key = key.0,
+                        "holepunch connect over the rate limit; ignored"
+                    );
+                    return;
+                }
+                self.dial_holepunch(addr);
+            }
+            HolepunchMsg::Error { addr, code } => {
+                // Normal retries go on.
+                debug!(key = key.0, %addr, code, "rendezvous refused by the relay");
+                self.hp_pending.remove(&addr);
+            }
+        }
+    }
+
+    /// Relays a `Rendezvous(target)` from `key`: both learn each other's
+    /// address, or `key` gets the BEP 55 error.
+    fn relay_rendezvous(&mut self, key: PeerKey, target: SocketAddr) {
+        let Some(requester) = self
+            .peers
+            .get(&key)
+            .map(|p| connectable_addr(p).unwrap_or(p.addr))
+        else {
+            return;
+        };
+        let target_peer = self
+            .peers
+            .iter()
+            .find(|(k, p)| **k != key && p.live() && connectable_addr(p) == Some(target))
+            .map(|(k, p)| (*k, p.supports_holepunch()));
+        let ours: Vec<SocketAddr> = self
+            .shared
+            .utp
+            .iter()
+            .map(fbt_utp::UtpSocket::local_addr)
+            .collect();
+        match relay(target, requester, &ours, target_peer) {
+            RelayAction::Connect {
+                to_target,
+                to_requester,
+            } => {
+                // `relay` connects only a target it was given.
+                let Some((target_key, _)) = target_peer else {
+                    return;
+                };
+                debug!(%target, %requester, "relaying a rendezvous");
+                self.send(
+                    target_key,
+                    PeerCommand::SendHolepunch(HolepunchMsg::Connect(to_target)),
+                );
+                self.send(
+                    key,
+                    PeerCommand::SendHolepunch(HolepunchMsg::Connect(to_requester)),
+                );
+            }
+            RelayAction::Error(code) => {
+                debug!(%target, code, "rendezvous refused");
+                self.send(
+                    key,
+                    PeerCommand::SendHolepunch(HolepunchMsg::Error { addr: target, code }),
+                );
+            }
+        }
     }
 
     // ----- metadata exchange (BEP 9) ------------------------------------------

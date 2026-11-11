@@ -10,7 +10,7 @@ use std::net::IpAddr;
 
 use bytes::Bytes;
 use fbt_wire::{
-    EXT_HANDSHAKE_ID, ExtError, ExtHandshake, LT_DONTHAVE, Message, MetadataMsg,
+    EXT_HANDSHAKE_ID, ExtError, ExtHandshake, HolepunchMsg, LT_DONTHAVE, Message, MetadataMsg,
     OUR_LT_DONTHAVE_ID, OUR_UPLOAD_ONLY_ID, OUR_UT_HOLEPUNCH_ID, OUR_UT_METADATA_ID, OUR_UT_PEX_ID,
     PexMsg, UPLOAD_ONLY, UT_HOLEPUNCH, UT_METADATA, UT_PEX, decode_donthave, decode_upload_only,
     encode_donthave, encode_upload_only,
@@ -80,6 +80,9 @@ pub(crate) fn repeat_handshake_message(cfg: &ExtConfig, remote_ip: IpAddr) -> Me
     if !cfg.pex {
         hs.m.insert(UT_PEX.to_owned(), 0);
     }
+    if !cfg.holepunch {
+        hs.m.insert(UT_HOLEPUNCH.to_owned(), 0);
+    }
     Message::Extended {
         id: EXT_HANDSHAKE_ID,
         payload: hs.encode(),
@@ -94,6 +97,7 @@ pub(crate) struct RemoteIds {
     ut_pex: Option<u8>,
     upload_only: Option<u8>,
     lt_donthave: Option<u8>,
+    ut_holepunch: Option<u8>,
 }
 
 impl RemoteIds {
@@ -104,6 +108,7 @@ impl RemoteIds {
         self.ut_pex = hs.id_of(UT_PEX);
         self.upload_only = hs.id_of(UPLOAD_ONLY);
         self.lt_donthave = hs.id_of(LT_DONTHAVE);
+        self.ut_holepunch = hs.id_of(UT_HOLEPUNCH);
     }
 
     /// A BEP 21 `upload_only` message, if the remote speaks it.
@@ -130,6 +135,14 @@ impl RemoteIds {
         })
     }
 
+    /// `msg` addressed with the remote's `ut_holepunch` id.
+    pub(crate) fn holepunch(&self, msg: &HolepunchMsg) -> Option<Message> {
+        self.ut_holepunch.map(|id| Message::Extended {
+            id,
+            payload: msg.encode(),
+        })
+    }
+
     /// `msg` addressed with the remote's `ut_pex` id.
     pub(crate) fn pex(&self, msg: &PexMsg) -> Option<Message> {
         self.ut_pex.map(|id| Message::Extended {
@@ -149,14 +162,22 @@ pub(crate) enum Incoming {
     UploadOnly(bool),
     /// A BEP 54 `lt_donthave` message (index not range-checked here).
     DontHave(u32),
+    /// A BEP 55 `ut_holepunch` message (addresses not checked here).
+    Holepunch(HolepunchMsg),
     /// An id we never assigned: ignored.
     Unknown,
 }
 
 /// Decodes the extended message `id` (one of ours) with `payload`. With
-/// `pex` off (we did not advertise `ut_pex`) its id is one we never
-/// assigned: the message is [`Incoming::Unknown`], not even decoded.
-pub(crate) fn decode(id: u8, payload: &Bytes, pex: bool) -> Result<Incoming, ExtError> {
+/// `pex` (or `holepunch`) off we did not advertise `ut_pex` (or
+/// `ut_holepunch`): its id is one we never assigned, and the message is
+/// [`Incoming::Unknown`], not even decoded.
+pub(crate) fn decode(
+    id: u8,
+    payload: &Bytes,
+    pex: bool,
+    holepunch: bool,
+) -> Result<Incoming, ExtError> {
     Ok(match id {
         EXT_HANDSHAKE_ID => {
             let mut hs = ExtHandshake::decode(payload)?;
@@ -167,6 +188,7 @@ pub(crate) fn decode(id: u8, payload: &Bytes, pex: bool) -> Result<Incoming, Ext
         OUR_UT_PEX_ID if pex => Incoming::Pex(PexMsg::decode(payload)?),
         OUR_UPLOAD_ONLY_ID => Incoming::UploadOnly(decode_upload_only(payload)?),
         OUR_LT_DONTHAVE_ID => Incoming::DontHave(decode_donthave(payload)?),
+        OUR_UT_HOLEPUNCH_ID if holepunch => Incoming::Holepunch(HolepunchMsg::decode(payload)?),
         _ => Incoming::Unknown,
     })
 }
@@ -224,7 +246,8 @@ mod tests {
             reqq: Some(u32::MAX),
             ..ExtHandshake::default()
         };
-        let Ok(Incoming::Handshake(hs)) = decode(EXT_HANDSHAKE_ID, &hs.encode(), true) else {
+        let Ok(Incoming::Handshake(hs)) = decode(EXT_HANDSHAKE_ID, &hs.encode(), true, false)
+        else {
             panic!("decode");
         };
         assert_eq!(hs.reqq, Some(MAX_REMOTE_REQQ));
@@ -234,14 +257,45 @@ mod tests {
     fn pex_id_is_unknown_unless_advertised() {
         let junk = Bytes::from_static(b"not bencode");
         assert!(matches!(
-            decode(OUR_UT_PEX_ID, &junk, false),
+            decode(OUR_UT_PEX_ID, &junk, false, false),
             Ok(Incoming::Unknown)
         ));
-        assert!(decode(OUR_UT_PEX_ID, &junk, true).is_err());
+        assert!(decode(OUR_UT_PEX_ID, &junk, true, false).is_err());
         let msg = PexMsg::default().encode();
         assert!(matches!(
-            decode(OUR_UT_PEX_ID, &msg, true),
+            decode(OUR_UT_PEX_ID, &msg, true, false),
             Ok(Incoming::Pex(_))
+        ));
+    }
+
+    #[test]
+    fn holepunch_id_is_unknown_unless_advertised() {
+        let addr = "10.0.0.1:6881".parse().expect("addr");
+        let msg = HolepunchMsg::Rendezvous(addr).encode();
+        assert!(matches!(
+            decode(OUR_UT_HOLEPUNCH_ID, &msg, true, false),
+            Ok(Incoming::Unknown)
+        ));
+        assert!(matches!(
+            decode(OUR_UT_HOLEPUNCH_ID, &msg, true, true),
+            Ok(Incoming::Holepunch(HolepunchMsg::Rendezvous(a))) if a == addr
+        ));
+        // Repeated without holepunch: turned off explicitly.
+        let ip: IpAddr = "10.1.2.3".parse().expect("ip");
+        let Message::Extended { payload, .. } = repeat_handshake_message(&cfg(), ip) else {
+            panic!("extended");
+        };
+        let hs = ExtHandshake::decode(&payload).expect("handshake");
+        assert_eq!(hs.m.get(UT_HOLEPUNCH), Some(&0));
+        // The remote's id addresses our messages.
+        let mut theirs = ExtHandshake::default();
+        theirs.m.insert(UT_HOLEPUNCH.to_owned(), 9);
+        let mut ids = RemoteIds::default();
+        assert!(ids.holepunch(&HolepunchMsg::Connect(addr)).is_none());
+        ids.update(&theirs);
+        assert!(matches!(
+            ids.holepunch(&HolepunchMsg::Connect(addr)),
+            Some(Message::Extended { id: 9, .. })
         ));
     }
 

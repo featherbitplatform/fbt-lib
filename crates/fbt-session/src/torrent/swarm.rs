@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
-use fbt_wire::{CryptoMethods, ExtHandshake};
+use fbt_wire::{CryptoMethods, ExtHandshake, HolepunchMsg, UT_HOLEPUNCH};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
@@ -47,6 +47,13 @@ pub(super) struct KnownPeer {
     /// A peer listed it with the PEX `UTP` flag since it last turned out
     /// TCP-only: it is dialled over uTP first again.
     pub utp: bool,
+    /// The peer whose PEX message listed it last (BEP 55: the relay we ask
+    /// for a rendezvous when a connection to it fails).
+    pub pex_source: Option<PeerKey>,
+    /// That message listed it with the `HOLEPUNCH` flag.
+    pub holepunch: bool,
+    /// We asked a relay for a rendezvous with it (once per address).
+    pub rendezvous_sent: bool,
 }
 
 /// The addresses a torrent connects to (from `add_peer` and trackers),
@@ -137,6 +144,18 @@ pub(super) fn keep_new_connection(
     }
     // Keep the connection we initiated exactly when our id is the lower.
     new_outgoing == (our_id.0 < their_id.0)
+}
+
+/// What became of a connection whose handshake finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConnectOutcome {
+    /// It stays; the first connection to this peer.
+    New,
+    /// It stays and an older connection to the same peer id was closed in
+    /// its favour: the peer was already reported connected.
+    Replaced,
+    /// It was closed as a duplicate of an older connection.
+    Dropped,
 }
 
 /// What a bad-metadata ban applies to.
@@ -464,6 +483,9 @@ pub(super) struct Peer {
     pub pex: Option<PexPeer>,
     /// The peer said it is upload-only (BEP 21).
     pub upload_only: bool,
+    /// Closed as a duplicate in favour of a newer connection to the same
+    /// peer: the peer stays connected, so its end is not reported.
+    pub replaced: bool,
 }
 
 impl Peer {
@@ -508,6 +530,7 @@ impl Peer {
             metadata_requests: 0,
             pex: None,
             upload_only: false,
+            replaced: false,
         }
     }
 
@@ -552,6 +575,18 @@ impl Peer {
     /// Some allowed-fast piece can be requested.
     pub(super) fn can_request_fast(&self) -> bool {
         self.fast_has.is_some() && self.allowed_fast.iter().any(|&i| self.has(i))
+    }
+
+    /// Its extension handshake advertised `ut_holepunch` (BEP 55).
+    pub(super) fn supports_holepunch(&self) -> bool {
+        self.ext
+            .as_ref()
+            .is_some_and(|h| h.id_of(UT_HOLEPUNCH).is_some())
+    }
+
+    /// Connected and not closed.
+    pub(super) fn live(&self) -> bool {
+        self.connected && self.tx.is_some()
     }
 
     /// Connected, not closed, and we do not choke it.
@@ -606,8 +641,19 @@ impl Actor {
             dht_port: dht_port_for(&self.shared.dht_addrs, addr).filter(|_| !self.is_private()),
             reqq: u32::try_from(self.shared.settings.max_incoming_requests).unwrap_or(u32::MAX),
             upload_only: self.upload_only_sent,
-            holepunch: false,
+            holepunch: self.holepunch_active(),
         }
+    }
+
+    /// BEP 55 holepunch runs: enabled, uTP on in both directions with a
+    /// socket to use, and the torrent not (known to be) private.
+    pub(super) fn holepunch_active(&self) -> bool {
+        let s = &self.shared.settings;
+        s.enable_holepunch
+            && s.enable_outgoing_utp
+            && s.enable_incoming_utp
+            && !self.shared.utp.is_empty()
+            && !self.is_private()
     }
 
     pub(super) fn new_key(&mut self) -> PeerKey {
@@ -672,23 +718,55 @@ impl Actor {
         }
     }
 
+    /// Takes a peer slot, a global one and a half-open one for an outgoing
+    /// connection; false (nothing taken) when a limit is reached.
+    fn reserve_dial(&self) -> bool {
+        let s = &self.shared.settings;
+        if self.peers.len() >= s.max_peers_per_torrent {
+            return false;
+        }
+        if !try_reserve(&self.shared.global_peers, s.max_peers_global) {
+            return false;
+        }
+        if !try_reserve(&self.shared.half_open, s.max_half_open) {
+            release(&self.shared.global_peers);
+            return false;
+        }
+        true
+    }
+
+    /// Gives back what [`reserve_dial`](Self::reserve_dial) took.
+    fn unreserve_dial(&self) {
+        release(&self.shared.half_open);
+        release(&self.shared.global_peers);
+    }
+
+    /// Dials `addr` over `transport` in slots already reserved.
+    fn spawn_dial(&mut self, addr: SocketAddr, transport: Transport) {
+        let utp = match transport {
+            Transport::Utp => self.shared.utp_for(&addr).cloned(),
+            Transport::Tcp => None,
+        };
+        let key = self.new_key();
+        let ctx = self.ctx(key, &addr);
+        let have = ctx.have.clone();
+        let num_pieces = ctx.have.len();
+        let tx = spawn_outgoing(addr, ctx, self.mse_provide(&addr), transport, utp);
+        let mut peer = Peer::new(addr, tx, self.generation, num_pieces, transport);
+        peer.outgoing = true;
+        peer.connecting = true;
+        peer.have_sent = Some(have);
+        self.peers.insert(key, peer);
+    }
+
     /// Starts outgoing connections while every limit allows.
     pub(super) fn try_connect(&mut self) {
-        let s = Arc::clone(&self.shared.settings);
         while self.connectable() && !self.candidates.is_empty() {
-            if self.peers.len() >= s.max_peers_per_torrent {
-                break;
-            }
-            if !try_reserve(&self.shared.global_peers, s.max_peers_global) {
-                break;
-            }
-            if !try_reserve(&self.shared.half_open, s.max_half_open) {
-                release(&self.shared.global_peers);
+            if !self.reserve_dial() {
                 break;
             }
             let Some(addr) = self.candidates.pop_front() else {
-                release(&self.shared.half_open);
-                release(&self.shared.global_peers);
+                self.unreserve_dial();
                 break;
             };
             // It may have connected (or connected to us) since it was
@@ -696,8 +774,7 @@ impl Actor {
             if self.addr_busy(&addr) || self.metadata_ip_banned(&addr) {
                 // A fallback queued for it is not dialled now: forget it.
                 self.retries.clear_transport_failed(&addr);
-                release(&self.shared.half_open);
-                release(&self.shared.global_peers);
+                self.unreserve_dial();
                 continue;
             }
             // A pending fallback goes first; otherwise the transport the
@@ -708,25 +785,69 @@ impl Actor {
                 .or_else(|| self.first_transport(&addr));
             let Some(transport) = transport else {
                 debug!(%addr, "no enabled transport can reach this address");
-                release(&self.shared.half_open);
-                release(&self.shared.global_peers);
+                self.unreserve_dial();
                 continue;
             };
-            let utp = match transport {
-                Transport::Utp => self.shared.utp_for(&addr).cloned(),
-                Transport::Tcp => None,
-            };
-            let key = self.new_key();
-            let ctx = self.ctx(key, &addr);
-            let have = ctx.have.clone();
-            let num_pieces = ctx.have.len();
-            let tx = spawn_outgoing(addr, ctx, self.mse_provide(&addr), transport, utp);
-            let mut peer = Peer::new(addr, tx, self.generation, num_pieces, transport);
-            peer.outgoing = true;
-            peer.connecting = true;
-            peer.have_sent = Some(have);
-            self.peers.insert(key, peer);
+            self.spawn_dial(addr, transport);
         }
+    }
+
+    /// A relay told us to connect to `addr` (BEP 55 `Connect`): dialled
+    /// over uTP at once, ahead of the queue and any retry wait, unless it
+    /// is connected or being dialled already, or a limit is reached.
+    pub(super) fn dial_holepunch(&mut self, addr: SocketAddr) {
+        if !self.connectable()
+            || self.retries.is_never(&addr)
+            || self.addr_busy(&addr)
+            || self.metadata_ip_banned(&addr)
+            || !self.transport_usable(&addr, Transport::Utp)
+        {
+            return;
+        }
+        if !self.reserve_dial() {
+            debug!(%addr, "no connection slot for a holepunch dial");
+            return;
+        }
+        debug!(%addr, "holepunch: dialling over uTP");
+        self.spawn_dial(addr, Transport::Utp);
+    }
+
+    /// An outgoing connection to `addr` failed at connect over every
+    /// transport we may use: if PEX listed it with the `HOLEPUNCH` flag and
+    /// that source is still connected and speaks `ut_holepunch`, it is
+    /// asked for a rendezvous (once per address).
+    fn request_rendezvous(&mut self, addr: SocketAddr) {
+        if !self.holepunch_active() {
+            return;
+        }
+        let Some(k) = self.known.get(&addr) else {
+            return;
+        };
+        if !k.holepunch || k.rendezvous_sent {
+            return;
+        }
+        let Some(relay) = k.pex_source else {
+            return;
+        };
+        if !self
+            .peers
+            .get(&relay)
+            .is_some_and(|p| p.live() && p.supports_holepunch())
+        {
+            return;
+        }
+        if !self.hp_pending.insert(addr, Instant::now()) {
+            debug!(%addr, "too many rendezvous requests pending; not asking");
+            return;
+        }
+        if let Some(k) = self.known.get_mut(&addr) {
+            k.rendezvous_sent = true;
+        }
+        debug!(%addr, relay = relay.0, "connect failed; asking for a rendezvous");
+        self.send(
+            relay,
+            PeerCommand::SendHolepunch(HolepunchMsg::Rendezvous(addr)),
+        );
     }
 
     /// The transport to dial `addr` over first: uTP when outgoing uTP is
@@ -870,8 +991,9 @@ impl Actor {
     }
 
     /// Bookkeeping for a finished handshake: slots, retries and the
-    /// duplicate peer-id guard. Returns whether the connection stays; the
-    /// caller then catches it up on our pieces.
+    /// duplicate peer-id guard. Says whether the connection stays (the
+    /// caller then catches it up on our pieces) and whether it took over
+    /// from an older connection to the same peer.
     pub(super) fn on_connected(
         &mut self,
         key: PeerKey,
@@ -879,7 +1001,7 @@ impl Actor {
         addr: SocketAddr,
         encrypted: bool,
         transport: Transport,
-    ) -> bool {
+    ) -> ConnectOutcome {
         let duplicate = self
             .peers
             .iter()
@@ -889,7 +1011,7 @@ impl Actor {
             .map(|(k, o)| (*k, o.outgoing));
         self.on_peer_set_changed();
         let Some(p) = self.peers.get_mut(&key) else {
-            return false;
+            return ConnectOutcome::Dropped;
         };
         if p.connecting {
             p.connecting = false;
@@ -907,19 +1029,26 @@ impl Actor {
             }
         }
         let Some((old, old_outgoing)) = duplicate else {
-            return true;
+            return ConnectOutcome::New;
         };
-        // Already connected to this peer: both dialled each other, or it
+        // Already connected to this peer: both dialled each other (a
+        // simultaneous dial, or both ends of a holepunch), or it
         // reconnected. Both ends agree on which connection stays.
         let keep_new =
             keep_new_connection(&self.shared.peer_id, &peer_id, p.outgoing, old_outgoing);
-        let (loser, survives) = if keep_new { (old, true) } else { (key, false) };
         debug!(%addr, keep_new, "duplicate peer id; closing one connection");
+        let (loser, outcome) = if keep_new {
+            (old, ConnectOutcome::Replaced)
+        } else {
+            (key, ConnectOutcome::Dropped)
+        };
         if let Some(l) = self.peers.get_mut(&loser) {
             l.close_reason = Some(DisconnectReason::Duplicate);
+            // The peer stays connected through the new connection.
+            l.replaced = keep_new;
         }
         self.close_peer(loser);
-        survives
+        outcome
     }
 
     /// Bookkeeping for a closed connection: slots, retries and the known
@@ -968,6 +1097,11 @@ impl Actor {
             // We closed the attempt: a fallback it was does not carry over.
             self.retries.clear_transport_failed(&p.addr);
         } else if p.outgoing && !p.connected {
+            // Failed at connect with no other transport left to try: a
+            // relay may still introduce us (before a give-up forgets it).
+            if connect_failed.is_some() {
+                self.request_rendezvous(p.addr);
+            }
             // The connection or handshake failed (we did not close it).
             if self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp {
                 // Forgotten: `requeue_known` must not dial it again.
@@ -1232,13 +1366,16 @@ pub(super) mod tests {
             let mut p = Peer::new(peer_addr, tx, a.generation, 1, Transport::Tcp);
             p.outgoing = true;
             a.peers.insert(key, p);
-            assert!(a.on_connected(
-                key,
-                PeerId([round + 1; 20]),
-                peer_addr,
-                false,
-                Transport::Tcp
-            ));
+            assert_eq!(
+                a.on_connected(
+                    key,
+                    PeerId([round + 1; 20]),
+                    peer_addr,
+                    false,
+                    Transport::Tcp
+                ),
+                ConnectOutcome::New
+            );
             assert!(a.retries.is_tcp_only(&peer_addr), "round {round}");
             assert!(
                 !a.known.get(&peer_addr).expect("known").utp,

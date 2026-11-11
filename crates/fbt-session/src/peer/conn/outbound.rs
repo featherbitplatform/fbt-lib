@@ -202,6 +202,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     self.send(m).await?;
                 }
             }
+            PeerCommand::SendHolepunch(msg) => {
+                if let Some(m) = self.remote_ids.holepunch(&msg) {
+                    self.send(m).await?;
+                }
+            }
             PeerCommand::UploadOnly(on) => {
                 if let Some(m) = self.remote_ids.upload_only(on) {
                     self.send(m).await?;

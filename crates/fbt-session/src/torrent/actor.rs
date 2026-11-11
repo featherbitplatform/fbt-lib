@@ -180,6 +180,10 @@ pub(crate) struct Actor {
     /// Pieces lost on disk and not downloaded again yet, for peers whose
     /// extension handshake comes late.
     pub(super) lost_pieces: std::collections::BTreeSet<u32>,
+    /// Addresses we asked a relay to introduce us to (BEP 55).
+    pub(super) hp_pending: super::holepunch::Pending,
+    /// Rendezvous work accepted per peer (BEP 55).
+    pub(super) hp_limiter: super::holepunch::RendezvousLimiter,
     pub(super) rng: StdRng,
     /// What the tracker and DHT announcers are told.
     pub(super) signals: watch::Sender<Signals>,
@@ -338,6 +342,8 @@ impl Actor {
             seed_addrs: Default::default(),
             lost_files: Default::default(),
             lost_pieces: Default::default(),
+            hp_pending: Default::default(),
+            hp_limiter: Default::default(),
             rng: rand::make_rng(),
             signals,
             announcer,

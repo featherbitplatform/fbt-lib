@@ -130,6 +130,9 @@ fn flags_of(p: &Peer) -> PexFlags {
     if p.is_seed() {
         f |= PexFlags::SEED;
     }
+    if p.supports_holepunch() {
+        f |= PexFlags::HOLEPUNCH;
+    }
     f
 }
 
@@ -242,7 +245,8 @@ impl Actor {
     /// [`MAX_PEX_ADDED`] dialable `added` addresses join the known ones.
     /// `dropped` is ignored: known peers stay known until connecting fails.
     /// An address listed with the `UTP` flag is dialled over uTP first,
-    /// even if it turned out TCP-only before.
+    /// even if it turned out TCP-only before; each address remembers the
+    /// peer that listed it last and its `HOLEPUNCH` flag.
     pub(super) fn on_pex(&mut self, key: PeerKey, msg: PexMsg) {
         if !self.pex_active() {
             return;
@@ -261,14 +265,19 @@ impl Actor {
             .filter(|(a, _)| dialable(a))
             .take(MAX_PEX_ADDED)
             .collect();
-        // Flags first, so the dials `on_found_peers` starts see them.
+        // Flags first, so the dials `on_found_peers` starts see them. The
+        // sender is the relay a failed connection asks for a rendezvous
+        // (BEP 55), with the `HOLEPUNCH` flag the address came with.
         for (addr, flags) in &added {
-            if flags.contains(PexFlags::UTP)
-                && !self.retries.is_never(addr)
+            if !self.retries.is_never(addr)
                 && self.remember(*addr)
                 && let Some(k) = self.known.get_mut(addr)
             {
-                k.utp = true;
+                if flags.contains(PexFlags::UTP) {
+                    k.utp = true;
+                }
+                k.pex_source = Some(key);
+                k.holepunch = flags.contains(PexFlags::HOLEPUNCH);
             }
         }
         let addrs: Vec<SocketAddr> = added.into_iter().map(|(a, _)| a).collect();

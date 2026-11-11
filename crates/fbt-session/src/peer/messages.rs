@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use fbt_core::{Bitfield, BlockRef, PeerId, PieceLayout};
-use fbt_wire::{ExtHandshake, MetadataMsg, PexMsg, Reserved};
+use fbt_wire::{ExtHandshake, HolepunchMsg, MetadataMsg, PexMsg, Reserved};
 
 use super::ext::ExtConfig;
 use super::transport::Transport;
@@ -128,6 +128,8 @@ pub(crate) enum PeerEvent {
     Metadata { key: PeerKey, msg: MetadataMsg },
     /// A BEP 11 `ut_pex` message.
     Pex { key: PeerKey, msg: PexMsg },
+    /// A BEP 55 `ut_holepunch` message (only while we advertise it).
+    Holepunch { key: PeerKey, msg: HolepunchMsg },
     /// The remote's DHT port (BEP 5 `Port`), at most once per connection.
     DhtPort { key: PeerKey, port: u16 },
     /// The connection ended; `outstanding` lists requests never satisfied.
@@ -182,6 +184,8 @@ pub(crate) enum PeerCommand {
     SendMetadata(MetadataMsg),
     /// Send a `ut_pex` message (dropped if the remote lacks it).
     SendPex(PexMsg),
+    /// Send a `ut_holepunch` message (dropped if the remote lacks it).
+    SendHolepunch(HolepunchMsg),
     /// Close the connection.
     Close,
 }

@@ -226,6 +226,19 @@ pub struct Settings {
     /// the stable API. Non-zero.
     #[doc(hidden)]
     pub utp_connect_timeout: Duration,
+    /// BEP 55 holepunch over uTP: we advertise `ut_holepunch`, relay
+    /// rendezvous requests between peers we are connected to, and when a
+    /// connection to an address learned through PEX fails, ask the peer we
+    /// learned it from to introduce us. Takes effect only with both
+    /// `enable_outgoing_utp` and `enable_incoming_utp`, and never for
+    /// private torrents.
+    pub enable_holepunch: bool,
+    /// Emulates an endpoint-dependent NAT in front of the session, for
+    /// tests: incoming TCP is refused, and a uTP SYN is accepted only from
+    /// an address the session sent a uTP datagram to in the last 30 s.
+    /// Internal tunable; not part of the stable API.
+    #[doc(hidden)]
+    pub nat_emulation: bool,
     /// Storage jobs (piece reads, writes and flushes) running at once
     /// across the session, each on a blocking thread (1 to
     /// [`MAX_DISK_THREADS`]). Piece checks do not count against it: they
@@ -439,6 +452,8 @@ impl Default for Settings {
             enable_outgoing_utp: true,
             enable_incoming_utp: true,
             utp_connect_timeout: Duration::from_secs(3),
+            enable_holepunch: true,
+            nat_emulation: false,
             disk_threads: 8,
             max_active_checks: 1,
             cache_size: 64 * 1024 * 1024,

@@ -150,7 +150,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// Routes an extended message by the id we assigned.
     pub(super) async fn on_extended(&mut self, id: u8, payload: &Bytes) -> Flow {
         let key = self.key;
-        let msg = ext::decode(id, payload, self.ext.pex)
+        let msg = ext::decode(id, payload, self.ext.pex, self.ext.holepunch)
             .map_err(|e| DisconnectReason::Protocol(format!("extended message {id}: {e}")))?;
         match msg {
             Incoming::Handshake(hs) => {
@@ -179,6 +179,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
             Incoming::Metadata(msg) => self.emit(PeerEvent::Metadata { key, msg }).await,
             Incoming::Pex(msg) => self.emit(PeerEvent::Pex { key, msg }).await,
+            Incoming::Holepunch(msg) => self.emit(PeerEvent::Holepunch { key, msg }).await,
             Incoming::Unknown => Ok(()),
         }
     }
