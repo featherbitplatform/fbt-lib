@@ -54,7 +54,8 @@ bash dev/sast.sh semgrep      # one tool
 bash dev/interop/run.sh
 
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec
-# handshake http_announce udp_announce path krpc extension mse magnet. Seeds live in fuzz/seeds/<target>/.
+# handshake http_announce udp_announce path krpc extension mse magnet utp_packet utp_conn lsd ssdp
+# upnp_xml natpmp. Seeds live in fuzz/seeds/<target>/.
 mkdir -p fuzz/corpus/<target>
 cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 ```
