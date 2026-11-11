@@ -462,6 +462,8 @@ pub(super) struct Peer {
     /// PEX state; `Some` while PEX runs with this peer (it advertised
     /// `ut_pex`, the setting is on and the torrent is not private).
     pub pex: Option<PexPeer>,
+    /// The peer said it is upload-only (BEP 21).
+    pub upload_only: bool,
 }
 
 impl Peer {
@@ -505,6 +507,7 @@ impl Peer {
             connected_at: None,
             metadata_requests: 0,
             pex: None,
+            upload_only: false,
         }
     }
 
@@ -602,6 +605,8 @@ impl Actor {
             // privacy is unknown until its metadata: it advertises both).
             dht_port: dht_port_for(&self.shared.dht_addrs, addr).filter(|_| !self.is_private()),
             reqq: u32::try_from(self.shared.settings.max_incoming_requests).unwrap_or(u32::MAX),
+            upload_only: self.upload_only_sent,
+            holepunch: false,
         }
     }
 

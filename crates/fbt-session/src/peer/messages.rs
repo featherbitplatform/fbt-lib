@@ -39,6 +39,9 @@ pub enum DisconnectReason {
     /// that is inconsistent or fails the info-hash check; it is never
     /// dialled again.
     BadMetadata,
+    /// We are finished and the peer is a seed or upload-only (BEP 21):
+    /// neither side has anything to gain.
+    UploadOnly,
 }
 
 /// The pieces a remote announced, owned.
@@ -73,6 +76,12 @@ pub(crate) enum PeerEvent {
     },
     /// The remote completed a piece (index already range-checked).
     Have { key: PeerKey, piece: u32 },
+    /// The remote retracted a piece (BEP 54 `lt_donthave`; index already
+    /// range-checked).
+    DontHave { key: PeerKey, piece: u32 },
+    /// The remote is upload-only (BEP 21), from its extension handshake or
+    /// an `upload_only` message.
+    UploadOnly { key: PeerKey, on: bool },
     /// The remote choked us.
     Choked { key: PeerKey },
     /// The remote unchoked us.
@@ -152,6 +161,12 @@ pub(crate) enum PeerCommand {
     /// Announce several pieces at once: those completed while the
     /// connection was being set up, after its initial bitfield was taken.
     Haves(Vec<u32>),
+    /// Tell the remote we are (or are no longer) upload-only (BEP 21);
+    /// dropped if it lacks the extension.
+    UploadOnly(bool),
+    /// Tell the remote we lost a piece (BEP 54); dropped if it lacks the
+    /// extension.
+    DontHave(u32),
     /// Answer a queued request: the block waits in the connection's upload
     /// queue for its rate limit, and is dropped there if cancelled or
     /// choked away first.

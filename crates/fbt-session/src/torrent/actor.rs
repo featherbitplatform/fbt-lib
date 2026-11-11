@@ -167,6 +167,9 @@ pub(crate) struct Actor {
     pub(super) last_state: TorrentState,
     /// `TorrentFinished` was emitted for the current set of wanted pieces.
     pub(super) finished_emitted: bool,
+    /// We told our peers we are upload-only (BEP 21): the torrent is
+    /// seeding, with every piece on disk.
+    pub(super) upload_only_sent: bool,
     pub(super) rng: StdRng,
     /// What the tracker and DHT announcers are told.
     pub(super) signals: watch::Sender<Signals>,
@@ -321,6 +324,7 @@ impl Actor {
             counters: Counters::default(),
             last_state: TorrentState::CheckingFiles { progress: 0.0 },
             finished_emitted: false,
+            upload_only_sent: false,
             rng: rand::make_rng(),
             signals,
             announcer,
@@ -597,6 +601,7 @@ impl Actor {
                 state,
             });
         }
+        self.sync_upload_only();
         self.sync_running();
     }
 

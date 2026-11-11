@@ -10,8 +10,10 @@ use std::net::IpAddr;
 
 use bytes::Bytes;
 use fbt_wire::{
-    EXT_HANDSHAKE_ID, ExtError, ExtHandshake, Message, MetadataMsg, OUR_UT_METADATA_ID,
-    OUR_UT_PEX_ID, PexMsg, UT_METADATA, UT_PEX,
+    EXT_HANDSHAKE_ID, ExtError, ExtHandshake, LT_DONTHAVE, Message, MetadataMsg,
+    OUR_LT_DONTHAVE_ID, OUR_UPLOAD_ONLY_ID, OUR_UT_HOLEPUNCH_ID, OUR_UT_METADATA_ID, OUR_UT_PEX_ID,
+    PexMsg, UPLOAD_ONLY, UT_HOLEPUNCH, UT_METADATA, UT_PEX, decode_donthave, decode_upload_only,
+    encode_donthave, encode_upload_only,
 };
 
 use crate::settings::MAX_INCOMING_REQUESTS;
@@ -33,6 +35,10 @@ pub(crate) struct ExtConfig {
     pub dht_port: Option<u16>,
     /// Requests we queue from one peer (`reqq`).
     pub reqq: u32,
+    /// We are finished (BEP 21): the handshake carries `upload_only: 1`.
+    pub upload_only: bool,
+    /// Advertise `ut_holepunch` (BEP 55).
+    pub holepunch: bool,
 }
 
 /// Our extension handshake to a remote at `remote_ip`.
@@ -42,6 +48,14 @@ pub(crate) fn our_handshake(cfg: &ExtConfig, remote_ip: IpAddr) -> ExtHandshake 
     if cfg.pex {
         hs.m.insert(UT_PEX.to_owned(), OUR_UT_PEX_ID);
     }
+    // Both are always accepted: `upload_only` can flip at any time and
+    // `lt_donthave` is harmless when unused.
+    hs.m.insert(UPLOAD_ONLY.to_owned(), OUR_UPLOAD_ONLY_ID);
+    hs.m.insert(LT_DONTHAVE.to_owned(), OUR_LT_DONTHAVE_ID);
+    if cfg.holepunch {
+        hs.m.insert(UT_HOLEPUNCH.to_owned(), OUR_UT_HOLEPUNCH_ID);
+    }
+    hs.upload_only = cfg.upload_only.then_some(true);
     hs.client = Some(concat!("fbt/", env!("CARGO_PKG_VERSION")).to_owned());
     hs.listen_port = Some(cfg.listen_port).filter(|p| *p != 0);
     hs.reqq = Some(cfg.reqq);
@@ -78,6 +92,8 @@ pub(crate) fn repeat_handshake_message(cfg: &ExtConfig, remote_ip: IpAddr) -> Me
 pub(crate) struct RemoteIds {
     ut_metadata: Option<u8>,
     ut_pex: Option<u8>,
+    upload_only: Option<u8>,
+    lt_donthave: Option<u8>,
 }
 
 impl RemoteIds {
@@ -86,6 +102,24 @@ impl RemoteIds {
     pub(crate) fn update(&mut self, hs: &ExtHandshake) {
         self.ut_metadata = hs.id_of(UT_METADATA);
         self.ut_pex = hs.id_of(UT_PEX);
+        self.upload_only = hs.id_of(UPLOAD_ONLY);
+        self.lt_donthave = hs.id_of(LT_DONTHAVE);
+    }
+
+    /// A BEP 21 `upload_only` message, if the remote speaks it.
+    pub(crate) fn upload_only(&self, on: bool) -> Option<Message> {
+        self.upload_only.map(|id| Message::Extended {
+            id,
+            payload: encode_upload_only(on),
+        })
+    }
+
+    /// A BEP 54 `lt_donthave` message, if the remote speaks it.
+    pub(crate) fn donthave(&self, piece: u32) -> Option<Message> {
+        self.lt_donthave.map(|id| Message::Extended {
+            id,
+            payload: encode_donthave(piece),
+        })
     }
 
     /// `msg` addressed with the remote's `ut_metadata` id.
@@ -111,6 +145,10 @@ pub(crate) enum Incoming {
     Handshake(Box<ExtHandshake>),
     Metadata(MetadataMsg),
     Pex(PexMsg),
+    /// A BEP 21 `upload_only` message.
+    UploadOnly(bool),
+    /// A BEP 54 `lt_donthave` message (index not range-checked here).
+    DontHave(u32),
     /// An id we never assigned: ignored.
     Unknown,
 }
@@ -127,6 +165,8 @@ pub(crate) fn decode(id: u8, payload: &Bytes, pex: bool) -> Result<Incoming, Ext
         }
         OUR_UT_METADATA_ID => Incoming::Metadata(MetadataMsg::decode(payload)?),
         OUR_UT_PEX_ID if pex => Incoming::Pex(PexMsg::decode(payload)?),
+        OUR_UPLOAD_ONLY_ID => Incoming::UploadOnly(decode_upload_only(payload)?),
+        OUR_LT_DONTHAVE_ID => Incoming::DontHave(decode_donthave(payload)?),
         _ => Incoming::Unknown,
     })
 }
@@ -142,6 +182,8 @@ mod tests {
             pex: true,
             dht_port: None,
             reqq: 250,
+            upload_only: false,
+            holepunch: false,
         }
     }
 
@@ -156,6 +198,24 @@ mod tests {
         assert_eq!(hs.metadata_size, Some(1234));
         assert_eq!(hs.your_ip, Some(ip));
         assert!(hs.client.as_deref().is_some_and(|v| v.starts_with("fbt/")));
+    }
+
+    #[test]
+    fn upload_only_and_donthave_are_advertised() {
+        let ip: IpAddr = "10.1.2.3".parse().expect("ip");
+        let hs = our_handshake(&cfg(), ip);
+        assert_eq!(hs.id_of(UPLOAD_ONLY), Some(OUR_UPLOAD_ONLY_ID));
+        assert_eq!(hs.id_of(LT_DONTHAVE), Some(OUR_LT_DONTHAVE_ID));
+        assert_eq!(hs.upload_only, None);
+        assert_eq!(hs.id_of(UT_HOLEPUNCH), None);
+        let on = ExtConfig {
+            upload_only: true,
+            holepunch: true,
+            ..cfg()
+        };
+        let hs = our_handshake(&on, ip);
+        assert_eq!(hs.upload_only, Some(true));
+        assert_eq!(hs.id_of(UT_HOLEPUNCH), Some(OUR_UT_HOLEPUNCH_ID));
     }
 
     #[test]

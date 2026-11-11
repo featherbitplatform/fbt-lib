@@ -3,8 +3,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use fbt_core::BlockRef;
 use fbt_wire::{
-    ExtHandshake, Message, MessageCodec, MetadataMsg, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, PexFlags,
-    PexMsg, Reserved, UT_METADATA, UT_PEX, read_handshake, write_handshake,
+    ExtHandshake, LT_DONTHAVE, Message, MessageCodec, MetadataMsg, OUR_LT_DONTHAVE_ID,
+    OUR_UPLOAD_ONLY_ID, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, PexFlags, PexMsg, Reserved, UPLOAD_ONLY,
+    UT_METADATA, UT_PEX, decode_donthave, decode_upload_only, encode_donthave, encode_upload_only,
+    read_handshake, write_handshake,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncWriteExt, DuplexStream};
@@ -62,6 +64,8 @@ fn ext_cfg() -> ExtConfig {
         pex: true,
         dht_port: None,
         reqq: 250,
+        upload_only: false,
+        holepunch: false,
     }
 }
 
@@ -949,6 +953,112 @@ async fn ext_messages_routed_by_our_ids() {
     send(&mut wire, ext_msg(9, Bytes::from_static(b"junk"))).await;
     send(&mut wire, Message::Interested).await;
     assert_eq!(r.next().await, PeerEvent::Interested { key: KEY });
+}
+
+/// `lt_donthave` (BEP 54) is routed by our id and range-checked like
+/// `Have`; the command sends it with the remote's id, or drops it when the
+/// remote lacks the extension.
+#[tokio::test(start_paused = true)]
+async fn donthave_routed_and_range_checked() {
+    let h = start(Bitfield::new(PIECES));
+    let (mut wire, mut r, _) = connect_ext(h, reserved(true, true, false)).await;
+    let hs = our_ext(&mut wire).await;
+    assert_eq!(hs.m.get(LT_DONTHAVE), Some(&OUR_LT_DONTHAVE_ID));
+    assert_eq!(recv(&mut wire).await, Message::HaveNone);
+    send(&mut wire, ext_msg(OUR_LT_DONTHAVE_ID, encode_donthave(2))).await;
+    assert_eq!(r.next().await, PeerEvent::DontHave { key: KEY, piece: 2 });
+
+    // Not advertised by the remote yet: dropped, so the next frame is the
+    // `Have` that follows it.
+    r.cmd(PeerCommand::DontHave(1)).await;
+    r.cmd(PeerCommand::Have(0)).await;
+    assert_eq!(recv(&mut wire).await, Message::Have(0));
+    let mut theirs = their_ext(None, None);
+    theirs.m.insert(LT_DONTHAVE.to_owned(), 9);
+    send(&mut wire, ext_msg(0, theirs.encode())).await;
+    assert!(matches!(r.next().await, PeerEvent::ExtHandshake { .. }));
+    r.cmd(PeerCommand::DontHave(1)).await;
+    match recv(&mut wire).await {
+        Message::Extended { id: 9, payload } => assert_eq!(decode_donthave(&payload).ok(), Some(1)),
+        other => panic!("expected lt_donthave, got {other:?}"),
+    }
+
+    // Out of range is a protocol error; a short payload too.
+    send(
+        &mut wire,
+        ext_msg(OUR_LT_DONTHAVE_ID, encode_donthave(PIECES)),
+    )
+    .await;
+    let (reason, _) = r.disconnected().await;
+    assert!(
+        matches!(reason, DisconnectReason::Protocol(_)),
+        "{reason:?}"
+    );
+    let h = start(Bitfield::new(PIECES));
+    let (mut wire, mut r, _) = connect_ext(h, reserved(true, true, false)).await;
+    send(
+        &mut wire,
+        ext_msg(OUR_LT_DONTHAVE_ID, Bytes::from_static(b"\x00\x01")),
+    )
+    .await;
+    let (reason, _) = r.disconnected().await;
+    assert!(
+        matches!(reason, DisconnectReason::Protocol(_)),
+        "{reason:?}"
+    );
+}
+
+/// BEP 21: `upload_only` arrives as a handshake key or a message, and
+/// `UploadOnly` sends it to a remote that speaks it; our own handshake
+/// carries the key only once we are upload-only.
+#[tokio::test(start_paused = true)]
+async fn upload_only_from_handshake_and_message() {
+    let h = start(Bitfield::new(PIECES));
+    let (mut wire, mut r, _) = connect_ext(h, reserved(true, true, false)).await;
+    let hs = our_ext(&mut wire).await;
+    assert_eq!(hs.m.get(UPLOAD_ONLY), Some(&OUR_UPLOAD_ONLY_ID));
+    assert_eq!(hs.upload_only, None);
+    assert_eq!(recv(&mut wire).await, Message::HaveNone);
+
+    let mut theirs = their_ext(None, None);
+    theirs.m.insert(UPLOAD_ONLY.to_owned(), 5);
+    theirs.upload_only = Some(true);
+    send(&mut wire, ext_msg(0, theirs.encode())).await;
+    assert!(matches!(r.next().await, PeerEvent::ExtHandshake { .. }));
+    assert_eq!(r.next().await, PeerEvent::UploadOnly { key: KEY, on: true });
+    send(
+        &mut wire,
+        ext_msg(OUR_UPLOAD_ONLY_ID, encode_upload_only(false)),
+    )
+    .await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::UploadOnly {
+            key: KEY,
+            on: false
+        }
+    );
+    send(
+        &mut wire,
+        ext_msg(OUR_UPLOAD_ONLY_ID, encode_upload_only(true)),
+    )
+    .await;
+    assert_eq!(r.next().await, PeerEvent::UploadOnly { key: KEY, on: true });
+
+    r.cmd(PeerCommand::UploadOnly(true)).await;
+    match recv(&mut wire).await {
+        Message::Extended { id: 5, payload } => {
+            assert_eq!(decode_upload_only(&payload).ok(), Some(true))
+        }
+        other => panic!("expected upload_only, got {other:?}"),
+    }
+
+    // A finished torrent says so in its handshake.
+    let mut cfg = ext_cfg();
+    cfg.upload_only = true;
+    let h = start_ctx(Bitfield::full(PIECES), Some(layout(PIECES)), cfg);
+    let (mut wire, _r, _) = connect_ext(h, reserved(true, true, false)).await;
+    assert_eq!(our_ext(&mut wire).await.upload_only, Some(true));
 }
 
 /// Without `ut_pex` advertised (a private torrent, PEX disabled) its id

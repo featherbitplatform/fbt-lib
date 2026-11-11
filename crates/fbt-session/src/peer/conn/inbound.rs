@@ -160,7 +160,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 if hs.reqq.is_some() {
                     self.remote_reqq = hs.reqq;
                 }
-                self.emit(PeerEvent::ExtHandshake { key, hs }).await
+                let upload_only = hs.upload_only == Some(true);
+                self.emit(PeerEvent::ExtHandshake { key, hs }).await?;
+                if upload_only {
+                    self.emit(PeerEvent::UploadOnly { key, on: true }).await?;
+                }
+                Ok(())
+            }
+            Incoming::UploadOnly(on) => self.emit(PeerEvent::UploadOnly { key, on }).await,
+            Incoming::DontHave(piece) => {
+                // Without metadata there is nothing to retract yet.
+                if self.pending.is_some() {
+                    return Ok(());
+                }
+                if piece >= self.num_pieces {
+                    return Err(protocol("lt_donthave index out of range"));
+                }
+                self.emit(PeerEvent::DontHave { key, piece }).await
             }
             Incoming::Metadata(msg) => self.emit(PeerEvent::Metadata { key, msg }).await,
             Incoming::Pex(msg) => self.emit(PeerEvent::Pex { key, msg }).await,

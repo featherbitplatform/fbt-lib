@@ -21,6 +21,7 @@ use crate::peer::DisconnectReason;
 use crate::peer::messages::{PeerCommand, PeerEvent, PeerPiecesOwned};
 use crate::peer::transport::Transport;
 use crate::picker::{PeerKey, PeerPieces, PiecePicker};
+use crate::status::TorrentState;
 
 impl Actor {
     // ----- peer events --------------------------------------------------------
@@ -37,6 +38,8 @@ impl Actor {
             } => self.on_peer_connected(key, peer_id, addr, encrypted, transport),
             PeerEvent::Pieces { key, pieces } => self.on_pieces(key, pieces),
             PeerEvent::Have { key, piece } => self.on_have(key, piece),
+            PeerEvent::DontHave { key, piece } => self.on_donthave(key, piece),
+            PeerEvent::UploadOnly { key, on } => self.on_upload_only(key, on),
             PeerEvent::Choked { key } => {
                 if let Some(p) = self.peers.get_mut(&key) {
                     p.choked_us = true;
@@ -161,6 +164,7 @@ impl Actor {
         }
         self.update_interest(key);
         self.fill(key);
+        self.close_if_upload_only(key);
     }
 
     pub(super) fn on_have(&mut self, key: PeerKey, piece: u32) {
@@ -183,6 +187,91 @@ impl Actor {
             self.update_interest(key);
         }
         self.fill(key);
+        self.close_if_upload_only(key);
+    }
+
+    /// The remote retracted a piece (BEP 54): it no longer counts in the
+    /// availability, and our interest is re-evaluated. A `HaveAll` peer is
+    /// first turned into the equivalent full bitfield.
+    fn on_donthave(&mut self, key: PeerKey, piece: u32) {
+        let generation = self.generation;
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        if !p.has(piece) {
+            return;
+        }
+        let counted = p.generation == generation;
+        let picker = self.loaded.as_mut().and_then(|l| l.picker.as_mut());
+        let mut picker = picker.filter(|_| counted);
+        if p.seed {
+            let full = Bitfield::full(p.bits.len());
+            if let Some(pk) = picker.as_deref_mut() {
+                pk.remove_peer_pieces(PeerPieces::All);
+                pk.add_peer_pieces(PeerPieces::Some(&full));
+            }
+            p.seed = false;
+            p.bits = full;
+        }
+        p.bits.clear(piece);
+        if let Some(f) = p.fast_has.as_mut() {
+            f.clear(piece);
+        }
+        if let Some(pk) = picker {
+            pk.peer_lost(piece);
+        }
+        self.update_interest(key);
+    }
+
+    /// The remote is (no longer) upload-only (BEP 21).
+    fn on_upload_only(&mut self, key: PeerKey, on: bool) {
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        p.upload_only = on;
+        self.close_if_upload_only(key);
+    }
+
+    /// While we are finished and on disk, a peer that is a seed or
+    /// upload-only has nothing to trade with us: closed.
+    pub(super) fn close_if_upload_only(&mut self, key: PeerKey) {
+        if !self.upload_only_sent {
+            return;
+        }
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        if p.connected && p.tx.is_some() && (p.upload_only || p.is_seed()) {
+            debug!(key = key.0, "closing an upload-only peer while seeding");
+            p.close_reason = Some(DisconnectReason::UploadOnly);
+            self.close_peer(key);
+        }
+    }
+
+    /// Follows the seeding state: peers learn when we become (or stop
+    /// being) upload-only, and upload-only peers are dropped once we are.
+    /// "Finished" means seeding, with the data on disk, not merely every
+    /// piece verified.
+    pub(super) fn sync_upload_only(&mut self) {
+        let on = matches!(self.last_state, TorrentState::Seeding);
+        if on == self.upload_only_sent {
+            return;
+        }
+        self.upload_only_sent = on;
+        let keys: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.connected && p.tx.is_some())
+            .map(|(k, _)| *k)
+            .collect();
+        for &key in &keys {
+            self.send(key, PeerCommand::UploadOnly(on));
+        }
+        if on {
+            for key in keys {
+                self.close_if_upload_only(key);
+            }
+        }
     }
 
     pub(super) fn on_interested(&mut self, key: PeerKey, on: bool) {

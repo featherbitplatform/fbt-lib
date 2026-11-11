@@ -127,7 +127,9 @@ pub enum Event {
         /// Why.
         reason: DisconnectReason,
     },
-    /// Reading or writing torrent data failed; the torrent stopped.
+    /// Reading or writing torrent data failed; the torrent stopped, except
+    /// for a piece found missing on disk while serving a peer: that piece
+    /// is downloaded again and the torrent keeps running.
     FileError {
         /// The file involved, when known.
         path: Option<PathBuf>,

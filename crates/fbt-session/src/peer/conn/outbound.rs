@@ -202,6 +202,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     self.send(m).await?;
                 }
             }
+            PeerCommand::UploadOnly(on) => {
+                if let Some(m) = self.remote_ids.upload_only(on) {
+                    self.send(m).await?;
+                }
+            }
+            PeerCommand::DontHave(piece) => {
+                if let Some(m) = self.remote_ids.donthave(piece) {
+                    self.send(m).await?;
+                }
+            }
             PeerCommand::Close => return Err(DisconnectReason::Shutdown),
         }
         Ok(())

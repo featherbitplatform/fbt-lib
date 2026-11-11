@@ -6,17 +6,20 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use fbt_core::{BLOCK_SIZE, BlockRef};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::actor::{Actor, Phase};
 use super::data::Job;
+use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
 use crate::storage::cache::{CacheBudget, CacheKind};
+use crate::storage::error_path;
 
 impl Actor {
     /// A peer requests `block`: served only if we have the piece, the block
@@ -132,7 +135,14 @@ impl Actor {
             }
             Err(e) => {
                 self.cache.release_clean(read.reserved);
-                self.fail(&e, "reading a block");
+                if e.kind() == io::ErrorKind::NotFound
+                    && generation == self.generation
+                    && matches!(self.phase, Phase::Ready)
+                {
+                    self.piece_lost(piece, &e, read.waiting);
+                } else {
+                    self.fail(&e, "reading a block");
+                }
                 return;
             }
         };
@@ -187,8 +197,55 @@ impl Actor {
         }
         match result {
             Ok(buf) => self.deliver(key, block, Bytes::from(buf)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.piece_lost(block.piece, &e, vec![(key, block)]);
+            }
             Err(e) => self.fail(&e, "reading a block"),
         }
+    }
+
+    /// A piece we have is gone from disk (BEP 54): it is wanted again, our
+    /// peers are told, the requests waiting on it are rejected and
+    /// `FileError` reports the file; the torrent keeps running. A piece
+    /// already given up (a second read failing) is only rejected.
+    fn piece_lost(&mut self, piece: u32, e: &io::Error, waiting: Vec<(PeerKey, BlockRef)>) {
+        let lost = self
+            .loaded
+            .as_mut()
+            .and_then(|l| l.picker.as_mut())
+            .is_some_and(|pk| {
+                let had = pk.have().get(piece);
+                pk.piece_lost(piece);
+                had
+            });
+        for (key, block) in waiting {
+            self.send(key, PeerCommand::Reject(block));
+        }
+        if !lost {
+            return;
+        }
+        warn!(torrent = %self.name(), piece, error = %e, "piece lost on disk");
+        self.emit(Event::FileError {
+            path: error_path(e).map(Path::to_path_buf),
+            torrent: self.ih,
+            message: format!("reading a block: {e}"),
+        });
+        // Wanted again, so the torrent is no longer finished.
+        self.finished_emitted = false;
+        let keys: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.connected && p.tx.is_some())
+            .map(|(k, _)| *k)
+            .collect();
+        for &key in &keys {
+            self.send(key, PeerCommand::DontHave(piece));
+        }
+        self.refresh_state();
+        for key in keys {
+            self.update_interest(key);
+        }
+        self.top_up_all(None);
     }
 }
 
