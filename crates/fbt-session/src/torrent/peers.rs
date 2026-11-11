@@ -477,13 +477,18 @@ impl Actor {
             picker.release_peer(key);
             picker.remove_peer_pieces(p.pieces());
         }
-        // A connection that got through reports its end only if it is the
-        // one `PeerConnected` named (a duplicate closed by the tie-break
-        // stays silent: the peer is still connected through the other); an
-        // attempt that never connected reports its failure.
+        // `PeerDisconnected` stays paired with `PeerConnected`. A
+        // connection that got through reports its end only if it is the one
+        // `PeerConnected` named (a duplicate closed by the tie-break stays
+        // silent: the peer is still connected through the other). An
+        // attempt that never connected reports its failure, unless another
+        // connection to that address is the reported one (a holepunch dial
+        // that lost the race to the other side's).
         let report = match p.reported {
             Some(addr) => Some(addr),
-            None if !p.connected => Some(p.addr),
+            None if !p.connected && !self.peers.values().any(|o| o.reported == Some(p.addr)) => {
+                Some(p.addr)
+            }
             None => None,
         };
         if let Some(addr) = report {
@@ -537,8 +542,9 @@ impl Actor {
                     );
                     return;
                 }
-                HolepunchCounters::bump(&self.shared.holepunch.connects_received);
-                self.dial_holepunch(addr);
+                if self.dial_holepunch(addr) {
+                    HolepunchCounters::bump(&self.shared.holepunch.connects_received);
+                }
             }
             HolepunchMsg::Error { addr, code } => {
                 // Only an answer from the relay we asked counts; normal

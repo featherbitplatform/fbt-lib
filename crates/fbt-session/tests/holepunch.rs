@@ -17,10 +17,9 @@ use std::time::Duration;
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::MemStorage;
 use fbt_session::{
-    AddTorrent, DisconnectReason, Event, EventMask, EventStream, RateLimit, Session, Settings,
-    TorrentHandle, TorrentState, Transport,
+    AddTorrent, Event, EventMask, EventStream, RateLimit, Session, Settings, TorrentHandle,
+    TorrentState, Transport,
 };
-use fbt_utp::UtpError;
 use fbt_wire::{
     ExtHandshake, HP_NOT_CONNECTED, HolepunchMsg, Message, OUR_UT_HOLEPUNCH_ID, Reserved,
     UT_HOLEPUNCH,
@@ -107,10 +106,9 @@ async fn holepunch_connects_two_natted_peers() {
     let (m, payload) = make_torrent(&[("a", 1 << 20)], 16_384);
     let (r, c, a, ha, mut eva) = three(&m, payload, true).await;
     let c_addr = c.local_addr();
-    // A holepunch dial of A's that loses the race to C's (its SYN reached
-    // C before C's NAT opened) fails at connect; that attempt never got
-    // through, so it may report its failure. Nothing else may end C.
-    let utp_timeout = DisconnectReason::Io(UtpError::ConnectTimeout.to_string());
+    // Paired events: once C is reported connected, nothing reports it
+    // gone until the window ends, not even a holepunch dial of A's that
+    // lost the race to C's (it never got through).
     let mut connected = Vec::new();
     let mut ended_after_connect = Vec::new();
     let end = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -126,7 +124,7 @@ async fn holepunch_connects_two_natted_peers() {
                 addr, transport, ..
             } if addr == c_addr => connected.push(transport),
             Event::PeerDisconnected { addr, reason, .. }
-                if addr == c_addr && !connected.is_empty() && reason != utp_timeout =>
+                if addr == c_addr && !connected.is_empty() =>
             {
                 ended_after_connect.push(reason)
             }

@@ -25,6 +25,14 @@ const RENDEZVOUS_WINDOW: Duration = Duration::from_secs(60);
 /// Peer IPs the limiter tracks at once. Entries outlive their connections
 /// (a reconnect must not reset the budget) and go once their window ended
 /// and the table is full; a new IP beyond it is refused until then.
+///
+/// The trade-off: peers from 1024 distinct IPs, each sending one message a
+/// minute, can keep the table full and lock out a new IP's rendezvous work
+/// for as long as they keep it up. That costs only holepunching (normal
+/// connections are unaffected); the alternative, evicting live windows,
+/// would let one peer reset its own budget by cycling IPs through the
+/// table. Filling it takes connections from 1024 distinct IPs within a
+/// minute, and keeping it full, as many again every minute.
 const MAX_LIMITED_PEERS: usize = 1024;
 /// Addresses we asked a relay about and still wait on.
 pub(super) const MAX_PENDING: usize = 64;

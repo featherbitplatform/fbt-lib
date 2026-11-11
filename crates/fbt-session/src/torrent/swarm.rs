@@ -804,8 +804,8 @@ impl Actor {
     /// over uTP at once, ahead of the queue and any retry wait, unless it
     /// is connected or being dialled already, a seed we turned away while
     /// finished, or a limit is reached. Only this one attempt: see
-    /// [`Peer::holepunch`].
-    pub(super) fn dial_holepunch(&mut self, addr: SocketAddr) {
+    /// [`Peer::holepunch`]. Returns whether it dialled.
+    pub(super) fn dial_holepunch(&mut self, addr: SocketAddr) -> bool {
         if !self.connectable()
             || self.retries.is_never(&addr)
             || (self.upload_only_sent && self.seed_addrs.contains(&addr))
@@ -813,17 +813,18 @@ impl Actor {
             || self.metadata_ip_banned(&addr)
             || !self.transport_usable(&addr, Transport::Utp)
         {
-            return;
+            return false;
         }
         if !self.reserve_dial() {
             debug!(%addr, "no connection slot for a holepunch dial");
-            return;
+            return false;
         }
         debug!(%addr, "holepunch: dialling over uTP");
         let key = self.spawn_dial(addr, Transport::Utp);
         if let Some(p) = self.peers.get_mut(&key) {
             p.holepunch = true;
         }
+        true
     }
 
     /// An outgoing connection to `addr` failed at connect over every
@@ -1450,6 +1451,67 @@ pub(super) mod tests {
         assert!(a.candidates.is_empty(), "nothing queued");
         assert!(a.retries.is_pending(&known), "a known address retries");
         assert_eq!(a.retries.fallback_transport(&known), None, "no fallback");
+    }
+
+    /// `PeerDisconnected` stays paired with `PeerConnected`: an attempt
+    /// that never got through (a holepunch dial losing the race) says
+    /// nothing while another connection to that address is the reported
+    /// one; that one reports its own end, and a failed attempt to an
+    /// address nobody reported still reports its failure.
+    #[tokio::test]
+    async fn failed_attempt_to_a_reported_address_stays_silent() {
+        use crate::event::Event;
+        use crate::peer::messages::PeerEvent;
+        use crate::torrent::actor::EMITTED;
+
+        let disconnects = || -> Vec<(SocketAddr, DisconnectReason)> {
+            EMITTED
+                .take()
+                .into_iter()
+                .filter_map(|(e, _)| match e {
+                    Event::PeerDisconnected { addr, reason, .. } => Some((addr, reason)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let gone = |key: PeerKey, reason: DisconnectReason, failed: Option<Transport>| {
+            PeerEvent::Disconnected {
+                key,
+                reason,
+                outstanding: Vec::new(),
+                connect_failed: failed,
+            }
+        };
+        let timeout = DisconnectReason::Io("uTP connect timed out".into());
+        let mut a = actor();
+        let c = addr(1);
+        let (tx, _rx1) = mpsc::channel(4);
+        let live = a.new_key();
+        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        p.connected = true;
+        p.reported = Some(c);
+        a.peers.insert(live, p);
+        let (tx, _rx2) = mpsc::channel(4);
+        let attempt = a.new_key();
+        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        p.outgoing = true;
+        p.holepunch = true;
+        a.peers.insert(attempt, p);
+        EMITTED.take();
+
+        a.on_peer_event(gone(attempt, timeout.clone(), Some(Transport::Utp)));
+        assert_eq!(disconnects(), vec![], "the losing attempt is silent");
+        a.on_peer_event(gone(live, DisconnectReason::Closed, None));
+        assert_eq!(disconnects(), vec![(c, DisconnectReason::Closed)]);
+
+        // Nobody reported for the address: the failure is reported.
+        let (tx, _rx3) = mpsc::channel(4);
+        let lone = a.new_key();
+        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        p.outgoing = true;
+        a.peers.insert(lone, p);
+        a.on_peer_event(gone(lone, timeout.clone(), Some(Transport::Utp)));
+        assert_eq!(disconnects(), vec![(c, timeout)]);
     }
 
     #[test]
