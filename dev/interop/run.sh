@@ -9,7 +9,17 @@
 # Needs Docker with Compose v2. Everything lands in target/interop/.
 #
 #   bash dev/interop/run.sh
+#
+# INTEROP_ONLY=utp (a comma-separated list of download, seed, encryption,
+# magnet, pex, utp, lsd) runs only those scenarios, after the shared setup;
+# uTP always runs. FBT_RUST_LOG sets RUST_LOG for the uTP download (its
+# tracing lands in fbt-download-utp.log), e.g. FBT_RUST_LOG=fbt_utp=debug.
 set -euo pipefail
+
+# want <scenario>: INTEROP_ONLY is unset or names it.
+want() { [ -z "${INTEROP_ONLY:-}" ] || [[ ",$INTEROP_ONLY," == *",$1,"* ]]; }
+utp_env=()
+[ -z "${FBT_RUST_LOG:-}" ] || utp_env=(env "RUST_LOG=$FBT_RUST_LOG")
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -331,6 +341,10 @@ wait_for "Transmission RPC" 120 trc timeout 15 transmission-remote -l
 tr_ip=$(container_ip transmission)
 qbt_ip=$(container_ip qbittorrent)
 [ -n "$tr_ip" ] && [ -n "$qbt_ip" ] || fail "could not resolve the client addresses"
+# Setup (image builds and pulls, container start, DHT join) is timed apart
+# from the scenarios, which alone say anything about our code.
+setup_secs=$SECONDS
+echo "interop: setup took ${setup_secs}s"
 
 # ---------------------------------------------------------------- download --
 echo "interop: creating payload and fixture.torrent"
@@ -346,6 +360,7 @@ trc transmission-remote -a /interop/fixture.torrent -w /interop/payload >/dev/nu
 wait_for "qBittorrent to verify and seed fixture" 120 qbt_seeding "$hash1"
 wait_for "Transmission to verify and seed fixture" 120 tr_complete "$hash1"
 
+if want download; then
 echo "interop: fbt-example download (timeout 300s)"
 set +e
 fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt --port 6890 \
@@ -359,6 +374,7 @@ wait_for "qBittorrent to report uploaded > 0" 30 qbt_uploaded "$hash1"
 wait_for "Transmission to report uploaded data" 30 tr_uploaded "$hash1"
 echo "interop: qBittorrent uploaded $(qbt_field "$hash1" .uploaded) bytes, Transmission uploaded $(tr_field "$hash1" Uploaded)"
 echo "interop: download OK (qbittorrent, transmission)"
+fi
 
 # -------------------------------------------------------------------- seed --
 echo "interop: creating payload and fixture2.torrent"
@@ -367,6 +383,7 @@ make_torrent /interop/payload2/fixture2 /interop/fixture2.torrent
 hash2=$(info_hash /interop/fixture2.torrent)
 [ -n "$hash2" ] || fail "could not read the info hash of fixture2.torrent"
 
+if want seed; then
 echo "interop: fbt-example seed (420s)"
 start_seed /interop/fixture2.torrent /interop/payload2 6891 "$logs/fbt-seed.log" --no-dht
 
@@ -376,7 +393,9 @@ wait_for "Transmission to complete fixture2" 300 tr_complete "$hash2"
 other_client_data /interop/payload2 /interop/tr-dl fixture2 Transmission
 stop_seed
 echo "interop: seed OK (transmission)"
+fi
 
+if want encryption; then
 # -------------------------------------------------------- forced encryption --
 echo "interop: switching qBittorrent and Transmission to encryption required"
 set_encryption required
@@ -408,7 +427,9 @@ grep -q "^peer connected $tr_ip:" "$logs/fbt-seed-enc.log" ||
 stop_seed
 set_encryption preferred
 echo "interop: encryption OK (qbittorrent, transmission)"
+fi
 
+if want magnet; then
 # ------------------------------------------------------- magnet through DHT --
 echo "interop: creating payload and trackerless fixture3.torrent"
 make_payload /interop/payload3/fixture3
@@ -462,7 +483,9 @@ while :; do
 done
 echo "interop: magnet attempt $attempt passed"
 echo "interop: magnet via DHT OK"
+fi
 
+if want pex; then
 # --------------------------------------------------------------------- PEX --
 echo "interop: creating payload and trackerless fixture4.torrent"
 make_payload /interop/payload4/fixture4
@@ -492,6 +515,7 @@ grep -Eq 'found .* peers via pex' "$logs/fbt-pex.log" ||
 grep -Eq "^peer connected $tr_ip:51413 via (tcp|utp)$" "$logs/fbt-pex.log" ||
     fail "never connected to Transmission, which only PEX could name (see $logs/fbt-pex.log)"
 echo "interop: PEX OK"
+fi
 
 # ------------------------------------------------------ uTP with qBittorrent --
 fbt_ip=$(network_ip fbt swarm)
@@ -501,8 +525,9 @@ set_bt_protocol 2
 qbt_up_before=$(qbt_field "$hash1" .uploaded)
 
 echo "interop: fbt-example download --transport utp (timeout 300s)"
+utp_started=$SECONDS
 set +e
-fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt-utp --port 6895 \
+fbt ${utp_env[@]+"${utp_env[@]}"} timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt-utp --port 6895 \
     --transport utp --no-dht --dht-bootstrap "$dht_bootstrap" >"$logs/fbt-download-utp.log" 2>&1
 status=$?
 set -e
@@ -513,12 +538,14 @@ grep -Eq "^peer connected $qbt_ip:6882 via utp$" "$logs/fbt-download-utp.log" ||
     fail "never connected to qBittorrent ($qbt_ip:6882) over uTP (see $logs/fbt-download-utp.log)"
 wait_for "qBittorrent's uploaded to grow over uTP" 30 qbt_uploaded_more_than "$hash1" "$qbt_up_before"
 echo "interop: uTP: qBittorrent uploaded $qbt_up_before -> $(qbt_field "$hash1" .uploaded) bytes"
-echo "interop: uTP download OK (qbittorrent)"
+echo "interop: uTP download OK (qbittorrent) in $((SECONDS - utp_started))s"
 
 echo "interop: fbt-example seed --transport utp; qBittorrent (uTP only) downloads fixture2"
 # Transmission still seeds fixture2 (and would be on the tracker's list):
 # drop it, so the uTP seed is qBittorrent's only source.
+if want seed; then
 trc transmission-remote -t "$hash2" -r >/dev/null
+fi
 start_seed /interop/fixture2.torrent /interop/payload2 6896 "$logs/fbt-seed-utp.log" --no-dht --transport utp
 qbt_api torrents/add -F torrents=@/interop/fixture2.torrent -F savepath=/interop/qbt-utp >/dev/null
 wait_for "qBittorrent to add fixture2" 30 qbt_has "$hash2"
@@ -531,6 +558,7 @@ stop_seed
 set_bt_protocol 0
 echo "interop: uTP seed OK (qbittorrent)"
 
+if want lsd; then
 # --------------------------------------------------------------------- LSD --
 echo "interop: creating payload and trackerless fixture5.torrent"
 make_payload /interop/payload5/fixture5
@@ -575,4 +603,5 @@ grep -Eq "^peer connected $lsd_ip:6897 via (tcp|utp)$" "$lsd_log" ||
 stop_seed
 seed_service=fbt
 echo "interop: LSD OK"
-echo "interop: all scenarios passed in ${SECONDS}s"
+fi
+echo "interop: all scenarios passed in $((SECONDS - setup_secs))s (setup ${setup_secs}s, total ${SECONDS}s)"

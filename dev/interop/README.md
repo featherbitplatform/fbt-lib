@@ -219,6 +219,15 @@ uid/gid, so the directory stays removable. On failure it writes
 `logs/containers.log` and prints the tail of every log. Set `RUST_LOG` (for
 example `RUST_LOG=debug`) to raise `fbt-example`'s log level.
 
+To chase one scenario, `INTEROP_ONLY` takes a comma-separated list of
+`download`, `seed`, `encryption`, `magnet`, `pex`, `utp` and `lsd`; the
+shared setup and the uTP scenarios always run, the others only when named.
+`FBT_RUST_LOG` sets `RUST_LOG` for the uTP download alone (its tracing goes
+to `fbt-download-utp.log`), for example
+`INTEROP_ONLY=utp FBT_RUST_LOG=info,fbt_utp=debug,fbt_session=debug`. The
+script prints the setup time (image builds and pulls, container start, DHT
+join) apart from the scenario time, and the uTP download's own duration.
+
 ## Images
 
 All pinned by the digest of the multi-arch index (manifest list), so the same
