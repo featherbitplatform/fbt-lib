@@ -22,7 +22,7 @@ use crate::peer::messages::PeerCommand;
 use crate::peer::transport::Transport;
 use crate::picker::{PeerKey, PeerPieces};
 use crate::rate::RateMeter;
-use crate::session::{dht_port_for, release, try_reserve};
+use crate::session::{HolepunchCounters, dht_port_for, release, try_reserve};
 use crate::settings::EncryptionPolicy;
 
 /// Connection attempts per address before it is given up.
@@ -483,9 +483,15 @@ pub(super) struct Peer {
     pub pex: Option<PexPeer>,
     /// The peer said it is upload-only (BEP 21).
     pub upload_only: bool,
-    /// Closed as a duplicate in favour of a newer connection to the same
-    /// peer: the peer stays connected, so its end is not reported.
-    pub replaced: bool,
+    /// The address its `PeerConnected` named, `Some` while this
+    /// connection is the one the session reported for the peer: it then
+    /// reports its end. A tie-break that replaces a connection with a newer
+    /// one to the same peer moves it to the newer one.
+    pub reported: Option<SocketAddr>,
+    /// Dialled on a relay's BEP 55 `Connect`: a failure neither falls back
+    /// to TCP nor asks for a rendezvous, and is retried only for an address
+    /// we knew already.
+    pub holepunch: bool,
 }
 
 impl Peer {
@@ -530,7 +536,8 @@ impl Peer {
             metadata_requests: 0,
             pex: None,
             upload_only: false,
-            replaced: false,
+            reported: None,
+            holepunch: false,
         }
     }
 
@@ -742,7 +749,7 @@ impl Actor {
     }
 
     /// Dials `addr` over `transport` in slots already reserved.
-    fn spawn_dial(&mut self, addr: SocketAddr, transport: Transport) {
+    fn spawn_dial(&mut self, addr: SocketAddr, transport: Transport) -> PeerKey {
         let utp = match transport {
             Transport::Utp => self.shared.utp_for(&addr).cloned(),
             Transport::Tcp => None,
@@ -757,6 +764,7 @@ impl Actor {
         peer.connecting = true;
         peer.have_sent = Some(have);
         self.peers.insert(key, peer);
+        key
     }
 
     /// Starts outgoing connections while every limit allows.
@@ -794,10 +802,13 @@ impl Actor {
 
     /// A relay told us to connect to `addr` (BEP 55 `Connect`): dialled
     /// over uTP at once, ahead of the queue and any retry wait, unless it
-    /// is connected or being dialled already, or a limit is reached.
+    /// is connected or being dialled already, a seed we turned away while
+    /// finished, or a limit is reached. Only this one attempt: see
+    /// [`Peer::holepunch`].
     pub(super) fn dial_holepunch(&mut self, addr: SocketAddr) {
         if !self.connectable()
             || self.retries.is_never(&addr)
+            || (self.upload_only_sent && self.seed_addrs.contains(&addr))
             || self.addr_busy(&addr)
             || self.metadata_ip_banned(&addr)
             || !self.transport_usable(&addr, Transport::Utp)
@@ -809,7 +820,10 @@ impl Actor {
             return;
         }
         debug!(%addr, "holepunch: dialling over uTP");
-        self.spawn_dial(addr, Transport::Utp);
+        let key = self.spawn_dial(addr, Transport::Utp);
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.holepunch = true;
+        }
     }
 
     /// An outgoing connection to `addr` failed at connect over every
@@ -836,7 +850,7 @@ impl Actor {
         {
             return;
         }
-        if !self.hp_pending.insert(addr, Instant::now()) {
+        if !self.hp_pending.insert(addr, relay, Instant::now()) {
             debug!(%addr, "too many rendezvous requests pending; not asking");
             return;
         }
@@ -844,10 +858,12 @@ impl Actor {
             k.rendezvous_sent = true;
         }
         debug!(%addr, relay = relay.0, "connect failed; asking for a rendezvous");
-        self.send(
+        if self.send(
             relay,
             PeerCommand::SendHolepunch(HolepunchMsg::Rendezvous(addr)),
-        );
+        ) {
+            HolepunchCounters::bump(&self.shared.holepunch.rendezvous_sent);
+        }
     }
 
     /// The transport to dial `addr` over first: uTP when outgoing uTP is
@@ -1044,8 +1060,14 @@ impl Actor {
         };
         if let Some(l) = self.peers.get_mut(&loser) {
             l.close_reason = Some(DisconnectReason::Duplicate);
-            // The peer stays connected through the new connection.
-            l.replaced = keep_new;
+        }
+        if keep_new {
+            // The peer stays connected through the new connection, which
+            // reports its end from now on.
+            let reported = self.peers.get_mut(&old).and_then(|o| o.reported.take());
+            if let Some(n) = self.peers.get_mut(&key) {
+                n.reported = reported;
+            }
         }
         self.close_peer(loser);
         outcome
@@ -1071,7 +1093,19 @@ impl Actor {
             release(&self.shared.half_open);
         }
         release(&self.shared.global_peers);
-        if reason == DisconnectReason::SelfConnection {
+        if p.holepunch && p.outgoing && !p.connected {
+            // A relay's introduction that did not work out. The address
+            // came from a remote: no fallback, no rendezvous, and retries
+            // only for an address we knew before (never from a `Connect`
+            // alone).
+            if reason != DisconnectReason::Shutdown
+                && self.known.get(&p.addr).is_some()
+                && self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp
+            {
+                self.known.remove(&p.addr);
+                self.candidates.retain(|a| *a != p.addr);
+            }
+        } else if reason == DisconnectReason::SelfConnection {
             self.retries.never(p.addr);
             self.known.remove(&p.addr);
             self.candidates.retain(|a| *a != p.addr);
@@ -1333,6 +1367,7 @@ pub(super) mod tests {
             disk: crate::disk::DiskPool::new(1, 1),
             cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
+            holepunch: Default::default(),
         });
         let add = AddTorrent::new(meta, PathBuf::from("unused"));
         let ih = add.source.info_hashes();
@@ -1383,6 +1418,37 @@ pub(super) mod tests {
             );
             a.peers.remove(&key);
         }
+    }
+
+    /// A failed holepunch dial to an address we never knew (it came only
+    /// in a relay's `Connect`) leaves nothing behind: no fallback, no retry,
+    /// nothing queued. One to a known address is an ordinary failure, still
+    /// without a fallback.
+    #[tokio::test]
+    async fn failed_holepunch_dial_never_feeds_retries() {
+        let mut a = actor();
+        let stranger = addr(1);
+        let known = addr(2);
+        assert!(a.remember(known));
+        for target in [stranger, known] {
+            let key = a.new_key();
+            let (tx, _rx) = mpsc::channel(4);
+            let mut p = Peer::new(target, tx, a.generation, 1, Transport::Utp);
+            p.outgoing = true;
+            p.holepunch = true;
+            a.peers.insert(key, p);
+            a.on_disconnected(
+                key,
+                DisconnectReason::Io("connect timed out".into()),
+                Some(Transport::Utp),
+            );
+        }
+        assert!(!a.retries.is_pending(&stranger));
+        assert_eq!(a.retries.fallback_transport(&stranger), None);
+        assert!(a.known.get(&stranger).is_none());
+        assert!(a.candidates.is_empty(), "nothing queued");
+        assert!(a.retries.is_pending(&known), "a known address retries");
+        assert_eq!(a.retries.fallback_transport(&known), None, "no fallback");
     }
 
     #[test]

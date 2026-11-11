@@ -25,6 +25,7 @@ use crate::peer::DisconnectReason;
 use crate::peer::messages::{PeerCommand, PeerEvent, PeerPiecesOwned};
 use crate::peer::transport::Transport;
 use crate::picker::{PeerKey, PeerPieces, PiecePicker};
+use crate::session::HolepunchCounters;
 use crate::status::TorrentState;
 
 impl Actor {
@@ -141,10 +142,16 @@ impl Actor {
             }
         }
         debug!(%addr, encrypted, ?transport, "peer connected");
-        if outcome == ConnectOutcome::Replaced {
+        if outcome == ConnectOutcome::Replaced
+            && self.peers.get(&key).is_some_and(|p| p.reported.is_some())
+        {
             // Reported when its first connection came up; the swap of
-            // connections is not a new peer.
+            // connections is not a new peer (`transport` and `encrypted`
+            // of that report stay those of the first connection).
             return;
+        }
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.reported = Some(addr);
         }
         self.emit(Event::PeerConnected {
             torrent: self.ih,
@@ -457,7 +464,6 @@ impl Actor {
             return;
         };
         self.note_seed_gone(&p);
-        self.hp_limiter.forget(key);
         if let Some(m) = self.magnet.as_mut() {
             let sends = m.fetch.on_peer_gone(key);
             self.send_metadata(sends);
@@ -471,12 +477,19 @@ impl Actor {
             picker.release_peer(key);
             picker.remove_peer_pieces(p.pieces());
         }
-        // A connection replaced by a newer one to the same peer: the peer
-        // is still connected, as reported.
-        if !p.replaced {
+        // A connection that got through reports its end only if it is the
+        // one `PeerConnected` named (a duplicate closed by the tie-break
+        // stays silent: the peer is still connected through the other); an
+        // attempt that never connected reports its failure.
+        let report = match p.reported {
+            Some(addr) => Some(addr),
+            None if !p.connected => Some(p.addr),
+            None => None,
+        };
+        if let Some(addr) = report {
             self.emit(Event::PeerDisconnected {
                 torrent: self.ih,
-                addr: p.addr,
+                addr,
                 reason,
             });
         }
@@ -490,37 +503,49 @@ impl Actor {
     /// the extension). Ignored once holepunch no longer applies (a magnet
     /// turned out private).
     fn on_holepunch(&mut self, key: PeerKey, msg: HolepunchMsg) {
-        if !self.holepunch_active() || !self.peers.get(&key).is_some_and(|p| p.live()) {
+        if !self.holepunch_active() {
             return;
         }
+        let Some(ip) = self
+            .peers
+            .get(&key)
+            .filter(|p| p.live())
+            .map(|p| p.addr.ip())
+        else {
+            return;
+        };
         let now = Instant::now();
         match msg {
             HolepunchMsg::Rendezvous(target) => {
-                if !self.hp_limiter.allow(key, now) {
+                if !self.hp_limiter.allow(ip, now) {
                     debug!(key = key.0, "rendezvous over the rate limit; ignored");
                     return;
                 }
                 self.relay_rendezvous(key, target);
             }
             HolepunchMsg::Connect(addr) => {
-                // Our own request's answer, or an introduction a relay
-                // makes for another peer's request (rate-limited).
+                // The answer to our own request (from the relay we asked),
+                // or an introduction a relay makes for another peer's
+                // request (rate-limited per relay IP).
                 if !dialable(&addr) {
                     return;
                 }
-                if !self.hp_pending.take(&addr, now) && !self.hp_limiter.allow(key, now) {
+                if !self.hp_pending.take(&addr, key, now) && !self.hp_limiter.allow(ip, now) {
                     debug!(
                         key = key.0,
                         "holepunch connect over the rate limit; ignored"
                     );
                     return;
                 }
+                HolepunchCounters::bump(&self.shared.holepunch.connects_received);
                 self.dial_holepunch(addr);
             }
             HolepunchMsg::Error { addr, code } => {
-                // Normal retries go on.
-                debug!(key = key.0, %addr, code, "rendezvous refused by the relay");
-                self.hp_pending.remove(&addr);
+                // Only an answer from the relay we asked counts; normal
+                // retries go on either way.
+                if self.hp_pending.take(&addr, key, now) {
+                    debug!(key = key.0, %addr, code, "rendezvous refused by the relay");
+                }
             }
         }
     }
@@ -556,6 +581,7 @@ impl Actor {
                     return;
                 };
                 debug!(%target, %requester, "relaying a rendezvous");
+                HolepunchCounters::bump(&self.shared.holepunch.relayed);
                 self.send(
                     target_key,
                     PeerCommand::SendHolepunch(HolepunchMsg::Connect(to_target)),

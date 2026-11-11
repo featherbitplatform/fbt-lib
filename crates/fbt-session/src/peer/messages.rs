@@ -33,7 +33,8 @@ pub enum DisconnectReason {
     /// We closed the connection (`PeerCommand::Close` or the torrent went away).
     Shutdown,
     /// We closed it because the same peer id is already connected to the
-    /// torrent; the older connection stays.
+    /// torrent and the tie-break kept the other connection. Not reported in
+    /// events: the peer stays connected through the other one.
     Duplicate,
     /// The peer advertised an unacceptable metadata size or sent metadata
     /// that is inconsistent or fails the info-hash check; it is never

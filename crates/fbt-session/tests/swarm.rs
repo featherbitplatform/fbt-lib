@@ -537,8 +537,10 @@ async fn piece_finished_while_a_peer_connects_is_announced() {
     s.shutdown().await;
 }
 
-/// A second connection under a peer id that is already connected is closed
-/// with `Duplicate`; the first one keeps working.
+/// A second connection under a peer id that is already connected is
+/// closed (the older one stays, same direction) without any event: the
+/// peer was reported connected once and still is. The first connection
+/// keeps working and alone reports its end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_peer_id_is_rejected() {
     let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
@@ -547,29 +549,40 @@ async fn duplicate_peer_id_is_rejected() {
     let id = fbt_core::PeerId([0x42; 20]);
     let mut ev = s.subscribe(EventMask::PEER);
     let mut first = ScriptedPeer::connect_as(s.local_addr(), ih, id, false).await;
-    next_matching(&mut ev, |e| matches!(e, Event::PeerConnected { .. }), T)
+    let first_addr = match next_matching(&mut ev, |e| matches!(e, Event::PeerConnected { .. }), T)
         .await
-        .expect("first connected");
+        .expect("first connected")
+    {
+        Event::PeerConnected { addr, .. } => addr,
+        _ => unreachable!(),
+    };
     let mut second = ScriptedPeer::connect_as(s.local_addr(), ih, id, false).await;
     assert_eq!(second.wait_closed(T).await, PeerEnd::Closed);
-    let e = next_matching(&mut ev, |e| matches!(e, Event::PeerDisconnected { .. }), T)
-        .await
-        .expect("second disconnected");
-    assert!(
-        matches!(
-            e,
-            Event::PeerDisconnected {
-                reason: DisconnectReason::Duplicate,
-                ..
-            }
-        ),
-        "{e:?}"
-    );
+    let e = next_matching(
+        &mut ev,
+        |e| {
+            matches!(
+                e,
+                Event::PeerConnected { .. } | Event::PeerDisconnected { .. }
+            )
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(e.is_none(), "the duplicate was reported: {e:?}");
     first.send(Message::Interested).await;
     first
         .next_matching(|m| *m == Message::Unchoke)
         .await
         .expect("the first connection still works");
+    drop(first);
+    let e = next_matching(&mut ev, |e| matches!(e, Event::PeerDisconnected { .. }), T)
+        .await
+        .expect("the first connection reports its end");
+    assert!(
+        matches!(e, Event::PeerDisconnected { addr, .. } if addr == first_addr),
+        "{e:?}"
+    );
     s.shutdown().await;
 }
 

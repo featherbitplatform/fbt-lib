@@ -17,9 +17,10 @@ use std::time::Duration;
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::MemStorage;
 use fbt_session::{
-    AddTorrent, Event, EventMask, EventStream, RateLimit, Session, Settings, TorrentHandle,
-    TorrentState, Transport,
+    AddTorrent, DisconnectReason, Event, EventMask, EventStream, RateLimit, Session, Settings,
+    TorrentHandle, TorrentState, Transport,
 };
+use fbt_utp::UtpError;
 use fbt_wire::{
     ExtHandshake, HP_NOT_CONNECTED, HolepunchMsg, Message, OUR_UT_HOLEPUNCH_ID, Reserved,
     UT_HOLEPUNCH,
@@ -106,35 +107,55 @@ async fn holepunch_connects_two_natted_peers() {
     let (m, payload) = make_torrent(&[("a", 1 << 20)], 16_384);
     let (r, c, a, ha, mut eva) = three(&m, payload, true).await;
     let c_addr = c.local_addr();
+    // A holepunch dial of A's that loses the race to C's (its SYN reached
+    // C before C's NAT opened) fails at connect; that attempt never got
+    // through, so it may report its failure. Nothing else may end C.
+    let utp_timeout = DisconnectReason::Io(UtpError::ConnectTimeout.to_string());
     let mut connected = Vec::new();
+    let mut ended_after_connect = Vec::new();
     let end = tokio::time::Instant::now() + Duration::from_secs(20);
-    let mut finished = false;
-    while let Ok(Some(e)) = tokio::time::timeout_at(end, eva.recv()).await {
+    // The window ends with A's last piece: its `Have` shows C that A is a
+    // seed too, and C parts from it (BEP 21), ahead of A's
+    // `TorrentFinished` (which waits for the final flush).
+    let mut pieces_left = m.info.pieces.len();
+    while pieces_left > 0
+        && let Ok(Some(e)) = tokio::time::timeout_at(end, eva.recv()).await
+    {
         match e {
             Event::PeerConnected {
                 addr, transport, ..
             } if addr == c_addr => connected.push(transport),
-            Event::TorrentFinished { .. } => {
-                finished = true;
-                break;
+            Event::PeerDisconnected { addr, reason, .. }
+                if addr == c_addr && !connected.is_empty() && reason != utp_timeout =>
+            {
+                ended_after_connect.push(reason)
             }
+            Event::PieceFinished { .. } => pieces_left -= 1,
             _ => {}
         }
     }
-    assert!(finished, "A did not finish within 20 s ({connected:?})");
-    // A late duplicate connection would still be reported now.
-    let end = tokio::time::Instant::now() + Duration::from_millis(500);
-    while let Ok(Some(e)) = tokio::time::timeout_at(end, eva.recv()).await {
-        if let Event::PeerConnected {
-            addr, transport, ..
-        } = e
-            && addr == c_addr
-        {
-            connected.push(transport);
-        }
-    }
+    assert_eq!(
+        pieces_left, 0,
+        "A did not finish within 20 s ({connected:?})"
+    );
+    assert!(wait_state(&ha, |s| *s == TorrentState::Seeding, T).await);
     assert_eq!(connected, vec![Transport::Utp], "PeerConnected for C at A");
+    assert!(
+        ended_after_connect.is_empty(),
+        "PeerDisconnected for C at A while connected: {ended_after_connect:?}"
+    );
     assert!(ha.status().progress >= 1.0);
+    // The exchange happened: A asked R, R introduced A and C, and both
+    // acted on R's `Connect`.
+    let (a_sent, _, a_connects) = a.holepunch_stats();
+    let (_, r_relayed, _) = r.holepunch_stats();
+    let (_, _, c_connects) = c.holepunch_stats();
+    assert!(a_sent >= 1, "A sent no Rendezvous");
+    assert!(r_relayed >= 1, "R relayed nothing");
+    assert!(
+        a_connects >= 1 && c_connects >= 1,
+        "{a_connects} {c_connects}"
+    );
     for s in [a, c, r] {
         s.shutdown().await;
     }
@@ -152,6 +173,8 @@ async fn nat_emulation_blocks_unsolicited() {
     )
     .await;
     assert!(got.is_none(), "A reached C through its NAT: {got:?}");
+    assert_eq!(a.holepunch_stats(), (0, 0, 0));
+    assert_eq!(r.holepunch_stats(), (0, 0, 0));
     for s in [a, c, r] {
         s.shutdown().await;
     }
@@ -251,6 +274,7 @@ async fn private_torrent_never_relays() {
     };
     let (a, b) = tokio::join!(p1.next_matching(is_hp), p2.next_matching(is_hp));
     assert!(a.is_none() && b.is_none(), "relayed: {a:?} {b:?}");
+    assert_eq!(r.holepunch_stats(), (0, 0, 0));
     r.shutdown().await;
 }
 
@@ -280,5 +304,6 @@ async fn public_torrent_relays_between_scripted_peers() {
         HolepunchMsg::decode(&to_p2).unwrap(),
         HolepunchMsg::Connect("127.0.0.1:7001".parse().unwrap())
     );
+    assert_eq!(r.holepunch_stats(), (0, 1, 0));
     r.shutdown().await;
 }

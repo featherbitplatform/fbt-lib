@@ -106,7 +106,12 @@ pub enum Event {
         /// Nodes in the routing tables at that moment.
         nodes: usize,
     },
-    /// A peer completed the handshake.
+    /// A peer completed the handshake. Reported once per peer: when two
+    /// connections to the same peer id meet (both sides dialled, as in a
+    /// holepunch), the one the tie-break closes reports nothing, and if the
+    /// newer one survives, it takes over the first one's report without a
+    /// new event. `transport` and `encrypted` then describe the first
+    /// connection, not the one still open.
     PeerConnected {
         /// The torrent.
         torrent: InfoHashes,
@@ -118,7 +123,9 @@ pub enum Event {
         /// MSE-negotiated or not.
         encrypted: bool,
     },
-    /// A peer connection ended (or never got established).
+    /// A peer connection ended (or never got established). Exactly one
+    /// follows each `PeerConnected`, with its `addr`; a connection closed as
+    /// a duplicate by the tie-break reports nothing.
     PeerDisconnected {
         /// The torrent.
         torrent: InfoHashes,

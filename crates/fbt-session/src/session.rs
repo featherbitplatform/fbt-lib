@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
@@ -172,6 +172,25 @@ pub(crate) struct Shared {
     pub cache: Arc<CacheBudget>,
     /// The global and class rate limits.
     pub bandwidth: Arc<Bandwidth>,
+    /// BEP 55 holepunch activity, for [`Session::holepunch_stats`].
+    pub holepunch: HolepunchCounters,
+}
+
+/// BEP 55 holepunch messages handled, over every torrent of the session.
+#[derive(Debug, Default)]
+pub(crate) struct HolepunchCounters {
+    /// `Rendezvous` messages we sent to a relay.
+    pub rendezvous_sent: AtomicU64,
+    /// Rendezvous we relayed (`Connect` sent to both peers).
+    pub relayed: AtomicU64,
+    /// `Connect` messages we accepted and acted on.
+    pub connects_received: AtomicU64,
+}
+
+impl HolepunchCounters {
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The DHT port to send a peer at `peer` in `Port`: that of our DHT socket
@@ -392,6 +411,7 @@ impl Session {
             disk,
             cache,
             bandwidth,
+            holepunch: HolepunchCounters::default(),
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -430,6 +450,20 @@ impl Session {
         }
         *inner.listeners.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
         Ok(Session { inner })
+    }
+
+    /// BEP 55 holepunch activity so far, over every torrent: `Rendezvous`
+    /// messages sent, rendezvous relayed and `Connect` messages acted on.
+    /// Internal (tests observe the exchange with it); not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub fn holepunch_stats(&self) -> (u64, u64, u64) {
+        let h = &self.inner.shared.holepunch;
+        (
+            h.rendezvous_sent.load(Ordering::Relaxed),
+            h.relayed.load(Ordering::Relaxed),
+            h.connects_received.load(Ordering::Relaxed),
+        )
     }
 
     /// The session's DHT node, `None` with [`Settings::dht_enabled`] off.
@@ -755,6 +789,7 @@ mod tests {
             disk: crate::disk::DiskPool::new(1, 1),
             cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
+            holepunch: HolepunchCounters::default(),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();

@@ -8,7 +8,7 @@
 //! or the [`RendezvousLimiter`]'s say-so.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use fbt_wire::{HP_NO_SELF, HP_NO_SUPPORT, HP_NOT_CONNECTED};
@@ -17,14 +17,14 @@ use tokio::time::Instant;
 use crate::picker::PeerKey;
 
 /// Rendezvous work (a relayed `Rendezvous`, or an unsolicited `Connect`)
-/// accepted from one peer per [`RENDEZVOUS_WINDOW`]; beyond that its
+/// accepted from one peer IP per [`RENDEZVOUS_WINDOW`]; beyond that its
 /// messages are ignored.
 pub(super) const MAX_RENDEZVOUS_PER_MIN: u32 = 10;
 /// The window [`MAX_RENDEZVOUS_PER_MIN`] counts over.
 const RENDEZVOUS_WINDOW: Duration = Duration::from_secs(60);
-/// Peers the limiter tracks at once. Entries go when their peer
-/// disconnects, so the per-torrent peer limit keeps it far below this; a
-/// new peer beyond it is refused until an entry's window ends.
+/// Peer IPs the limiter tracks at once. Entries outlive their connections
+/// (a reconnect must not reset the budget) and go once their window ended
+/// and the table is full; a new IP beyond it is refused until then.
 const MAX_LIMITED_PEERS: usize = 1024;
 /// Addresses we asked a relay about and still wait on.
 pub(super) const MAX_PENDING: usize = 64;
@@ -76,17 +76,20 @@ pub(super) fn relay(
     }
 }
 
-/// At most [`MAX_RENDEZVOUS_PER_MIN`] accepted per peer per minute.
+/// At most [`MAX_RENDEZVOUS_PER_MIN`] accepted per peer IP per minute.
 #[derive(Debug, Default)]
 pub(super) struct RendezvousLimiter {
-    /// Per peer: when its current window started and what it used of it.
-    peers: HashMap<PeerKey, (Instant, u32)>,
+    /// Per peer IP: when its current window started and what it used of it.
+    peers: HashMap<IpAddr, (Instant, u32)>,
 }
 
 impl RendezvousLimiter {
-    /// Counts one message from `key`; false when it is over its limit (or
-    /// the table is full of live windows), and the message is ignored.
-    pub(super) fn allow(&mut self, key: PeerKey, now: Instant) -> bool {
+    /// Counts one message from a peer at `ip`; false when that IP is over
+    /// its limit (or the table is full of live windows), and the message is
+    /// ignored.
+    pub(super) fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
+        // `::ffff:a.b.c.d` and `a.b.c.d` are one source.
+        let key = ip.to_canonical();
         let expired = |start: &Instant| now.saturating_duration_since(*start) >= RENDEZVOUS_WINDOW;
         if !self.peers.contains_key(&key) && self.peers.len() >= MAX_LIMITED_PEERS {
             self.peers.retain(|_, (start, _)| !expired(start));
@@ -105,19 +108,14 @@ impl RendezvousLimiter {
         *used += 1;
         true
     }
-
-    /// `key` disconnected.
-    pub(super) fn forget(&mut self, key: PeerKey) {
-        self.peers.remove(&key);
-    }
 }
 
-/// The addresses we sent a `Rendezvous` for: a `Connect` for one of them
-/// is the answer we asked for. At most [`MAX_PENDING`], each for
-/// [`PENDING_TTL`].
+/// The addresses we sent a `Rendezvous` for, with the relay we asked: a
+/// `Connect` or `Error` for one of them from that relay is the answer we
+/// asked for. At most [`MAX_PENDING`], each for [`PENDING_TTL`].
 #[derive(Debug, Default)]
 pub(super) struct Pending {
-    since: HashMap<SocketAddr, Instant>,
+    since: HashMap<SocketAddr, (PeerKey, Instant)>,
     /// `since` in insertion order, oldest first.
     order: VecDeque<SocketAddr>,
 }
@@ -129,7 +127,7 @@ impl Pending {
             let live = self
                 .since
                 .get(&a)
-                .is_some_and(|t| now.saturating_duration_since(*t) < PENDING_TTL);
+                .is_some_and(|(_, t)| now.saturating_duration_since(*t) < PENDING_TTL);
             if live {
                 break;
             }
@@ -138,29 +136,37 @@ impl Pending {
         }
     }
 
-    /// Remembers that we asked about `addr`; false (and nothing changes)
-    /// when [`MAX_PENDING`] requests are already waiting.
-    pub(super) fn insert(&mut self, addr: SocketAddr, now: Instant) -> bool {
+    /// Remembers that we asked `relay` about `addr`; false (and nothing
+    /// changes) when [`MAX_PENDING`] requests are already waiting.
+    pub(super) fn insert(&mut self, addr: SocketAddr, relay: PeerKey, now: Instant) -> bool {
         self.expire(now);
         if self.since.contains_key(&addr) {
             self.remove(&addr);
         } else if self.since.len() >= MAX_PENDING {
             return false;
         }
-        self.since.insert(addr, now);
+        self.since.insert(addr, (relay, now));
         self.order.push_back(addr);
         true
     }
 
-    /// Whether we asked about `addr` within [`PENDING_TTL`]; it is no
-    /// longer pending afterwards.
-    pub(super) fn take(&mut self, addr: &SocketAddr, now: Instant) -> bool {
+    /// Whether we asked `from` about `addr` within [`PENDING_TTL`]; it is
+    /// no longer pending afterwards. An answer from another peer changes
+    /// nothing.
+    pub(super) fn take(&mut self, addr: &SocketAddr, from: PeerKey, now: Instant) -> bool {
         self.expire(now);
+        if !self
+            .since
+            .get(addr)
+            .is_some_and(|(relay, _)| *relay == from)
+        {
+            return false;
+        }
         self.remove(addr)
     }
 
     /// Forgets `addr`; returns whether it was pending.
-    pub(super) fn remove(&mut self, addr: &SocketAddr) -> bool {
+    fn remove(&mut self, addr: &SocketAddr) -> bool {
         if self.since.remove(addr).is_none() {
             return false;
         }
@@ -227,68 +233,78 @@ mod tests {
         );
     }
 
+    fn ip(i: u32) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i))
+    }
+
     #[tokio::test(start_paused = true)]
     async fn rendezvous_rate_limited() {
         let mut l = RendezvousLimiter::default();
-        let a = PeerKey(1);
-        let b = PeerKey(2);
+        let a = ip(1);
+        let b = ip(2);
         for _ in 0..MAX_RENDEZVOUS_PER_MIN {
             assert!(l.allow(a, Instant::now()));
         }
         assert!(!l.allow(a, Instant::now()), "the eleventh is ignored");
-        // Another peer has its own budget.
+        // The same IP as IPv4-mapped IPv6 (a reconnect, another socket)
+        // shares the budget.
+        assert!(!l.allow(sa("[::ffff:10.0.0.1]:1").ip(), Instant::now()));
+        // Another IP has its own budget.
         assert!(l.allow(b, Instant::now()));
         tokio::time::advance(RENDEZVOUS_WINDOW - Duration::from_secs(1)).await;
         assert!(!l.allow(a, Instant::now()), "still within the minute");
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(l.allow(a, Instant::now()), "a new minute");
-        // A disconnected peer leaves nothing behind.
-        l.forget(a);
-        l.forget(b);
-        assert!(l.peers.is_empty());
-        // The table is bounded: a new peer beyond it waits for a window to
+        // The table is bounded: a new IP beyond it waits for a window to
         // end.
-        for i in 0..MAX_LIMITED_PEERS as u64 {
-            assert!(l.allow(PeerKey(100 + i), Instant::now()));
+        tokio::time::advance(RENDEZVOUS_WINDOW).await;
+        for i in 0..MAX_LIMITED_PEERS as u32 {
+            assert!(l.allow(ip(100 + i), Instant::now()));
         }
-        assert!(!l.allow(PeerKey(5), Instant::now()));
+        assert!(!l.allow(ip(5), Instant::now()));
         assert_eq!(l.peers.len(), MAX_LIMITED_PEERS);
         tokio::time::advance(RENDEZVOUS_WINDOW).await;
-        assert!(l.allow(PeerKey(5), Instant::now()));
+        assert!(l.allow(ip(5), Instant::now()));
         assert_eq!(l.peers.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn pending_expires_and_is_capped() {
+        let r = PeerKey(1);
+        let other = PeerKey(2);
         let mut p = Pending::default();
         let a = addr(1);
-        assert!(!p.take(&a, Instant::now()), "never asked");
-        assert!(p.insert(a, Instant::now()));
-        assert!(p.take(&a, Instant::now()));
-        assert!(!p.take(&a, Instant::now()), "taken once");
+        assert!(!p.take(&a, r, Instant::now()), "never asked");
+        assert!(p.insert(a, r, Instant::now()));
+        assert!(!p.take(&a, other, Instant::now()), "not the relay we asked");
+        assert!(p.take(&a, r, Instant::now()));
+        assert!(!p.take(&a, r, Instant::now()), "taken once");
         // Expires after 30 s.
-        assert!(p.insert(a, Instant::now()));
+        assert!(p.insert(a, r, Instant::now()));
         tokio::time::advance(PENDING_TTL - Duration::from_millis(1)).await;
-        assert!(p.take(&a, Instant::now()), "just in time");
-        assert!(p.insert(a, Instant::now()));
+        assert!(p.take(&a, r, Instant::now()), "just in time");
+        assert!(p.insert(a, r, Instant::now()));
         tokio::time::advance(PENDING_TTL).await;
-        assert!(!p.take(&a, Instant::now()), "expired");
+        assert!(!p.take(&a, r, Instant::now()), "expired");
         assert_eq!(p.len(), 0);
         // At most 64 at once; an expired one makes room.
         for i in 0..MAX_PENDING as u32 {
-            assert!(p.insert(addr(i), Instant::now()));
+            assert!(p.insert(addr(i), r, Instant::now()));
         }
-        assert!(!p.insert(addr(1000), Instant::now()), "full");
+        assert!(!p.insert(addr(1000), r, Instant::now()), "full");
         assert_eq!(p.len(), MAX_PENDING);
         // Asking again about a pending address renews it.
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert!(p.insert(addr(0), Instant::now()));
+        assert!(p.insert(addr(0), r, Instant::now()));
         assert_eq!(p.len(), MAX_PENDING);
         tokio::time::advance(PENDING_TTL - Duration::from_secs(5)).await;
-        assert!(p.insert(addr(1000), Instant::now()), "the old ones expired");
+        assert!(
+            p.insert(addr(1000), r, Instant::now()),
+            "the old ones expired"
+        );
         assert_eq!(p.len(), 2);
-        assert!(p.take(&addr(0), Instant::now()));
-        assert!(p.remove(&addr(1000)));
+        assert!(p.take(&addr(0), r, Instant::now()));
+        assert!(p.take(&addr(1000), r, Instant::now()));
         assert_eq!(p.len(), 0);
         assert!(p.order.is_empty());
     }
