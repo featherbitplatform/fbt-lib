@@ -18,6 +18,7 @@ use crate::bandwidth::{PeerThrottles, Throttle};
 use crate::peer::ext::{self, ExtConfig, RemoteIds};
 use crate::peer::messages::{DisconnectReason, PeerCommand, PeerEvent, PeerPiecesOwned};
 use crate::picker::PeerKey;
+use crate::rate::RateMeter;
 use crate::settings::Settings;
 
 /// A piece set as the remote sent it, before validation.
@@ -105,6 +106,17 @@ pub(super) struct Conn<S> {
     /// Since when the download throttle holds reads back: the idle timer
     /// is paused meanwhile, since unread messages are not silence.
     pub(super) held_since: Option<Instant>,
+    /// Payload of the blocks we requested, as they arrive: sizes the
+    /// request pipeline.
+    pub(super) block_rate: RateMeter,
+    /// The remote's `reqq` (BEP 10), already clamped: the pipeline never
+    /// goes deeper.
+    pub(super) remote_reqq: Option<u32>,
+    /// Our requests went unanswered for `snub_timeout`.
+    pub(super) snubbed: bool,
+    /// Where the snub timer starts: the last block, or the first request
+    /// sent into an empty pipeline (or the unchoke). Paused with reads.
+    pub(super) snub_since: Instant,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
@@ -146,6 +158,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             queued: HashSet::new(),
             floor_read: false,
             held_since: None,
+            block_rate: RateMeter::new(),
+            remote_reqq: None,
+            snubbed: false,
+            snub_since: now,
         }
     }
 
@@ -254,6 +270,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 for t in self.outstanding.values_mut() {
                     *t = after(*t, paused).min(now);
                 }
+                self.snub_since = after(self.snub_since, paused).min(now);
                 self.held_since = None;
             }
             _ => {}
@@ -267,6 +284,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .then(|| after(self.last_recv, self.settings.peer_idle_timeout))
     }
 
+    /// When the remote is snubbed unless a block arrives first: while
+    /// requests are outstanding, it does not choke us, it is not snubbed
+    /// already and reads are not held.
+    pub(super) fn snub_deadline(&self) -> Option<Instant> {
+        (!self.snubbed && !self.choked && !self.outstanding.is_empty() && self.held_since.is_none())
+            .then(|| after(self.snub_since, self.settings.snub_timeout))
+    }
+
     pub(super) fn next_deadline(&self) -> Instant {
         let s = &self.settings;
         let keepalive = after(self.last_send, s.keepalive_interval);
@@ -278,7 +303,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .min()
             .filter(|_| self.held_since.is_none())
             .map(|&t| after(t, s.request_timeout));
-        idle.min(keepalive).min(request.unwrap_or(idle))
+        let snub = self.snub_deadline().unwrap_or(idle);
+        idle.min(keepalive).min(request.unwrap_or(idle)).min(snub)
     }
 
     pub(super) async fn on_timer(&mut self) -> Flow {
@@ -307,6 +333,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .await?;
             }
             self.want_blocks().await?;
+        }
+        if self.snub_deadline().is_some_and(|t| now >= t) {
+            self.snubbed = true;
+            self.emit(PeerEvent::Snubbed {
+                key: self.key,
+                snubbed: true,
+            })
+            .await?;
         }
         if now >= after(self.last_send, self.settings.keepalive_interval) {
             self.send(Message::KeepAlive).await?;

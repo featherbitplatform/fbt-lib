@@ -54,6 +54,7 @@ pub mod storage;
 mod torrent;
 
 pub use bandwidth::{MixedMode, PeerClassLimits, RateLimit};
+pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::SessionError;
 pub use event::{Event, EventMask, EventStream, PeerSource};
 pub use fbt_dht::DhtStats;

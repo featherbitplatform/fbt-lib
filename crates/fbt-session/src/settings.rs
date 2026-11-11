@@ -6,6 +6,7 @@ use std::time::Duration;
 use fbt_tracker::TrackerConfig;
 
 use crate::bandwidth::{MixedMode, PeerClassLimits, RateLimit};
+use crate::choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 
 /// Largest accepted [`Settings::event_queue`]; the queue is allocated up
 /// front.
@@ -74,9 +75,40 @@ pub struct Settings {
     pub max_peers_global: usize,
     /// Outgoing connections still connecting or handshaking.
     pub max_half_open: usize,
-    /// Upload slots per torrent (regular plus optimistic).
+    /// Upload slots per torrent (regular plus optimistic). With
+    /// [`ChokingAlgorithm::RateBased`] it bounds only the slots given
+    /// between rechokes; the rechoke opens regular slots by rate.
     pub unchoke_slots: usize,
-    /// Block requests in flight to one peer.
+    /// How regular upload slots are opened while downloading.
+    pub choking_algorithm: ChokingAlgorithm,
+    /// How regular upload slots are given while seeding.
+    pub seed_choking_algorithm: SeedChokingAlgorithm,
+    /// Optimistic upload slots per torrent, part of
+    /// [`unchoke_slots`](Self::unchoke_slots); 0 means
+    /// `max(1, unchoke_slots / 5)`.
+    pub optimistic_unchoke_slots: usize,
+    /// How often the optimistic slots move to other peers (30 s). At least
+    /// [`rechoke_interval`](Self::rechoke_interval): they rotate every
+    /// `optimistic_unchoke_interval / rechoke_interval` rechokes.
+    pub optimistic_unchoke_interval: Duration,
+    /// With [`SeedChokingAlgorithm::RoundRobin`], a peer keeps its seeding
+    /// slot until it has received this many pieces' worth of bytes (20) or
+    /// three rechokes have passed.
+    pub seeding_piece_quota: u32,
+    /// A peer that sends none of the blocks we requested for this long
+    /// (60 s) is snubbed: one request in flight at a time, and only
+    /// optimistic upload slots, until a block arrives. Non-zero. The timer
+    /// pauses while a download limit holds its reads.
+    pub snub_timeout: Duration,
+    /// Each peer gets enough requests in flight to keep it busy this long
+    /// at its current rate (3 s): `rate * request_queue_time / 16 KiB`,
+    /// at least 2 and at most
+    /// [`max_outstanding_requests`](Self::max_outstanding_requests), and
+    /// no more than the `reqq` the peer advertised.
+    pub request_queue_time: Duration,
+    /// Most block requests in flight to one peer (500, libtorrent's
+    /// `max_out_request_queue`). The cache budget still bounds how many
+    /// pieces are in progress.
     pub max_outstanding_requests: usize,
     /// Requests from one peer queued before further ones are dropped
     /// (1 to [`MAX_INCOMING_REQUESTS`]). Under an upload limit, the blocks
@@ -263,11 +295,15 @@ impl Settings {
             ("pex_interval", self.pex_interval),
             ("utp_connect_timeout", self.utp_connect_timeout),
             ("cache_expiry", self.cache_expiry),
+            ("snub_timeout", self.snub_timeout),
         ];
         for (name, d) in non_zero {
             if d.is_zero() {
                 return Err(format!("{name} must be greater than zero"));
             }
+        }
+        if self.optimistic_unchoke_interval < self.rechoke_interval {
+            return Err("optimistic_unchoke_interval must be at least rechoke_interval".to_owned());
         }
         if !(self.enable_outgoing_tcp
             || self.enable_incoming_tcp
@@ -363,7 +399,14 @@ impl Default for Settings {
             max_peers_global: 200,
             max_half_open: 10,
             unchoke_slots: 4,
-            max_outstanding_requests: 32,
+            choking_algorithm: ChokingAlgorithm::default(),
+            seed_choking_algorithm: SeedChokingAlgorithm::default(),
+            optimistic_unchoke_slots: 0,
+            optimistic_unchoke_interval: Duration::from_secs(30),
+            seeding_piece_quota: 20,
+            snub_timeout: Duration::from_secs(60),
+            request_queue_time: Duration::from_secs(3),
+            max_outstanding_requests: 500,
             max_incoming_requests: 250,
             connect_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(10),

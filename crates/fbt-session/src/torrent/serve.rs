@@ -171,6 +171,7 @@ impl Actor {
         self.counters.ul.record(len);
         if let Some(p) = self.peers.get_mut(&key) {
             p.to_rate.record(len);
+            p.uploaded_since_unchoke = p.uploaded_since_unchoke.saturating_add(len);
         }
     }
 

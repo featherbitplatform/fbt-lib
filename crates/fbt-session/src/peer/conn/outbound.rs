@@ -1,5 +1,8 @@
 //! Torrent commands and everything we write.
 
+use std::time::Duration;
+
+use fbt_core::BLOCK_SIZE;
 use fbt_wire::{Message, WireError};
 use futures_util::SinkExt;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -9,12 +12,50 @@ use super::state::Conn;
 use super::{Flow, wire_len, wire_reason};
 use crate::peer::messages::{DisconnectReason, PeerCommand, PeerEvent};
 
+/// Requests to keep in flight to a peer delivering `rate` bytes per second:
+/// enough for `queue_time` at that rate, in 16 KiB blocks, at least 2 and
+/// at most `max`, never beyond the remote's advertised `reqq` (at least 1),
+/// and 1 while it is snubbed.
+pub(super) fn pipeline_depth(
+    rate: u64,
+    queue_time: Duration,
+    max: usize,
+    reqq: Option<u32>,
+    snubbed: bool,
+) -> usize {
+    if snubbed {
+        return max.min(1);
+    }
+    let blocks =
+        u128::from(rate).saturating_mul(queue_time.as_millis()) / (1000 * u128::from(BLOCK_SIZE));
+    let depth = usize::try_from(blocks)
+        .unwrap_or(usize::MAX)
+        .max(2)
+        .min(max);
+    match reqq {
+        Some(r) => depth.min(usize::try_from(r.max(1)).unwrap_or(usize::MAX)),
+        None => depth,
+    }
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
+    /// The pipeline depth now: see [`pipeline_depth`].
+    pub(super) fn target_depth(&self) -> usize {
+        let s = &self.settings;
+        pipeline_depth(
+            self.block_rate.rate(Instant::now()),
+            s.request_queue_time,
+            s.max_outstanding_requests,
+            self.remote_reqq,
+            self.snubbed,
+        )
+    }
+
     /// Asks the torrent for more blocks when we may request and the pipeline
-    /// is below half full.
+    /// is below half its target depth.
     pub(super) async fn want_blocks(&mut self) -> Flow {
         let may_request = !self.choked || (self.fast && !self.allowed_fast.is_empty());
-        let max = self.settings.max_outstanding_requests;
+        let max = self.target_depth();
         let n = self.outstanding.len();
         if may_request && n.saturating_mul(2) < max {
             self.emit(PeerEvent::WantBlocks {
@@ -32,6 +73,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 let now = Instant::now();
                 let mut rejected = Vec::new();
                 let mut sent = false;
+                if self.outstanding.is_empty() {
+                    // The snub timer starts with the first request in flight.
+                    self.snub_since = now;
+                }
                 for b in blocks {
                     if self.outstanding.contains_key(&b) {
                         continue;
@@ -59,6 +104,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             PeerCommand::Cancel(b) => {
                 if self.outstanding.remove(&b).is_some() {
                     self.send(Message::Cancel(b)).await?;
+                    // The cancelled request (an end-game duplicate another
+                    // peer answered) frees pipeline room; with a shallow
+                    // pipeline nothing else may ask for it again.
+                    self.want_blocks().await?;
                 }
             }
             PeerCommand::Choke => {

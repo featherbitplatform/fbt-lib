@@ -29,7 +29,7 @@ use super::serve::PieceReads;
 use super::swarm::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::bandwidth::BucketPair;
-use crate::choker::Choker;
+use crate::choker::{Choker, ChokerConfig};
 use crate::event::{Event, PeerSource};
 use crate::peer::messages::PeerEvent;
 use crate::picker::{PeerKey, PiecePicker};
@@ -261,7 +261,10 @@ impl Actor {
             Phase::Metadata
         };
         let (peer_tx, peer_rx) = mpsc::channel(PEER_EVENT_QUEUE);
-        let choker = Choker::new(shared.settings.unchoke_slots);
+        let piece_len = loaded
+            .as_ref()
+            .map_or(0, |l| u64::from(l.layout.piece_len()));
+        let choker = Choker::new(ChokerConfig::from_settings(&shared.settings, piece_len));
         let retries = Retries::new(shared.settings.peer_retry_delay);
         let (signals, _) = watch::channel(Signals::default());
         let (announcer, tracker_rx) = announcer::spawn(announcer::Params {

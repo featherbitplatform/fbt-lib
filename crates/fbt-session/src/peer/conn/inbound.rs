@@ -34,6 +34,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Message::Unchoke => {
                 if self.choked {
                     self.choked = false;
+                    // Time choked never counts towards a snub.
+                    self.snub_since = tokio::time::Instant::now();
                     self.emit(PeerEvent::Unchoked { key }).await?;
                     self.want_blocks().await?;
                 }
@@ -82,6 +84,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
                 let block = BlockRef { piece, offset, len };
                 if self.outstanding.remove(&block).is_some() {
+                    self.block_rate.record(data.len() as u64);
+                    self.snub_since = tokio::time::Instant::now();
+                    if self.snubbed {
+                        self.snubbed = false;
+                        self.emit(PeerEvent::Snubbed {
+                            key,
+                            snubbed: false,
+                        })
+                        .await?;
+                    }
                     self.emit(PeerEvent::Block { key, block, data }).await?;
                     self.want_blocks().await?;
                 } else {
@@ -138,6 +150,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         match msg {
             Incoming::Handshake(hs) => {
                 self.remote_ids.update(&hs);
+                // Clamped by the decoder; a repeat without `reqq` keeps the
+                // last one.
+                if hs.reqq.is_some() {
+                    self.remote_reqq = hs.reqq;
+                }
                 self.emit(PeerEvent::ExtHandshake { key, hs }).await
             }
             Incoming::Metadata(msg) => self.emit(PeerEvent::Metadata { key, msg }).await,

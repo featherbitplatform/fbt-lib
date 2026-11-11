@@ -610,7 +610,7 @@ async fn dropped_remove_future_still_unregisters() {
 #[tokio::test]
 async fn invalid_settings_are_rejected() {
     type Tweak = fn(&mut fbt_session::Settings);
-    let bad: [(&str, Tweak); 14] = [
+    let bad: [(&str, Tweak); 16] = [
         ("status_interval", |s| s.status_interval = Duration::ZERO),
         ("rechoke_interval", |s| s.rechoke_interval = Duration::ZERO),
         ("keepalive_interval", |s| {
@@ -635,6 +635,10 @@ async fn invalid_settings_are_rejected() {
         }),
         ("max_active_checks", |s| s.max_active_checks = 0),
         ("max_active_checks", |s| s.max_active_checks = 65),
+        ("snub_timeout", |s| s.snub_timeout = Duration::ZERO),
+        ("optimistic_unchoke_interval", |s| {
+            s.optimistic_unchoke_interval = s.rechoke_interval / 2
+        }),
     ];
     for (field, tweak) in bad {
         let mut st = test_settings();
@@ -660,6 +664,11 @@ async fn extreme_settings_do_not_panic() {
     st.max_outstanding_requests = usize::MAX;
     st.max_incoming_requests = 1 << 16;
     st.rechoke_interval = Duration::MAX;
+    st.optimistic_unchoke_interval = Duration::MAX;
+    st.optimistic_unchoke_slots = usize::MAX;
+    st.seeding_piece_quota = u32::MAX;
+    st.snub_timeout = Duration::MAX;
+    st.request_queue_time = Duration::MAX;
     st.keepalive_interval = Duration::MAX;
     st.peer_idle_timeout = Duration::MAX;
     st.request_timeout = Duration::MAX;

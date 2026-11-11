@@ -70,6 +70,11 @@ impl Actor {
                 self.fill(key);
             }
             PeerEvent::Request { key, block } => self.on_request(key, block),
+            PeerEvent::Snubbed { key, snubbed } => {
+                if let Some(p) = self.peers.get_mut(&key) {
+                    p.snubbed = snubbed;
+                }
+            }
             // The peer task drops the cancelled request itself; an answer
             // already being read is discarded there.
             PeerEvent::Cancel { .. } => {}
@@ -199,6 +204,12 @@ impl Actor {
 
     /// Chokes or unchokes a peer, sending only on change.
     pub(super) fn set_choke(&mut self, key: PeerKey, choke: bool) {
+        self.set_choke_at(key, choke, Instant::now());
+    }
+
+    /// [`Self::set_choke`] at `now`: an unchoke starts the peer's turn
+    /// (`unchoked_since`, `uploaded_since_unchoke`).
+    fn set_choke_at(&mut self, key: PeerKey, choke: bool, now: Instant) {
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
@@ -206,6 +217,12 @@ impl Actor {
             return;
         }
         p.am_choking = choke;
+        if choke {
+            p.unchoked_since = None;
+        } else {
+            p.unchoked_since = Some(now);
+            p.uploaded_since_unchoke = 0;
+        }
         let cmd = if choke {
             PeerCommand::Choke
         } else {
@@ -214,13 +231,20 @@ impl Actor {
         self.send(key, cmd);
     }
 
-    /// Runs the choker over the connected peers: rate from each peer while
-    /// downloading, rate to it while seeding.
+    /// Runs the choker over the connected peers (see
+    /// [`Choker`](crate::choker::Choker)), then records who holds the
+    /// optimistic slots.
     pub(super) fn rechoke(&mut self) {
         if !self.active() {
             return;
         }
         let now = Instant::now();
+        let num_pieces = self.loaded.as_ref().map(|l| l.layout.num_pieces());
+        if let Some(l) = self.loaded.as_ref() {
+            let quota = u64::from(self.shared.settings.seeding_piece_quota)
+                .saturating_mul(u64::from(l.layout.piece_len()));
+            self.choker.set_piece_quota_bytes(quota);
+        }
         let infos: Vec<PeerChokeInfo> = self
             .peers
             .iter()
@@ -230,6 +254,11 @@ impl Actor {
                 interested: p.peer_interested,
                 rate_from_peer: p.from_rate.rate(now),
                 rate_to_peer: p.to_rate.rate(now),
+                snubbed: p.snubbed,
+                progress_ppm: progress_ppm(p, num_pieces),
+                unchoked_since: p.unchoked_since,
+                uploaded_since_unchoke: p.uploaded_since_unchoke,
+                last_optimistic: p.last_optimistic,
             })
             .collect();
         let seeding = self
@@ -237,9 +266,14 @@ impl Actor {
             .as_ref()
             .and_then(|l| l.picker.as_ref())
             .is_some_and(PiecePicker::is_finished);
-        let unchoke = self.choker.rechoke(&infos, seeding, &mut self.rng);
+        let unchoke = self.choker.rechoke(&infos, seeding, now, &mut self.rng);
         for info in infos {
-            self.set_choke(info.key, !unchoke.contains(&info.key));
+            self.set_choke_at(info.key, !unchoke.contains(&info.key), now);
+        }
+        for key in self.choker.optimistic() {
+            if let Some(p) = self.peers.get_mut(key) {
+                p.last_optimistic = Some(now);
+            }
         }
     }
 
@@ -619,6 +653,19 @@ impl Actor {
     }
 }
 
+/// The peer's share of the torrent's `num_pieces` pieces in parts per
+/// million; 0 while the metadata is pending.
+fn progress_ppm(p: &super::swarm::Peer, num_pieces: Option<u32>) -> u32 {
+    match num_pieces {
+        _ if p.seed => 1_000_000,
+        Some(n) if n > 0 => {
+            let have = u64::from(p.bits.count_ones().min(n));
+            u32::try_from(have * 1_000_000 / u64::from(n)).unwrap_or(1_000_000)
+        }
+        _ => 0,
+    }
+}
+
 /// Most pieces a torrent downloads at once: those already in progress
 /// plus the new buffers the cache budget has `room` for (see
 /// [`PieceCache::partial_room`](crate::storage::cache::PieceCache::partial_room)).
@@ -783,6 +830,20 @@ mod tests {
         let more = pick_capped(&mut p, PeerKey(2), PeerPieces::All, 32, 8, &mut rng);
         assert_eq!(more.len(), 1);
         assert_eq!(p.num_in_progress(), 8);
+    }
+
+    /// A 500-deep pipeline asks for far more blocks than the cache budget
+    /// has pieces for: it gets only the blocks of `cap` pieces.
+    #[test]
+    fn deep_pipeline_stays_within_the_partial_cap() {
+        let mut rng = StdRng::seed_from_u64(4);
+        // Four blocks per piece, room for 5 pieces.
+        let mut p = picker(200, 65_536);
+        let got = pick_capped(&mut p, PeerKey(1), PeerPieces::All, 500, 5, &mut rng);
+        assert_eq!(got.len(), 20);
+        assert_eq!(pieces_of(&got).len(), 5);
+        assert_eq!(p.num_in_progress(), 5);
+        assert!(pick_capped(&mut p, PeerKey(2), PeerPieces::All, 500, 5, &mut rng).is_empty());
     }
 
     #[test]

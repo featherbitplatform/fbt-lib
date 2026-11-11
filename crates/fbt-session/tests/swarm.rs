@@ -667,6 +667,45 @@ async fn rechoke_chokes_peer_that_lost_its_slot() {
     s.shutdown().await;
 }
 
+/// A round-robin seeder with two upload slots (one regular, one
+/// optimistic) and six leechers that only know the seeder: its upload is
+/// throttled so no leecher is done within one turn, the regular slot
+/// moves on every quota or three rechokes, and every leecher finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeding_round_robin_serves_every_leecher() {
+    let (m, payload) = make_torrent(&[("a", 512 << 10)], 32_768);
+    let mut st = settings();
+    st.unchoke_slots = 2;
+    st.rechoke_interval = Duration::from_millis(200);
+    st.seeding_piece_quota = 4;
+    st.pex_enabled = false;
+    st.rate_limit = fbt_session::RateLimit::new(0, 2 << 20);
+    st.rate_limit_local_peers = true;
+    let s = Session::new(st).await.unwrap();
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(Arc::new(MemStorage::from_bytes(payload.clone())));
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+
+    let mut leechers = Vec::new();
+    for _ in 0..6 {
+        let mut ls = settings();
+        ls.pex_enabled = false;
+        let (l, lh, storage) = mem_leecher_with(ls, &m, payload.len()).await;
+        let ev = l.subscribe(EventMask::ALL);
+        lh.add_peer(s.local_addr()).await.unwrap();
+        leechers.push((l, lh, storage, ev));
+    }
+    for (_, _, storage, ev) in &mut leechers {
+        finished(ev).await;
+        assert!(stored(storage, payload.len()) == payload, "data differs");
+    }
+    for (l, ..) in leechers {
+        l.shutdown().await;
+    }
+    s.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_while_choked_gets_reject_with_fast() {
     let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);

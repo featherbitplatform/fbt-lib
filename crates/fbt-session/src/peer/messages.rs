@@ -93,6 +93,10 @@ pub(crate) enum PeerEvent {
     AllowedFast { key: PeerKey, piece: u32 },
     /// The pipeline has room for this many more requests.
     WantBlocks { key: PeerKey, count: usize },
+    /// The remote left our requests unanswered for `snub_timeout`
+    /// (`snubbed: true`), or a block arrived after that (`false`); sent on
+    /// every change.
+    Snubbed { key: PeerKey, snubbed: bool },
     /// The remote requests a block (not validated).
     Request { key: PeerKey, block: BlockRef },
     /// A `Piece` message answering the remote's request for `block` was

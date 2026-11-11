@@ -68,6 +68,16 @@ fn ext_cfg() -> ExtConfig {
 /// Starts a peer task with an explicit layout (`None`: no metadata yet)
 /// and extension config.
 fn start_ctx(have: Bitfield, layout: Option<PieceLayout>, ext: ExtConfig) -> Harness {
+    start_full(have, layout, ext, Settings::default())
+}
+
+/// [`start_ctx`] with `settings`.
+fn start_full(
+    have: Bitfield,
+    layout: Option<PieceLayout>,
+    ext: ExtConfig,
+    settings: Settings,
+) -> Harness {
     let (ours, remote) = tokio::io::duplex(1 << 20);
     let (etx, events) = mpsc::channel(1024);
     let (cmds, crx) = mpsc::channel(256);
@@ -78,7 +88,7 @@ fn start_ctx(have: Bitfield, layout: Option<PieceLayout>, ext: ExtConfig) -> Har
         layout,
         have,
         ext,
-        settings: Arc::new(Settings::default()),
+        settings: Arc::new(settings),
         events: etx,
         encrypted: false,
         transport: crate::peer::transport::Transport::Tcp,
@@ -206,13 +216,7 @@ async fn unchoke_and_request(
 ) {
     send(wire, Message::Unchoke).await;
     assert_eq!(r.next().await, PeerEvent::Unchoked { key: KEY });
-    assert_eq!(
-        r.next().await,
-        PeerEvent::WantBlocks {
-            key: KEY,
-            count: 32
-        }
-    );
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
     r.cmd(PeerCommand::Request(blocks.to_vec())).await;
     for b in blocks {
         assert_eq!(recv(wire).await, Message::Request(*b));
@@ -367,8 +371,8 @@ async fn requests_flow_when_unchoked() {
     let blocks = [block(0, 0), block(0, 16_384)];
     unchoke_and_request(&mut wire, &mut r, &blocks).await;
 
-    // A delivered block is forwarded; outstanding is below half the
-    // maximum, so the pipeline asks for more.
+    // A delivered block is forwarded; with one of two still outstanding
+    // the pipeline is half full, so it asks for nothing more.
     send(
         &mut wire,
         Message::Piece {
@@ -385,17 +389,17 @@ async fn requests_flow_when_unchoked() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(
-        r.next().await,
-        PeerEvent::WantBlocks {
-            key: KEY,
-            count: 31
-        }
-    );
 
     // Closing reports what is still outstanding.
     r.cmd(PeerCommand::Close).await;
-    let (reason, outstanding) = r.disconnected().await;
+    let PeerEvent::Disconnected {
+        reason,
+        outstanding,
+        ..
+    } = r.next().await
+    else {
+        panic!("Disconnected next");
+    };
     assert_eq!(reason, DisconnectReason::Shutdown);
     assert_eq!(outstanding, vec![block(0, 16_384)]);
 }
@@ -423,13 +427,7 @@ async fn allowed_fast_requests_go_out_while_choked() {
         r.next().await,
         PeerEvent::AllowedFast { key: KEY, piece: 2 }
     );
-    assert_eq!(
-        r.next().await,
-        PeerEvent::WantBlocks {
-            key: KEY,
-            count: 32
-        }
-    );
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
     r.cmd(PeerCommand::Request(vec![block(2, 0), block(1, 0)]))
         .await;
     assert_eq!(recv(&mut wire).await, Message::Request(block(2, 0)));
@@ -494,13 +492,7 @@ async fn choke_keeps_requesting_allowed_fast_pieces() {
     // demand, so the pipeline asks again for the allowed-fast piece.
     send(&mut wire, Message::Choke).await;
     assert_eq!(r.next().await, PeerEvent::Choked { key: KEY });
-    assert_eq!(
-        r.next().await,
-        PeerEvent::WantBlocks {
-            key: KEY,
-            count: 32
-        }
-    );
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
 }
 
 #[tokio::test(start_paused = true)]
@@ -566,13 +558,7 @@ async fn unrequested_or_wrong_length_piece_is_dropped() {
         },
     )
     .await;
-    assert_eq!(
-        r.next().await,
-        PeerEvent::WantBlocks {
-            key: KEY,
-            count: 32
-        }
-    );
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
     assert_eq!(
         r.next().await,
         PeerEvent::Wasted {
@@ -588,6 +574,9 @@ async fn cancelled_block_arriving_late_is_wasted() {
     unchoke_and_request(&mut wire, &mut r, &[block(0, 0)]).await;
     r.cmd(PeerCommand::Cancel(block(0, 0))).await;
     assert_eq!(recv(&mut wire).await, Message::Cancel(block(0, 0)));
+    // The cancel frees pipeline room, asked for again at once (an end-game
+    // duplicate cancelled this way must not leave the peer idle).
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
     send(
         &mut wire,
         Message::Piece {
@@ -1365,4 +1354,194 @@ async fn read_hold_is_capped_at_the_idle_timeout() {
     assert!(!d.conn.read_held(t0 + idle + Duration::from_secs(5)));
     d.conn.floor_read = false;
     assert!(d.conn.read_held(t0 + idle + Duration::from_secs(6)));
+}
+
+// ----- adaptive pipeline and snubbing -------------------------------------------
+
+/// What a scripted-peer loop saw next.
+enum Step {
+    Event(PeerEvent),
+    Frame(Message),
+    Tick,
+    End,
+}
+
+/// A remote serving 2 MiB/s (a block every 1/128 s) as long as it has
+/// requests: the pipeline deepens with the measured rate, well past the
+/// old fixed 32 within 2 s.
+#[tokio::test(start_paused = true)]
+async fn pipeline_grows_with_rate() {
+    const MANY: u32 = 4096;
+    let (mut wire, mut r) = start_with(Bitfield::new(MANY), MANY).connect(true).await;
+    send(&mut wire, Message::Unchoke).await;
+    assert_eq!(r.next().await, PeerEvent::Unchoked { key: KEY });
+    let t0 = Instant::now();
+    let end = t0 + Duration::from_secs(2);
+    let mut tick = tokio::time::interval(Duration::from_micros(7_812));
+    let mut queue: std::collections::VecDeque<BlockRef> = Default::default();
+    let (mut next, mut requested, mut received, mut most) = (0u32, 0usize, 0usize, 0usize);
+    let mut first = None;
+    while most <= 32 {
+        let step = tokio::select! {
+            ev = r.next() => Step::Event(ev),
+            m = wire.next() => Step::Frame(m.expect("frame").expect("decode")),
+            _ = tick.tick() => Step::Tick,
+            () = tokio::time::sleep_until(end) => Step::End,
+        };
+        match step {
+            Step::Event(PeerEvent::WantBlocks { count, .. }) => {
+                first.get_or_insert(count);
+                let blocks: Vec<BlockRef> = (next..next + count as u32)
+                    .map(|i| block(i / 2, (i % 2) * 16_384))
+                    .collect();
+                next += count as u32;
+                requested += blocks.len();
+                r.cmd(PeerCommand::Request(blocks)).await;
+            }
+            Step::Event(PeerEvent::Block { .. }) => received += 1,
+            Step::Event(other) => panic!("{other:?}"),
+            Step::Frame(Message::Request(b)) => queue.push_back(b),
+            Step::Frame(Message::KeepAlive) => {}
+            Step::Frame(other) => panic!("{other:?}"),
+            Step::Tick => {
+                if let Some(b) = queue.pop_front() {
+                    let data = Bytes::from(vec![7; b.len as usize]);
+                    let piece = Message::Piece {
+                        piece: b.piece,
+                        offset: b.offset,
+                        data,
+                    };
+                    send(&mut wire, piece).await;
+                }
+            }
+            Step::End => break,
+        }
+        most = most.max(requested - received);
+    }
+    assert_eq!(first, Some(2), "a new peer starts at the minimum");
+    assert!(most > 32, "at most {most} outstanding");
+    assert!(t0.elapsed() <= Duration::from_secs(2));
+}
+
+#[test]
+fn pipeline_minimum_is_two() {
+    use super::outbound::pipeline_depth;
+    let q = Duration::from_secs(3);
+    assert_eq!(pipeline_depth(0, q, 500, None, false), 2);
+    assert_eq!(pipeline_depth(5_000, q, 500, None, false), 2);
+    // 1 MiB/s for 3 s is 192 blocks.
+    assert_eq!(pipeline_depth(1 << 20, q, 500, None, false), 192);
+    assert_eq!(
+        pipeline_depth(u64::MAX, Duration::MAX, 500, None, false),
+        500
+    );
+    assert_eq!(pipeline_depth(u64::MAX, Duration::MAX, 0, None, false), 0);
+    assert_eq!(pipeline_depth(0, Duration::ZERO, 500, None, false), 2);
+    // Never deeper than the remote's `reqq`, which may go below 2.
+    assert_eq!(pipeline_depth(1 << 20, q, 500, Some(50), false), 50);
+    assert_eq!(pipeline_depth(0, q, 500, Some(1), false), 1);
+    assert_eq!(pipeline_depth(0, q, 500, Some(0), false), 1);
+    // Snubbed: one request at a time.
+    assert_eq!(pipeline_depth(1 << 20, q, 500, None, true), 1);
+}
+
+/// A remote advertising `reqq` 1 gets one request at a time.
+#[tokio::test(start_paused = true)]
+async fn pipeline_capped_by_remote_reqq() {
+    let h = start(Bitfield::new(PIECES));
+    let (mut wire, mut r, _) = connect_ext(h, reserved(true, true, false)).await;
+    our_ext(&mut wire).await;
+    assert_eq!(recv(&mut wire).await, Message::HaveNone);
+    let mut theirs = their_ext(None, None);
+    theirs.reqq = Some(1);
+    send(&mut wire, ext_msg(0, theirs.encode())).await;
+    assert!(matches!(r.next().await, PeerEvent::ExtHandshake { .. }));
+    send(&mut wire, Message::Unchoke).await;
+    assert_eq!(r.next().await, PeerEvent::Unchoked { key: KEY });
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 1 });
+}
+
+/// No block for `snub_timeout` snubs the remote (one request at a time);
+/// the next block clears it. Each flip is reported once.
+#[tokio::test(start_paused = true)]
+async fn snub_after_timeout_and_clear_on_block() {
+    let settings = Settings {
+        snub_timeout: Duration::from_millis(300),
+        ..Settings::default()
+    };
+    let h = start_full(
+        Bitfield::new(PIECES),
+        Some(layout(PIECES)),
+        ext_cfg(),
+        settings,
+    );
+    let (mut wire, mut r) = h.connect(true).await;
+    let t0 = Instant::now();
+    unchoke_and_request(&mut wire, &mut r, &[block(0, 0), block(0, 16_384)]).await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Snubbed {
+            key: KEY,
+            snubbed: true
+        }
+    );
+    assert!(t0.elapsed() >= Duration::from_millis(300));
+    let piece = |offset| Message::Piece {
+        piece: 0,
+        offset,
+        data: Bytes::from(vec![1; 16_384]),
+    };
+    send(&mut wire, piece(0)).await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Snubbed {
+            key: KEY,
+            snubbed: false
+        }
+    );
+    assert!(matches!(r.next().await, PeerEvent::Block { .. }));
+    // Not snubbed again before another full timeout without a block.
+    let t1 = Instant::now();
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Snubbed {
+            key: KEY,
+            snubbed: true
+        }
+    );
+    assert!(t1.elapsed() >= Duration::from_millis(300));
+    // The last block clears it again, and the emptied pipeline asks for
+    // the minimum.
+    send(&mut wire, piece(16_384)).await;
+    assert!(matches!(
+        r.next().await,
+        PeerEvent::Snubbed { snubbed: false, .. }
+    ));
+    assert!(matches!(r.next().await, PeerEvent::Block { .. }));
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
+}
+
+/// A read hold pauses the snub timer as it does the request timeouts.
+#[tokio::test(start_paused = true)]
+async fn read_hold_pauses_the_snub_timer() {
+    let s = Settings {
+        snub_timeout: Duration::from_secs(2),
+        ..Settings::default()
+    };
+    let mut d = direct(s, 0, 0);
+    let t0 = Instant::now();
+    d.conn.choked = false;
+    d.conn.snub_since = t0;
+    d.conn.outstanding.insert(block(0, 0), t0);
+    assert_eq!(d.conn.snub_deadline(), Some(t0 + Duration::from_secs(2)));
+    d.conn.hold_reads(true, t0 + Duration::from_secs(1));
+    assert_eq!(d.conn.snub_deadline(), None);
+    d.conn.hold_reads(false, t0 + Duration::from_secs(5));
+    assert_eq!(d.conn.snub_deadline(), Some(t0 + Duration::from_secs(6)));
+    // Never while choked, or once snubbed.
+    d.conn.choked = true;
+    assert_eq!(d.conn.snub_deadline(), None);
+    d.conn.choked = false;
+    d.conn.snubbed = true;
+    assert_eq!(d.conn.snub_deadline(), None);
 }

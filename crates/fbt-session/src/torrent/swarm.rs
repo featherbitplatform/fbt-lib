@@ -437,6 +437,15 @@ pub(super) struct Peer {
     pub from_rate: RateMeter,
     /// Payload we upload to the peer.
     pub to_rate: RateMeter,
+    /// The peer task reports our requests to it unanswered for
+    /// `snub_timeout`.
+    pub snubbed: bool,
+    /// Since when we unchoke it; `None` while choked.
+    pub unchoked_since: Option<Instant>,
+    /// Payload sent to it (`BlockSent`) since it was last unchoked.
+    pub uploaded_since_unchoke: u64,
+    /// When it last held an optimistic upload slot.
+    pub last_optimistic: Option<Instant>,
     /// The peer's latest BEP 10 extension handshake (untrusted values).
     pub ext: Option<Box<ExtHandshake>>,
     /// The listen port from that handshake (`p`).
@@ -485,6 +494,10 @@ impl Peer {
             demand: 0,
             from_rate: RateMeter::new(),
             to_rate: RateMeter::new(),
+            snubbed: false,
+            unchoked_since: None,
+            uploaded_since_unchoke: 0,
+            last_optimistic: None,
             ext: None,
             listen_port: None,
             encrypted: false,
