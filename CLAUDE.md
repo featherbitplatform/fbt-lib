@@ -50,7 +50,8 @@ bash dev/sast.sh              # everything
 bash dev/sast.sh semgrep      # one tool
 
 # Live interop vs qBittorrent-nox and Transmission via opentracker, plus magnet via DHT, forced
-# encryption and PEX on an isolated network with our own dht-node (Docker; see dev/interop/README.md)
+# encryption, PEX, uTP with qBittorrent and LSD between two fbt-example containers, on isolated
+# networks with our own dht-node (Docker; see dev/interop/README.md)
 bash dev/interop/run.sh
 
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec

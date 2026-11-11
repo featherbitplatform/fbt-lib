@@ -37,14 +37,37 @@
   `fbt-example download --no-dht --peer <qbittorrent>:6882` must learn
   Transmission's address via PEX (BEP 11) from qBittorrent and connect to its
   listen port, `<transmission>:51413`.
+- **uTP download from qBittorrent:** qBittorrent switches to uTP only
+  (`app/setPreferences` `{"bittorrent_protocol":2}`, read back).
+  `fbt-example download --transport utp --no-dht` fetches the first torrent
+  again; it must finish with matching hashes, its log must show
+  `peer connected <qbittorrent>:6882 via utp`, and qBittorrent's `uploaded`
+  must grow.
+- **uTP seed to qBittorrent:** Transmission drops the second torrent, so
+  `fbt-example seed --transport utp` (port 6896) is the only source;
+  qBittorrent, still uTP only, adds it into a fresh save path and is pointed
+  at the `fbt` container (`torrents/addPeers`). It must reach progress 1 with
+  matching hashes, and the seed's log must show qBittorrent connecting
+  `via utp`. qBittorrent then goes back to `bittorrent_protocol` 0.
+- **LSD:** a fifth trackerless torrent moves between two of our own
+  processes: `fbt-lsd` seeds it (`--lsd --no-dht --no-pex --port 6897`) and
+  `fbt` downloads it (`--lsd --no-dht --no-pex --port 6898`, no `--peer`).
+  The download must finish with matching hashes, and its log must show
+  `found <n> peers via lsd` and `peer connected <fbt-lsd>:6897`. A session
+  announces each torrent only once per 5 minutes and nothing answers an
+  announce, so the download starts first and waits until its own announce
+  is out (three progress lines in the downloading state); the seed's
+  announce, sent once it has verified its data, is then the only way the
+  download can learn `fbt-lsd`'s address.
 
 Every `fbt-example` run passes `--dht-bootstrap dht-node:6881`. On success it
 prints `interop: download OK (qbittorrent, transmission)`,
 `interop: seed OK (transmission)`,
 `interop: encryption OK (qbittorrent, transmission)`,
-`interop: magnet via DHT OK` and `interop: PEX OK`, and exits 0. It also prints
-how long the DHT took to join and the total time. CI runs it as the `interop`
-job (40-minute timeout).
+`interop: magnet via DHT OK`, `interop: PEX OK`,
+`interop: uTP download OK (qbittorrent)`, `interop: uTP seed OK (qbittorrent)`
+and `interop: LSD OK`, and exits 0. It also prints how long the DHT took to
+join and the total time. CI runs it as the `interop` job (55-minute timeout).
 
 ## Layout
 
@@ -56,7 +79,11 @@ needed on the host.
 **No public DHT node is ever contacted.** `swarm` is `internal: true`: no
 container has a route out of it (`run.sh` checks
 `docker network inspect fbt-interop_swarm --format '{{.Internal}}'` prints
-`true`), and every image is pulled or built before `up`. Transmission still
+`true`, and the same for `fbt-interop_lan`), and every image is pulled or
+built before `up`. **There is no router on either network**, so no UPnP or
+NAT-PMP answer is possible, and both stay off everywhere anyway: our CLI
+leaves them off unless `--nat` is given (no run passes it), and qBittorrent
+keeps `PortForwardingEnabled=false`. Transmission still
 tries to resolve its built-in `dht.transmissionbt.com` and logs
 `Couldn't look up 'dht.transmissionbt.com:6881'`; that is the expected
 outcome.
@@ -68,11 +95,65 @@ outcome.
 | `transmission` | Transmission daemon, `transmission/settings.json` | peers 51413, RPC 9091 |
 | `dht-node` | `fbt-example dht-node` (same image as `fbt`): the private DHT's bootstrap node | DHT 6881 UDP |
 | `dht-helper-1` to `dht-helper-11` | the same, bootstrapped from `dht-node:6881`; one container (and address) each | DHT 6881 UDP |
-| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed) |
+| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe) |
+| `fbt-lsd` | the same image, idle like `fbt`; on `swarm` and `lan` | 6897 (LSD seed), 6899 (LSD probe) |
+| `fbt-mcast-route`, `fbt-lsd-mcast-route` | one-shot, in the network namespace of `fbt` / `fbt-lsd`: routes 224.0.0.0/4 out of the `lan` interface | none |
+
+### Multicast and LSD
+
+LSD (BEP 14) multicasts to 239.192.152.143:6771, and the `swarm` bridge does
+not carry that: Docker filters an internal bridge network with iptables and
+drops every packet whose destination lies outside the network's subnet,
+multicast included (measured on Docker 29.8: two `lsd-probe` runs on an
+internal bridge never hear each other, on a non-internal one they do at
+once). So `fbt` and `fbt-lsd` are also on a second network, `lan`: an
+internal macvlan network (`10.143.152.0/24`) on a dummy parent interface,
+with no uplink, no host address and no iptables in the path, which passes
+multicast between its members. Nothing else is on it.
+
+An internal network gives its containers no default route either, and
+joining a multicast group on the default interface then fails with
+`No such device`. The one-shot services `fbt-mcast-route` and
+`fbt-lsd-mcast-route` (the tracker's Alpine image, root with `NET_ADMIN`,
+sharing the target's network namespace) add `224.0.0.0/4 dev <lan interface>`
+in `fbt` and `fbt-lsd`; those two stay unprivileged. Multicast leaves with
+TTL 1 and only ever reaches `lan`.
+
+Before any scenario, `run.sh` checks both networks are internal, waits until
+the multicast route shows in `/proc/net/route` of both containers, and runs
+`fbt-example lsd-probe --port 6899 --timeout-secs 3` in `fbt` and `fbt-lsd`
+at the same time (the hidden subcommand announces a fixed probe hash every
+500 ms and exits 0 with `lsd probe: found <addr>` once it hears the other,
+announcing once more first: the probe that started first hears the other's
+very first announce, and without that answer the later one, which joined
+after the earlier one's last announce, timed out in about one run in two).
+`docker compose exec` can take seconds while containers start, so both
+first wait for the same second on their shared clock, which keeps the two
+3 s windows overlapping. Both must exit 0, or
+the run fails with "multicast does not reach ..." instead of a misleading
+LSD failure later. By hand, after `up`:
+
+```
+docker network inspect fbt-interop_swarm fbt-interop_lan --format '{{.Name}} {{.Driver}} {{.Internal}}'
+docker compose -f dev/interop/compose.yaml exec -T fbt fbt-example lsd-probe --port 6899 --timeout-secs 3 &
+docker compose -f dev/interop/compose.yaml exec -T fbt-lsd fbt-example lsd-probe --port 6899 --timeout-secs 3
+```
+
+### qBittorrent's transport switch
+
+The uTP scenarios use the WebUI preference `bittorrent_protocol` (0 = TCP
+and uTP, 1 = TCP, 2 = uTP), the WebUI's Advanced setting "Peer connection
+protocol". Checked against the pinned 5.3.0 image: `app/preferences`
+reports `"bittorrent_protocol":0` by default and reads back 2 and 0 after
+`app/setPreferences`, and qBittorrent writes it to `qBittorrent.conf` as
+`Session\BTProtocol` in `[BitTorrent]`, by name: `Both`, `TCP` or `UTP`. The
+committed conf leaves it at the default (`Both`); `run.sh` switches it at
+run time and restores 0.
 
 ### DHT and PEX
 
-DHT and PEX are on in both clients; LSD and UPnP/NAT-PMP stay off. Our own
+DHT and PEX are on in both clients; LSD and UPnP/NAT-PMP stay off in both
+(LSD runs only between our own two processes, on `lan`). Our own
 `fbt-example dht-node` is the only DHT bootstrap for everyone:
 
 - **qBittorrent:** `Session\DHTBootstrapNodes=dht-node:6881` in the
@@ -105,8 +186,13 @@ DHT and PEX are on in both clients; LSD and UPnP/NAT-PMP stay off. Our own
   `dht-node` first and waits until it is healthy (its `fbt-example` runs),
   then the helpers; Transmission waits for all twelve. `run.sh` waits until
   all twelve are listening, every helper knows a node and `dht-node` knows at
-  least eleven, and prints the time from `up`: about 14 s locally, most of it
-  the nodes' 10 s stats interval (they print `dht nodes:` every 10 s).
+  least 8 (one full bucket, K), and prints the time from `up`: about 14 s
+  locally, most of it the nodes' 10 s stats interval (they print `dht nodes:`
+  every 10 s). It used to require eleven, one per helper, which a Kademlia
+  table cannot promise: only the bucket holding the node's own id splits, so
+  the far half of the id space keeps at most 8 nodes, and with random ids
+  more than 8 helpers land there in a few percent of runs (a local run sat
+  at `v4=10` for the whole 120 s wait).
 - **libtorrent's /24 rule.** libtorrent keeps at most one routing-table node
   per /24 by default, and every container shares one bridge subnet, so
   qBittorrent's table holds a single node, and its announces reach only 3 of

@@ -3,7 +3,9 @@
 # and Transmission, then seeds to Transmission, all through opentracker; then
 # repeats both with encryption forced everywhere, downloads a trackerless
 # magnet through the private DHT (bootstrapped from the `dht-node` service
-# only) with BEP 9 metadata exchange, and finds a peer through PEX alone.
+# only) with BEP 9 metadata exchange, finds a peer through PEX alone, moves
+# a torrent each way with qBittorrent over uTP only, and finds a second
+# fbt-example (the `fbt-lsd` service) through LSD alone.
 # Needs Docker with Compose v2. Everything lands in target/interop/.
 #
 #   bash dev/interop/run.sh
@@ -31,6 +33,7 @@ announced_nodes=5
 dc() { docker compose -f "$here/compose.yaml" "$@"; }
 # Commands inside the long-running containers.
 fbt() { dc exec -T fbt "$@"; }
+lsd_host() { dc exec -T fbt-lsd "$@"; }
 trc() { dc exec -T -u abc transmission "$@"; }
 
 fail() {
@@ -102,6 +105,18 @@ container_ip() {
     fbt getent hosts "$1" | awk '{print $1; exit}'
 }
 
+# network_ip <service> <network>: its address on one compose network (fbt
+# and fbt-lsd are on two, so a name lookup could answer with either).
+network_ip() {
+    docker inspect --format "{{(index .NetworkSettings.Networks \"fbt-interop_$2\").IPAddress}}" \
+        "$(dc ps -q "$1")"
+}
+
+# has_mcast_route <service>: 224.0.0.0/4 is routed (fbt-mcast-route ran).
+has_mcast_route() {
+    dc exec -T "$1" cat /proc/net/route | awk '$2 == "000000E0" && $8 == "000000F0" {f = 1} END {exit !f}'
+}
+
 # hashes <parent dir> <torrent name>: sha256 of every file, relative paths.
 hashes() {
     fbt sh -c "cd '$1' && find '$2' -type f | sort | xargs sha256sum"
@@ -137,6 +152,18 @@ qbt_started() {
     [ "$(qbt_field "$1" '.progress > 0')" = true ]
 }
 
+qbt_complete() {
+    [ "$(qbt_field "$1" '.progress == 1')" = true ]
+}
+
+# set_bt_protocol <0|1|2>: qBittorrent's peer connection protocol (0 both,
+# 1 TCP, 2 uTP; Advanced, "Peer connection protocol"), read back.
+set_bt_protocol() {
+    qbt_api app/setPreferences --data-urlencode "json={\"bittorrent_protocol\":$1}" >/dev/null
+    [ "$(qbt_api app/preferences | fbt jq -r .bittorrent_protocol)" = "$1" ] ||
+        fail "qBittorrent did not take bittorrent_protocol=$1"
+}
+
 tr_info() { trc timeout 15 transmission-remote -t "$1" -i; }
 
 tr_field() { # tr_field <hash> <label>
@@ -163,8 +190,12 @@ tr_uploaded_changed() { # tr_uploaded_changed <hash> <previous Uploaded>
 dht_log() { dc logs --no-color --no-log-prefix "${dht_services[@]}"; }
 
 # dht_nodes_up: every DHT node is listening, every helper knows a node, and
-# the bootstrap node dht-node knows at least as many nodes as there are
-# helpers.
+# the bootstrap node dht-node knows at least dht_bucket nodes. Not one per
+# helper: a Kademlia table splits only the bucket holding its own id, so the
+# far half of the id space holds at most K = 8 nodes, and with random ids
+# more than 8 of the 11 helpers land there in a few percent of runs (seen:
+# dht-node stuck at v4=10 for the whole 120 s).
+dht_bucket=8
 dht_nodes_up() {
     local log listening joined v4
     log=$(dht_log)
@@ -173,7 +204,7 @@ dht_nodes_up() {
         awk '{c[$1] = $2} END {for (p in c) if (c[p] > 0) n++; print n + 0}')
     v4=$(echo "$log" | sed -n 's/^\[dht-node\] dht nodes: v4=\([0-9]*\) .*/\1/p' | tail -n 1)
     [ "$listening" -eq "$dht_nodes" ] && [ "$joined" -eq $((dht_nodes - 1)) ] &&
-        [ "${v4:-0}" -ge $((dht_nodes - 1)) ]
+        [ "${v4:-0}" -ge "$dht_bucket" ]
 }
 
 # dht_store_counts: "<service> <stored info hashes>" per node, latest report.
@@ -204,12 +235,16 @@ set_encryption() {
         fail "Transmission did not take encryption $1"
 }
 
+# The container start_seed and stop_seed run in.
+seed_service=fbt
+
 # start_seed <torrent> <data dir> <port> <log> [extra args...]: background
-# fbt-example seed (420 s); sets seed_pid and waits until it is seeding.
+# fbt-example seed (420 s) in $seed_service; sets seed_pid and waits until
+# it is seeding.
 start_seed() {
     local torrent=$1 data=$2 port=$3 log=$4
     shift 4
-    fbt fbt-example seed "$torrent" --data "$data" --port "$port" \
+    dc exec -T "$seed_service" fbt-example seed "$torrent" --data "$data" --port "$port" \
         --dht-bootstrap "$dht_bootstrap" --seed-for 420 "$@" >"$log" 2>&1 &
     seed_pid=$!
     seed_log=$log
@@ -221,12 +256,12 @@ seed_ready() {
     grep -q ' seeding$' "$seed_log"
 }
 
-fbt_example_gone() { ! fbt pidof fbt-example >/dev/null; }
+fbt_example_gone() { ! dc exec -T "$seed_service" pidof fbt-example >/dev/null; }
 
 # stop_seed: ends the background fbt-example seed (the only fbt-example
-# process in the fbt container while it runs) and waits until it is gone.
+# process in its container while it runs) and waits until it is gone.
 stop_seed() {
-    fbt sh -c 'kill $(pidof fbt-example)' ||
+    dc exec -T "$seed_service" sh -c 'kill $(pidof fbt-example)' ||
         fail "no fbt-example seed was running to stop (see $seed_log)"
     wait_for "fbt-example seed to exit" 30 fbt_example_gone
     wait "$seed_pid" 2>/dev/null || true
@@ -251,8 +286,31 @@ dc --progress quiet pull --ignore-buildable --policy missing
 # helper) to be healthy.
 dht_started=$SECONDS
 dc up -d --quiet-pull
-[ "$(docker network inspect fbt-interop_swarm --format '{{.Internal}}')" = true ] ||
-    fail "the swarm network is not internal"
+for net in swarm lan; do
+    [ "$(docker network inspect "fbt-interop_$net" --format '{{.Internal}}')" = true ] ||
+        fail "the $net network is not internal"
+done
+
+# LSD needs multicast between fbt and fbt-lsd (over `lan`, see compose.yaml).
+# Both announce a probe hash at once and must hear each other, or the run
+# stops here instead of reporting a bogus LSD failure later.
+wait_for "the multicast route in fbt" 30 has_mcast_route fbt
+wait_for "the multicast route in fbt-lsd" 30 has_mcast_route fbt-lsd
+# `docker compose exec` alone can take seconds while the other containers
+# start, enough to slide one 3 s probe past the other's end, so both wait
+# for the same second on the clock they share (one kernel) and then start.
+probe_at=$(($(fbt date +%s) + 3))
+probe() { # probe <service>: lsd-probe from second probe_at on
+    dc exec -T "$1" sh -c "while [ \$(date +%s) -lt $probe_at ]; do sleep 0.05; done
+        exec fbt-example lsd-probe --port 6899 --timeout-secs 3"
+}
+probe fbt >"$logs/lsd-probe-fbt.log" 2>&1 &
+probe_pid=$!
+probe fbt-lsd >"$logs/lsd-probe-fbt-lsd.log" 2>&1 ||
+    fail "multicast does not reach fbt-lsd from fbt: LSD cannot work on this Docker network (see $logs/lsd-probe-fbt-lsd.log)"
+wait "$probe_pid" ||
+    fail "multicast does not reach fbt from fbt-lsd: LSD cannot work on this Docker network (see $logs/lsd-probe-fbt.log)"
+echo "interop: multicast between fbt and fbt-lsd OK ($(cat "$logs/lsd-probe-fbt.log"))"
 wait_for "all $dht_nodes DHT nodes to listen and join" 120 dht_nodes_up
 echo "interop: all $dht_nodes DHT nodes joined $((SECONDS - dht_started))s after starting the containers"
 wait_for "opentracker" 60 fbt curl -fsS http://tracker:6969/stats
@@ -424,4 +482,88 @@ grep -Eq 'found .* peers via pex' "$logs/fbt-pex.log" ||
 grep -Eq "^peer connected $tr_ip:51413 via (tcp|utp)$" "$logs/fbt-pex.log" ||
     fail "never connected to Transmission, which only PEX could name (see $logs/fbt-pex.log)"
 echo "interop: PEX OK"
+
+# ------------------------------------------------------ uTP with qBittorrent --
+fbt_ip=$(network_ip fbt swarm)
+[ -n "$fbt_ip" ] || fail "could not resolve fbt's address on swarm"
+echo "interop: switching qBittorrent to uTP only"
+set_bt_protocol 2
+qbt_up_before=$(qbt_field "$hash1" .uploaded)
+
+echo "interop: fbt-example download --transport utp (timeout 300s)"
+set +e
+fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt-utp --port 6895 \
+    --transport utp --no-dht --dht-bootstrap "$dht_bootstrap" >"$logs/fbt-download-utp.log" 2>&1
+status=$?
+set -e
+check_download "$logs/fbt-download-utp.log" "$status" "fbt-example download --transport utp"
+[ "$(hashes /interop/payload fixture)" = "$(hashes /interop/fbt-utp fixture)" ] ||
+    fail "data downloaded over uTP differs from the payload"
+grep -Eq "^peer connected $qbt_ip:6882 via utp$" "$logs/fbt-download-utp.log" ||
+    fail "never connected to qBittorrent ($qbt_ip:6882) over uTP (see $logs/fbt-download-utp.log)"
+wait_for "qBittorrent's uploaded to grow over uTP" 30 qbt_uploaded_more_than "$hash1" "$qbt_up_before"
+echo "interop: uTP: qBittorrent uploaded $qbt_up_before -> $(qbt_field "$hash1" .uploaded) bytes"
+echo "interop: uTP download OK (qbittorrent)"
+
+echo "interop: fbt-example seed --transport utp; qBittorrent (uTP only) downloads fixture2"
+# Transmission still seeds fixture2 (and would be on the tracker's list):
+# drop it, so the uTP seed is qBittorrent's only source.
+trc transmission-remote -t "$hash2" -r >/dev/null
+start_seed /interop/fixture2.torrent /interop/payload2 6896 "$logs/fbt-seed-utp.log" --no-dht --transport utp
+qbt_api torrents/add -F torrents=@/interop/fixture2.torrent -F savepath=/interop/qbt-utp >/dev/null
+wait_for "qBittorrent to add fixture2" 30 qbt_has "$hash2"
+qbt_api torrents/addPeers --data-urlencode "hashes=$hash2" --data-urlencode "peers=$fbt_ip:6896" >/dev/null
+wait_for "qBittorrent to complete fixture2 from the uTP seed" 300 qbt_complete "$hash2"
+[ "$(hashes /interop/payload2 fixture2)" = "$(hashes /interop/qbt-utp fixture2)" ] ||
+    fail "data qBittorrent downloaded over uTP differs from the payload"
+grep -Eq "^peer connected $qbt_ip:[0-9]+ via utp$" "$logs/fbt-seed-utp.log" ||
+    fail "qBittorrent never connected to the uTP seed (see $logs/fbt-seed-utp.log)"
+stop_seed
+set_bt_protocol 0
+echo "interop: uTP seed OK (qbittorrent)"
+
+# --------------------------------------------------------------------- LSD --
+echo "interop: creating payload and trackerless fixture5.torrent"
+make_payload /interop/payload5/fixture5
+make_trackerless_torrent /interop/payload5/fixture5 /interop/fixture5.torrent
+hash5=$(info_hash /interop/fixture5.torrent)
+[ -n "$hash5" ] || fail "could not read the info hash of fixture5.torrent"
+lsd_ip=$(network_ip fbt-lsd lan)
+[ -n "$lsd_ip" ] || fail "could not resolve fbt-lsd's address on lan"
+
+# A session announces each torrent on LSD once per 5 minutes, at its start,
+# and nothing answers an announce. So the download (no tracker, no DHT, no
+# PEX, no --peer) runs first and has sent its own announce before the seed
+# starts; the seed's announce, once it has verified its data, is then the
+# only way the download can learn fbt-lsd's address, and the download dials
+# it (fbt-lsd:6897) rather than being dialled from an ephemeral port.
+echo "interop: fbt-example download --lsd in fbt (timeout 300s)"
+lsd_log="$logs/fbt-lsd-download.log"
+fbt timeout 300 fbt-example download /interop/fixture5.torrent --lsd --no-dht --no-pex \
+    --dht-bootstrap "$dht_bootstrap" --out /interop/fbt-lsd --port 6898 >"$lsd_log" 2>&1 &
+lsd_dl_pid=$!
+# Progress lines come once a second; three in the downloading state put the
+# download's first announce (sent within 750 ms of it starting) behind us.
+lsd_download_announced() {
+    kill -0 "$lsd_dl_pid" 2>/dev/null || fail "the LSD download exited early (see $lsd_log)"
+    [ "$(grep -c ' downloading$' "$lsd_log")" -ge 3 ]
+}
+wait_for "the LSD download to start" 60 lsd_download_announced
+
+echo "interop: fbt-example seed --lsd in fbt-lsd ($lsd_ip:6897)"
+seed_service=fbt-lsd
+start_seed /interop/fixture5.torrent /interop/payload5 6897 "$logs/fbt-lsd-seed.log" --lsd --no-dht --no-pex
+set +e
+wait "$lsd_dl_pid"
+status=$?
+set -e
+check_download "$lsd_log" "$status" "fbt-example download --lsd"
+[ "$(hashes /interop/payload5 fixture5)" = "$(hashes /interop/fbt-lsd fixture5)" ] ||
+    fail "data downloaded in the LSD scenario differs from the payload"
+grep -Eq 'found .* peers via lsd' "$lsd_log" || fail "no peers came from LSD (see $lsd_log)"
+grep -Eq "^peer connected $lsd_ip:6897 via (tcp|utp)$" "$lsd_log" ||
+    fail "never connected to fbt-lsd ($lsd_ip:6897), which only LSD could name (see $lsd_log)"
+stop_seed
+seed_service=fbt
+echo "interop: LSD OK"
 echo "interop: all scenarios passed in ${SECONDS}s"

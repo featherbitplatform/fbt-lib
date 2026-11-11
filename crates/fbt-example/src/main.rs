@@ -615,26 +615,12 @@ async fn bench(
 const LSD_PROBE_HASH: [u8; 20] = *b"fbt-lsd-probe-hash-1";
 
 /// Announces [`LSD_PROBE_HASH`] with `port` on the real LSD group and exits 0
-/// once another process announces it too, 1 after `timeout_secs`.
+/// once another process announces it too (answering it once first), 1 after
+/// `timeout_secs`.
 async fn lsd_probe(port: u16, timeout_secs: u64) -> Result<ExitCode, Error> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let lsd = fbt_net::lsd::Lsd::spawn(fbt_net::lsd::LsdConfig::default(), tx)?;
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    // Short-lived diagnostic bounded by `timeout_secs`, so it re-announces
-    // every 500 ms instead of the library's 5-minute cadence.
-    let mut announce = interval(Duration::from_millis(500));
-    announce.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let found = loop {
-        tokio::select! {
-            _ = announce.tick() => lsd.announce(port, &[LSD_PROBE_HASH]),
-            Some(peer) = rx.recv() => {
-                if peer.info_hash == LSD_PROBE_HASH {
-                    break Some(peer.addr);
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => break None,
-        }
-    };
+    let found = probe_lsd(&lsd, &mut rx, port, Duration::from_secs(timeout_secs)).await;
     lsd.shutdown().await;
     Ok(match found {
         Some(addr) => {
@@ -646,6 +632,36 @@ async fn lsd_probe(port: u16, timeout_secs: u64) -> Result<ExitCode, Error> {
             ExitCode::FAILURE
         }
     })
+}
+
+/// The probe itself: announces [`LSD_PROBE_HASH`] with `port` on `lsd` and
+/// returns the first other prober heard on `rx`, or `None` after `timeout`.
+async fn probe_lsd(
+    lsd: &fbt_net::lsd::Lsd,
+    rx: &mut tokio::sync::mpsc::Receiver<fbt_net::lsd::LsdPeer>,
+    port: u16,
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    let deadline = Instant::now() + timeout;
+    // Short-lived diagnostic bounded by `timeout`, so it re-announces every
+    // 500 ms instead of the library's 5-minute cadence.
+    let mut announce = interval(Duration::from_millis(500));
+    announce.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = announce.tick() => lsd.announce(port, &[LSD_PROBE_HASH]),
+            Some(peer) = rx.recv() => {
+                if peer.info_hash == LSD_PROBE_HASH {
+                    // The other prober may have joined after our last
+                    // announce; it keeps listening until it hears one, so
+                    // answer once before leaving.
+                    lsd.announce(port, &[LSD_PROBE_HASH]);
+                    return Some(peer.addr);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => return None,
+        }
+    }
 }
 
 /// Runs a session with only the DHT until `run_for` elapses or Ctrl-C.
@@ -796,7 +812,7 @@ async fn watch(
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, fill_pattern, human_bytes, parse_rate};
+    use super::{Cli, Command, fill_pattern, human_bytes, parse_rate, probe_lsd};
 
     #[test]
     fn parse_rate_accepts_numbers_and_suffixes() {
@@ -882,5 +898,45 @@ mod tests {
     fn formats_bytes() {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1_258_291), "1.2 MiB");
+    }
+
+    /// Two probes that do not start together: the early one hears the late
+    /// one's first announce at once, and the late one must still hear the
+    /// early one (unicast on loopback stands in for the multicast group).
+    #[tokio::test]
+    async fn lsd_probe_late_starter_hears_the_early_one() {
+        use fbt_net::lsd::{Lsd, LsdConfig};
+        use std::net::UdpSocket;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let free = || {
+            UdpSocket::bind("127.0.0.1:0")
+                .and_then(|s| s.local_addr())
+                .expect("free port")
+        };
+        let (early_addr, late_addr) = (free(), free());
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let early = Lsd::spawn_unicast(LsdConfig::default(), early_addr, vec![late_addr], tx)
+            .expect("early probe");
+        let early_task = tokio::spawn(async move {
+            let found = probe_lsd(&early, &mut rx, 7001, Duration::from_secs(5)).await;
+            early.shutdown().await;
+            found
+        });
+        // The early probe announces at 0, 500 and 1000 ms to a port nobody
+        // has bound yet; the late one starts between two of its announces.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let late = Lsd::spawn_unicast(LsdConfig::default(), late_addr, vec![early_addr], tx)
+            .expect("late probe");
+        let late_found = probe_lsd(&late, &mut rx, 7002, Duration::from_secs(2)).await;
+        late.shutdown().await;
+
+        let early_found = early_task.await.expect("early probe task");
+        assert_eq!(early_found.map(|a| a.port()), Some(7002));
+        assert_eq!(late_found.map(|a| a.port()), Some(7001));
     }
 }
