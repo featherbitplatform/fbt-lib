@@ -71,7 +71,10 @@ pub struct UtpConfig {
     pub max_retransmits: u32,
     /// Connections per socket (used by the socket runtime).
     pub max_connections: usize,
-    /// Accepted connections waiting for `accept` (used by the socket runtime).
+    /// Incoming connections half-open (SYN answered, the dialer not yet
+    /// heard from), and confirmed ones waiting for `accept`: at most this
+    /// many of each (used by the socket runtime). A SYN beyond the
+    /// half-open cap evicts the oldest half-open connection.
     pub max_pending_accept: usize,
 }
 

@@ -163,8 +163,9 @@ pub(crate) fn spawn_outgoing(
 /// to the socket's connect timeout (`utp_connect_timeout`). Fails with
 /// [`DisconnectReason::Io`] and whether it was a connect failure that the
 /// other transport may get past: every TCP error and timeout, a uTP
-/// `ConnectTimeout` or `Reset`. Local uTP errors (no socket, too many
-/// connections, the socket closed) are not.
+/// `ConnectTimeout`, `Reset` or `TooManyConnections` (a full uTP table
+/// says nothing about TCP). The other local uTP errors (no socket for the
+/// address family, the socket closed) are not.
 async fn connect(
     addr: SocketAddr,
     transport: Transport,
@@ -195,7 +196,10 @@ async fn connect(
             match timeout(bound, socket.connect(to)).await {
                 Ok(Ok(s)) => Ok(PeerTransport::Utp(s)),
                 Ok(Err(e)) => {
-                    let failed = matches!(e, UtpError::ConnectTimeout | UtpError::Reset);
+                    let failed = matches!(
+                        e,
+                        UtpError::ConnectTimeout | UtpError::Reset | UtpError::TooManyConnections
+                    );
                     Err((io(e.to_string()), failed))
                 }
                 Err(_) => Err((io(UtpError::ConnectTimeout.to_string()), true)),

@@ -54,17 +54,17 @@ async fn step<T>(f: impl std::future::Future<Output = T>) -> T {
 }
 
 /// A connected (client, server) stream pair, confirmed: the server has
-/// heard from the dialer after the handshake (one byte, already read).
+/// heard from the dialer after the handshake (one byte, already read). As
+/// in BitTorrent, the dialer speaks first: `accept` returns only then.
 async fn pair(client: &UtpSocket, server: &UtpSocket) -> (UtpStream, UtpStream) {
     let srv = server.clone();
     let accept = tokio::spawn(async move { srv.accept().await });
-    let c = step(client.connect(server.local_addr())).await.unwrap();
-    let (s, from) = step(accept).await.unwrap().unwrap();
+    let mut c = step(client.connect(server.local_addr())).await.unwrap();
+    step(c.write_all(&[0])).await.unwrap();
+    let (mut s, from) = step(accept).await.unwrap().unwrap();
     assert_eq!(from, client.local_addr());
     assert_eq!(c.peer_addr(), server.local_addr());
     assert_eq!(s.peer_addr(), client.local_addr());
-    let (mut c, mut s) = (c, s);
-    step(c.write_all(&[0])).await.unwrap();
     let mut b = [1u8];
     step(s.read_exact(&mut b)).await.unwrap();
     assert_eq!(b, [0]);
@@ -519,7 +519,10 @@ async fn syn_flood_from_one_address_cannot_lock_out_others() {
         .expect("honest connect stalled during the flood")
         .unwrap();
     assert!(started.elapsed() < Duration::from_secs(3));
+    step(c.write_all(&[0])).await.unwrap();
     let mut s = step(accept).await.unwrap();
+    let mut b = [1u8];
+    step(s.read_exact(&mut b)).await.unwrap();
     echo_roundtrip(&mut c, &mut s, b"honest").await;
     assert!(server.num_connections() <= fbt_utp::MAX_PENDING_PER_IP + 1);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -699,4 +702,137 @@ async fn forged_ack_does_not_confirm_a_half_open_connection() {
     })
     .await;
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// A packet from a dialler that sent `SYN(id)`: it sends with `id + 1`.
+fn ack_of(ty: PacketType, id: u16, ack_nr: u16) -> Vec<u8> {
+    let mut p = Packet::decode(&Bytes::from(packet(ty, id.wrapping_add(1), 2))).unwrap();
+    p.ack_nr = ack_nr;
+    let mut d = Vec::new();
+    p.encode(&mut d);
+    d
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn syn_is_accepted_only_once_the_dialler_acks_our_state() {
+    let server = bind(UtpConfig::default()).await;
+    let raw = tokio::net::UdpSocket::bind(loopback()).await.unwrap();
+    let id = 4000u16;
+    raw.send_to(&packet(PacketType::Syn, id, 1), server.local_addr())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1500];
+    let (n, _) = step(raw.recv_from(&mut buf)).await.unwrap();
+    let state = Packet::decode(&Bytes::copy_from_slice(&buf[..n])).unwrap();
+    assert_eq!(state.ty, PacketType::State);
+    assert_eq!(server.num_connections(), 1);
+
+    let srv = server.clone();
+    let mut accept = tokio::spawn(async move { srv.accept().await });
+    // Half-open: a SYN alone is never handed out.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut accept)
+            .await
+            .is_err(),
+        "an unconfirmed SYN reached accept"
+    );
+    // A STATE whose ack misses our handshake does not confirm it either.
+    raw.send_to(
+        &ack_of(PacketType::State, id, state.seq_nr.wrapping_add(3)),
+        server.local_addr(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut accept)
+            .await
+            .is_err(),
+        "a forged ack confirmed the SYN"
+    );
+    // The dialler's first STATE acking our sequence number confirms it.
+    raw.send_to(
+        &ack_of(PacketType::State, id, state.seq_nr.wrapping_sub(1)),
+        server.local_addr(),
+    )
+    .await
+    .unwrap();
+    let (_s, from) = step(accept).await.unwrap().unwrap();
+    assert_eq!(from, raw.local_addr().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spoofed_syn_flood_neither_reaches_accept_nor_fills_the_table() {
+    const CAP: usize = 16;
+    let mut cfg = UtpConfig::default();
+    cfg.max_pending_accept = CAP;
+    cfg.max_connections = 64;
+    let udp = shared_bind();
+    let server = UtpSocket::new(udp.sender(), cfg);
+    udp.set_handler(PacketKind::Utp, server.handler());
+
+    // A session-like accept loop drains the queue as fast as it fills.
+    let accepted: Arc<Mutex<Vec<(UtpStream, SocketAddr)>>> = Arc::new(Mutex::new(Vec::new()));
+    let acceptor = {
+        let srv = server.clone();
+        let accepted = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok(a) = srv.accept().await {
+                accepted.lock().unwrap().push(a);
+            }
+        })
+    };
+
+    // Spoofed SYNs from random sources, fed straight into the handler (the
+    // STATE replies to those addresses go nowhere).
+    let handler = server.handler();
+    let mut rng = rand::rng();
+    for _ in 0..2000 {
+        let from = SocketAddr::from((
+            [127, rng.random(), rng.random(), rng.random_range(2..255u8)],
+            rng.random_range(1024..65535u16),
+        ));
+        handler.handle(from, &packet(PacketType::Syn, rng.random(), 1));
+        assert!(
+            server.num_connections() <= CAP,
+            "{}",
+            server.num_connections()
+        );
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        accepted.lock().unwrap().is_empty(),
+        "an unconfirmed SYN was accepted"
+    );
+    assert_eq!(server.num_connections(), CAP);
+
+    // The flood still running, an outgoing dial gets a slot...
+    let peer = bind(UtpConfig::default()).await;
+    let peer_srv = peer.clone();
+    let peer_accept = tokio::spawn(async move { peer_srv.accept().await });
+    let mut out = step(server.connect(peer.local_addr())).await.unwrap();
+    step(out.write_all(b"out")).await.unwrap();
+    let (mut theirs, _) = step(peer_accept).await.unwrap().unwrap();
+    let mut b = [0u8; 3];
+    step(theirs.read_exact(&mut b)).await.unwrap();
+    assert_eq!(&b, b"out");
+
+    // ...and an honest dialler, which evicts the oldest half-open entry,
+    // is accepted as soon as it speaks.
+    for _ in 0..200 {
+        let from = SocketAddr::from(([127, 0, 0, 3], rng.random_range(1024..65535u16)));
+        handler.handle(from, &packet(PacketType::Syn, rng.random(), 1));
+    }
+    let mut c = step(peer.connect(server.local_addr())).await.unwrap();
+    step(c.write_all(b"in")).await.unwrap();
+    let honest = peer.local_addr();
+    step(async {
+        while !accepted.lock().unwrap().iter().any(|(_, a)| *a == honest) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(accepted.lock().unwrap().len(), 1);
+    assert!(server.num_connections() <= CAP + 2);
+    acceptor.abort();
 }

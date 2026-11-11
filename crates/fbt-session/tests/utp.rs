@@ -427,3 +427,49 @@ async fn mixed_swarm_tcp_and_utp() {
         l.session.shutdown().await;
     }
 }
+
+/// Unconfirmed uTP SYNs (what a spoofed flood leaves) take no
+/// pending-handshake permit: with more of them half-open than there are
+/// permits, a TCP peer still gets in at once.
+#[tokio::test]
+async fn unconfirmed_utp_syns_take_no_handshake_permits() {
+    let (m, payload) = torrent();
+    let mut st = settings();
+    st.max_peers_global = 4;
+    let (seed, _h) = seeder(st, &m, &payload).await;
+
+    let raw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for i in 0..8u16 {
+        let syn = fbt_utp::Packet {
+            ty: fbt_utp::PacketType::Syn,
+            conn_id: i * 10,
+            timestamp_us: 0,
+            timestamp_diff_us: 0,
+            wnd_size: 1 << 20,
+            seq_nr: 1,
+            ack_nr: 0,
+            sack: None,
+            payload: bytes::Bytes::new(),
+        };
+        let mut d = Vec::new();
+        syn.encode(&mut d);
+        raw.send_to(&d, seed.local_addr()).await.unwrap();
+    }
+    // Each SYN got its STATE: all eight are half-open at the seed.
+    let mut buf = [0u8; 1500];
+    for _ in 0..8 {
+        tokio::time::timeout(T, raw.recv_from(&mut buf))
+            .await
+            .expect("a STATE for each SYN")
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut peer = ScriptedPeer::connect(seed.local_addr(), m.info_hashes.wire_hash()).await;
+    assert!(
+        peer.next_matching(|m| matches!(m, fbt_wire::Message::Bitfield(_)))
+            .await
+            .is_some(),
+        "the seed did not serve the TCP peer"
+    );
+}

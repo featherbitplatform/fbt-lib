@@ -9,7 +9,7 @@
 //! lock is held across an await; datagrams are sent with every lock
 //! released.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -39,7 +39,7 @@ pub const RESETS_PER_SECOND: u32 = 10;
 /// ack a retransmitted FIN.
 pub const CLOSE_LINGER: Duration = Duration::from_secs(5);
 /// Half-open incoming connections (SYN acked, nothing else heard yet) kept
-/// per source IP, so one host cannot fill the accept queue.
+/// per source IP, so one host cannot take every half-open place.
 pub const MAX_PENDING_PER_IP: usize = 8;
 /// Random connection ids tried before `connect` gives up on a peer.
 const ID_ATTEMPTS: usize = 64;
@@ -195,14 +195,19 @@ fn reset_packet(conn_id: u16, seq_nr: u16, ack_nr: u16) -> Vec<u8> {
     out
 }
 
-/// The connections, and the half-open ones counted per source IP.
+/// The connections, and the half-open ones (incoming, not yet confirmed by
+/// the dialler) in arrival order and counted per source IP.
 #[derive(Debug, Default)]
 struct Table {
     slots: HashMap<Key, Slot>,
     /// The slots we dialled (`connect`), a subset of `slots`, with the
     /// sequence number of their SYN.
     outgoing: HashMap<Key, u16>,
-    half_open: HashSet<Key>,
+    /// Half-open slots (a subset of `slots`) and their arrival stamp.
+    half_open: HashMap<Key, u64>,
+    /// `half_open` by arrival stamp, oldest first.
+    half_open_order: BTreeMap<u64, Key>,
+    next_stamp: u64,
     half_open_per_ip: HashMap<IpAddr, usize>,
 }
 
@@ -212,14 +217,26 @@ impl Table {
     }
 
     fn add_half_open(&mut self, key: Key) {
-        if self.half_open.insert(key) {
-            *self.half_open_per_ip.entry(key.0.ip()).or_insert(0) += 1;
+        if self.half_open.contains_key(&key) {
+            return;
         }
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.wrapping_add(1);
+        self.half_open.insert(key, stamp);
+        self.half_open_order.insert(stamp, key);
+        *self.half_open_per_ip.entry(key.0.ip()).or_insert(0) += 1;
+    }
+
+    /// The oldest half-open slot.
+    fn oldest_half_open(&self) -> Option<(Key, Slot)> {
+        let (_, key) = self.half_open_order.first_key_value()?;
+        Some((*key, Arc::clone(self.slots.get(key)?)))
     }
 
     /// Idempotent: only the first call for a key counts.
     fn drop_half_open(&mut self, key: Key) {
-        if self.half_open.remove(&key) {
+        if let Some(stamp) = self.half_open.remove(&key) {
+            self.half_open_order.remove(&stamp);
             let ip = key.0.ip();
             if let Some(n) = self.half_open_per_ip.get_mut(&ip) {
                 *n = n.saturating_sub(1);
@@ -240,7 +257,7 @@ pub(crate) struct Shared {
     sender: Arc<dyn DatagramSender>,
     pub(crate) cfg: UtpConfig,
     table: Mutex<Table>,
-    /// Accepted connections not yet handed out by `accept`.
+    /// Confirmed incoming connections not yet handed out by `accept`.
     pending: Mutex<VecDeque<(Key, Slot)>>,
     accept_ready: Notify,
     filter: Mutex<Option<AcceptFilter>>,
@@ -408,11 +425,56 @@ impl Shared {
         if st.remove {
             self.remove(key, slot);
         } else if st.confirmed {
-            let mut table = lock(&self.table);
-            if table.holds(key, slot) {
-                table.drop_half_open(key);
-            }
+            self.confirmed(key, slot);
         }
+    }
+
+    /// The dialler of a half-open slot proved it got our STATE: the slot
+    /// leaves the half-open set and joins the accept queue, or is reset
+    /// when that queue is full.
+    fn confirmed(&self, key: Key, slot: &Slot) {
+        let queued = {
+            let mut table = lock(&self.table);
+            if !table.holds(key, slot) {
+                return;
+            }
+            table.drop_half_open(key);
+            let mut pending = lock(&self.pending);
+            if pending.len() < self.cfg.max_pending_accept {
+                pending.push_back((key, Arc::clone(slot)));
+                true
+            } else {
+                false
+            }
+        };
+        if queued {
+            self.accept_ready.notify_one();
+            return;
+        }
+        tracing::debug!(peer = %key.0, "utp accept queue full; resetting a confirmed connection");
+        let (peer, out) = {
+            let mut s = lock(slot);
+            if s.local_error.is_some() {
+                return;
+            }
+            s.local_error = Some(UtpError::Closed);
+            (s.peer, reset_packet(s.conn.send_id(), 0, 0))
+        };
+        self.send_all(peer, &[out]);
+        self.remove(key, slot);
+    }
+
+    /// Drops a half-open slot to make room for a newer SYN. No reset: its
+    /// SYN was most likely forged. A slot confirmed meanwhile is kept.
+    fn evict(&self, key: Key, slot: &Slot) {
+        {
+            let mut s = lock(slot);
+            if s.unconfirmed_until.is_none() || s.local_error.is_some() {
+                return;
+            }
+            s.local_error = Some(UtpError::TimedOut);
+        }
+        self.remove(key, slot);
     }
 
     /// Removes `slot` from the table, the accept queue and the index.
@@ -496,29 +558,49 @@ impl Shared {
         self.finish(key, slot, peer, st);
     }
 
-    /// Room for one more half-open connection at `key` for `syn`: under
-    /// the limits, and no neighbouring id in use by that peer (as `connect`
-    /// keeps them free), so a reset by send id matches one connection only;
-    /// see [`syn_neighbours_free`] for the one exception.
-    fn has_room(&self, table: &Table, pending: usize, key: Key, syn: &Packet) -> bool {
+    /// Whether a SYN at `key` may take a half-open place, possibly the
+    /// oldest one's: under the limits other than the half-open total, and
+    /// no neighbouring id in use by that peer (as `connect` keeps them
+    /// free), so a reset by send id matches one connection only; see
+    /// [`syn_neighbours_free`] for the one exception.
+    fn admissible(&self, table: &Table, pending: usize, key: Key, syn: &Packet) -> bool {
         table.slots.len() < self.cfg.max_connections
             && pending < self.cfg.max_pending_accept
             && table.half_open_from(key.0.ip()) < MAX_PENDING_PER_IP
             && syn_neighbours_free(table, key, syn)
     }
 
+    /// [`Shared::admissible`] with a free half-open place.
+    fn has_room(&self, table: &Table, pending: usize, key: Key, syn: &Packet) -> bool {
+        table.half_open.len() < self.cfg.max_pending_accept
+            && self.admissible(table, pending, key, syn)
+    }
+
+    /// A SYN for no known connection. It gets a half-open slot (and our
+    /// STATE), but reaches `accept` only once the dialler confirms it (see
+    /// `deliver`). At most `max_pending_accept` slots are half-open; a newer
+    /// SYN evicts the oldest, so forged SYNs can neither fill the table
+    /// nor keep an honest dialler out for longer than its round trip.
     fn incoming_syn(&self, key: Key, syn: &Packet, now: Instant) {
         // Checked before any allocation, so a flood costs a lookup each.
-        {
+        let victim = {
             let table = lock(&self.table);
             let pending = lock(&self.pending).len();
-            if !self.has_room(&table, pending, key, syn) {
+            if !self.admissible(&table, pending, key, syn) {
                 return;
             }
-        }
+            if table.half_open.len() >= self.cfg.max_pending_accept {
+                table.oldest_half_open()
+            } else {
+                None
+            }
+        };
         let filter = lock(&self.filter).clone();
         if filter.is_some_and(|f| !f(key.0)) {
             return;
+        }
+        if let Some((vkey, vslot)) = victim {
+            self.evict(vkey, &vslot);
         }
         let isn: u16 = rand::rng().random();
         let conn = Connection::accept(&self.cfg, key.0, syn, isn, now);
@@ -527,17 +609,15 @@ impl Shared {
         let slot = Arc::new(Mutex::new(slot));
         {
             let mut table = lock(&self.table);
-            let mut pending = lock(&self.pending);
-            if table.slots.contains_key(&key) || !self.has_room(&table, pending.len(), key, syn) {
+            let pending = lock(&self.pending).len();
+            if table.slots.contains_key(&key) || !self.has_room(&table, pending, key, syn) {
                 return;
             }
             table.slots.insert(key, Arc::clone(&slot));
             table.add_half_open(key);
-            pending.push_back((key, Arc::clone(&slot)));
         }
         let st = self.settle(&mut lock(&slot), now, None);
         self.finish(key, &slot, key.0, st);
-        self.accept_ready.notify_one();
     }
 
     /// A packet for no connection we know: one rate-limited reset, echoing
@@ -611,6 +691,7 @@ impl Shared {
         let slots: Vec<(Key, Slot)> = {
             let mut table = lock(&self.table);
             table.half_open.clear();
+            table.half_open_order.clear();
             table.half_open_per_ip.clear();
             table.outgoing.clear();
             table.slots.drain().collect()
@@ -849,10 +930,12 @@ impl UtpSocket {
 
     /// The next incoming connection and its peer address.
     ///
-    /// An incoming connection must hear from the dialer (a packet with a
-    /// valid ack of our handshake, in BitTorrent its handshake) within
-    /// `connect_timeout` of the SYN; otherwise it fails with `TimedOut`,
-    /// accepted or not.
+    /// A SYN alone is never handed out: an incoming connection is queued
+    /// here only once the dialer confirmed it with a packet that acks our
+    /// handshake STATE (in BitTorrent its first STATE or the data of its
+    /// handshake, which the dialer always sends first). One not confirmed
+    /// within `connect_timeout` of the SYN is dropped. So a protocol whose
+    /// acceptor must speak first cannot run over an accepted stream.
     pub async fn accept(&self) -> Result<(UtpStream, SocketAddr), UtpError> {
         let sh = &self.inner;
         loop {
