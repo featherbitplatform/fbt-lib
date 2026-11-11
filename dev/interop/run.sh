@@ -383,9 +383,9 @@ while :; do
         fail "data downloaded from the magnet differs from the payload"
     grep -Eq 'found .* peers via dht' "$log" || fail "no peers came from the DHT (see $log)"
     grep -q 'metadata received: fixture3' "$log" || fail "no metadata received for the magnet (see $log)"
-    grep -q "^peer connected $qbt_ip:6882$" "$log" ||
+    grep -Eq "^peer connected $qbt_ip:6882 via (tcp|utp)$" "$log" ||
         fail "the magnet download never connected to qBittorrent ($qbt_ip:6882) found via the DHT (see $log)"
-    grep -q "^peer connected $tr_ip:51413$" "$log" && break
+    grep -Eq "^peer connected $tr_ip:51413 via (tcp|utp)$" "$log" && break
     [ "$attempt" -lt 3 ] ||
         fail "no attempt connected to Transmission ($tr_ip:51413) found via the DHT (see $logs/fbt-magnet-*.log)"
     echo "interop: attempt $attempt did not reach Transmission through the DHT; retrying in 30s"
@@ -421,7 +421,7 @@ check_download "$logs/fbt-pex.log" "$status" "fbt-example download (PEX)"
     fail "data downloaded in the PEX scenario differs from the payload"
 grep -Eq 'found .* peers via pex' "$logs/fbt-pex.log" ||
     fail "no peers came from PEX (see $logs/fbt-pex.log)"
-grep -q "^peer connected $tr_ip:51413$" "$logs/fbt-pex.log" ||
+grep -Eq "^peer connected $tr_ip:51413 via (tcp|utp)$" "$logs/fbt-pex.log" ||
     fail "never connected to Transmission, which only PEX could name (see $logs/fbt-pex.log)"
 echo "interop: PEX OK"
 echo "interop: all scenarios passed in ${SECONDS}s"
