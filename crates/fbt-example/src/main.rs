@@ -70,6 +70,21 @@ enum TransportChoice {
     Utp,
 }
 
+impl TransportChoice {
+    /// Enables exactly the chosen transports, in both directions.
+    fn apply(self, settings: &mut Settings) {
+        let (tcp, utp) = match self {
+            TransportChoice::Both => (true, true),
+            TransportChoice::Tcp => (true, false),
+            TransportChoice::Utp => (false, true),
+        };
+        settings.enable_outgoing_tcp = tcp;
+        settings.enable_incoming_tcp = tcp;
+        settings.enable_outgoing_utp = utp;
+        settings.enable_incoming_utp = utp;
+    }
+}
+
 /// Parses `1048576`, `512K` or `1M` (powers of 1024) into bytes per second.
 fn parse_rate(s: &str) -> Result<u64, String> {
     let bad = || format!("invalid rate {s:?}: expected a number with an optional K or M suffix");
@@ -104,15 +119,7 @@ impl NetArgs {
         settings.enable_lsd = self.lsd;
         settings.enable_upnp = self.nat;
         settings.enable_natpmp = self.nat;
-        let (tcp, utp) = match self.transport {
-            TransportChoice::Both => (true, true),
-            TransportChoice::Tcp => (true, false),
-            TransportChoice::Utp => (false, true),
-        };
-        settings.enable_outgoing_tcp = tcp;
-        settings.enable_incoming_tcp = tcp;
-        settings.enable_outgoing_utp = utp;
-        settings.enable_incoming_utp = utp;
+        self.transport.apply(settings);
         if self.download_limit.is_some() || self.upload_limit.is_some() {
             settings.rate_limit = RateLimit::new(
                 self.download_limit.unwrap_or(0),
@@ -200,6 +207,23 @@ enum Command {
         #[arg(long, value_name = "S", default_value_t = 3)]
         timeout_secs: u64,
     },
+    /// Loopback throughput and idle-torrent benchmark (used by
+    /// `dev/bench.sh`); sends nothing off this machine.
+    #[command(hide = true)]
+    Bench {
+        /// Payload to move from the seed to the leech, in MiB (0: skip).
+        #[arg(long, value_name = "MiB", default_value_t = 0)]
+        size: u64,
+        /// Transport both sessions use.
+        #[arg(long, value_enum, default_value = "tcp")]
+        transport: TransportChoice,
+        /// Seed this many small torrents idle (0: skip).
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        torrents: u32,
+        /// How long the idle torrents run.
+        #[arg(long, value_name = "S", default_value_t = 60)]
+        idle_secs: u64,
+    },
     /// Print what a .torrent file contains.
     Info {
         /// The .torrent file.
@@ -259,6 +283,12 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             let source = Source::File(load(&torrent)?);
             transfer(source, data, port, seed_for, &[], false, &net).await
         }
+        Command::Bench {
+            size,
+            transport,
+            torrents,
+            idle_secs,
+        } => bench(size, transport, torrents, idle_secs).await,
         Command::LsdProbe { port, timeout_secs } => lsd_probe(port, timeout_secs).await,
         Command::DhtNode {
             port,
@@ -381,6 +411,204 @@ async fn transfer(
     .await;
     session.shutdown().await;
     Ok(code)
+}
+
+/// Piece length of the benchmark torrents.
+const BENCH_PIECE_LEN: u32 = 256 * 1024;
+/// How long `bench` stays alive after each measurement line so that
+/// `dev/bench.sh` can take its closing `ps` sample.
+const BENCH_SETTLE: Duration = Duration::from_secs(2);
+
+/// Deterministic payload that takes no memory: byte `i` is derived from `i`
+/// alone, so the seed reads it back on demand and the leech can discard what
+/// it receives (the session verifies every piece against the torrent's
+/// hashes before it writes it; the leech's reads report "not found").
+#[derive(Debug)]
+struct BenchStorage {
+    discard: bool,
+}
+
+/// SplitMix64 of `n`: the payload's 8-byte word number `n`.
+fn pattern_word(n: u64) -> u64 {
+    let mut z = n.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn fill_pattern(offset: u64, buf: &mut [u8]) {
+    let mut pos = offset;
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let word = pattern_word(pos / 8).to_le_bytes();
+        let skip = (pos % 8) as usize;
+        let n = (8 - skip).min(rest.len());
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(n);
+        if let Some(src) = word.get(skip..skip + n) {
+            head.copy_from_slice(src);
+        }
+        rest = tail;
+        pos += n as u64;
+    }
+}
+
+impl fbt::Storage for BenchStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        if self.discard {
+            // Like a file that does not exist yet: the initial check counts
+            // every piece as missing.
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+        fill_pattern(offset, buf);
+        Ok(())
+    }
+
+    fn write(&self, _offset: u64, _data: &[u8]) -> std::io::Result<()> {
+        if self.discard {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("bench seed storage is read-only"))
+        }
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn delete_files(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A one-file torrent `name` of `len` bytes over the benchmark pattern.
+fn bench_torrent(name: &str, len: u64, piece_len: u32) -> Result<Metainfo, Error> {
+    use sha1::{Digest, Sha1};
+    let mut pieces = Vec::new();
+    let mut buf = vec![0u8; piece_len as usize];
+    let mut off = 0u64;
+    while off < len {
+        let n = (len - off).min(u64::from(piece_len)) as usize;
+        let chunk = buf.get_mut(..n).ok_or("piece buffer")?;
+        fill_pattern(off, chunk);
+        pieces.extend_from_slice(&Sha1::digest(&*chunk));
+        off += n as u64;
+    }
+    let mut info = fbt_bencode::DictBuilder::new();
+    info.insert(b"length", len as i64);
+    info.insert(b"name", name);
+    info.insert(b"piece length", i64::from(piece_len));
+    info.insert(b"pieces", pieces);
+    let mut root = fbt_bencode::DictBuilder::new();
+    root.insert(b"info", info.build());
+    Ok(Metainfo::from_bytes(&fbt_bencode::encode(&root.build()))?)
+}
+
+/// Settings for a benchmark session: loopback only, and no DHT, LSD, UPnP,
+/// NAT-PMP, PEX or holepunching, so nothing leaves this machine.
+fn bench_settings(transport: TransportChoice) -> Settings {
+    let mut s = Settings::default();
+    s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
+    s.dht_enabled = false;
+    s.dht_bootstrap_nodes = Vec::new();
+    s.enable_lsd = false;
+    s.enable_upnp = false;
+    s.enable_natpmp = false;
+    s.pex_enabled = false;
+    s.enable_holepunch = false;
+    transport.apply(&mut s);
+    s
+}
+
+/// Polls until every handle is seeding; fails on error or after `limit`.
+async fn wait_seeding(handles: &[TorrentHandle], limit: Duration) -> Result<(), Error> {
+    let end = Instant::now() + limit;
+    loop {
+        let mut done = true;
+        for h in handles {
+            let st = h.status();
+            match st.state {
+                TorrentState::Seeding => {}
+                TorrentState::Error => {
+                    return Err(st.error.unwrap_or_else(|| "torrent stopped".into()).into());
+                }
+                _ => done = false,
+            }
+        }
+        if done {
+            return Ok(());
+        }
+        if Instant::now() >= end {
+            return Err("timed out waiting for the torrents to seed".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Seeds and leeches `size_mib` MiB in this process over loopback.
+async fn bench_transfer(size_mib: u64, transport: TransportChoice) -> Result<(), Error> {
+    let len = size_mib.saturating_mul(1024 * 1024);
+    let m = bench_torrent("bench", len, BENCH_PIECE_LEN)?;
+    let seed = Session::new(bench_settings(transport)).await?;
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(std::sync::Arc::new(BenchStorage { discard: false }));
+    let seed_handle = seed.add_torrent(p).await?;
+    wait_seeding(&[seed_handle], Duration::from_secs(300)).await?;
+    let leech = Session::new(bench_settings(transport)).await?;
+    let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+    p.storage = Some(std::sync::Arc::new(BenchStorage { discard: true }));
+    let handle = leech.add_torrent(p).await?;
+    println!("bench: start");
+    let t0 = Instant::now();
+    handle.add_peer(seed.local_addr()).await?;
+    wait_seeding(&[handle], Duration::from_secs(3600)).await?;
+    let secs = t0.elapsed().as_secs_f64();
+    let mbit = len as f64 * 8.0 / 1e6 / secs;
+    let name = match transport {
+        TransportChoice::Utp => "utp",
+        TransportChoice::Tcp => "tcp",
+        TransportChoice::Both => "both",
+    };
+    println!("bench: {name} {size_mib} MiB in {secs:.2} s = {mbit:.0} Mbit/s");
+    tokio::time::sleep(BENCH_SETTLE).await;
+    leech.shutdown().await;
+    seed.shutdown().await;
+    Ok(())
+}
+
+/// Seeds `count` small torrents with no peers for `idle_secs`.
+async fn bench_idle(count: u32, idle_secs: u64) -> Result<(), Error> {
+    let session = Session::new(bench_settings(TransportChoice::Both)).await?;
+    let mut handles = Vec::new();
+    for i in 0..count {
+        let m = bench_torrent(&format!("idle-{i}"), 16 * 1024, 16 * 1024)?;
+        let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+        p.storage = Some(std::sync::Arc::new(BenchStorage { discard: false }));
+        handles.push(session.add_torrent(p).await?);
+    }
+    wait_seeding(&handles, Duration::from_secs(600)).await?;
+    println!("bench: idle start");
+    tokio::time::sleep(Duration::from_secs(idle_secs)).await;
+    println!("bench: idle {count} torrents for {idle_secs} s");
+    tokio::time::sleep(BENCH_SETTLE).await;
+    session.shutdown().await;
+    Ok(())
+}
+
+/// The `bench` subcommand: see `dev/bench.sh`.
+async fn bench(
+    size_mib: u64,
+    transport: TransportChoice,
+    torrents: u32,
+    idle_secs: u64,
+) -> Result<ExitCode, Error> {
+    println!("bench: pid {}", std::process::id());
+    if size_mib > 0 {
+        bench_transfer(size_mib, transport).await?;
+    }
+    if torrents > 0 {
+        bench_idle(torrents, idle_secs).await?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The info hash `lsd-probe` announces and waits for.
@@ -568,7 +796,7 @@ async fn watch(
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, human_bytes, parse_rate};
+    use super::{Cli, Command, fill_pattern, human_bytes, parse_rate};
 
     #[test]
     fn parse_rate_accepts_numbers_and_suffixes() {
@@ -609,6 +837,45 @@ mod tests {
         let mut settings = fbt::Settings::default();
         net.apply(&mut settings);
         assert_eq!(settings.cache_size, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bench_pattern_is_offset_independent() {
+        let mut whole = [0u8; 64];
+        fill_pattern(5, &mut whole);
+        for start in 0..whole.len() {
+            let mut part = vec![0u8; whole.len() - start];
+            fill_pattern(5 + start as u64, &mut part);
+            assert_eq!(part, whole[start..]);
+        }
+        assert_ne!(whole[..8], whole[8..16]);
+    }
+
+    #[test]
+    fn bench_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "fbt-example",
+            "bench",
+            "--size",
+            "8",
+            "--transport",
+            "utp",
+            "--torrents",
+            "3",
+            "--idle-secs",
+            "1",
+        ])
+        .expect("parses");
+        let Command::Bench {
+            size,
+            torrents,
+            idle_secs,
+            ..
+        } = cli.command
+        else {
+            panic!("not bench");
+        };
+        assert_eq!((size, torrents, idle_secs), (8, 3, 1));
     }
 
     #[test]
