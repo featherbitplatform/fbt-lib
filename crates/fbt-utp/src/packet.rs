@@ -129,7 +129,10 @@ impl Packet {
             let end = start + len;
             let body = d.get(start..end).ok_or(bad)?;
             if next == EXT_SACK {
-                if len == 0 || len % 4 != 0 {
+                // BEP 29 asks for a multiple of four bytes, but libtorrent
+                // sends only the bytes its bits need (`ceil(span / 8)`), so
+                // any non-empty length is taken.
+                if len == 0 {
                     return Err(bad);
                 }
                 if sack.is_none() {
@@ -268,7 +271,7 @@ mod tests {
         assert_eq!(Packet::decode(&v.into()), Err(PacketError::BadType));
         let mut v = syn_bytes();
         v[1] = 1;
-        v.extend([0, 3, 1, 2, 3]);
+        v.extend([0, 0]);
         assert_eq!(Packet::decode(&v.into()), Err(PacketError::BadExtension));
         let mut v = syn_bytes();
         v[1] = 9;
@@ -314,6 +317,25 @@ mod tests {
         p.encode(&mut out);
         assert_eq!(out[21], 32);
         assert_eq!(out.len(), 20 + 2 + 32);
+    }
+
+    /// libtorrent sizes its SACK to the bits it needs, `ceil(span / 8)`
+    /// bytes, not a multiple of four as BEP 29 asks: seen from qBittorrent
+    /// 5.3 as a 1-byte mask. Rejecting it dropped every packet (data and
+    /// acks) qBittorrent sent while it held a hole in our stream.
+    #[test]
+    fn libtorrent_sack_of_any_length_is_accepted() {
+        for len in [1u8, 2, 3, 5] {
+            let mut v = syn_bytes();
+            v[1] = 1;
+            v.extend([0, len]);
+            v.extend((0..len).map(|i| i + 1));
+            v.extend([7, 7]);
+            let p = Packet::decode(&Bytes::from(v)).unwrap();
+            let want: Vec<u8> = (0..len).map(|i| i + 1).collect();
+            assert_eq!(p.sack.as_deref(), Some(&want[..]));
+            assert_eq!(&p.payload[..], &[7, 7]);
+        }
     }
 
     #[test]
