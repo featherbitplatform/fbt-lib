@@ -11,6 +11,10 @@ use fbt::{
     SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
     TrackerConfig, TrackerError, Transport,
 };
+use fbt::{
+    CacheStats, ChokingAlgorithm, ExternalIpSource, MapMethod, MapProtocol, MixedMode,
+    PeerClassLimits, RateLimit, SeedChokingAlgorithm, StorageError,
+};
 
 fn names(
     _: Option<AddTorrent>,
@@ -56,6 +60,16 @@ fn names(
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
     _: Option<Transport>,
+    _: Option<StorageError>,
+    _: Option<RateLimit>,
+    _: Option<PeerClassLimits>,
+    _: Option<MixedMode>,
+    _: Option<ChokingAlgorithm>,
+    _: Option<SeedChokingAlgorithm>,
+    _: Option<CacheStats>,
+    _: Option<MapProtocol>,
+    _: Option<MapMethod>,
+    _: Option<ExternalIpSource>,
     _: Option<&dyn Storage>,
 ) {
 }

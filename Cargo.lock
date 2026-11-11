@@ -563,6 +563,7 @@ dependencies = [
  "clap",
  "fbt",
  "fbt-bencode",
+ "fbt-net",
  "sha1",
  "tempfile",
  "tokio",

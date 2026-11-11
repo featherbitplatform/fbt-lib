@@ -13,8 +13,9 @@ workspace = true
 
 [dependencies]
 fbt = { path = "../fbt" }
+fbt-net = { path = "../fbt-net" }
 clap.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "sync"] }
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

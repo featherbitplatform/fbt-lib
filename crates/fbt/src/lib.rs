@@ -96,6 +96,94 @@
 //! caller's job. Peer exchange (BEP 11) is on with [`Settings::pex_enabled`].
 //! Private torrents use neither the DHT nor PEX.
 //!
+//! # Transports
+//!
+//! Peers are reached over uTP (BEP 29) first, with TCP as the fallback when
+//! the uTP connect fails, and either may accept an incoming connection.
+//! [`Transport`] tells which one a connection runs on
+//! ([`Event::PeerConnected`]). Four switches turn them off one by one:
+//! [`Settings::enable_outgoing_tcp`], [`Settings::enable_incoming_tcp`],
+//! [`Settings::enable_outgoing_utp`] and [`Settings::enable_incoming_utp`].
+//!
+//! # Listen addresses
+//!
+//! [`Settings::listen_addrs`] lists the addresses to listen on (IPv4 and
+//! IPv6, port 0 picks a free one). Each address serves TCP and uTP on the
+//! same port number: the UDP socket is shared with the DHT, uTP and the
+//! other UDP protocols. An address that cannot be bound is skipped;
+//! [`Session::local_addrs`] lists the ones that were, and [`ListenError`]
+//! reports when none could be.
+//!
+//! # Rate limits and peer classes
+//!
+//! [`Settings::rate_limit`] ([`RateLimit`]) caps payload and message bytes
+//! per second in each direction; 0 means unlimited. Peers on the local
+//! network are exempt unless [`Settings::rate_limit_local_peers`] is set.
+//! [`Settings::peer_class_limits`] ([`PeerClassLimits`]) limits the `tcp`,
+//! `utp` and `local` classes, always including local peers, and
+//! [`MixedMode`] decides how a global limit is shared between TCP and uTP.
+//! Limits change at runtime with [`Session::set_rate_limit`] and
+//! [`Session::set_peer_class_limits`].
+//!
+//! # Cache
+//!
+//! [`Settings::cache_size`] bounds the memory the session spends on dirty,
+//! clean and partial-piece bytes together. Only verified bytes are served
+//! to peers or written to storage. Verified pieces are written once they
+//! pass half the cache, once they are older than [`Settings::cache_expiry`],
+//! and always when a torrent finishes, pauses, is removed or rechecks, and
+//! at shutdown. Each downloading torrent also has a progress floor of a few
+//! pieces beyond the bound, documented on [`Settings::cache_size`], so a
+//! small cache slows it down without stalling it. [`CacheStats`] reports
+//! the dirty, clean and partial bytes and the limit
+//! ([`Session::cache_stats`]).
+//!
+//! # Local discovery and port mapping
+//!
+//! With [`Settings::enable_lsd`] (on by default) the session announces the
+//! info hashes of its public torrents on the LAN's multicast group (BEP 14)
+//! at most every five minutes, each announce naming the listen port and a
+//! random cookie that identifies our own messages, and treats the answers
+//! as peers ([`PeerSource::Lsd`]). Private torrents are never announced.
+//! [`Settings::enable_upnp`] and [`Settings::enable_natpmp`] (also on by
+//! default) ask the router to map the listen ports, with UPnP, PCP or
+//! NAT-PMP, and renew the mappings. They send SSDP, SOAP and NAT-PMP/PCP
+//! datagrams to the default gateway only. Results arrive as
+//! [`Event::PortMapped`], [`Event::PortMappingFailed`] and
+//! [`Event::ExternalIpChanged`] under [`EventMask::NAT`].
+//!
+//! # Holepunch
+//!
+//! With [`Settings::enable_holepunch`] peers that cannot reach each other
+//! because of a NAT ask a common peer to relay a rendezvous (BEP 55) and
+//! then connect to each other at the same time, over uTP. The relay rides
+//! on peer exchange, so private torrents never use it.
+//!
+//! Limits, the cache and the NAT events together:
+//!
+//! ```no_run
+//! use fbt::{Event, EventMask, RateLimit, Session, Settings};
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut settings = Settings::default();
+//! settings.rate_limit = RateLimit::new(2_000_000, 500_000);
+//! settings.cache_size = 128 * 1024 * 1024;
+//! let session = Session::new(settings).await?;
+//! let mut events = session.subscribe(EventMask::NAT);
+//! while let Some(event) = events.recv().await {
+//!     match event {
+//!         Event::PortMapped { protocol, method, external, .. } => {
+//!             println!("{protocol:?} mapped by {method:?}: {external}");
+//!         }
+//!         Event::ExternalIpChanged { ip, source } => println!("{ip} from {source:?}"),
+//!         _ => {}
+//!     }
+//! }
+//! session.shutdown().await;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Features
 //!
 //! - `tls` (default): HTTPS trackers over rustls with the `ring` provider,
@@ -116,10 +204,11 @@ pub use fbt_core::{
 pub use fbt_metainfo::{FileEntry, Info, Magnet, MagnetError, Metainfo, MetainfoError, RelPath};
 pub use fbt_session::storage::{FsStorage, MemStorage, Storage};
 pub use fbt_session::{
-    AddTorrent, CacheStats, DEFAULT_DHT_BOOTSTRAP, DhtStats, DisconnectReason, EncryptionPolicy,
-    Event, EventMask, EventStream, ListenError, MAX_METADATA_SIZE, PeerSource, Priority,
-    RemoveMode, Session, SessionError, Settings, TorrentHandle, TorrentSource, TorrentState,
-    TorrentStatus, Transport,
+    AddTorrent, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtStats, DisconnectReason,
+    EncryptionPolicy, Event, EventMask, EventStream, ExternalIpSource, ListenError,
+    MAX_METADATA_SIZE, MapMethod, MapProtocol, MixedMode, PeerClassLimits, PeerSource, Priority,
+    RateLimit, RemoveMode, SeedChokingAlgorithm, Session, SessionError, Settings, StorageError,
+    TorrentHandle, TorrentSource, TorrentState, TorrentStatus, Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

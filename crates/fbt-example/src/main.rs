@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fbt::{
-    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, Magnet, Metainfo, PeerSource,
-    Session, Settings, TorrentHandle, TorrentState, TorrentStatus,
+    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, Magnet, MapMethod, MapProtocol,
+    Metainfo, PeerSource, RateLimit, Session, Settings, TorrentHandle, TorrentState, TorrentStatus,
+    Transport,
 };
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
@@ -36,6 +37,49 @@ struct NetArgs {
     /// Do not exchange peers with other peers (PEX).
     #[arg(long)]
     no_pex: bool,
+    /// Which transports to use, in both directions.
+    #[arg(long, value_enum, default_value = "both")]
+    transport: TransportChoice,
+    /// Address to listen on (TCP and uTP); may be repeated. Replaces
+    /// `--port` when given.
+    #[arg(long, value_name = "ADDR")]
+    listen: Vec<SocketAddr>,
+    /// Download limit in bytes per second (suffixes K and M); also applies
+    /// to peers on the local network.
+    #[arg(long, value_name = "BYTES/S", value_parser = parse_rate)]
+    download_limit: Option<u64>,
+    /// Upload limit in bytes per second (suffixes K and M); also applies
+    /// to peers on the local network.
+    #[arg(long, value_name = "BYTES/S", value_parser = parse_rate)]
+    upload_limit: Option<u64>,
+    /// Find peers on the local network (LSD, multicast).
+    #[arg(long)]
+    lsd: bool,
+    /// Ask the router for port mappings (UPnP and NAT-PMP).
+    #[arg(long)]
+    nat: bool,
+    /// Disk cache size in MiB.
+    #[arg(long, value_name = "N")]
+    cache_mb: Option<u64>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TransportChoice {
+    Both,
+    Tcp,
+    Utp,
+}
+
+/// Parses `1048576`, `512K` or `1M` (powers of 1024) into bytes per second.
+fn parse_rate(s: &str) -> Result<u64, String> {
+    let bad = || format!("invalid rate {s:?}: expected a number with an optional K or M suffix");
+    let (digits, mult) = match s.chars().last() {
+        Some('k' | 'K') => (s.get(..s.len() - 1), 1024),
+        Some('m' | 'M') => (s.get(..s.len() - 1), 1024 * 1024),
+        _ => (Some(s), 1),
+    };
+    let n: u64 = digits.and_then(|d| d.parse().ok()).ok_or_else(bad)?;
+    n.checked_mul(mult).ok_or_else(bad)
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -55,11 +99,33 @@ fn host_port(s: &str) -> Result<String, String> {
 impl NetArgs {
     fn apply(&self, settings: &mut Settings) {
         settings.dht_enabled = !self.no_dht;
-        // LSD multicasts on the LAN: off until the `--lsd` flag exists.
-        settings.enable_lsd = false;
-        // UPnP and NAT-PMP talk to the real router: off until the `--nat` flag exists.
-        settings.enable_upnp = false;
-        settings.enable_natpmp = false;
+        // LSD multicasts on the LAN and UPnP/NAT-PMP talk to the router:
+        // all off unless asked for.
+        settings.enable_lsd = self.lsd;
+        settings.enable_upnp = self.nat;
+        settings.enable_natpmp = self.nat;
+        let (tcp, utp) = match self.transport {
+            TransportChoice::Both => (true, true),
+            TransportChoice::Tcp => (true, false),
+            TransportChoice::Utp => (false, true),
+        };
+        settings.enable_outgoing_tcp = tcp;
+        settings.enable_incoming_tcp = tcp;
+        settings.enable_outgoing_utp = utp;
+        settings.enable_incoming_utp = utp;
+        if self.download_limit.is_some() || self.upload_limit.is_some() {
+            settings.rate_limit = RateLimit::new(
+                self.download_limit.unwrap_or(0),
+                self.upload_limit.unwrap_or(0),
+            );
+            settings.rate_limit_local_peers = true;
+        }
+        if let Some(mb) = self.cache_mb {
+            settings.cache_size = mb.saturating_mul(1024 * 1024);
+        }
+        if !self.listen.is_empty() {
+            settings.listen_addrs = self.listen.clone();
+        }
         settings.pex_enabled = !self.no_pex;
         if let Some(e) = self.encryption {
             settings.encryption = match e {
@@ -123,6 +189,17 @@ enum Command {
         #[arg(long, value_name = "SECS")]
         run_for: Option<u64>,
     },
+    /// Announce a fixed probe hash on the LAN and wait for another probe
+    /// (used by the interop scripts).
+    #[command(hide = true)]
+    LsdProbe {
+        /// Port to announce.
+        #[arg(long)]
+        port: u16,
+        /// Give up after this many seconds.
+        #[arg(long, value_name = "S", default_value_t = 3)]
+        timeout_secs: u64,
+    },
     /// Print what a .torrent file contains.
     Info {
         /// The .torrent file.
@@ -182,6 +259,7 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             let source = Source::File(load(&torrent)?);
             transfer(source, data, port, seed_for, &[], false, &net).await
         }
+        Command::LsdProbe { port, timeout_secs } => lsd_probe(port, timeout_secs).await,
         Command::DhtNode {
             port,
             dht_bootstrap,
@@ -278,12 +356,14 @@ async fn transfer(
 ) -> Result<ExitCode, Error> {
     let mut settings = Settings::default();
     net.apply(&mut settings);
-    if let Some(port) = port {
+    if let Some(port) = port
+        && net.listen.is_empty()
+    {
         settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];
     }
     let session = Session::new(settings).await?;
     println!("listening on {}", session.local_addr());
-    let mut events = session.subscribe(EventMask::STATUS | EventMask::PEER);
+    let mut events = session.subscribe(EventMask::STATUS | EventMask::PEER | EventMask::NAT);
     let params = match source {
         Source::File(m) => AddTorrent::new(m, dir),
         Source::Magnet(m) => AddTorrent::magnet(m, dir),
@@ -301,6 +381,41 @@ async fn transfer(
     .await;
     session.shutdown().await;
     Ok(code)
+}
+
+/// The info hash `lsd-probe` announces and waits for.
+const LSD_PROBE_HASH: [u8; 20] = *b"fbt-lsd-probe-hash-1";
+
+/// Announces [`LSD_PROBE_HASH`] with `port` on the real LSD group and exits 0
+/// once another process announces it too, 1 after `timeout_secs`.
+async fn lsd_probe(port: u16, timeout_secs: u64) -> Result<ExitCode, Error> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let lsd = fbt_net::lsd::Lsd::spawn(fbt_net::lsd::LsdConfig::default(), tx)?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut announce = interval(Duration::from_millis(500));
+    announce.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let found = loop {
+        tokio::select! {
+            _ = announce.tick() => lsd.announce(port, &[LSD_PROBE_HASH]),
+            Some(peer) = rx.recv() => {
+                if peer.info_hash == LSD_PROBE_HASH {
+                    break Some(peer.addr);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break None,
+        }
+    };
+    lsd.shutdown().await;
+    Ok(match found {
+        Some(addr) => {
+            println!("lsd probe: found {addr}");
+            ExitCode::SUCCESS
+        }
+        None => {
+            println!("lsd probe: nothing within {timeout_secs} s");
+            ExitCode::FAILURE
+        }
+    })
 }
 
 /// Runs a session with only the DHT until `run_for` elapses or Ctrl-C.
@@ -354,6 +469,7 @@ fn source_name(source: PeerSource) -> &'static str {
         PeerSource::Dht => "dht",
         PeerSource::Pex => "pex",
         PeerSource::Magnet => "magnet",
+        PeerSource::Lsd => "lsd",
         _ => "other",
     }
 }
@@ -364,7 +480,33 @@ fn print_event(handle: &TorrentHandle, event: &Event) {
         Event::PeersFound { source, count, .. } => {
             println!("found {count} peers via {}", source_name(*source));
         }
-        Event::PeerConnected { addr, .. } => println!("peer connected {addr}"),
+        Event::PeerConnected {
+            addr, transport, ..
+        } => {
+            let via = match transport {
+                Transport::Utp => "utp",
+                _ => "tcp",
+            };
+            println!("peer connected {addr} via {via}");
+        }
+        Event::PortMapped {
+            protocol,
+            method,
+            external,
+            ..
+        } => {
+            let proto = match protocol {
+                MapProtocol::Udp => "udp",
+                _ => "tcp",
+            };
+            let via = match method {
+                MapMethod::Upnp => "upnp",
+                MapMethod::NatPmp => "natpmp",
+                MapMethod::Pcp => "pcp",
+                _ => "other",
+            };
+            println!("port mapped {proto} {external} via {via}");
+        }
         _ => {}
     }
 }
