@@ -16,4 +16,7 @@
 
 pub mod demux;
 pub mod lsd;
+pub mod natpmp;
 pub mod upnp;
+
+pub use natpmp::{MapMethod, MapProtocol};
