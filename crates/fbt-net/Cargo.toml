@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 fbt-core = { path = "../fbt-core" }
-tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
+tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "io-util"] }
 socket2.workspace = true
 bytes.workspace = true
 rand.workspace = true
