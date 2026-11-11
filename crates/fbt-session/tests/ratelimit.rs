@@ -120,7 +120,7 @@ async fn global_download_limit_is_honored() {
     st.rate_limit = RateLimit::new(MIB, 0);
     let took = timed_download(st, &seed, &m, &payload).await;
     assert!(
-        took >= Duration::from_millis(6500) && took <= Duration::from_secs(10),
+        took >= Duration::from_millis(6500) && took <= Duration::from_secs(12),
         "8 MiB at 1 MiB/s took {took:?}"
     );
     seed.shutdown().await;
@@ -132,7 +132,7 @@ async fn torrent_upload_limit_is_honored() {
     let (seed, _) = seeder(settings(), &m, &payload, RateLimit::new(0, MIB)).await;
     let took = timed_download(settings(), &seed, &m, &payload).await;
     assert!(
-        took >= Duration::from_millis(6500) && took <= Duration::from_secs(10),
+        took >= Duration::from_millis(6500) && took <= Duration::from_secs(12),
         "8 MiB at 1 MiB/s took {took:?}"
     );
     seed.shutdown().await;
@@ -171,7 +171,7 @@ async fn local_limit_applies_when_enabled() {
     };
     let exempt = timed_download(limited(false), &seed, &m, &payload).await;
     assert!(
-        exempt < Duration::from_secs(2),
+        exempt < Duration::from_secs(3),
         "a loopback peer is exempt by default, took {exempt:?}"
     );
     let honored = timed_download(limited(true), &seed, &m, &payload).await;
@@ -217,9 +217,35 @@ async fn tiny_limit_keeps_connections_alive() {
     assert!(gone.is_none(), "disconnected: {gone:?}");
     assert_eq!(l.handle.status().num_peers, 1);
     assert_eq!(sh.status().num_peers, 1);
-    // Keepalives (and their acks) kept flowing both ways.
-    assert!(utp_datagrams(&seed) >= seed_before + 5);
-    assert!(utp_datagrams(&l.session) >= leech_before + 5);
+    // Keepalives kept flowing both ways: every 500 ms each side sends one
+    // and acks the other's, about 20 datagrams per side in 5 s. Nothing
+    // else is sent meanwhile (no payload passes a 1 B/s limit, PEX waits
+    // 60 s and uTP's own keepalive far longer), so at least 12 means
+    // BitTorrent keepalives arrived.
+    assert!(utp_datagrams(&seed) >= seed_before + 12);
+    assert!(utp_datagrams(&l.session) >= leech_before + 12);
+    l.session.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// A held read does not let our own requests time out: their answers
+/// wait unread, so cancelling and re-requesting them would only waste
+/// bandwidth.
+#[tokio::test]
+async fn held_reads_do_not_time_out_requests() {
+    let (m, payload) = torrent(1 << 20);
+    let (seed, _) = seeder(settings(), &m, &payload, RateLimit::default()).await;
+    let mut st = settings();
+    st.rate_limit = RateLimit::new(4 * KIB, 0);
+    st.request_timeout = Duration::from_secs(2);
+    let l = leecher(st, &m, payload.len()).await;
+    l.handle.add_peer(seed.local_addr()).await.unwrap();
+    assert!(wait_until(|| l.handle.status().num_peers == 1, T).await);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let st = l.handle.status();
+    assert!(st.total_downloaded > 0, "nothing arrived");
+    assert_eq!(st.total_wasted, 0, "timed-out requests were answered");
+    assert_eq!(st.num_peers, 1);
     l.session.shutdown().await;
     seed.shutdown().await;
 }

@@ -97,6 +97,11 @@ pub(super) struct Conn<S> {
     /// entry whose block left `incoming` (cancelled, choked away) is
     /// skipped; at most `max_incoming_requests` live ones.
     pub(super) uploads: VecDeque<(BlockRef, Bytes)>,
+    /// The blocks in `uploads`, each queued at most once.
+    pub(super) queued: HashSet<BlockRef>,
+    /// The read hold reached `peer_idle_timeout`: reads are allowed (and
+    /// the idle and request timers run) until one frame arrives.
+    pub(super) floor_read: bool,
     /// Since when the download throttle holds reads back: the idle timer
     /// is paused meanwhile, since unread messages are not silence.
     pub(super) held_since: Option<Instant>,
@@ -138,6 +143,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             down: throttles.down.clone(),
             up: throttles.up.clone(),
             uploads: VecDeque::new(),
+            queued: HashSet::new(),
+            floor_read: false,
             held_since: None,
         }
     }
@@ -157,8 +164,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 return reason;
             }
             let now = Instant::now();
-            let read_held = self.down.ready_at(now).is_some();
-            self.hold_reads(read_held, now);
+            let read_held = self.read_held(now);
             let upload_held = !self.uploads.is_empty();
             let deadline = self.next_deadline();
             // Never blocks: a throttle only disables the read branch (the
@@ -168,6 +174,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 msg = self.framed.next(), if !read_held => match msg {
                     Some(Ok(m)) => {
                         self.last_recv = Instant::now();
+                        self.floor_read = false;
                         self.down.charge(wire_len(&m));
                         self.on_message(m).await
                     }
@@ -216,14 +223,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         self.flush().await
     }
 
-    /// Starts or ends a read hold; at its end the idle timer resumes where
-    /// it stood when the hold began.
+    /// Whether reads wait for the download throttle now; starts and ends
+    /// holds. A hold lasts at most `peer_idle_timeout`: then one frame is
+    /// read whatever the debt (charged as usual), so a closed or dead
+    /// connection is still noticed, and the hold starts over after it.
+    pub(super) fn read_held(&mut self, now: Instant) -> bool {
+        if self.floor_read {
+            return false;
+        }
+        if let Some(since) = self.held_since
+            && now >= after(since, self.settings.peer_idle_timeout)
+        {
+            self.hold_reads(false, now);
+            self.floor_read = true;
+            return false;
+        }
+        let held = self.down.ready_at(now).is_some();
+        self.hold_reads(held, now);
+        held
+    }
+
+    /// Starts or ends a read hold; at its end the idle timer and the
+    /// request timeouts resume where they stood when the hold began.
     pub(super) fn hold_reads(&mut self, held: bool, now: Instant) {
         match (held, self.held_since) {
             (true, None) => self.held_since = Some(now),
             (false, Some(since)) => {
                 let paused = now.saturating_duration_since(since);
                 self.last_recv = after(self.last_recv, paused).min(now);
+                for t in self.outstanding.values_mut() {
+                    *t = after(*t, paused).min(now);
+                }
                 self.held_since = None;
             }
             _ => {}
@@ -241,10 +271,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         let s = &self.settings;
         let keepalive = after(self.last_send, s.keepalive_interval);
         let idle = self.idle_deadline().unwrap_or(keepalive);
+        // Requests do not time out while we hold their answers unread.
         let request = self
             .outstanding
             .values()
             .min()
+            .filter(|_| self.held_since.is_none())
             .map(|&t| after(t, s.request_timeout));
         idle.min(keepalive).min(request.unwrap_or(idle))
     }
@@ -258,7 +290,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         let expired: Vec<BlockRef> = self
             .outstanding
             .iter()
-            .filter(|(_, t)| now >= after(**t, limit))
+            .filter(|(_, t)| self.held_since.is_none() && now >= after(**t, limit))
             .map(|(b, _)| *b)
             .collect();
         if !expired.is_empty() {

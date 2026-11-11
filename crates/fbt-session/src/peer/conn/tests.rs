@@ -1138,3 +1138,231 @@ async fn pending_haves_are_bounded() {
     assert_eq!(haves.len(), MAX_PENDING_HAVES);
     assert_eq!(haves, (0..MAX_PENDING_HAVES as u32).collect::<Vec<_>>());
 }
+
+// ----- rate limits ------------------------------------------------------------
+
+/// A connection built directly (no task), with fast, unchoking the
+/// remote, whose TCP class limits are `down` and `up` bytes per second.
+struct Direct {
+    conn: state::Conn<DuplexStream>,
+    _remote: DuplexStream,
+    events: mpsc::Receiver<PeerEvent>,
+    bandwidth: Arc<crate::bandwidth::Bandwidth>,
+}
+
+fn direct(settings: Settings, down: u64, up: u64) -> Direct {
+    use crate::bandwidth::{Bandwidth, BucketPair, PeerClassLimits, RateLimit};
+    let (ours, remote) = tokio::io::duplex(1 << 20);
+    let (etx, events) = mpsc::channel(4096);
+    let settings = Arc::new(settings);
+    let bandwidth = Arc::new(Bandwidth::new(&settings));
+    bandwidth.set_classes(PeerClassLimits {
+        tcp: RateLimit::new(down, up),
+        ..PeerClassLimits::default()
+    });
+    let ctx = PeerCtx {
+        key: KEY,
+        info_hash: HASH,
+        our_id: OUR_ID,
+        layout: Some(layout(PIECES)),
+        have: Bitfield::full(PIECES),
+        ext: ext_cfg(),
+        settings,
+        events: etx,
+        encrypted: false,
+        transport: Transport::Tcp,
+        bandwidth: Arc::clone(&bandwidth),
+        torrent_rate: BucketPair::new(RateLimit::default()),
+    };
+    let theirs = Handshake {
+        reserved: reserved(true, false, false),
+        info_hash: HASH,
+        peer_id: THEIR_ID,
+    };
+    let throttles = bandwidth.peer(Transport::Tcp, addr().ip(), &ctx.torrent_rate);
+    let mut conn = state::Conn::new(ours, &theirs, addr().ip(), &ctx, &throttles);
+    conn.choking = false;
+    Direct {
+        conn,
+        _remote: remote,
+        events,
+        bandwidth,
+    }
+}
+
+impl Direct {
+    /// Lifts the upload limit and writes whatever is queued.
+    async fn unlimit_and_drain(&mut self) {
+        self.bandwidth
+            .set_classes(crate::bandwidth::PeerClassLimits::default());
+        self.conn.drain_uploads().await.expect("drain");
+    }
+
+    /// The `BlockSent` events so far.
+    fn sent(&mut self) -> Vec<BlockRef> {
+        let mut out = Vec::new();
+        while let Ok(ev) = self.events.try_recv() {
+            if let PeerEvent::BlockSent { block, .. } = ev {
+                out.push(block);
+            }
+        }
+        out
+    }
+}
+
+/// A remote looping Request, (answer), Cancel on one block while the
+/// upload is throttled queues it once: the queue stays bounded and the
+/// block goes out once.
+#[tokio::test(start_paused = true)]
+async fn requeued_block_is_queued_and_sent_once() {
+    let s = Settings {
+        max_incoming_requests: 4,
+        ..Settings::default()
+    };
+    let mut d = direct(s, 0, 1);
+    // In debt for a long time: nothing drains.
+    d.conn.up.charge(1_000_000);
+    let data = Bytes::from(vec![9; 16_384]);
+    let x = block(1, 0);
+    for _ in 0..1000 {
+        d.conn
+            .on_message(Message::Request(x))
+            .await
+            .expect("request");
+        d.conn
+            .on_command(PeerCommand::SendBlock {
+                block: x,
+                data: data.clone(),
+            })
+            .await
+            .expect("send block");
+        d.conn.on_message(Message::Cancel(x)).await.expect("cancel");
+        d.conn.drain_uploads().await.expect("drain");
+        assert!(d.conn.uploads.len() <= 4, "{}", d.conn.uploads.len());
+    }
+    assert_eq!(d.conn.uploads.len(), 1);
+    // Requested once more: the queued entry answers it, once.
+    d.conn
+        .on_message(Message::Request(x))
+        .await
+        .expect("request");
+    d.conn
+        .on_command(PeerCommand::SendBlock { block: x, data })
+        .await
+        .expect("send block");
+    assert_eq!(d.conn.uploads.len(), 1);
+    d.unlimit_and_drain().await;
+    assert_eq!(d.sent(), vec![x]);
+    assert!(d.conn.uploads.is_empty() && d.conn.queued.is_empty());
+}
+
+/// Distinct blocks fill the queue up to `max_incoming_requests` at most.
+#[tokio::test(start_paused = true)]
+async fn upload_queue_is_bounded_by_incoming_requests() {
+    let s = Settings {
+        max_incoming_requests: 3,
+        ..Settings::default()
+    };
+    let mut d = direct(s, 0, 1);
+    d.conn.up.charge(1_000_000);
+    let data = Bytes::from(vec![9; 16_384]);
+    for i in 0..PIECES {
+        for off in [0, 16_384] {
+            let b = block(i, off);
+            d.conn
+                .on_message(Message::Request(b))
+                .await
+                .expect("request");
+            d.conn
+                .on_command(PeerCommand::SendBlock {
+                    block: b,
+                    data: data.clone(),
+                })
+                .await
+                .expect("send block");
+            assert!(d.conn.uploads.len() <= 3);
+        }
+    }
+    assert_eq!(d.conn.uploads.len(), 3);
+}
+
+/// Blocks still queued when we choke are never written or reported sent,
+/// so they never count as uploaded.
+#[tokio::test(start_paused = true)]
+async fn choke_drops_queued_blocks() {
+    let mut d = direct(Settings::default(), 0, 1);
+    d.conn.up.charge(1_000_000);
+    let data = Bytes::from(vec![9; 16_384]);
+    for b in [block(0, 0), block(0, 16_384)] {
+        d.conn
+            .on_message(Message::Request(b))
+            .await
+            .expect("request");
+        d.conn
+            .on_command(PeerCommand::SendBlock {
+                block: b,
+                data: data.clone(),
+            })
+            .await
+            .expect("send block");
+    }
+    assert_eq!(d.conn.uploads.len(), 2);
+    d.conn.on_command(PeerCommand::Choke).await.expect("choke");
+    d.unlimit_and_drain().await;
+    assert!(d.sent().is_empty());
+    assert!(d.conn.uploads.is_empty() && d.conn.queued.is_empty());
+}
+
+/// A read hold pauses the idle timer and the request timeouts: when it
+/// ends, both resume where they stood.
+#[tokio::test(start_paused = true)]
+async fn read_hold_pauses_idle_and_request_timers() {
+    let s = Settings {
+        request_timeout: Duration::from_secs(2),
+        peer_idle_timeout: Duration::from_secs(3),
+        ..Settings::default()
+    };
+    let mut d = direct(s, 0, 0);
+    let t0 = Instant::now();
+    d.conn.last_recv = t0;
+    d.conn.outstanding.insert(block(0, 0), t0);
+    assert_eq!(d.conn.next_deadline(), t0 + Duration::from_secs(2));
+    d.conn.hold_reads(true, t0 + Duration::from_secs(1));
+    // Neither the idle nor the request deadline counts while held: only
+    // the keepalive.
+    assert_eq!(
+        d.conn.next_deadline(),
+        d.conn.last_send + d.conn.settings.keepalive_interval
+    );
+    d.conn.hold_reads(false, t0 + Duration::from_secs(4));
+    assert_eq!(d.conn.last_recv, t0 + Duration::from_secs(3));
+    assert_eq!(
+        d.conn.outstanding[&block(0, 0)],
+        t0 + Duration::from_secs(3)
+    );
+    assert!(d.conn.held_since.is_none());
+    // Shifted no later than now.
+    d.conn.hold_reads(true, t0 + Duration::from_secs(4));
+    d.conn.last_recv = t0 + Duration::from_secs(5);
+    d.conn.hold_reads(false, t0 + Duration::from_secs(6));
+    assert_eq!(d.conn.last_recv, t0 + Duration::from_secs(6));
+}
+
+/// A hold lasts at most `peer_idle_timeout`: then one frame may be read
+/// whatever the debt, and the hold starts over after it.
+#[tokio::test(start_paused = true)]
+async fn read_hold_is_capped_at_the_idle_timeout() {
+    let s = Settings::default();
+    let idle = s.peer_idle_timeout;
+    let mut d = direct(s, 1, 0);
+    d.conn.down.charge(1_000_000);
+    let t0 = Instant::now();
+    assert!(d.conn.read_held(t0));
+    assert!(d.conn.read_held(t0 + idle - Duration::from_secs(1)));
+    assert!(!d.conn.read_held(t0 + idle), "one frame may be read");
+    assert!(d.conn.floor_read && d.conn.held_since.is_none());
+    // Until that frame arrives the idle timer runs again.
+    assert!(!d.conn.read_held(t0 + idle + Duration::from_secs(5)));
+    d.conn.floor_read = false;
+    assert!(d.conn.read_held(t0 + idle + Duration::from_secs(6)));
+}

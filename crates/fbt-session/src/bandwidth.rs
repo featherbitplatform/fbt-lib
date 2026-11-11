@@ -5,16 +5,18 @@
 //! the connection waits until the debt is repaid before the next one. A
 //! peer's [`Throttle`] chains the buckets that apply to it:
 //!
-//! - its transport class (`tcp` or `utp`), always;
+//! - its transport class (`tcp` or `utp`, at the user's class limit),
+//!   always;
 //! - `local`, for a peer on the local network ([`fbt_dht::is_local`]);
-//! - the global and its torrent's buckets, for a non-local peer, and for a
-//!   local one only with [`Settings::rate_limit_local_peers`].
+//! - its transport's mixed-mode share, the global and its torrent's
+//!   buckets, for a non-local peer, and for a local one only with
+//!   [`Settings::rate_limit_local_peers`].
 //!
 //! **Mixed mode.** While a global limit is set, a task re-evaluated every
-//! second also caps the TCP and uTP class buckets with a share of it (see
-//! [`MixedMode`]), counting the connected peers the global limit applies
-//! to. A class's own non-zero limit always caps it as well. The class
-//! buckets are shared by every peer of the transport, local ones included.
+//! second sets the TCP and uTP share buckets to their part of it (see
+//! [`MixedMode`]), counting only the connected peers the global limit
+//! applies to. Peers exempt from the global limit never chain a share
+//! bucket, so mixed mode never limits them.
 //!
 //! Rates are bytes per second, 0 meaning unlimited. No value from 0 to
 //! `u64::MAX` overflows or panics: every step saturates.
@@ -30,6 +32,14 @@ use crate::peer::transport::Transport;
 use crate::settings::Settings;
 
 /// A download and an upload limit in bytes per second; 0 means unlimited.
+///
+/// Whole messages are read and written, then charged, so a connection may
+/// run up to one message ahead of its limit. A download limit holds a
+/// connection's reads for at most
+/// [`Settings::peer_idle_timeout`](crate::Settings::peer_idle_timeout) at a
+/// time: then one message is read whatever the debt, so a closed or dead
+/// connection is still noticed. That is the floor of any download limit,
+/// about one message per idle timeout and connection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RateLimit {
@@ -333,6 +343,10 @@ pub(crate) struct Bandwidth {
     tcp: BucketPair,
     utp: BucketPair,
     local: BucketPair,
+    /// The mixed-mode shares of the global limit, chained only by peers
+    /// the global limit applies to.
+    tcp_share: BucketPair,
+    utp_share: BucketPair,
     /// Connected TCP and uTP peers the global limit applies to.
     tcp_peers: AtomicUsize,
     utp_peers: AtomicUsize,
@@ -352,6 +366,8 @@ impl Bandwidth {
             tcp: BucketPair::new(classes.tcp),
             utp: BucketPair::new(classes.utp),
             local: BucketPair::new(classes.local),
+            tcp_share: BucketPair::new(RateLimit::default()),
+            utp_share: BucketPair::new(RateLimit::default()),
             tcp_peers: AtomicUsize::new(0),
             utp_peers: AtomicUsize::new(0),
         };
@@ -377,6 +393,13 @@ impl Bandwidth {
         }
     }
 
+    fn share(&self, t: Transport) -> &BucketPair {
+        match t {
+            Transport::Tcp => &self.tcp_share,
+            Transport::Utp => &self.utp_share,
+        }
+    }
+
     /// Sets the global limit, at once.
     pub(crate) fn set_global(&self, limit: RateLimit) {
         let mut l = self.limits();
@@ -389,11 +412,12 @@ impl Bandwidth {
     pub(crate) fn set_classes(&self, classes: PeerClassLimits) {
         let mut l = self.limits();
         l.classes = classes;
+        self.tcp.set(classes.tcp);
+        self.utp.set(classes.utp);
         self.local.set(classes.local);
-        self.apply(&l);
     }
 
-    /// Sets the TCP and uTP class rates from their own limits and the
+    /// Sets the TCP and uTP share rates from the global limit and the
     /// current peer counts.
     pub(crate) fn rebalance(&self) {
         let l = self.limits();
@@ -412,10 +436,10 @@ impl Bandwidth {
                 b.set_rate(rate, now);
             }
         };
-        set(&self.tcp.down, cap(l.classes.tcp.download, tcp_down));
-        set(&self.tcp.up, cap(l.classes.tcp.upload, tcp_up));
-        set(&self.utp.down, cap(l.classes.utp.download, utp_down));
-        set(&self.utp.up, cap(l.classes.utp.upload, utp_up));
+        set(&self.tcp_share.down, tcp_down);
+        set(&self.tcp_share.up, tcp_up);
+        set(&self.utp_share.down, utp_down);
+        set(&self.utp_share.up, utp_up);
     }
 
     /// Re-evaluates mixed mode every second while the session lives.
@@ -453,8 +477,9 @@ impl Bandwidth {
         }
         let global = !local || self.limit_local_peers;
         if global {
-            down.extend([Arc::clone(&self.global.down), Arc::clone(&torrent.down)]);
-            up.extend([Arc::clone(&self.global.up), Arc::clone(&torrent.up)]);
+            let share = self.share(transport);
+            down.extend([&share.down, &self.global.down, &torrent.down].map(Arc::clone));
+            up.extend([&share.up, &self.global.up, &torrent.up].map(Arc::clone));
             let n = self.count(transport);
             let _ = n.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1));
         }
@@ -469,16 +494,7 @@ impl Bandwidth {
     }
 }
 
-/// `a` capped by `b`, where 0 is unlimited.
-fn cap(a: u64, b: u64) -> u64 {
-    match (a, b) {
-        (0, x) | (x, 0) => x,
-        (a, b) => a.min(b),
-    }
-}
-
-/// The TCP and uTP class shares of a `global` rate (0: none, the class is
-/// left to its own limit). A class without counted peers gets none; one
+/// The TCP and uTP shares of a `global` rate (0: no share). A class without counted peers gets none; one
 /// with peers never gets less than 1 byte per second.
 fn mixed_shares(mode: MixedMode, global: u64, tcp: usize, utp: usize) -> (u64, u64) {
     if global == 0 {
@@ -635,25 +651,28 @@ mod tests {
         b.tcp_peers.store(2, Ordering::Release);
         b.utp_peers.store(1, Ordering::Release);
         b.rebalance();
-        assert_eq!(rates(&b.tcp), (600, 600));
-        assert_eq!(rates(&b.utp), (300, 300));
-        // A class's own limit still caps its share.
+        assert_eq!(rates(&b.tcp_share), (600, 600));
+        assert_eq!(rates(&b.utp_share), (300, 300));
+        // The class buckets keep the user's own class limits.
+        assert_eq!(rates(&b.tcp), (0, 0));
         let classes = PeerClassLimits {
             utp: RateLimit::new(100, 0),
             ..PeerClassLimits::default()
         };
         b.set_classes(classes);
-        assert_eq!(rates(&b.utp), (100, 300));
-        // Without a global limit, the classes keep only their own.
+        assert_eq!(rates(&b.utp), (100, 0));
+        assert_eq!(rates(&b.utp_share), (300, 300));
+        // Without a global limit there are no shares.
         b.set_global(RateLimit::default());
-        assert_eq!(rates(&b.tcp), (0, 0));
+        assert_eq!(rates(&b.tcp_share), (0, 0));
+        assert_eq!(rates(&b.utp_share), (0, 0));
         assert_eq!(rates(&b.utp), (100, 0));
         // Huge counts and limits do not overflow.
         b.set_global(RateLimit::new(u64::MAX, 1));
         b.tcp_peers.store(usize::MAX, Ordering::Release);
         b.utp_peers.store(usize::MAX, Ordering::Release);
-        b.set_classes(PeerClassLimits::default());
-        assert_eq!(rates(&b.tcp), (u64::MAX / 2, 1));
+        b.rebalance();
+        assert_eq!(rates(&b.tcp_share), (u64::MAX / 2, 1));
     }
 
     #[test]
@@ -667,11 +686,12 @@ mod tests {
         b.tcp_peers.store(1, Ordering::Release);
         b.utp_peers.store(3, Ordering::Release);
         b.rebalance();
-        assert_eq!(rates(&b.utp), (100, 100));
-        assert_eq!(rates(&b.tcp), (1000, 1000));
+        assert_eq!(rates(&b.utp_share), (100, 100));
+        assert_eq!(rates(&b.tcp_share), (1000, 1000));
         b.tcp_peers.store(0, Ordering::Release);
         b.rebalance();
-        assert_eq!(rates(&b.utp), (1000, 1000));
+        assert_eq!(rates(&b.utp_share), (1000, 1000));
+        assert_eq!(rates(&b.tcp_share), (0, 0));
     }
 
     fn has(t: &Throttle, b: &Bucket) -> bool {
@@ -691,10 +711,16 @@ mod tests {
         assert!(has(&p.up, &b.utp.up) && has(&p.up, &b.local.up));
         assert!(p.counted.is_none());
         assert_eq!(b.utp_peers.load(Ordering::Acquire), 0);
-        // A remote peer: its class, the global and the torrent buckets.
+        // No mixed-mode share either: exempt peers are never capped by it.
+        for share in [&b.tcp_share, &b.utp_share] {
+            assert!(!has(&p.down, &share.down) && !has(&p.up, &share.up));
+        }
+        // A remote peer: its class, its share, the global and the torrent
+        // buckets.
         let w = b.peer(Transport::Tcp, wan, &torrent);
-        assert_eq!(w.up.chain.len(), 3);
+        assert_eq!(w.up.chain.len(), 4);
         assert!(has(&w.up, &b.tcp.up) && has(&w.up, &b.global.up));
+        assert!(has(&w.up, &b.tcp_share.up) && !has(&w.up, &b.utp_share.up));
         assert!(has(&w.up, &torrent.up) && !has(&w.up, &b.local.up));
         assert_eq!(b.tcp_peers.load(Ordering::Acquire), 1);
         drop(w);
@@ -706,8 +732,15 @@ mod tests {
         };
         let b = bw(&s);
         let p = b.peer(Transport::Tcp, lan, &torrent);
-        assert_eq!(p.down.chain.len(), 4);
-        for want in [&b.tcp.down, &b.local.down, &b.global.down, &torrent.down] {
+        assert_eq!(p.down.chain.len(), 5);
+        let all = [
+            &b.tcp.down,
+            &b.local.down,
+            &b.tcp_share.down,
+            &b.global.down,
+            &torrent.down,
+        ];
+        for want in all {
             assert!(has(&p.down, want));
         }
         assert_eq!(b.tcp_peers.load(Ordering::Acquire), 1);

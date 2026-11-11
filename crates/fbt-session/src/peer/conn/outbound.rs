@@ -68,6 +68,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     // Queued requests die with the choke, answered or not;
                     // with fast they are rejected explicitly.
                     self.uploads.clear();
+                    self.queued.clear();
                     for b in std::mem::take(&mut self.incoming) {
                         if self.fast {
                             self.feed(Message::RejectRequest(b)).await?;
@@ -104,16 +105,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
             PeerCommand::SendBlock { block, data } => {
                 // Only answer requests still queued (not cancelled or choked
-                // away); the block stays in `incoming` until it is written.
-                if self.incoming.contains(&block) {
-                    if self.uploads.len() >= self.settings.max_incoming_requests {
-                        // Drop entries cancelled since: the live ones are
-                        // all in `incoming`, which is bounded.
-                        let incoming = &self.incoming;
-                        self.uploads.retain(|(b, _)| incoming.contains(b));
-                    }
-                    self.uploads.push_back((block, data));
+                // away), and each block once: one re-requested after a
+                // cancel is still queued and goes out from there. The block
+                // stays in `incoming` until it is written.
+                if !self.incoming.contains(&block) || self.queued.contains(&block) {
+                    return Ok(());
                 }
+                let max = self.settings.max_incoming_requests;
+                if self.uploads.len() >= max {
+                    // Drop entries cancelled since.
+                    let (incoming, queued) = (&self.incoming, &mut self.queued);
+                    self.uploads.retain(|(b, _)| {
+                        let live = incoming.contains(b);
+                        if !live {
+                            queued.remove(b);
+                        }
+                        live
+                    });
+                }
+                if self.uploads.len() >= max {
+                    // Unreachable while `incoming` holds at most `max`;
+                    // refused rather than queued past the bound.
+                    if self.incoming.remove(&block) && self.fast {
+                        self.send(Message::RejectRequest(block)).await?;
+                    }
+                    return Ok(());
+                }
+                self.queued.insert(block);
+                self.uploads.push_back((block, data));
             }
             PeerCommand::Reject(b) => {
                 if self.incoming.remove(&b) && self.fast {
@@ -144,6 +163,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             let Some((block, data)) = self.uploads.pop_front() else {
                 break;
             };
+            self.queued.remove(&block);
             // Cancelled, rejected or choked away while queued.
             if !self.incoming.remove(&block) {
                 continue;

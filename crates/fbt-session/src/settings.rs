@@ -79,7 +79,12 @@ pub struct Settings {
     /// Block requests in flight to one peer.
     pub max_outstanding_requests: usize,
     /// Requests from one peer queued before further ones are dropped
-    /// (1 to [`MAX_INCOMING_REQUESTS`]).
+    /// (1 to [`MAX_INCOMING_REQUESTS`]). Under an upload limit, the blocks
+    /// answering them wait in the connection as copies outside
+    /// [`cache_size`](Self::cache_size): up to this many 16 KiB blocks per
+    /// connection (about 4 MiB with the default 250). Copies, because a
+    /// queued block sharing its cached piece would keep the whole piece
+    /// alive, which costs more.
     pub max_incoming_requests: usize,
     /// TCP connect timeout.
     pub connect_timeout: Duration,
