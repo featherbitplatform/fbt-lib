@@ -34,6 +34,16 @@ impl FakeGateway {
     /// `from_other_socket` sends every answer from a second socket; `code` is
     /// the result code of every answer.
     pub async fn start(mode: Mode, from_other_socket: bool, code: u16) -> FakeGateway {
+        Self::spawn(mode, from_other_socket, code, false).await
+    }
+
+    /// Like `start`, but every NAT-PMP map request is first answered with a
+    /// stale 8-byte "unsupported version" reply.
+    pub async fn start_stale(mode: Mode) -> FakeGateway {
+        Self::spawn(mode, false, 0, true).await
+    }
+
+    async fn spawn(mode: Mode, from_other_socket: bool, code: u16, stale: bool) -> FakeGateway {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = sock.local_addr().unwrap().port();
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -44,6 +54,9 @@ impl FakeGateway {
             while let Ok((n, src)) = sock.recv_from(&mut buf).await {
                 let req = buf[..n].to_vec();
                 log.lock().unwrap().push(req.clone());
+                if stale && req.first() == Some(&0) && matches!(req.get(1), Some(1 | 2)) {
+                    let _ = sock.send_to(&[0, 129, 0, 1, 0, 0, 0, 5], src).await;
+                }
                 let Some(reply) = answer(mode, &req, code) else {
                     continue;
                 };
@@ -82,7 +95,7 @@ fn answer(mode: Mode, req: &[u8], code: u16) -> Option<Vec<u8>> {
             r[4..8].copy_from_slice(&req[4..8]);
             r[8..12].copy_from_slice(&9u32.to_be_bytes());
             r[24..44].copy_from_slice(&req[24..44]);
-            r[42..44].copy_from_slice(&req[42..44]);
+            r[42..44].copy_from_slice(&assigned(&req[42..44], &req[4..8]));
             r[54..56].copy_from_slice(&[0xff, 0xff]);
             r[56..60].copy_from_slice(&EXTERNAL_IP);
             Some(r)
@@ -96,11 +109,22 @@ fn answer(mode: Mode, req: &[u8], code: u16) -> Option<Vec<u8>> {
                 r.extend_from_slice(&EXTERNAL_IP);
             } else {
                 r.extend_from_slice(req.get(4..6)?);
-                r.extend_from_slice(req.get(6..8)?);
+                r.extend_from_slice(&assigned(req.get(6..8)?, req.get(8..12)?));
                 r.extend_from_slice(req.get(8..12)?);
             }
             Some(r)
         }
         _ => None,
+    }
+}
+
+/// The external port granted: the suggestion plus one, except for deletes
+/// (lifetime 0), which echo it.
+fn assigned(suggested: &[u8], lifetime: &[u8]) -> [u8; 2] {
+    let s = u16::from_be_bytes([suggested[0], suggested[1]]);
+    if lifetime == [0, 0, 0, 0] {
+        s.to_be_bytes()
+    } else {
+        s.wrapping_add(1).to_be_bytes()
     }
 }
