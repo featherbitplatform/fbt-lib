@@ -139,3 +139,21 @@ async fn real_multicast_loopback() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+#[tokio::test]
+async fn shutdown_releases_the_port() {
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = probe.local_addr().unwrap();
+    drop(probe);
+    let (tx, _rx) = mpsc::channel(4);
+    let lsd = Lsd::spawn_unicast(cfg("port"), bind, vec![bind], tx).unwrap();
+    assert!(
+        std::net::UdpSocket::bind(bind).is_err(),
+        "held while running"
+    );
+    lsd.shutdown().await;
+    assert!(
+        std::net::UdpSocket::bind(bind).is_ok(),
+        "free after shutdown"
+    );
+}

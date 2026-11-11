@@ -237,6 +237,10 @@ pub struct Settings {
     /// BEP 14 local service discovery: announce each public torrent on the
     /// LAN's multicast groups (at most every 5 minutes) and connect to the
     /// peers that announce the same torrent. Private torrents never use it.
+    /// Caveat (BEP 27): a magnet whose metadata has not arrived yet is
+    /// announced, because whether it is private is unknown until then. On a
+    /// multi-homed host only one interface is used (IPv4 the OS default,
+    /// IPv6 interface 0).
     pub enable_lsd: bool,
     /// The multicast groups LSD announces to. Internal tunable (tests point
     /// it at unicast loopback); not part of the stable API.

@@ -124,6 +124,7 @@ impl LsdMessage {
             } else if name.eq_ignore_ascii_case("infohash") {
                 if info_hashes.len() < MAX_LSD_DECODED_HASHES
                     && let Some(h) = parse_hash(value)
+                    && !info_hashes.contains(&h)
                 {
                     info_hashes.push(h);
                 }
@@ -216,7 +217,8 @@ type Destinations = Vec<(Arc<dyn DatagramSender>, SocketAddr)>;
 
 struct Core {
     cookie: String,
-    destinations: Destinations,
+    /// Emptied at shutdown, which drops the send halves and frees the ports.
+    destinations: Mutex<Destinations>,
     found: mpsc::Sender<LsdPeer>,
     limiter: Mutex<IpRateLimiter>,
 }
@@ -231,7 +233,7 @@ impl Core {
     fn new(cfg: &LsdConfig, destinations: Destinations, found: mpsc::Sender<LsdPeer>) -> Arc<Core> {
         Arc::new(Core {
             cookie: cfg.cookie.clone(),
-            destinations,
+            destinations: Mutex::new(destinations),
             found,
             limiter: Mutex::new(IpRateLimiter::new(cfg.rate_per_ip, LSD_BURST, LSD_MAX_IPS)),
         })
@@ -255,11 +257,25 @@ impl DatagramHandler for Core {
         if msg.cookie.as_deref() == Some(self.cookie.as_str()) {
             return;
         }
-        let addr = SocketAddr::new(from.ip().to_canonical(), msg.port);
+        let addr = peer_addr(from, msg.port);
         for info_hash in msg.info_hashes {
             if self.found.try_send(LsdPeer { info_hash, addr }).is_err() {
                 break;
             }
+        }
+    }
+}
+
+/// The address a peer announcing `port` from `from` listens on. An IPv4-mapped
+/// source becomes plain IPv4; any other address keeps its IPv6 scope id,
+/// which a link-local peer cannot be dialled without.
+fn peer_addr(from: SocketAddr, port: u16) -> SocketAddr {
+    match from.ip().to_canonical() {
+        IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), port),
+        IpAddr::V6(_) => {
+            let mut a = from;
+            a.set_port(port);
+            a
         }
     }
 }
@@ -313,6 +329,10 @@ impl Lsd {
     /// Joins the configured multicast groups on the real network (IPv4 on
     /// `0.0.0.0:<group port>`, IPv6 when it can; that is skipped with a
     /// debug log) and starts listening. Must run inside a tokio runtime.
+    ///
+    /// IPv4 joins and sends on the OS default interface (or
+    /// [`LsdConfig::interface_v4`]) and IPv6 uses interface 0, so a
+    /// multi-homed host reaches the peers of one interface only.
     ///
     /// Fails when no configured group could be joined.
     pub fn spawn(cfg: LsdConfig, found: mpsc::Sender<LsdPeer>) -> io::Result<Lsd> {
@@ -420,7 +440,12 @@ impl Lsd {
                 info_hashes: chunk.to_vec(),
                 cookie: Some(self.core.cookie.clone()),
             };
-            for (sender, dest) in &self.core.destinations {
+            let dests = self
+                .core
+                .destinations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (sender, dest) in dests.iter() {
                 if let Err(e) = sender.send_to(&msg.encode(*dest), *dest) {
                     debug!(%dest, error = %e, "LSD announce failed");
                 }
@@ -428,11 +453,18 @@ impl Lsd {
         }
     }
 
-    /// Stops the receive tasks and releases their sockets.
+    /// Stops the receive tasks and drops the send halves, releasing the
+    /// sockets (for sockets this instance opened itself). Later announces do
+    /// nothing.
     pub async fn shutdown(&self) {
         for t in self.tasks.abort() {
             let _ = t.await;
         }
+        self.core
+            .destinations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 }
 
@@ -599,6 +631,45 @@ mod tests {
                 info_hash: hash(7),
                 addr: "10.1.2.3:6881".parse().unwrap()
             }
+        );
+    }
+
+    #[test]
+    fn decode_drops_repeated_hashes() {
+        let h = "ab".repeat(20);
+        let mut s = String::from("BT-SEARCH * HTTP/1.1\r\nPort: 1\r\n");
+        for _ in 0..20 {
+            s.push_str(&format!("Infohash: {h}\r\n"));
+        }
+        s.push_str("\r\n\r\n");
+        assert_eq!(
+            LsdMessage::decode(s.as_bytes()).unwrap().info_hashes.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn link_local_source_keeps_its_scope_and_mapped_v4_is_canonical() {
+        use std::net::SocketAddrV6;
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_lsd, handler) = Lsd::spawn_on(LsdConfig::default(), Vec::new(), tx);
+        let msg = LsdMessage {
+            port: 6881,
+            info_hashes: vec![hash(7)],
+            cookie: None,
+        }
+        .encode(LSD_V6);
+        let ll = SocketAddrV6::new("fe80::1".parse().unwrap(), 5555, 0, 3);
+        handler.handle(SocketAddr::V6(ll), &msg);
+        let SocketAddr::V6(got) = rx.try_recv().unwrap().addr else {
+            panic!("IPv6 expected");
+        };
+        assert_eq!((got.port(), got.scope_id()), (6881, 3));
+        assert_eq!(got.ip(), ll.ip());
+        handler.handle("[::ffff:10.1.2.3]:5555".parse().unwrap(), &msg);
+        assert_eq!(
+            rx.try_recv().unwrap().addr,
+            "10.1.2.3:6881".parse::<SocketAddr>().unwrap()
         );
     }
 

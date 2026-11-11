@@ -1,7 +1,7 @@
 //! Binding the listen addresses: one TCP peer listener per address and, on
 //! the same port, one UDP socket shared by uTP, the DHT and UDP trackers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use fbt_core::udp::DatagramSender;
 use fbt_net::demux::{PacketKind, SharedUdpSocket};
-use fbt_net::lsd::{Lsd, LsdConfig, LsdPeer};
+use fbt_net::lsd::{LSD_HASHES_PER_MESSAGE, Lsd, LsdConfig, LsdPeer};
 use fbt_utp::{UtpConfig, UtpSocket};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -169,12 +169,38 @@ const LSD_FOUND_QUEUE: usize = 256;
 /// batching them across torrents.
 const LSD_FLUSH: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Default)]
+/// Messages the receiving side lets through per source in a burst
+/// (`fbt-net`'s inbound limiter), then one a second. The session paces its
+/// sends to match, or the hashes beyond the burst would be dropped every
+/// cycle.
+const LSD_SEND_BURST: u64 = 5;
+/// Cost of one message in the pacing bucket, in milliseconds of refill (one
+/// message a second).
+const LSD_MSG_COST_MS: u64 = 1000;
+
+#[derive(Debug)]
 struct LsdState {
     /// When each wire hash was last queued for announcing.
     last: HashMap<[u8; 20], Instant>,
-    /// Hashes waiting for the next flush.
-    pending: Vec<[u8; 20]>,
+    /// Hashes waiting to be sent, oldest first; `queued` is their set.
+    pending: VecDeque<[u8; 20]>,
+    queued: HashSet<[u8; 20]>,
+    /// Pacing bucket in milliseconds of credit (a message costs
+    /// [`LSD_MSG_COST_MS`]), and when it was last refilled.
+    credit_ms: u64,
+    refilled: Option<Instant>,
+}
+
+impl Default for LsdState {
+    fn default() -> Self {
+        LsdState {
+            last: HashMap::new(),
+            pending: VecDeque::new(),
+            queued: HashSet::new(),
+            credit_ms: LSD_SEND_BURST * LSD_MSG_COST_MS,
+            refilled: None,
+        }
+    }
 }
 
 /// The session's local service discovery: the [`Lsd`] instance (none when
@@ -250,21 +276,52 @@ impl LsdHub {
             return;
         }
         st.last.insert(wire_hash, now);
-        st.pending.push(wire_hash);
+        if st.queued.insert(wire_hash) {
+            st.pending.push_back(wire_hash);
+        }
     }
 
-    /// Announces the queued hashes, with our listen `port`.
+    /// The hashes to send now: as many as the pacing allows (at most
+    /// [`LSD_SEND_BURST`] messages' worth, then about one message a second),
+    /// oldest first; the rest stay pending.
+    fn take_batch(&self, now: Instant) -> Vec<[u8; 20]> {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let interval = self.interval;
+        st.last
+            .retain(|_, t| now.saturating_duration_since(*t) < interval);
+        let cap = LSD_SEND_BURST * LSD_MSG_COST_MS;
+        if let Some(prev) = st.refilled {
+            let ms =
+                u64::try_from(now.saturating_duration_since(prev).as_millis()).unwrap_or(u64::MAX);
+            st.credit_ms = st.credit_ms.saturating_add(ms).min(cap);
+        }
+        st.refilled = Some(now);
+        let messages = usize::try_from(st.credit_ms / LSD_MSG_COST_MS).unwrap_or(0);
+        let n = st
+            .pending
+            .len()
+            .min(messages.saturating_mul(LSD_HASHES_PER_MESSAGE));
+        if n == 0 {
+            return Vec::new();
+        }
+        let used = u64::try_from(n.div_ceil(LSD_HASHES_PER_MESSAGE)).unwrap_or(u64::MAX);
+        st.credit_ms = st
+            .credit_ms
+            .saturating_sub(used.saturating_mul(LSD_MSG_COST_MS));
+        let batch: Vec<[u8; 20]> = st.pending.drain(..n).collect();
+        for h in &batch {
+            st.queued.remove(h);
+        }
+        batch
+    }
+
+    /// Announces the queued hashes that the pacing allows, with our listen
+    /// `port`.
     pub(crate) fn flush(&self, port: u16, now: Instant) {
         let Some(lsd) = &self.lsd else {
             return;
         };
-        let hashes = {
-            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let interval = self.interval;
-            st.last
-                .retain(|_, t| now.saturating_duration_since(*t) < interval);
-            std::mem::take(&mut st.pending)
-        };
+        let hashes = self.take_batch(now);
         if !hashes.is_empty() {
             lsd.announce(port, &hashes);
         }
@@ -290,16 +347,28 @@ pub(crate) fn spawn_lsd_task(
             tokio::select! {
                 peer = found.recv() => {
                     let Some(peer) = peer else { return };
+                    // One batch per torrent for everything already waiting.
+                    let mut by_hash: HashMap<[u8; 20], Vec<SocketAddr>> = HashMap::new();
+                    by_hash.entry(peer.info_hash).or_default().push(peer.addr);
+                    for _ in 0..LSD_FOUND_QUEUE {
+                        let Ok(p) = found.try_recv() else { break };
+                        let addrs = by_hash.entry(p.info_hash).or_default();
+                        if !addrs.contains(&p.addr) {
+                            addrs.push(p.addr);
+                        }
+                    }
                     let Some(inner) = session.upgrade() else { return };
-                    let handle = {
-                        let reg = inner.registry();
-                        reg.by_wire
-                            .get(&peer.info_hash)
-                            .and_then(|ih| reg.torrents.get(ih))
-                            .map(|e| e.handle.clone())
-                    };
-                    if let Some(h) = handle {
-                        h.offer_found_peers(crate::event::PeerSource::Lsd, vec![peer.addr]);
+                    for (hash, addrs) in by_hash {
+                        let handle = {
+                            let reg = inner.registry();
+                            reg.by_wire
+                                .get(&hash)
+                                .and_then(|ih| reg.torrents.get(ih))
+                                .map(|e| e.handle.clone())
+                        };
+                        if let Some(h) = handle {
+                            h.offer_found_peers(crate::event::PeerSource::Lsd, addrs);
+                        }
                     }
                 }
                 _ = tick.tick() => {
@@ -512,5 +581,66 @@ mod tests {
         assert!(!f(sa("10.0.0.1:1")), "incoming uTP off wins");
         let f = utp_accept_filter(&s, None).expect("filter");
         assert!(!f(sa("10.0.0.1:1")));
+    }
+
+    fn hub(interval: Duration) -> LsdHub {
+        let (tx, _rx) = mpsc::channel(1);
+        let (lsd, _handler) = Lsd::spawn_on(LsdConfig::default(), Vec::new(), tx);
+        LsdHub {
+            lsd: Some(lsd),
+            interval,
+            state: Mutex::default(),
+        }
+    }
+
+    fn h(i: u32) -> [u8; 20] {
+        let mut x = [0u8; 20];
+        x[..4].copy_from_slice(&i.to_be_bytes());
+        x
+    }
+
+    #[test]
+    fn lsd_sends_are_paced_to_the_receivers_burst() {
+        let hub = hub(Duration::from_secs(300));
+        let t0 = Instant::now();
+        for i in 0..200 {
+            hub.want(h(i), t0);
+        }
+        // A burst of 5 messages (80 hashes), then nothing until credit refills.
+        assert_eq!(hub.take_batch(t0).len(), 5 * LSD_HASHES_PER_MESSAGE);
+        assert!(hub.take_batch(t0 + Duration::from_millis(250)).is_empty());
+        let one = hub.take_batch(t0 + Duration::from_secs(1));
+        assert_eq!(one.len(), LSD_HASHES_PER_MESSAGE);
+        assert_eq!(one.first(), Some(&h(80)), "oldest first");
+        // Credit is capped at the burst however long we wait; everything
+        // arrives eventually, each hash once.
+        let mut seen = 96;
+        let mut now = t0 + Duration::from_secs(100);
+        while seen < 200 {
+            let b = hub.take_batch(now);
+            assert!(b.len() <= 5 * LSD_HASHES_PER_MESSAGE);
+            assert!(!b.is_empty());
+            seen += b.len();
+            now += Duration::from_secs(100);
+        }
+        assert_eq!(seen, 200);
+        assert!(hub.take_batch(now).is_empty());
+    }
+
+    #[test]
+    fn a_torrent_is_announced_again_after_the_interval_only() {
+        let interval = Duration::from_secs(300);
+        let hub = hub(interval);
+        let t0 = Instant::now();
+        hub.want(h(1), t0);
+        assert_eq!(hub.take_batch(t0), vec![h(1)]);
+        let mid = t0 + interval / 2;
+        hub.want(h(1), mid);
+        assert!(hub.take_batch(mid).is_empty(), "within the interval");
+        let later = t0 + interval + Duration::from_secs(1);
+        hub.want(h(1), later);
+        assert_eq!(hub.take_batch(later), vec![h(1)], "after the interval");
+        hub.want(h(1), later + Duration::from_secs(1));
+        assert!(hub.take_batch(later + Duration::from_secs(1)).is_empty());
     }
 }
