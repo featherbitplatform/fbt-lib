@@ -309,3 +309,117 @@ fn download_from_seed_process() {
     let want = read_tree(&seed_dir.join("payload"));
     assert_eq!(got, want);
 }
+
+#[test]
+fn download_over_utp_from_seed_process() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (torrent_path, seed_dir, _) = seed_fixture(tmp.path());
+    let out_dir = tmp.path().join("out");
+    let (_seed, port) = spawn_seed(&torrent_path, &seed_dir, &["--transport", "utp"]);
+    let peer = format!("127.0.0.1:{port}");
+    let stdout = run_download(&[
+        torrent_path.to_str().expect("utf8"),
+        "--no-dht",
+        "--port",
+        "0",
+        "--transport",
+        "utp",
+        "--peer",
+        &peer,
+        "--out",
+        out_dir.to_str().expect("utf8"),
+    ]);
+    assert!(stdout.contains("via utp"), "{stdout}");
+    assert_eq!(
+        read_tree(&out_dir.join("payload")),
+        read_tree(&seed_dir.join("payload"))
+    );
+}
+
+#[test]
+fn download_limit_slows_transfer() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload: Vec<u8> = (0..4 * 1024 * 1024usize)
+        .map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8)
+        .collect();
+    let (torrent, _) = make_torrent(&[("big.bin", payload.len())], 65536);
+    let torrent_path = tmp.path().join("t.torrent");
+    std::fs::write(&torrent_path, &torrent).expect("write torrent");
+    let seed_dir = tmp.path().join("seed");
+    std::fs::create_dir_all(seed_dir.join("payload")).expect("mkdir");
+    std::fs::write(seed_dir.join("payload/big.bin"), &payload).expect("write");
+    let out_dir = tmp.path().join("out");
+    let (_seed, port) = spawn_seed(&torrent_path, &seed_dir, &[]);
+    let peer = format!("127.0.0.1:{port}");
+    let start = Instant::now();
+    run_download(&[
+        torrent_path.to_str().expect("utf8"),
+        "--no-dht",
+        "--port",
+        "0",
+        "--download-limit",
+        "1M",
+        "--peer",
+        &peer,
+        "--out",
+        out_dir.to_str().expect("utf8"),
+    ]);
+    assert!(
+        start.elapsed() >= Duration::from_secs(3),
+        "finished in {:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("payload/big.bin")).expect("read"),
+        payload
+    );
+}
+
+#[test]
+fn bad_limit_is_a_clean_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(BIN)
+        .args([
+            "download",
+            "magnet:?dn=x",
+            "--download-limit",
+            "12Q",
+            "--out",
+        ])
+        .arg(tmp.path())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("12Q"), "{stderr}");
+}
+
+#[test]
+fn listen_flag_accepts_two_addresses() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (torrent_path, seed_dir, _) = seed_fixture(tmp.path());
+    let out_dir = tmp.path().join("out");
+    let (_seed, port) = spawn_seed(
+        &torrent_path,
+        &seed_dir,
+        &["--listen", "127.0.0.1:0", "--listen", "[::1]:0"],
+    );
+    let peer = format!("127.0.0.1:{port}");
+    run_download(&[
+        torrent_path.to_str().expect("utf8"),
+        "--no-dht",
+        "--port",
+        "0",
+        "--peer",
+        &peer,
+        "--out",
+        out_dir.to_str().expect("utf8"),
+    ]);
+    assert_eq!(
+        read_tree(&out_dir.join("payload")),
+        read_tree(&seed_dir.join("payload"))
+    );
+}

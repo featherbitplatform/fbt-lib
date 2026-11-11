@@ -12,6 +12,8 @@ on:
       - "crates/fbt-wire/**"
       - "crates/fbt-tracker/**"
       - "crates/fbt-dht/**"
+      - "crates/fbt-utp/**"
+      - "crates/fbt-net/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
@@ -47,6 +49,12 @@ jobs:
           - extension
           - mse
           - magnet
+          - utp_packet
+          - utp_conn
+          - lsd
+          - ssdp
+          - upnp_xml
+          - natpmp
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

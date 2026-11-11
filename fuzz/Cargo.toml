@@ -17,6 +17,9 @@ fbt-metainfo = { path = "../crates/fbt-metainfo" }
 fbt-wire = { path = "../crates/fbt-wire" }
 fbt-tracker = { path = "../crates/fbt-tracker" }
 fbt-dht = { path = "../crates/fbt-dht" }
+fbt-core = { path = "../crates/fbt-core" }
+fbt-utp = { path = "../crates/fbt-utp" }
+fbt-net = { path = "../crates/fbt-net" }
 tokio = { version = "1", default-features = false, features = ["rt", "io-util"] }
 
 [workspace]
@@ -99,6 +102,48 @@ bench = false
 [[bin]]
 name = "magnet"
 path = "fuzz_targets/magnet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "utp_packet"
+path = "fuzz_targets/utp_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "utp_conn"
+path = "fuzz_targets/utp_conn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lsd"
+path = "fuzz_targets/lsd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssdp"
+path = "fuzz_targets/ssdp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upnp_xml"
+path = "fuzz_targets/upnp_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "natpmp"
+path = "fuzz_targets/natpmp.rs"
 test = false
 doc = false
 bench = false

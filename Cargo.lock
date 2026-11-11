@@ -513,7 +513,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fbt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-bencode"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rand",
  "sha1",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-dht"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -558,11 +558,12 @@ dependencies = [
 
 [[package]]
 name = "fbt-example"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "fbt",
  "fbt-bencode",
+ "fbt-net",
  "sha1",
  "tempfile",
  "tokio",
@@ -571,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-metainfo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -582,8 +583,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-net"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "fbt-core",
+ "proptest",
+ "rand",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-session"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bitflags",
  "bytes",
@@ -591,12 +606,15 @@ dependencies = [
  "fbt-core",
  "fbt-dht",
  "fbt-metainfo",
+ "fbt-net",
  "fbt-tracker",
+ "fbt-utp",
  "fbt-wire",
  "futures-core",
  "futures-util",
  "rand",
  "sha1",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -606,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-tracker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "fbt-bencode",
@@ -624,8 +642,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-utp"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "fbt-core",
+ "fbt-net",
+ "proptest",
+ "rand",
+ "sha1",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-wire"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bitflags",
  "bytes",

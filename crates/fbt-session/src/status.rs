@@ -8,14 +8,21 @@ use fbt_core::InfoHashes;
 pub enum TorrentState {
     /// A magnet torrent is fetching its metadata from peers.
     DownloadingMetadata,
+    /// Waiting for one of the session's
+    /// [`max_active_checks`](crate::Settings::max_active_checks) slots to
+    /// check its data.
+    QueuedForChecking,
     /// Existing data is being hash-checked; `progress` is in `0.0..=1.0`.
     CheckingFiles {
         /// Fraction of pieces checked.
         progress: f64,
     },
-    /// Some wanted pieces are missing.
+    /// Some wanted pieces are missing, or the last ones are verified but
+    /// not yet on disk (progress 100 %, still served from the cache).
     Downloading,
-    /// Every wanted piece is present.
+    /// Every wanted piece is verified and on disk: the final writes and the
+    /// storage flush completed (reached together with
+    /// [`Event::TorrentFinished`](crate::Event::TorrentFinished)).
     Seeding,
     /// Stopped by the user: no peers, no announces.
     Paused,
@@ -68,8 +75,10 @@ impl TorrentStatus {
             info_hashes,
             name,
             has_metadata,
+            // The actor's first publish says `CheckingFiles` once it has
+            // a check slot.
             state: if has_metadata {
-                TorrentState::CheckingFiles { progress: 0.0 }
+                TorrentState::QueuedForChecking
             } else {
                 TorrentState::DownloadingMetadata
             },

@@ -109,7 +109,7 @@ fn xor20(a: &[u8; 20], b: &[u8; 20]) -> [u8; 20] {
 }
 
 /// A random-length (0..=512) pad of random bytes.
-fn random_pad() -> Vec<u8> {
+pub(super) fn random_pad() -> Vec<u8> {
     let mut rng = rand::rng();
     let mut pad = vec![0u8; rng.random_range(0..=MSE_MAX_PAD)];
     rng.fill(&mut pad[..]);
@@ -133,10 +133,25 @@ fn keys(s: &[u8; DH_LEN], skey: &[u8; 20]) -> Result<(Cipher, Cipher), MseError>
 /// `initial_payload` (IA, at most [`MSE_MAX_IA`] bytes) is sent RC4-encrypted
 /// inside step 3, typically the BitTorrent handshake.
 pub async fn initiate<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    info_hash: &[u8; 20],
+    provide: CryptoMethods,
+    initial_payload: &[u8],
+) -> Result<MseStream<S>, MseError> {
+    initiate_with(stream, info_hash, provide, initial_payload, || {
+        (KeyPair::generate(), random_pad())
+    })
+    .await
+}
+
+/// [`initiate`] with the key pair and PadA chosen by `make_keys`, which runs
+/// only after the argument checks.
+pub(super) async fn initiate_with<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     info_hash: &[u8; 20],
     provide: CryptoMethods,
     initial_payload: &[u8],
+    make_keys: impl FnOnce() -> (KeyPair, Vec<u8>),
 ) -> Result<MseStream<S>, MseError> {
     let provide = provide & CryptoMethods::all();
     if provide.is_empty() {
@@ -148,8 +163,8 @@ pub async fn initiate<S: AsyncRead + AsyncWrite + Unpin>(
         .ok_or(MseError::BadLength("IA"))?;
 
     // Step 1.
-    let me = KeyPair::generate();
-    send(&mut stream, &[&me.public[..], &random_pad()].concat()).await?;
+    let (me, pad_a) = make_keys();
+    send(&mut stream, &[&me.public[..], &pad_a].concat()).await?;
 
     // Step 2.
     let mut rx = Rx { buf: Vec::new() };
@@ -214,19 +229,34 @@ pub async fn initiate<S: AsyncRead + AsyncWrite + Unpin>(
 /// Returns the stream, whose first readable bytes are the initiator's IA,
 /// and the info hash.
 pub async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
+    stream: S,
     prefix: Vec<u8>,
     lookup: &(dyn Fn(&[u8; 20]) -> Option<[u8; 20]> + Sync),
     allowed: CryptoMethods,
 ) -> Result<(MseStream<S>, [u8; 20]), MseError> {
+    respond_with(stream, prefix, lookup, allowed, || {
+        (KeyPair::generate(), random_pad())
+    })
+    .await
+}
+
+/// [`respond`] with the key pair and PadB chosen by `make_keys`, which runs only
+/// after the peer's `Ya` has been read.
+pub(super) async fn respond_with<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    prefix: Vec<u8>,
+    lookup: &(dyn Fn(&[u8; 20]) -> Option<[u8; 20]> + Sync),
+    allowed: CryptoMethods,
+    make_keys: impl FnOnce() -> (KeyPair, Vec<u8>),
+) -> Result<(MseStream<S>, [u8; 20]), MseError> {
     // Step 1.
     let mut rx = Rx { buf: prefix };
     let ya: [u8; DH_LEN] = rx.take_array(&mut stream).await?;
-    let me = KeyPair::generate();
+    let (me, pad_b) = make_keys();
     let s = me.shared(&ya)?;
 
     // Step 2.
-    send(&mut stream, &[&me.public[..], &random_pad()].concat()).await?;
+    send(&mut stream, &[&me.public[..], &pad_b].concat()).await?;
 
     // Step 3.
     rx.sync(&mut stream, &hash(b"req1", &[&s]), REQ1_SYNC_WINDOW)

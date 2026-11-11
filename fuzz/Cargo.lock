@@ -150,14 +150,14 @@ dependencies = [
 
 [[package]]
 name = "fbt-bencode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fbt-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rand",
  "sha1",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-dht"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -185,9 +185,12 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "fbt-bencode",
+ "fbt-core",
  "fbt-dht",
  "fbt-metainfo",
+ "fbt-net",
  "fbt-tracker",
+ "fbt-utp",
  "fbt-wire",
  "libfuzzer-sys",
  "tokio",
@@ -196,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-metainfo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -204,8 +207,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-net"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "fbt-core",
+ "rand",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-tracker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "fbt-bencode",
@@ -219,8 +235,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbt-utp"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "fbt-core",
+ "rand",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fbt-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags",
  "bytes",

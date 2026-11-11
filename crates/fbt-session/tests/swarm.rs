@@ -17,8 +17,8 @@ use fbt_session::{
     TorrentHandle, TorrentState,
 };
 use fbt_wire::{
-    ExtHandshake, Message, MetadataMsg, OUR_UT_METADATA_ID, OUR_UT_PEX_ID, Reserved, UT_METADATA,
-    UT_PEX,
+    ExtHandshake, LT_DONTHAVE, Message, MetadataMsg, OUR_LT_DONTHAVE_ID, OUR_UT_METADATA_ID,
+    OUR_UT_PEX_ID, Reserved, UT_METADATA, UT_PEX, decode_donthave, encode_donthave,
 };
 use support::*;
 
@@ -409,7 +409,9 @@ fn retry_settings() -> Settings {
 }
 
 /// A failed outgoing connection is dialled exactly three times in all, the
-/// retries after `peer_retry_delay`, and then given up.
+/// retries after (a twelfth of, then all of) `peer_retry_delay`, and then
+/// given up. Over TCP alone: nothing listens there at all, and the uTP
+/// detour of each attempt is `utp_connect_failure_falls_back_to_tcp`'s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_connect_is_retried_three_times_then_dropped() {
     // A loopback port nobody listens on.
@@ -418,7 +420,7 @@ async fn failed_connect_is_retried_three_times_then_dropped() {
         l.local_addr().unwrap()
     };
     let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
-    let (s, h, _) = mem_leecher_with(retry_settings(), &m, payload.len()).await;
+    let (s, h, _) = mem_leecher_with(dial_tcp(retry_settings()), &m, payload.len()).await;
     let mut ev = s.subscribe(EventMask::ALL);
     h.add_peer(closed).await.unwrap();
     let ours = |e: &Event| {
@@ -437,6 +439,101 @@ async fn failed_connect_is_retried_three_times_then_dropped() {
     // Given up: nothing more over five retry delays.
     let more = next_matching(&mut ev, ours, Duration::from_millis(1500)).await;
     assert!(more.is_none(), "a fourth attempt: {more:?}");
+    s.shutdown().await;
+}
+
+/// Retry settings dialling over TCP in plaintext, as `ScriptedPeer`
+/// answers.
+fn plain_dialler() -> Settings {
+    let mut s = retry_settings();
+    s.encryption = EncryptionPolicy::Disabled;
+    dial_tcp(s)
+}
+
+/// Accepts the session's dial on `listener` as a seed of all 7 pieces,
+/// unchokes it and answers its requests until `blocks` blocks went out,
+/// then drops the connection (a seed that died, or that our idle or uTP
+/// timeout cut, after doing useful work).
+async fn seed_then_drop(listener: &tokio::net::TcpListener, payload: &[u8], blocks: usize) {
+    let mut seed = ScriptedPeer::accept_with(listener, Reserved::default()).await;
+    seed.send(Message::Bitfield(bytes::Bytes::from_static(&[0xfe])))
+        .await;
+    seed.send(Message::Unchoke).await;
+    for _ in 0..blocks {
+        let Some(Message::Request(b)) = seed
+            .next_matching(|m| matches!(m, Message::Request(_)))
+            .await
+        else {
+            panic!("no request");
+        };
+        let start = b.piece as usize * 16_384 + b.offset as usize;
+        seed.send(Message::Piece {
+            piece: b.piece,
+            offset: b.offset,
+            data: bytes::Bytes::copy_from_slice(&payload[start..start + b.len as usize]),
+        })
+        .await;
+    }
+}
+
+/// An outgoing peer that delivered data and then dropped is dialled again
+/// soon (the first retry of a series, a twelfth of `peer_retry_delay`),
+/// not only when a tracker names it again. In CI qBittorrent's uTP
+/// connection timed out at 31 % and the lone seed was never redialled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn productive_peer_that_dropped_is_redialled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seed_addr = listener.local_addr().unwrap();
+    let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
+    let (s, h, storage) = mem_leecher_with(plain_dialler(), &m, payload.len()).await;
+    let mut ev = s.subscribe(EventMask::ALL);
+    h.add_peer(seed_addr).await.unwrap();
+    seed_then_drop(&listener, &payload, 2).await;
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == seed_addr),
+        T,
+    )
+    .await
+    .expect("the drop is reported");
+    // Redialled: this time the seed serves everything.
+    let mut seed = tokio::time::timeout(
+        Duration::from_secs(5),
+        ScriptedPeer::accept_with(&listener, Reserved::default()),
+    )
+    .await
+    .expect("the productive seed is dialled again");
+    seed.send(Message::Bitfield(bytes::Bytes::from_static(&[0xfe])))
+        .await;
+    seed.send(Message::Unchoke).await;
+    let serving = tokio::spawn(async move { seed.serve(&payload, 16_384).await });
+    finished(&mut ev).await;
+    assert_eq!(stored(&storage, 100_000).len(), 100_000);
+    serving.abort();
+    s.shutdown().await;
+}
+
+/// A peer that dropped without sending a single block is not redialled on
+/// its own (it is retried only when a tracker or PEX names it again), so a
+/// peer that accepts and hangs up at once cannot make us dial it in a loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unproductive_peer_that_dropped_is_not_redialled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seed_addr = listener.local_addr().unwrap();
+    let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
+    let (s, h, _) = mem_leecher_with(plain_dialler(), &m, payload.len()).await;
+    let mut ev = s.subscribe(EventMask::ALL);
+    h.add_peer(seed_addr).await.unwrap();
+    seed_then_drop(&listener, &payload, 0).await;
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == seed_addr),
+        T,
+    )
+    .await
+    .expect("the drop is reported");
+    let again = tokio::time::timeout(Duration::from_millis(1500), listener.accept()).await;
+    assert!(again.is_err(), "an unproductive peer was redialled");
     s.shutdown().await;
 }
 
@@ -481,8 +578,8 @@ async fn piece_finished_while_a_peer_connects_is_announced() {
 
     let (m, payload) = make_torrent(&[("a", 4 * 16_384)], 16_384);
     let ih = m.info_hashes.wire_hash();
-    // The hand-driven remote below speaks plaintext only.
-    let mut st = settings();
+    // The hand-driven remote below speaks plaintext, over TCP only.
+    let mut st = dial_tcp(settings());
     st.encryption = EncryptionPolicy::Disabled;
     let (s, h, _) = mem_leecher_with(st, &m, payload.len()).await;
     let mut ev = s.subscribe(EventMask::PIECE);
@@ -535,8 +632,10 @@ async fn piece_finished_while_a_peer_connects_is_announced() {
     s.shutdown().await;
 }
 
-/// A second connection under a peer id that is already connected is closed
-/// with `Duplicate`; the first one keeps working.
+/// A second connection under a peer id that is already connected is
+/// closed (the older one stays, same direction) without any event: the
+/// peer was reported connected once and still is. The first connection
+/// keeps working and alone reports its end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_peer_id_is_rejected() {
     let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
@@ -545,29 +644,40 @@ async fn duplicate_peer_id_is_rejected() {
     let id = fbt_core::PeerId([0x42; 20]);
     let mut ev = s.subscribe(EventMask::PEER);
     let mut first = ScriptedPeer::connect_as(s.local_addr(), ih, id, false).await;
-    next_matching(&mut ev, |e| matches!(e, Event::PeerConnected { .. }), T)
+    let first_addr = match next_matching(&mut ev, |e| matches!(e, Event::PeerConnected { .. }), T)
         .await
-        .expect("first connected");
+        .expect("first connected")
+    {
+        Event::PeerConnected { addr, .. } => addr,
+        _ => unreachable!(),
+    };
     let mut second = ScriptedPeer::connect_as(s.local_addr(), ih, id, false).await;
     assert_eq!(second.wait_closed(T).await, PeerEnd::Closed);
-    let e = next_matching(&mut ev, |e| matches!(e, Event::PeerDisconnected { .. }), T)
-        .await
-        .expect("second disconnected");
-    assert!(
-        matches!(
-            e,
-            Event::PeerDisconnected {
-                reason: DisconnectReason::Duplicate,
-                ..
-            }
-        ),
-        "{e:?}"
-    );
+    let e = next_matching(
+        &mut ev,
+        |e| {
+            matches!(
+                e,
+                Event::PeerConnected { .. } | Event::PeerDisconnected { .. }
+            )
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(e.is_none(), "the duplicate was reported: {e:?}");
     first.send(Message::Interested).await;
     first
         .next_matching(|m| *m == Message::Unchoke)
         .await
         .expect("the first connection still works");
+    drop(first);
+    let e = next_matching(&mut ev, |e| matches!(e, Event::PeerDisconnected { .. }), T)
+        .await
+        .expect("the first connection reports its end");
+    assert!(
+        matches!(e, Event::PeerDisconnected { addr, .. } if addr == first_addr),
+        "{e:?}"
+    );
     s.shutdown().await;
 }
 
@@ -576,7 +686,13 @@ async fn duplicate_peer_id_is_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_dial_leaves_one_connection() {
     let (m, payload) = make_torrent(&[("a", 1 << 20)], 65_536);
-    let (a, ha) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+    // Slow reads keep the download going past the check: once the leecher
+    // is a seed too, the two close (BEP 21).
+    let slow = Arc::new(SlowStorage::new(
+        payload.clone(),
+        Duration::from_millis(500),
+    ));
+    let (a, ha) = seeder(&m, slow).await;
     let (b, hb, storage) = mem_leecher(&m, payload.len()).await;
     let mut ev = b.subscribe(EventMask::ALL);
     let (ra, rb) = tokio::join!(ha.add_peer(b.local_addr()), hb.add_peer(a.local_addr()));
@@ -661,6 +777,60 @@ async fn rechoke_chokes_peer_that_lost_its_slot() {
         } else {
             unchoked[id] = true;
         }
+    }
+    s.shutdown().await;
+}
+
+/// A round-robin seeder with two upload slots (one regular, one
+/// optimistic) and six leechers that only know the seeder. Its upload is
+/// throttled so that a turn (three rechokes) is far shorter than the
+/// torrent: the regular slot moves on, so at least four leechers have
+/// data before the first one finishes (without rotation only the two
+/// holders would), and every leecher finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeding_round_robin_serves_every_leecher() {
+    let (m, payload) = make_torrent(&[("a", 384 << 10)], 32_768);
+    let mut st = settings();
+    st.unchoke_slots = 2;
+    st.rechoke_interval = Duration::from_millis(200);
+    st.seeding_piece_quota = 4;
+    st.pex_enabled = false;
+    st.rate_limit = fbt_session::RateLimit::new(0, 256 << 10);
+    st.rate_limit_local_peers = true;
+    let s = Session::new(st).await.unwrap();
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(Arc::new(MemStorage::from_bytes(payload.clone())));
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+
+    let mut leechers = Vec::new();
+    for _ in 0..6 {
+        let mut ls = settings();
+        ls.pex_enabled = false;
+        leechers.push(mem_leecher_with(ls, &m, payload.len()).await);
+    }
+    for (_, lh, _) in &leechers {
+        lh.add_peer(s.local_addr()).await.unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + T;
+    let served = loop {
+        let statuses: Vec<_> = leechers.iter().map(|(_, lh, _)| lh.status()).collect();
+        if statuses.iter().any(|st| st.state == TorrentState::Seeding) {
+            break statuses.iter().filter(|st| st.wanted_done > 0).count();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "nobody finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        served >= 4,
+        "only {served} leechers served before the first finished"
+    );
+    for (_, lh, storage) in &leechers {
+        assert!(wait_state(lh, |s| *s == TorrentState::Seeding, T).await);
+        assert!(stored(storage, payload.len()) == payload, "data differs");
+    }
+    for (l, ..) in leechers {
+        l.shutdown().await;
     }
     s.shutdown().await;
 }
@@ -877,4 +1047,304 @@ async fn extension_handshake_with_a_session() {
         "the seeder unchokes the interested peer"
     );
     s.shutdown().await;
+}
+
+/// BEP 21: two seeds of one torrent have nothing to trade; the one that
+/// learns the other is a seed while it is seeding itself closes with
+/// `UploadOnly`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeds_disconnect_from_upload_only_peers() {
+    let (m, payload) = make_torrent(&[("a", 100_000)], 32_768);
+    let (sa, _ha) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+    let (sb, hb) = seeder(&m, Arc::new(MemStorage::from_bytes(payload))).await;
+    let mut ea = sa.subscribe(EventMask::ALL);
+    let mut eb = sb.subscribe(EventMask::ALL);
+    hb.add_peer(sa.local_addr()).await.unwrap();
+    let within = Duration::from_secs(2);
+    let a = next_matching(
+        &mut ea,
+        |e| matches!(e, Event::PeerDisconnected { .. }),
+        within,
+    )
+    .await;
+    let b = next_matching(
+        &mut eb,
+        |e| matches!(e, Event::PeerDisconnected { .. }),
+        within,
+    )
+    .await;
+    let reasons: Vec<DisconnectReason> = [a, b]
+        .into_iter()
+        .map(|e| match e {
+            Some(Event::PeerDisconnected { reason, .. }) => reason,
+            other => panic!("no disconnect within 2 s: {other:?}"),
+        })
+        .collect();
+    assert!(
+        reasons.contains(&DisconnectReason::UploadOnly),
+        "reasons {reasons:?}"
+    );
+    sa.shutdown().await;
+    sb.shutdown().await;
+}
+
+/// BEP 54: a remote that sends `HaveAll` and then `lt_donthave` for piece 3
+/// does not have it any more, so it is never requested from that peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn donthave_from_remote_lowers_availability() {
+    let (m, payload) = make_torrent(&[("a", 6 * 16_384)], 16_384);
+    let (s, _h, _storage) = mem_leecher(&m, payload.len()).await;
+    let mut reserved = Reserved::default();
+    reserved.set_fast();
+    reserved.set_extended();
+    let mut peer =
+        ScriptedPeer::connect_with(s.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    peer.send(Message::HaveAll).await;
+    peer.send(Message::Extended {
+        id: OUR_LT_DONTHAVE_ID,
+        payload: encode_donthave(3),
+    })
+    .await;
+    peer.send(Message::Unchoke).await;
+    // The pipeline deepens as blocks arrive, so every request is answered.
+    let mut requested = std::collections::BTreeSet::new();
+    while requested.len() < 5 {
+        match peer
+            .next_matching(|m| matches!(m, Message::Request(_)))
+            .await
+        {
+            Some(Message::Request(b)) => {
+                requested.insert(b.piece);
+                let start = b.piece as usize * 16_384;
+                peer.send(Message::Piece {
+                    piece: b.piece,
+                    offset: b.offset,
+                    data: payload[start..start + 16_384].to_vec().into(),
+                })
+                .await;
+            }
+            other => panic!("expected requests, got {other:?} after {requested:?}"),
+        }
+    }
+    // Anything still to come would be piece 3.
+    let extra = tokio::time::timeout(
+        Duration::from_millis(500),
+        peer.next_matching(|m| matches!(m, Message::Request(_))),
+    )
+    .await;
+    if let Ok(Some(Message::Request(b))) = extra {
+        requested.insert(b.piece);
+    }
+    assert_eq!(
+        requested.into_iter().collect::<Vec<_>>(),
+        vec![0, 1, 2, 4, 5]
+    );
+    s.shutdown().await;
+}
+
+/// BEP 54: a piece that turns out to be gone from disk while serving is
+/// announced lost (`lt_donthave` to every peer, `FileError`, the request
+/// rejected), downloaded again from another seed, and the leecher that
+/// asked finishes from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_piece_sends_donthave_and_is_redownloaded() {
+    let piece_len = 65_536u32;
+    let (m, payload) = make_torrent(&[("a", 2 * 65_536), ("b", 2 * 65_536)], piece_len);
+    let (sa, _ha) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+
+    // B holds file `a` only (pieces 0 and 1), with no clean cache, so a
+    // read always reaches the disk.
+    let dir = tempfile::tempdir().unwrap();
+    write_payload(dir.path(), &m, &payload);
+    std::fs::remove_file(dir.path().join("torrent").join("b")).unwrap();
+    let mut st = settings();
+    st.cache_size = 0;
+    let sb = Session::new(st).await.unwrap();
+    let mut eb = sb.subscribe(EventMask::ALL);
+    let hb = sb
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&hb, |s| *s == TorrentState::Downloading, T).await);
+    assert!(wait_until(|| hb.status().wanted_done == 2 * 65_536, T).await);
+
+    // The observer advertises `lt_donthave` and sits there.
+    let mut reserved = Reserved::default();
+    reserved.set_fast();
+    reserved.set_extended();
+    let mut observer =
+        ScriptedPeer::connect_with(sb.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    let mut hs = ExtHandshake::default();
+    hs.m.insert(LT_DONTHAVE.to_owned(), 9);
+    observer.send_ext_handshake(&hs).await;
+    observer.send(Message::HaveNone).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // `a` is emptied under B. (FsStorage keeps its read handle, so the file
+    // is truncated, not removed: the read then fails with NotFound on every
+    // platform.)
+    let a = dir.path().join("torrent").join("a");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&a)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+
+    let (sc, hc, storage_c) = mem_leecher(&m, payload.len()).await;
+    let mut ec = sc.subscribe(EventMask::ALL);
+    hc.add_peer(sb.local_addr()).await.unwrap();
+
+    let note = observer.next_ext(9).await.expect("lt_donthave");
+    let lost = decode_donthave(&note).unwrap();
+    assert!(lost < 2, "piece {lost}");
+    let ev = next_matching(&mut eb, |e| matches!(e, Event::FileError { .. }), T)
+        .await
+        .expect("FileError");
+    let Event::FileError { path, .. } = ev else {
+        unreachable!()
+    };
+    assert_eq!(path.as_deref(), Some(a.as_path()));
+    // The torrent keeps running and gets the data again.
+    assert!(hb.status().error.is_none());
+    hb.add_peer(sa.local_addr()).await.unwrap();
+    assert!(wait_state(&hb, |s| *s == TorrentState::Seeding, T).await);
+    assert!(std::fs::read(&a).unwrap() == payload[..2 * 65_536]);
+
+    finished(&mut ec).await;
+    assert!(stored(&storage_c, payload.len()) == payload, "data differs");
+    sc.shutdown().await;
+    sb.shutdown().await;
+    sa.shutdown().await;
+}
+
+/// BEP 21 and un-finishing: a torrent that is seeding (its other file
+/// skipped) closes a seed it knows; once the skipped file is wanted, the
+/// seed is dialled again without another `add_peer`, and the file arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeds_are_redialled_when_the_torrent_is_unfinished() {
+    let (m, payload) = make_torrent(&[("a", 2 * 65_536), ("b", 2 * 65_536)], 65_536);
+    let (sx, _hx) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+    let dir = tempfile::tempdir().unwrap();
+    write_payload(dir.path(), &m, &payload);
+    std::fs::remove_file(dir.path().join("torrent").join("b")).unwrap();
+    let sy = Session::new(settings()).await.unwrap();
+    let mut p = AddTorrent::new(m.clone(), dir.path().to_path_buf());
+    p.file_priorities = vec![Priority::Normal, Priority::Skip];
+    let hy = sy.add_torrent(p).await.unwrap();
+    assert!(wait_state(&hy, |s| *s == TorrentState::Seeding, T).await);
+    let mut ey = sy.subscribe(EventMask::ALL);
+    hy.add_peer(sx.local_addr()).await.unwrap();
+    let ev = next_matching(
+        &mut ey,
+        |e| matches!(e, Event::PeerDisconnected { .. }),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the seeds part");
+    // Both sides are seeds, so either may close first: we see UploadOnly
+    // when we close, Closed when the remote seed beats us to it.
+    assert!(
+        matches!(
+            ev,
+            Event::PeerDisconnected {
+                reason: DisconnectReason::UploadOnly | DisconnectReason::Closed,
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    assert!(wait_until(|| hy.status().num_peers == 0, T).await);
+    // It does not come back while we are finished.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(hy.status().num_peers, 0);
+
+    hy.set_file_priorities(vec![Priority::Normal, Priority::Normal])
+        .await
+        .unwrap();
+    assert!(wait_state(&hy, |s| *s == TorrentState::Seeding, T).await);
+    let b = std::fs::read(dir.path().join("torrent").join("b")).unwrap();
+    assert!(b == payload[2 * 65_536..]);
+    sy.shutdown().await;
+    sx.shutdown().await;
+}
+
+/// The whole-piece read path (a clean cache with room) reports a lost
+/// file once, and every piece of it at once: all of them are announced
+/// lost, then downloaded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whole_piece_read_loss_reports_the_file_once() {
+    let (m, payload) = make_torrent(&[("a", 3 * 65_536), ("b", 65_536)], 65_536);
+    let (sa, _ha) = seeder(&m, Arc::new(MemStorage::from_bytes(payload.clone()))).await;
+    let dir = tempfile::tempdir().unwrap();
+    write_payload(dir.path(), &m, &payload);
+    std::fs::remove_file(dir.path().join("torrent").join("b")).unwrap();
+    // The default cache size leaves room for a clean whole-piece read.
+    let sb = Session::new(settings()).await.unwrap();
+    let mut eb = sb.subscribe(EventMask::ALL);
+    let hb = sb
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_until(|| hb.status().wanted_done == 3 * 65_536, T).await);
+    let mut reserved = Reserved::default();
+    reserved.set_fast();
+    reserved.set_extended();
+    let mut observer =
+        ScriptedPeer::connect_with(sb.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    let mut hs = ExtHandshake::default();
+    hs.m.insert(LT_DONTHAVE.to_owned(), 9);
+    observer.send_ext_handshake(&hs).await;
+    observer.send(Message::HaveNone).await;
+    observer.send(Message::Interested).await;
+    observer
+        .next_matching(|m| *m == Message::Unchoke)
+        .await
+        .expect("Unchoke");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let a = dir.path().join("torrent").join("a");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&a)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    observer
+        .send(Message::Request(BlockRef {
+            piece: 1,
+            offset: 0,
+            len: 16_384,
+        }))
+        .await;
+    // All three pieces of `a` are announced lost from the one request.
+    let mut lost = std::collections::BTreeSet::new();
+    while lost.len() < 3 {
+        let note = observer.next_ext(9).await.expect("lt_donthave");
+        lost.insert(decode_donthave(&note).unwrap());
+    }
+    assert_eq!(lost.into_iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+    next_matching(&mut eb, |e| matches!(e, Event::FileError { .. }), T)
+        .await
+        .expect("FileError");
+    // A second request for another lost piece adds no second report.
+    observer
+        .send(Message::Request(BlockRef {
+            piece: 2,
+            offset: 0,
+            len: 16_384,
+        }))
+        .await;
+    let again = next_matching(
+        &mut eb,
+        |e| matches!(e, Event::FileError { .. }),
+        Duration::from_millis(700),
+    )
+    .await;
+    assert!(again.is_none(), "second FileError {again:?}");
+    assert!(hb.status().error.is_none());
+    hb.add_peer(sa.local_addr()).await.unwrap();
+    assert!(wait_state(&hb, |s| *s == TorrentState::Seeding, T).await);
+    assert!(std::fs::read(&a).unwrap() == payload[..3 * 65_536]);
+    sb.shutdown().await;
+    sa.shutdown().await;
 }

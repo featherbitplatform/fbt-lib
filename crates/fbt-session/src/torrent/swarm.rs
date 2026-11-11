@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
-use fbt_wire::{CryptoMethods, ExtHandshake};
+use fbt_wire::{CryptoMethods, ExtHandshake, HolepunchMsg, UT_HOLEPUNCH};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
@@ -19,26 +19,49 @@ use crate::peer::DisconnectReason;
 use crate::peer::conn::{MAX_ALLOWED_FAST, PeerCtx, PeerStream, spawn_incoming, spawn_outgoing};
 use crate::peer::ext::ExtConfig;
 use crate::peer::messages::PeerCommand;
+use crate::peer::transport::Transport;
 use crate::picker::{PeerKey, PeerPieces};
 use crate::rate::RateMeter;
-use crate::session::{dht_port_for, release, try_reserve};
+use crate::session::{HolepunchCounters, dht_port_for, release, try_reserve};
 use crate::settings::EncryptionPolicy;
 
 /// Connection attempts per address before it is given up.
 const MAX_ATTEMPTS: u32 = 3;
+/// The first retry after a fresh failure waits `peer_retry_delay` divided by
+/// this (5 s of the default 60 s); later ones wait the full delay. A peer
+/// that was merely not ready (starting, checking its files, briefly full)
+/// usually accepts a few seconds later, and a lone explicit peer must not
+/// stall a download for a minute. Transmission's first retry is 5 s too.
+const FIRST_RETRY_DIVISOR: u32 = 12;
 /// Most addresses a torrent remembers for connecting; beyond it the oldest
 /// address not in use is forgotten.
-const MAX_KNOWN: usize = 1000;
+pub(super) const MAX_KNOWN: usize = 1000;
 /// Most never-retry addresses kept; the oldest is forgotten beyond it.
-/// Also bounds the plaintext-only addresses.
+/// Also bounds the plaintext-only and TCP-only addresses and the pending
+/// transport fallbacks.
 const MAX_NEVER: usize = 1000;
+
+/// What a torrent knows about one address it may connect to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KnownPeer {
+    /// A peer listed it with the PEX `UTP` flag since it last turned out
+    /// TCP-only: it is dialled over uTP first again.
+    pub utp: bool,
+    /// The peer whose PEX message listed it last (BEP 55: the relay we ask
+    /// for a rendezvous when a connection to it fails).
+    pub pex_source: Option<PeerKey>,
+    /// That message listed it with the `HOLEPUNCH` flag.
+    pub holepunch: bool,
+    /// We asked a relay for a rendezvous with it (once per address).
+    pub rendezvous_sent: bool,
+}
 
 /// The addresses a torrent connects to (from `add_peer` and trackers),
 /// reconnected on resume. At most [`MAX_KNOWN`]; when full, the oldest
 /// address not in use makes room for a new one.
 #[derive(Debug, Default)]
 pub(super) struct Known {
-    set: HashSet<SocketAddr>,
+    set: HashMap<SocketAddr, KnownPeer>,
     /// `set` in insertion order, oldest first.
     order: VecDeque<SocketAddr>,
 }
@@ -53,7 +76,7 @@ impl Known {
         addr: SocketAddr,
         in_use: impl Fn(&SocketAddr) -> bool,
     ) -> (bool, Option<SocketAddr>) {
-        if self.set.contains(&addr) {
+        if self.set.contains_key(&addr) {
             return (true, None);
         }
         let mut evicted = None;
@@ -66,15 +89,23 @@ impl Known {
                 self.set.remove(old);
             }
         }
-        self.set.insert(addr);
+        self.set.insert(addr, KnownPeer::default());
         self.order.push_back(addr);
         (true, evicted)
     }
 
     pub(super) fn remove(&mut self, addr: &SocketAddr) {
-        if self.set.remove(addr) {
+        if self.set.remove(addr).is_some() {
             self.order.retain(|a| a != addr);
         }
+    }
+
+    pub(super) fn get(&self, addr: &SocketAddr) -> Option<&KnownPeer> {
+        self.set.get(addr)
+    }
+
+    pub(super) fn get_mut(&mut self, addr: &SocketAddr) -> Option<&mut KnownPeer> {
+        self.set.get_mut(addr)
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &SocketAddr> {
@@ -115,6 +146,18 @@ pub(super) fn keep_new_connection(
     new_outgoing == (our_id.0 < their_id.0)
 }
 
+/// What became of a connection whose handshake finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConnectOutcome {
+    /// It stays; the first connection to this peer.
+    New,
+    /// It stays and an older connection to the same peer id was closed in
+    /// its favour: the peer was already reported connected.
+    Replaced,
+    /// It was closed as a duplicate of an older connection.
+    Dropped,
+}
+
 /// What a bad-metadata ban applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BanTarget {
@@ -135,7 +178,8 @@ pub(super) enum AfterFailure {
 }
 
 /// Outgoing connection retries: failed addresses come back after `delay`
-/// (`Settings::peer_retry_delay`), at most [`MAX_ATTEMPTS`] attempts in all;
+/// (`Settings::peer_retry_delay`; the first retry of a series sooner, see
+/// [`FIRST_RETRY_DIVISOR`]), at most [`MAX_ATTEMPTS`] attempts in all;
 /// an address that turned out to be ourselves is never tried again (the
 /// last [`MAX_NEVER`] such addresses are kept).
 #[derive(Debug)]
@@ -159,6 +203,17 @@ pub(super) struct Retries {
     metadata_ips: HashSet<IpAddr>,
     /// `metadata_ips` in insertion order, to forget the oldest.
     metadata_ip_order: VecDeque<IpAddr>,
+    /// Addresses whose connect over this transport failed and which are
+    /// being retried over the other one, until that attempt ends (the last
+    /// [`MAX_NEVER`]).
+    transport_failed: HashMap<SocketAddr, Transport>,
+    /// `transport_failed` in insertion order, to forget the oldest.
+    transport_failed_order: VecDeque<SocketAddr>,
+    /// Addresses a uTP connect failed to and a TCP one then reached: dialled
+    /// over TCP first from then on (the last [`MAX_NEVER`]).
+    tcp_only: HashSet<SocketAddr>,
+    /// `tcp_only` in insertion order, to forget the oldest.
+    tcp_only_order: VecDeque<SocketAddr>,
 }
 
 impl Retries {
@@ -173,6 +228,58 @@ impl Retries {
             plaintext_order: VecDeque::new(),
             metadata_ips: HashSet::new(),
             metadata_ip_order: VecDeque::new(),
+            transport_failed: HashMap::new(),
+            transport_failed_order: VecDeque::new(),
+            tcp_only: HashSet::new(),
+            tcp_only_order: VecDeque::new(),
+        }
+    }
+
+    /// Connecting to `addr` over `t` failed. True the first time: the
+    /// address is then retried at once over the other transport (without
+    /// counting an attempt); a failure of that retry is an ordinary one.
+    pub(super) fn transport_failed(&mut self, addr: SocketAddr, t: Transport) -> bool {
+        if self.transport_failed.contains_key(&addr) {
+            return false;
+        }
+        self.transport_failed.insert(addr, t);
+        self.transport_failed_order.push_back(addr);
+        while self.transport_failed_order.len() > MAX_NEVER {
+            if let Some(old) = self.transport_failed_order.pop_front() {
+                self.transport_failed.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// The transport to retry `addr` over after a connect failure, `None`
+    /// when no such retry is due.
+    pub(super) fn fallback_transport(&self, addr: &SocketAddr) -> Option<Transport> {
+        self.transport_failed.get(addr).map(|t| t.other())
+    }
+
+    /// The fallback attempt to `addr` ended (or will not happen); the next
+    /// one starts over.
+    pub(super) fn clear_transport_failed(&mut self, addr: &SocketAddr) -> Option<Transport> {
+        let t = self.transport_failed.remove(addr)?;
+        self.transport_failed_order.retain(|a| a != addr);
+        Some(t)
+    }
+
+    /// Dial `addr` over TCP first.
+    pub(super) fn is_tcp_only(&self, addr: &SocketAddr) -> bool {
+        self.tcp_only.contains(addr)
+    }
+
+    fn mark_tcp_only(&mut self, addr: SocketAddr) {
+        if !self.tcp_only.insert(addr) {
+            return;
+        }
+        self.tcp_only_order.push_back(addr);
+        while self.tcp_only_order.len() > MAX_NEVER {
+            if let Some(old) = self.tcp_only_order.pop_front() {
+                self.tcp_only.remove(&old);
+            }
         }
     }
 
@@ -218,6 +325,7 @@ impl Retries {
     pub(super) fn never(&mut self, addr: SocketAddr) {
         self.pending.remove(&addr);
         self.attempts.remove(&addr);
+        self.clear_transport_failed(&addr);
         if !self.never.insert(addr) {
             return;
         }
@@ -240,15 +348,21 @@ impl Retries {
 
     /// An attempt failed; schedules a retry unless attempts are used up.
     pub(super) fn failed(&mut self, addr: SocketAddr, now: Instant) -> AfterFailure {
+        self.clear_transport_failed(&addr);
         if self.never.contains(&addr) {
             return AfterFailure::GiveUp;
         }
         let n = self.attempts.entry(addr).or_insert(0);
         *n = n.saturating_add(1);
         if *n < MAX_ATTEMPTS {
+            let wait = if *n == 1 {
+                self.delay / FIRST_RETRY_DIVISOR
+            } else {
+                self.delay
+            };
             // A huge delay means "not in this process's lifetime".
             let at = now
-                .checked_add(self.delay)
+                .checked_add(wait)
                 .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
             self.pending.insert(addr, at);
             AfterFailure::Retry
@@ -258,10 +372,31 @@ impl Retries {
         }
     }
 
-    /// The handshake succeeded: the attempts start over.
-    pub(super) fn connected(&mut self, addr: &SocketAddr) {
+    /// The handshake over `transport` succeeded: the attempts start over.
+    /// After a fallback, the transport that worked is remembered: a TCP
+    /// success after a failed uTP connect makes the address TCP-only (and
+    /// returns true, also when it already was), a uTP success after a
+    /// failed TCP connect makes it uTP-first again.
+    pub(super) fn connected(&mut self, addr: &SocketAddr, transport: Transport) -> bool {
         self.attempts.remove(addr);
         self.pending.remove(addr);
+        match (self.clear_transport_failed(addr), transport) {
+            (Some(Transport::Utp), Transport::Tcp) => {
+                self.mark_tcp_only(*addr);
+                true
+            }
+            (Some(Transport::Tcp), Transport::Utp) => {
+                self.unmark_tcp_only(addr);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn unmark_tcp_only(&mut self, addr: &SocketAddr) {
+        if self.tcp_only.remove(addr) {
+            self.tcp_only_order.retain(|a| a != addr);
+        }
     }
 
     /// Removes and returns the addresses whose retry time has come.
@@ -321,12 +456,23 @@ pub(super) struct Peer {
     pub from_rate: RateMeter,
     /// Payload we upload to the peer.
     pub to_rate: RateMeter,
+    /// The peer task reports our requests to it unanswered for
+    /// `snub_timeout`.
+    pub snubbed: bool,
+    /// Since when we unchoke it; `None` while choked.
+    pub unchoked_since: Option<Instant>,
+    /// Payload sent to it (`BlockSent`) since it was last unchoked.
+    pub uploaded_since_unchoke: u64,
+    /// When it last held an optimistic upload slot.
+    pub last_optimistic: Option<Instant>,
     /// The peer's latest BEP 10 extension handshake (untrusted values).
     pub ext: Option<Box<ExtHandshake>>,
     /// The listen port from that handshake (`p`).
     pub listen_port: Option<u16>,
     /// The connection is RC4-encrypted (for PEX flags).
     pub encrypted: bool,
+    /// The transport it is dialled or accepted over.
+    pub transport: Transport,
     /// When the handshake finished.
     pub connected_at: Option<Instant>,
     /// `ut_metadata` requests it sent (served up to
@@ -335,6 +481,17 @@ pub(super) struct Peer {
     /// PEX state; `Some` while PEX runs with this peer (it advertised
     /// `ut_pex`, the setting is on and the torrent is not private).
     pub pex: Option<PexPeer>,
+    /// The peer said it is upload-only (BEP 21).
+    pub upload_only: bool,
+    /// The address its `PeerConnected` named, `Some` while this
+    /// connection is the one the session reported for the peer: it then
+    /// reports its end. A tie-break that replaces a connection with a newer
+    /// one to the same peer moves it to the newer one.
+    pub reported: Option<SocketAddr>,
+    /// Dialled on a relay's BEP 55 `Connect`: a failure neither falls back
+    /// to TCP nor asks for a rendezvous, and is retried only for an address
+    /// we knew already.
+    pub holepunch: bool,
 }
 
 impl Peer {
@@ -343,6 +500,7 @@ impl Peer {
         tx: mpsc::Sender<PeerCommand>,
         generation: u64,
         num_pieces: u32,
+        transport: Transport,
     ) -> Self {
         Peer {
             addr,
@@ -366,12 +524,20 @@ impl Peer {
             demand: 0,
             from_rate: RateMeter::new(),
             to_rate: RateMeter::new(),
+            snubbed: false,
+            unchoked_since: None,
+            uploaded_since_unchoke: 0,
+            last_optimistic: None,
             ext: None,
             listen_port: None,
             encrypted: false,
+            transport,
             connected_at: None,
             metadata_requests: 0,
             pex: None,
+            upload_only: false,
+            reported: None,
+            holepunch: false,
         }
     }
 
@@ -418,6 +584,18 @@ impl Peer {
         self.fast_has.is_some() && self.allowed_fast.iter().any(|&i| self.has(i))
     }
 
+    /// Its extension handshake advertised `ut_holepunch` (BEP 55).
+    pub(super) fn supports_holepunch(&self) -> bool {
+        self.ext
+            .as_ref()
+            .is_some_and(|h| h.id_of(UT_HOLEPUNCH).is_some())
+    }
+
+    /// Connected and not closed.
+    pub(super) fn live(&self) -> bool {
+        self.connected && self.tx.is_some()
+    }
+
     /// Connected, not closed, and we do not choke it.
     pub(super) fn unchoked(&self) -> bool {
         self.connected && self.tx.is_some() && !self.am_choking
@@ -450,6 +628,10 @@ impl Actor {
             settings: Arc::clone(&self.shared.settings),
             events: self.peer_tx.clone(),
             encrypted: false,
+            transport: Transport::Tcp,
+            bandwidth: Arc::clone(&self.shared.bandwidth),
+            torrent_rate: self.rate.clone(),
+            external_ip: Arc::clone(&self.shared.external_ip),
         }
     }
 
@@ -459,14 +641,27 @@ impl Actor {
     pub(super) fn ext_config(&self, addr: &SocketAddr) -> ExtConfig {
         let meta = self.loaded.as_ref().map(|l| &l.meta);
         ExtConfig {
-            listen_port: self.shared.listen_port,
+            listen_port: self.shared.listen_port_for(addr),
             metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),
             pex: self.shared.settings.pex_enabled && !meta.is_some_and(|m| m.info.private),
             // No DHT bit or `Port` for a private torrent (a magnet's
             // privacy is unknown until its metadata: it advertises both).
             dht_port: dht_port_for(&self.shared.dht_addrs, addr).filter(|_| !self.is_private()),
             reqq: u32::try_from(self.shared.settings.max_incoming_requests).unwrap_or(u32::MAX),
+            upload_only: self.upload_only_sent,
+            holepunch: self.holepunch_active(),
         }
+    }
+
+    /// BEP 55 holepunch runs: enabled, uTP on in both directions with a
+    /// socket to use, and the torrent not (known to be) private.
+    pub(super) fn holepunch_active(&self) -> bool {
+        let s = &self.shared.settings;
+        s.enable_holepunch
+            && s.enable_outgoing_utp
+            && s.enable_incoming_utp
+            && !self.shared.utp.is_empty()
+            && !self.is_private()
     }
 
     pub(super) fn new_key(&mut self) -> PeerKey {
@@ -488,6 +683,10 @@ impl Actor {
     /// retry, already connected or already queued.
     pub(super) fn queue_addr(&mut self, addr: SocketAddr) {
         if self.retries.is_never(&addr) || self.retries.is_pending(&addr) {
+            return;
+        }
+        // Finished: a seed has nothing to trade (BEP 21).
+        if self.upload_only_sent && self.seed_addrs.contains(&addr) {
             return;
         }
         if !self.addr_busy(&addr) && !self.candidates.contains(&addr) {
@@ -527,42 +726,171 @@ impl Actor {
         }
     }
 
+    /// Takes a peer slot, a global one and a half-open one for an outgoing
+    /// connection; false (nothing taken) when a limit is reached.
+    fn reserve_dial(&self) -> bool {
+        let s = &self.shared.settings;
+        if self.peers.len() >= s.max_peers_per_torrent {
+            return false;
+        }
+        if !try_reserve(&self.shared.global_peers, s.max_peers_global) {
+            return false;
+        }
+        if !try_reserve(&self.shared.half_open, s.max_half_open) {
+            release(&self.shared.global_peers);
+            return false;
+        }
+        true
+    }
+
+    /// Gives back what [`reserve_dial`](Self::reserve_dial) took.
+    fn unreserve_dial(&self) {
+        release(&self.shared.half_open);
+        release(&self.shared.global_peers);
+    }
+
+    /// Dials `addr` over `transport` in slots already reserved.
+    fn spawn_dial(&mut self, addr: SocketAddr, transport: Transport) -> PeerKey {
+        let utp = match transport {
+            Transport::Utp => self.shared.utp_for(&addr).cloned(),
+            Transport::Tcp => None,
+        };
+        let key = self.new_key();
+        let ctx = self.ctx(key, &addr);
+        let have = ctx.have.clone();
+        let num_pieces = ctx.have.len();
+        let tx = spawn_outgoing(addr, ctx, self.mse_provide(&addr), transport, utp);
+        let mut peer = Peer::new(addr, tx, self.generation, num_pieces, transport);
+        peer.outgoing = true;
+        peer.connecting = true;
+        peer.have_sent = Some(have);
+        self.peers.insert(key, peer);
+        key
+    }
+
     /// Starts outgoing connections while every limit allows.
     pub(super) fn try_connect(&mut self) {
-        let s = Arc::clone(&self.shared.settings);
         while self.connectable() && !self.candidates.is_empty() {
-            if self.peers.len() >= s.max_peers_per_torrent {
-                break;
-            }
-            if !try_reserve(&self.shared.global_peers, s.max_peers_global) {
-                break;
-            }
-            if !try_reserve(&self.shared.half_open, s.max_half_open) {
-                release(&self.shared.global_peers);
+            if !self.reserve_dial() {
                 break;
             }
             let Some(addr) = self.candidates.pop_front() else {
-                release(&self.shared.half_open);
-                release(&self.shared.global_peers);
+                self.unreserve_dial();
                 break;
             };
             // It may have connected (or connected to us) since it was
             // queued; an IP that sent bad metadata waits for the metadata.
             if self.addr_busy(&addr) || self.metadata_ip_banned(&addr) {
-                release(&self.shared.half_open);
-                release(&self.shared.global_peers);
+                // A fallback queued for it is not dialled now: forget it.
+                self.retries.clear_transport_failed(&addr);
+                self.unreserve_dial();
                 continue;
             }
-            let key = self.new_key();
-            let ctx = self.ctx(key, &addr);
-            let have = ctx.have.clone();
-            let num_pieces = ctx.have.len();
-            let tx = spawn_outgoing(addr, ctx, self.mse_provide(&addr));
-            let mut peer = Peer::new(addr, tx, self.generation, num_pieces);
-            peer.outgoing = true;
-            peer.connecting = true;
-            peer.have_sent = Some(have);
-            self.peers.insert(key, peer);
+            // A pending fallback goes first; otherwise the transport the
+            // settings and what we know of the address prefer.
+            let transport = self
+                .retries
+                .fallback_transport(&addr)
+                .or_else(|| self.first_transport(&addr));
+            let Some(transport) = transport else {
+                debug!(%addr, "no enabled transport can reach this address");
+                self.unreserve_dial();
+                continue;
+            };
+            self.spawn_dial(addr, transport);
+        }
+    }
+
+    /// A relay told us to connect to `addr` (BEP 55 `Connect`): dialled
+    /// over uTP at once, ahead of the queue and any retry wait, unless it
+    /// is connected or being dialled already, a seed we turned away while
+    /// finished, or a limit is reached. Only this one attempt: see
+    /// [`Peer::holepunch`]. Returns whether it dialled.
+    pub(super) fn dial_holepunch(&mut self, addr: SocketAddr) -> bool {
+        if !self.connectable()
+            || self.retries.is_never(&addr)
+            || (self.upload_only_sent && self.seed_addrs.contains(&addr))
+            || self.addr_busy(&addr)
+            || self.metadata_ip_banned(&addr)
+            || !self.transport_usable(&addr, Transport::Utp)
+        {
+            return false;
+        }
+        if !self.reserve_dial() {
+            debug!(%addr, "no connection slot for a holepunch dial");
+            return false;
+        }
+        debug!(%addr, "holepunch: dialling over uTP");
+        let key = self.spawn_dial(addr, Transport::Utp);
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.holepunch = true;
+        }
+        true
+    }
+
+    /// An outgoing connection to `addr` failed at connect over every
+    /// transport we may use: if PEX listed it with the `HOLEPUNCH` flag and
+    /// that source is still connected and speaks `ut_holepunch`, it is
+    /// asked for a rendezvous (once per address).
+    fn request_rendezvous(&mut self, addr: SocketAddr) {
+        if !self.holepunch_active() {
+            return;
+        }
+        let Some(k) = self.known.get(&addr) else {
+            return;
+        };
+        if !k.holepunch || k.rendezvous_sent {
+            return;
+        }
+        let Some(relay) = k.pex_source else {
+            return;
+        };
+        if !self
+            .peers
+            .get(&relay)
+            .is_some_and(|p| p.live() && p.supports_holepunch())
+        {
+            return;
+        }
+        if !self.hp_pending.insert(addr, relay, Instant::now()) {
+            debug!(%addr, "too many rendezvous requests pending; not asking");
+            return;
+        }
+        if let Some(k) = self.known.get_mut(&addr) {
+            k.rendezvous_sent = true;
+        }
+        debug!(%addr, relay = relay.0, "connect failed; asking for a rendezvous");
+        if self.send(
+            relay,
+            PeerCommand::SendHolepunch(HolepunchMsg::Rendezvous(addr)),
+        ) {
+            HolepunchCounters::bump(&self.shared.holepunch.rendezvous_sent);
+        }
+    }
+
+    /// The transport to dial `addr` over first: uTP when outgoing uTP is
+    /// on, a UDP socket of the address's family exists and the address is
+    /// not TCP-only (or a PEX `UTP` flag came for it since); otherwise TCP
+    /// when outgoing TCP is on. `None` when neither can reach it.
+    pub(super) fn first_transport(&self, addr: &SocketAddr) -> Option<Transport> {
+        let tcp_only =
+            self.retries.is_tcp_only(addr) && !self.known.get(addr).is_some_and(|k| k.utp);
+        if self.transport_usable(addr, Transport::Utp) && !tcp_only {
+            Some(Transport::Utp)
+        } else if self.transport_usable(addr, Transport::Tcp) {
+            Some(Transport::Tcp)
+        } else {
+            None
+        }
+    }
+
+    /// `t` is enabled for outgoing connections and, for uTP, a socket of
+    /// `addr`'s family exists.
+    fn transport_usable(&self, addr: &SocketAddr, t: Transport) -> bool {
+        let s = &self.shared.settings;
+        match t {
+            Transport::Tcp => s.enable_outgoing_tcp,
+            Transport::Utp => s.enable_outgoing_utp && self.shared.utp_for(addr).is_some(),
         }
     }
 
@@ -607,10 +935,12 @@ impl Actor {
         let key = self.new_key();
         let mut ctx = self.ctx(key, &addr);
         ctx.encrypted = stream.is_encrypted();
+        ctx.transport = stream.get_ref().kind();
+        let transport = ctx.transport;
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();
         let tx = spawn_incoming(stream, hs, addr, ctx);
-        let mut peer = Peer::new(addr, tx, self.generation, num_pieces);
+        let mut peer = Peer::new(addr, tx, self.generation, num_pieces, transport);
         peer.have_sent = Some(have);
         self.peers.insert(key, peer);
     }
@@ -629,6 +959,7 @@ impl Actor {
                 false
             }
             Err(TrySendError::Closed(_)) => {
+                self.on_peer_set_changed();
                 if let Some(p) = self.peers.get_mut(&key) {
                     p.tx = None;
                 }
@@ -637,9 +968,22 @@ impl Actor {
         }
     }
 
+    /// Sends an optional command only while the peer's queue has room to
+    /// spare (a whole file of `DontHave`s must not fill it: a full queue
+    /// closes the peer as stalled). Returns false when it was left out.
+    pub(super) fn send_lossy(&mut self, key: PeerKey, cmd: PeerCommand) -> bool {
+        let room = self
+            .peers
+            .get(&key)
+            .and_then(|p| p.tx.as_ref())
+            .is_some_and(|tx| tx.capacity() > 32);
+        room && self.send(key, cmd)
+    }
+
     /// Closes a peer: it stays until its `Disconnected` event, but its
     /// requests return to the picker now.
     pub(super) fn close_peer(&mut self, key: PeerKey) {
+        self.on_peer_set_changed();
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
@@ -665,15 +1009,17 @@ impl Actor {
     }
 
     /// Bookkeeping for a finished handshake: slots, retries and the
-    /// duplicate peer-id guard. Returns whether the connection stays; the
-    /// caller then catches it up on our pieces.
+    /// duplicate peer-id guard. Says whether the connection stays (the
+    /// caller then catches it up on our pieces) and whether it took over
+    /// from an older connection to the same peer.
     pub(super) fn on_connected(
         &mut self,
         key: PeerKey,
         peer_id: PeerId,
         addr: SocketAddr,
         encrypted: bool,
-    ) -> bool {
+        transport: Transport,
+    ) -> ConnectOutcome {
         let duplicate = self
             .peers
             .iter()
@@ -681,8 +1027,9 @@ impl Actor {
                 **k != key && o.connected && o.tx.is_some() && o.peer_id == Some(peer_id)
             })
             .map(|(k, o)| (*k, o.outgoing));
+        self.on_peer_set_changed();
         let Some(p) = self.peers.get_mut(&key) else {
-            return false;
+            return ConnectOutcome::Dropped;
         };
         if p.connecting {
             p.connecting = false;
@@ -692,34 +1039,54 @@ impl Actor {
         p.connected_at = Some(Instant::now());
         p.peer_id = Some(peer_id);
         p.encrypted = encrypted;
-        if p.outgoing {
-            self.retries.connected(&p.addr);
+        p.transport = transport;
+        if p.outgoing && self.retries.connected(&p.addr, transport) {
+            // TCP-only now; an older PEX `UTP` flag no longer counts.
+            if let Some(k) = self.known.get_mut(&p.addr) {
+                k.utp = false;
+            }
         }
         let Some((old, old_outgoing)) = duplicate else {
-            return true;
+            return ConnectOutcome::New;
         };
-        // Already connected to this peer: both dialled each other, or it
+        // Already connected to this peer: both dialled each other (a
+        // simultaneous dial, or both ends of a holepunch), or it
         // reconnected. Both ends agree on which connection stays.
         let keep_new =
             keep_new_connection(&self.shared.peer_id, &peer_id, p.outgoing, old_outgoing);
-        let (loser, survives) = if keep_new { (old, true) } else { (key, false) };
         debug!(%addr, keep_new, "duplicate peer id; closing one connection");
+        let (loser, outcome) = if keep_new {
+            (old, ConnectOutcome::Replaced)
+        } else {
+            (key, ConnectOutcome::Dropped)
+        };
         if let Some(l) = self.peers.get_mut(&loser) {
             l.close_reason = Some(DisconnectReason::Duplicate);
         }
+        if keep_new {
+            // The peer stays connected through the new connection, which
+            // reports its end from now on.
+            let reported = self.peers.get_mut(&old).and_then(|o| o.reported.take());
+            if let Some(n) = self.peers.get_mut(&key) {
+                n.reported = reported;
+            }
+        }
         self.close_peer(loser);
-        survives
+        outcome
     }
 
     /// Bookkeeping for a closed connection: slots, retries and the known
-    /// addresses. Returns the peer and the reason to report, or `None` for
-    /// an unknown key.
+    /// addresses. `connect_failed` names the transport an outgoing connect
+    /// failed over. Returns the peer and the reason to report, or `None`
+    /// for an unknown key.
     pub(super) fn on_disconnected(
         &mut self,
         key: PeerKey,
         reason: DisconnectReason,
+        connect_failed: Option<Transport>,
     ) -> Option<(Peer, DisconnectReason)> {
         let mut p = self.peers.remove(&key)?;
+        self.on_peer_set_changed();
         let reason = match p.close_reason.take() {
             Some(ours) if reason == DisconnectReason::Shutdown => ours,
             _ => reason,
@@ -728,7 +1095,19 @@ impl Actor {
             release(&self.shared.half_open);
         }
         release(&self.shared.global_peers);
-        if reason == DisconnectReason::SelfConnection {
+        if p.holepunch && p.outgoing && !p.connected {
+            // A relay's introduction that did not work out. The address
+            // came from a remote: no fallback, no rendezvous, and retries
+            // only for an address we knew before (never from a `Connect`
+            // alone).
+            if reason != DisconnectReason::Shutdown
+                && self.known.get(&p.addr).is_some()
+                && self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp
+            {
+                self.known.remove(&p.addr);
+                self.candidates.retain(|a| *a != p.addr);
+            }
+        } else if reason == DisconnectReason::SelfConnection {
             self.retries.never(p.addr);
             self.known.remove(&p.addr);
             self.candidates.retain(|a| *a != p.addr);
@@ -742,13 +1121,46 @@ impl Actor {
             // at once, in plaintext, without counting an attempt.
             debug!(addr = %p.addr, "MSE handshake failed; retrying in plaintext");
             self.queue_addr(p.addr);
-        } else if p.outgoing && !p.connected && reason != DisconnectReason::Shutdown {
+        } else if let Some(t) = connect_failed.filter(|_| p.outgoing && !p.connected)
+            && self.transport_usable(&p.addr, t.other())
+            && self.retries.transport_failed(p.addr, t)
+        {
+            // The first connect failure on this transport: dial the other
+            // one at once, without counting an attempt.
+            debug!(addr = %p.addr, failed = ?t, "connect failed; retrying over the other transport");
+            self.queue_addr(p.addr);
+        } else if p.outgoing && !p.connected && reason == DisconnectReason::Shutdown {
+            // We closed the attempt: a fallback it was does not carry over.
+            self.retries.clear_transport_failed(&p.addr);
+        } else if p.outgoing && !p.connected {
+            // Failed at connect with no other transport left to try: a
+            // relay may still introduce us (before a give-up forgets it).
+            if connect_failed.is_some() {
+                self.request_rendezvous(p.addr);
+            }
             // The connection or handshake failed (we did not close it).
             if self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp {
                 // Forgotten: `requeue_known` must not dial it again.
                 self.known.remove(&p.addr);
                 self.candidates.retain(|a| *a != p.addr);
             }
+        } else if p.outgoing
+            && p.connected
+            && matches!(
+                reason,
+                DisconnectReason::IdleTimeout | DisconnectReason::Io(_) | DisconnectReason::Closed
+            )
+            && (p.from_rate.total() > 0 || p.to_rate.total() > 0)
+        {
+            // A peer that traded data and then went away (it closed, its
+            // transport timed out, or it went idle): dialled again as the
+            // first retry of a series, a twelfth of `peer_retry_delay`.
+            // Otherwise only a tracker or PEX naming it again would, and a
+            // lone seed lost mid-download stalls it for an announce
+            // interval. One that never traded data is left alone, so a peer
+            // that accepts and hangs up cannot keep us dialling it.
+            debug!(addr = %p.addr, "productive peer dropped; redialling soon");
+            self.retries.failed(p.addr, Instant::now());
         }
         match &reason {
             DisconnectReason::Protocol(msg) => {
@@ -761,7 +1173,7 @@ impl Actor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -791,7 +1203,14 @@ mod tests {
         let mut attempts = 1;
         while r.failed(a, Instant::now()) == AfterFailure::Retry {
             assert!(r.is_pending(&a));
-            tokio::time::advance(DELAY - Duration::from_secs(1)).await;
+            // The first retry comes after 5 s of the 60 s, the next after
+            // all of it.
+            let wait = if attempts == 1 {
+                Duration::from_secs(5)
+            } else {
+                DELAY
+            };
+            tokio::time::advance(wait - Duration::from_secs(1)).await;
             assert!(r.due(Instant::now()).is_empty(), "not before the delay");
             tokio::time::advance(Duration::from_secs(1)).await;
             assert_eq!(r.due(Instant::now()), vec![a]);
@@ -813,7 +1232,7 @@ mod tests {
         let mut r = Retries::new(DELAY);
         r.failed(a, Instant::now());
         r.failed(a, Instant::now());
-        r.connected(&a);
+        r.connected(&a, Transport::Tcp);
         assert!(!r.is_pending(&a) && r.attempts.is_empty());
         // A fresh series: two more failures still schedule retries.
         assert_eq!(r.failed(a, Instant::now()), AfterFailure::Retry);
@@ -873,6 +1292,246 @@ mod tests {
         assert_eq!(r.plaintext_order.len(), MAX_NEVER);
         assert!(!r.is_plaintext_only(&a), "the oldest is forgotten");
         assert!(r.is_plaintext_only(&addr(MAX_NEVER as u32 + 11)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_fallback_is_due_once_per_attempt_and_bounded() {
+        let a = addr(1);
+        let mut r = Retries::new(DELAY);
+        assert_eq!(r.fallback_transport(&a), None);
+        assert!(r.transport_failed(a, Transport::Utp), "first uTP failure");
+        assert_eq!(r.fallback_transport(&a), Some(Transport::Tcp));
+        // The TCP fallback failing too is an ordinary failure.
+        assert!(!r.transport_failed(a, Transport::Tcp));
+        assert!(r.attempts.is_empty() && !r.is_pending(&a), "no attempt yet");
+        assert_eq!(r.failed(a, Instant::now()), AfterFailure::Retry);
+        // The next attempt starts over: uTP first, one fallback again.
+        assert_eq!(r.fallback_transport(&a), None);
+        assert!(r.transport_failed(a, Transport::Utp));
+        // uTP failed and TCP got through: TCP-only from then on.
+        assert!(r.connected(&a, Transport::Tcp));
+        assert!(r.is_tcp_only(&a) && r.fallback_transport(&a).is_none());
+        // A second fallback the same way (a PEX `UTP` flag made uTP first
+        // again) reports TCP-only again, so the flag is cleared again.
+        assert!(r.transport_failed(a, Transport::Utp));
+        assert!(
+            r.connected(&a, Transport::Tcp),
+            "already TCP-only: still true"
+        );
+        assert!(r.is_tcp_only(&a));
+        // TCP failing and the uTP fallback working: uTP first again.
+        assert!(r.transport_failed(a, Transport::Tcp));
+        assert_eq!(r.fallback_transport(&a), Some(Transport::Utp));
+        assert!(!r.connected(&a, Transport::Utp));
+        assert!(!r.is_tcp_only(&a) && !r.tcp_only_order.contains(&a));
+        // A plain success marks nothing.
+        let b = addr(2);
+        assert!(!r.connected(&b, Transport::Tcp) && !r.is_tcp_only(&b));
+        // A cleared fallback (skipped, or closed by us) is not dialled.
+        assert!(r.transport_failed(b, Transport::Utp));
+        assert_eq!(r.clear_transport_failed(&b), Some(Transport::Utp));
+        assert_eq!(r.fallback_transport(&b), None);
+        assert!(!r.connected(&b, Transport::Tcp) && !r.is_tcp_only(&b));
+        for i in 10..(MAX_NEVER as u32 + 20) {
+            r.transport_failed(addr(i), Transport::Utp);
+            r.connected(&addr(i), Transport::Tcp);
+            r.transport_failed(addr(i + 100_000), Transport::Utp);
+        }
+        assert_eq!(r.tcp_only.len(), MAX_NEVER);
+        assert_eq!(r.tcp_only_order.len(), MAX_NEVER);
+        assert!(!r.is_tcp_only(&addr(10)), "the oldest is forgotten");
+        assert!(r.transport_failed.len() <= MAX_NEVER);
+        assert_eq!(r.transport_failed.len(), r.transport_failed_order.len());
+    }
+
+    /// An actor for a one-piece torrent, with nothing connected.
+    pub(in crate::torrent) fn actor() -> Actor {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::{OnceLock, Weak};
+
+        use fbt_metainfo::Metainfo;
+        use fbt_tracker::TrackerClient;
+        use tokio::sync::{broadcast, watch};
+
+        use crate::session::{AddTorrent, Shared};
+        use crate::settings::Settings;
+        use crate::status::TorrentStatus;
+
+        let mut bytes =
+            b"d4:infod6:lengthi16384e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bytes.extend_from_slice(&[0u8; 20]);
+        bytes.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+        let settings = Settings {
+            dht_enabled: false,
+            dht_bootstrap_nodes: Vec::new(),
+            ..Settings::default()
+        };
+        let tracker = TrackerClient::new(settings.tracker.clone()).expect("tracker client");
+        let shared = Arc::new(Shared {
+            settings: Arc::new(settings),
+            peer_id: PeerId::generate(),
+            listen_port: 6881,
+            listen_port_v4: Some(6881),
+            listen_port_v6: None,
+            tracker,
+            events: broadcast::channel(64).0,
+            shutdown: AtomicBool::new(false),
+            global_peers: AtomicUsize::new(0),
+            half_open: AtomicUsize::new(0),
+            dht: None,
+            dht_addrs: Vec::new(),
+            utp: Vec::new(),
+            disk: crate::disk::DiskPool::new(1, 1),
+            cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
+            bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
+            holepunch: Default::default(),
+            lsd: crate::net::LsdHub::disabled(),
+            portmap: None,
+            external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
+        });
+        let add = AddTorrent::new(meta, PathBuf::from("unused"));
+        let ih = add.source.info_hashes();
+        let (status_tx, _) = watch::channel(TorrentStatus::initial(ih, "a".into(), true));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        Actor::new(
+            add,
+            None,
+            Arc::new(OnceLock::new()),
+            shared,
+            Weak::new(),
+            cmd_rx,
+            status_tx,
+        )
+    }
+
+    /// A TCP connection that got through after a failed uTP connect clears
+    /// the address's PEX `UTP` flag every time, also when it was TCP-only
+    /// already, so the flag never leaves it uTP-first for good.
+    #[tokio::test]
+    async fn tcp_success_after_utp_failure_clears_the_pex_utp_flag() {
+        let mut a = actor();
+        let peer_addr = addr(1);
+        assert!(a.remember(peer_addr));
+        for round in 0..2 {
+            // A PEX `UTP` flag came in (again).
+            a.known.get_mut(&peer_addr).expect("known").utp = true;
+            assert!(a.retries.transport_failed(peer_addr, Transport::Utp));
+            let key = a.new_key();
+            let (tx, _rx) = mpsc::channel(4);
+            let mut p = Peer::new(peer_addr, tx, a.generation, 1, Transport::Tcp);
+            p.outgoing = true;
+            a.peers.insert(key, p);
+            assert_eq!(
+                a.on_connected(
+                    key,
+                    PeerId([round + 1; 20]),
+                    peer_addr,
+                    false,
+                    Transport::Tcp
+                ),
+                ConnectOutcome::New
+            );
+            assert!(a.retries.is_tcp_only(&peer_addr), "round {round}");
+            assert!(
+                !a.known.get(&peer_addr).expect("known").utp,
+                "round {round}"
+            );
+            a.peers.remove(&key);
+        }
+    }
+
+    /// A failed holepunch dial to an address we never knew (it came only
+    /// in a relay's `Connect`) leaves nothing behind: no fallback, no retry,
+    /// nothing queued. One to a known address is an ordinary failure, still
+    /// without a fallback.
+    #[tokio::test]
+    async fn failed_holepunch_dial_never_feeds_retries() {
+        let mut a = actor();
+        let stranger = addr(1);
+        let known = addr(2);
+        assert!(a.remember(known));
+        for target in [stranger, known] {
+            let key = a.new_key();
+            let (tx, _rx) = mpsc::channel(4);
+            let mut p = Peer::new(target, tx, a.generation, 1, Transport::Utp);
+            p.outgoing = true;
+            p.holepunch = true;
+            a.peers.insert(key, p);
+            a.on_disconnected(
+                key,
+                DisconnectReason::Io("connect timed out".into()),
+                Some(Transport::Utp),
+            );
+        }
+        assert!(!a.retries.is_pending(&stranger));
+        assert_eq!(a.retries.fallback_transport(&stranger), None);
+        assert!(a.known.get(&stranger).is_none());
+        assert!(a.candidates.is_empty(), "nothing queued");
+        assert!(a.retries.is_pending(&known), "a known address retries");
+        assert_eq!(a.retries.fallback_transport(&known), None, "no fallback");
+    }
+
+    /// `PeerDisconnected` stays paired with `PeerConnected`: an attempt
+    /// that never got through (a holepunch dial losing the race) says
+    /// nothing while another connection to that address is the reported
+    /// one; that one reports its own end, and a failed attempt to an
+    /// address nobody reported still reports its failure.
+    #[tokio::test]
+    async fn failed_attempt_to_a_reported_address_stays_silent() {
+        use crate::event::Event;
+        use crate::peer::messages::PeerEvent;
+        use crate::torrent::actor::EMITTED;
+
+        let disconnects = || -> Vec<(SocketAddr, DisconnectReason)> {
+            EMITTED
+                .take()
+                .into_iter()
+                .filter_map(|(e, _)| match e {
+                    Event::PeerDisconnected { addr, reason, .. } => Some((addr, reason)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let gone = |key: PeerKey, reason: DisconnectReason, failed: Option<Transport>| {
+            PeerEvent::Disconnected {
+                key,
+                reason,
+                outstanding: Vec::new(),
+                connect_failed: failed,
+            }
+        };
+        let timeout = DisconnectReason::Io("uTP connect timed out".into());
+        let mut a = actor();
+        let c = addr(1);
+        let (tx, _rx1) = mpsc::channel(4);
+        let live = a.new_key();
+        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        p.connected = true;
+        p.reported = Some(c);
+        a.peers.insert(live, p);
+        let (tx, _rx2) = mpsc::channel(4);
+        let attempt = a.new_key();
+        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        p.outgoing = true;
+        p.holepunch = true;
+        a.peers.insert(attempt, p);
+        EMITTED.take();
+
+        a.on_peer_event(gone(attempt, timeout.clone(), Some(Transport::Utp)));
+        assert_eq!(disconnects(), vec![], "the losing attempt is silent");
+        a.on_peer_event(gone(live, DisconnectReason::Closed, None));
+        assert_eq!(disconnects(), vec![(c, DisconnectReason::Closed)]);
+
+        // Nobody reported for the address: the failure is reported.
+        let (tx, _rx3) = mpsc::channel(4);
+        let lone = a.new_key();
+        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        p.outgoing = true;
+        a.peers.insert(lone, p);
+        a.on_peer_event(gone(lone, timeout.clone(), Some(Transport::Utp)));
+        assert_eq!(disconnects(), vec![(c, timeout)]);
     }
 
     #[test]

@@ -1,9 +1,14 @@
 //! MSE/PE handshake: in-memory initiator <-> responder runs.
 
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use fbt_wire::mse_fuzzing::{initiate_fixed, respond_fixed};
 use fbt_wire::{
     CryptoMethods, MseError, MseStream, initiate, is_plaintext_handshake_prefix, req2_hash, respond,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -227,4 +232,96 @@ async fn plaintext_stream_serves_prefix_first() {
     let mut buf = [0; 7];
     s.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"prerest");
+}
+
+/// Records every byte written through it.
+struct Recording<S> {
+    inner: S,
+    sent: Arc<Mutex<Vec<u8>>>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Recording<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Recording<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &r {
+            self.sent
+                .lock()
+                .unwrap()
+                .extend_from_slice(buf.get(..*n).unwrap_or_default());
+        }
+        r
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// One fixed-key run; returns (initiator transcript, responder transcript).
+async fn fixed_run() -> (Vec<u8>, Vec<u8>) {
+    let (a, b) = tokio::io::duplex(8192);
+    let (sa, sb) = (
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let a = Recording {
+        inner: a,
+        sent: sa.clone(),
+    };
+    let b = Recording {
+        inner: b,
+        sent: sb.clone(),
+    };
+    let ih = [0xaa; 20];
+    let l = lookup_for(ih);
+    let (i, r) = tokio::join!(
+        initiate_fixed(a, &ih, CryptoMethods::RC4, b"hello", [7; 20], 0),
+        respond_fixed(b, Vec::new(), &l, CryptoMethods::all(), [9; 20], 0)
+    );
+    let (mut i, (mut r, skey)) = (i.unwrap(), r.unwrap());
+    assert_eq!(skey, ih);
+    assert!(i.is_encrypted() && r.is_encrypted());
+    let mut buf = [0; 5];
+    r.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello");
+    r.write_all(b"world").await.unwrap();
+    r.flush().await.unwrap();
+    i.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"world");
+    let ti = sa.lock().unwrap().clone();
+    let tr = sb.lock().unwrap().clone();
+    (ti, tr)
+}
+
+#[tokio::test]
+async fn fixed_keys_are_deterministic() {
+    let (first_i, first_r) = fixed_run().await;
+    let (second_i, second_r) = fixed_run().await;
+    assert_eq!(first_i, second_i);
+    assert_eq!(first_r, second_r);
+    // Ya (96) + req1/req2 (40) + VC, provide, padC len, IA len, IA (16 + 5).
+    assert_eq!(first_i.len(), 96 + 40 + 16 + 5);
+    // Seeds for the fuzz crate's `mse` target.
+    if let Some(dir) = std::env::var_os("FBT_MSE_SEED_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("initiator-transcript.bin"), &first_i).unwrap();
+        std::fs::write(dir.join("responder-transcript.bin"), &first_r).unwrap();
+    }
 }

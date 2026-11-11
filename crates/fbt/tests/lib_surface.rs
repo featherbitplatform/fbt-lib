@@ -5,11 +5,15 @@
 use fbt::{
     AddTorrent, Bitfield, BitfieldError, BlockRef, DEFAULT_DHT_BOOTSTRAP, DecodeError, DhtStats,
     DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, FileEntry, FileLayout,
-    FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2, InfoHashes, LayoutError, MAX_METADATA_SIZE,
-    Magnet, MagnetError, MemStorage, Metainfo, MetainfoError, ParseInfoHashError, PeerId,
-    PeerSource, PieceLayout, Priority, RelPath, RemoveMode, Session, SessionError, Settings,
-    Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus, TrackerConfig,
-    TrackerError,
+    FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2, InfoHashes, LayoutError, ListenError,
+    MAX_METADATA_SIZE, Magnet, MagnetError, MemStorage, Metainfo, MetainfoError,
+    ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority, RelPath, RemoveMode, Session,
+    SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
+    TrackerConfig, TrackerError, Transport,
+};
+use fbt::{
+    CacheStats, ChokingAlgorithm, ExternalIpSource, MapMethod, MapProtocol, MixedMode,
+    PeerClassLimits, RateLimit, SeedChokingAlgorithm, StorageError,
 };
 
 fn names(
@@ -18,6 +22,7 @@ fn names(
     _: Option<BlockRef>,
     _: Option<FileSlice>,
     _: Option<LayoutError>,
+    _: Option<ListenError>,
     _: Option<BitfieldError>,
     _: Option<DecodeError>,
     _: Option<DisconnectReason>,
@@ -54,12 +59,44 @@ fn names(
     _: Option<TorrentStatus>,
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
+    _: Option<Transport>,
+    _: Option<StorageError>,
+    _: Option<RateLimit>,
+    _: Option<PeerClassLimits>,
+    _: Option<MixedMode>,
+    _: Option<ChokingAlgorithm>,
+    _: Option<SeedChokingAlgorithm>,
+    _: Option<CacheStats>,
+    _: Option<MapProtocol>,
+    _: Option<MapMethod>,
+    _: Option<ExternalIpSource>,
     _: Option<&dyn Storage>,
 ) {
+}
+
+/// The fields `PeerConnected` carries.
+fn peer_connected(e: &Event) -> Option<(std::net::SocketAddr, Transport, bool)> {
+    match e {
+        Event::PeerConnected {
+            addr,
+            transport,
+            encrypted,
+            ..
+        } => Some((*addr, *transport, *encrypted)),
+        _ => None,
+    }
 }
 
 #[test]
 fn surface_compiles() {
     let _: [&str; 3] = DEFAULT_DHT_BOOTSTRAP;
     let _: usize = MAX_METADATA_SIZE;
+    let _ = [Transport::Tcp, Transport::Utp];
+    let s = Settings::default();
+    let _: [bool; 4] = [
+        s.enable_outgoing_tcp,
+        s.enable_incoming_tcp,
+        s.enable_outgoing_utp,
+        s.enable_incoming_utp,
+    ];
 }

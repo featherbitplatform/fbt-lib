@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use fbt_core::{Bitfield, BlockRef, PeerId, PieceLayout};
-use fbt_wire::{ExtHandshake, MetadataMsg, PexMsg, Reserved};
+use fbt_wire::{ExtHandshake, HolepunchMsg, MetadataMsg, PexMsg, Reserved};
 
 use super::ext::ExtConfig;
+use super::transport::Transport;
 use crate::picker::PeerKey;
 
 /// Why a peer connection ended.
@@ -32,12 +33,16 @@ pub enum DisconnectReason {
     /// We closed the connection (`PeerCommand::Close` or the torrent went away).
     Shutdown,
     /// We closed it because the same peer id is already connected to the
-    /// torrent; the older connection stays.
+    /// torrent and the tie-break kept the other connection. Not reported in
+    /// events: the peer stays connected through the other one.
     Duplicate,
     /// The peer advertised an unacceptable metadata size or sent metadata
     /// that is inconsistent or fails the info-hash check; it is never
     /// dialled again.
     BadMetadata,
+    /// We are finished and the peer is a seed or upload-only (BEP 21):
+    /// neither side has anything to gain.
+    UploadOnly,
 }
 
 /// The pieces a remote announced, owned.
@@ -62,6 +67,8 @@ pub(crate) enum PeerEvent {
         addr: SocketAddr,
         /// RC4-encrypted (MSE); false for plaintext, MSE-negotiated or not.
         encrypted: bool,
+        /// The transport the connection runs over.
+        transport: Transport,
     },
     /// The remote's initial piece set.
     Pieces {
@@ -70,6 +77,12 @@ pub(crate) enum PeerEvent {
     },
     /// The remote completed a piece (index already range-checked).
     Have { key: PeerKey, piece: u32 },
+    /// The remote retracted a piece (BEP 54 `lt_donthave`; index already
+    /// range-checked).
+    DontHave { key: PeerKey, piece: u32 },
+    /// The remote is upload-only (BEP 21), from its extension handshake or
+    /// an `upload_only` message.
+    UploadOnly { key: PeerKey, on: bool },
     /// The remote choked us.
     Choked { key: PeerKey },
     /// The remote unchoked us.
@@ -90,8 +103,19 @@ pub(crate) enum PeerEvent {
     AllowedFast { key: PeerKey, piece: u32 },
     /// The pipeline has room for this many more requests.
     WantBlocks { key: PeerKey, count: usize },
+    /// The remote left our requests unanswered for `snub_timeout`
+    /// (`snubbed: true`), or a block arrived after that (`false`); sent on
+    /// every change.
+    Snubbed { key: PeerKey, snubbed: bool },
     /// The remote requests a block (not validated).
     Request { key: PeerKey, block: BlockRef },
+    /// A `Piece` message answering the remote's request for `block` was
+    /// written and flushed: `len` payload bytes uploaded.
+    BlockSent {
+        key: PeerKey,
+        block: BlockRef,
+        len: u64,
+    },
     /// The remote cancels an earlier request.
     Cancel { key: PeerKey, block: BlockRef },
     /// Payload bytes dropped because they matched no outstanding request.
@@ -105,6 +129,8 @@ pub(crate) enum PeerEvent {
     Metadata { key: PeerKey, msg: MetadataMsg },
     /// A BEP 11 `ut_pex` message.
     Pex { key: PeerKey, msg: PexMsg },
+    /// A BEP 55 `ut_holepunch` message (only while we advertise it).
+    Holepunch { key: PeerKey, msg: HolepunchMsg },
     /// The remote's DHT port (BEP 5 `Port`), at most once per connection.
     DhtPort { key: PeerKey, port: u16 },
     /// The connection ended; `outstanding` lists requests never satisfied.
@@ -112,6 +138,11 @@ pub(crate) enum PeerEvent {
         key: PeerKey,
         reason: DisconnectReason,
         outstanding: Vec<BlockRef>,
+        /// An outgoing connection could not be made over this transport
+        /// (TCP refused or timed out, a uTP connect timed out or was
+        /// reset): the torrent may retry over the other one. `None` for
+        /// every other end, a failed handshake included.
+        connect_failed: Option<Transport>,
     },
 }
 
@@ -133,7 +164,15 @@ pub(crate) enum PeerCommand {
     /// Announce several pieces at once: those completed while the
     /// connection was being set up, after its initial bitfield was taken.
     Haves(Vec<u32>),
-    /// Answer a queued request.
+    /// Tell the remote we are (or are no longer) upload-only (BEP 21);
+    /// dropped if it lacks the extension.
+    UploadOnly(bool),
+    /// Tell the remote we lost a piece (BEP 54); dropped if it lacks the
+    /// extension.
+    DontHave(u32),
+    /// Answer a queued request: the block waits in the connection's upload
+    /// queue for its rate limit, and is dropped there if cancelled or
+    /// choked away first.
     SendBlock { block: BlockRef, data: Bytes },
     /// Refuse a queued request.
     Reject(BlockRef),
@@ -146,6 +185,8 @@ pub(crate) enum PeerCommand {
     SendMetadata(MetadataMsg),
     /// Send a `ut_pex` message (dropped if the remote lacks it).
     SendPex(PexMsg),
+    /// Send a `ut_holepunch` message (dropped if the remote lacks it).
+    SendHolepunch(HolepunchMsg),
     /// Close the connection.
     Close,
 }

@@ -1,15 +1,16 @@
 //! Session events and filtered subscriptions.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use fbt_core::InfoHashes;
+use fbt_net::{MapMethod, MapProtocol};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::sync::ReusableBoxFuture;
 
-use crate::peer::DisconnectReason;
+use crate::peer::{DisconnectReason, Transport};
 use crate::status::TorrentState;
 
 /// Where a batch of peer addresses came from.
@@ -24,6 +25,20 @@ pub enum PeerSource {
     Pex,
     /// A magnet link's `x.pe` hints.
     Magnet,
+    /// Local service discovery (BEP 14).
+    Lsd,
+}
+
+/// Where an external address estimate came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExternalIpSource {
+    /// The router, through UPnP, PCP or NAT-PMP.
+    PortMapping,
+    /// The DHT nodes' `ip` votes (BEP 42).
+    Dht,
+    /// Peers' `yourip` (BEP 10), once three of them agree.
+    Peers,
 }
 
 /// Something that happened in the session.
@@ -47,7 +62,9 @@ pub enum Event {
         /// The new state.
         state: TorrentState,
     },
-    /// A piece passed its hash check and was written.
+    /// A piece passed its hash check. It may not be on disk yet: the
+    /// write-back cache serves it from memory and writes it later (see
+    /// [`Settings::cache_size`](crate::Settings::cache_size)).
     PieceFinished {
         /// The torrent.
         torrent: InfoHashes,
@@ -66,7 +83,7 @@ pub enum Event {
         /// The torrent.
         torrent: InfoHashes,
     },
-    /// Every wanted piece was downloaded.
+    /// Every wanted piece was downloaded, verified and written to storage.
     TorrentFinished {
         /// The torrent.
         torrent: InfoHashes,
@@ -104,14 +121,26 @@ pub enum Event {
         /// Nodes in the routing tables at that moment.
         nodes: usize,
     },
-    /// A peer completed the handshake.
+    /// A peer completed the handshake. Reported once per peer: when two
+    /// connections to the same peer id meet (both sides dialled, as in a
+    /// holepunch), the one the tie-break closes reports nothing, and if the
+    /// newer one survives, it takes over the first one's report without a
+    /// new event. `transport` and `encrypted` then describe the first
+    /// connection, not the one still open.
     PeerConnected {
         /// The torrent.
         torrent: InfoHashes,
         /// Remote address.
         addr: SocketAddr,
+        /// The transport the connection runs over.
+        transport: Transport,
+        /// The connection is RC4-encrypted (MSE); false for plaintext,
+        /// MSE-negotiated or not.
+        encrypted: bool,
     },
-    /// A peer connection ended (or never got established).
+    /// A peer connection ended (or never got established). Exactly one
+    /// follows each `PeerConnected`, with its `addr`; a connection closed as
+    /// a duplicate by the tie-break reports nothing.
     PeerDisconnected {
         /// The torrent.
         torrent: InfoHashes,
@@ -120,7 +149,14 @@ pub enum Event {
         /// Why.
         reason: DisconnectReason,
     },
-    /// Reading or writing torrent data failed; the torrent stopped.
+    /// Reading or writing torrent data failed; the torrent stopped, except
+    /// for a piece found missing on disk while serving a peer: that piece
+    /// is downloaded again and the torrent keeps running.
+    /// That is reported once per file (until the torrent seeds again or is
+    /// rechecked), and every piece overlapping the file goes with it. On
+    /// Unix a file deleted while the torrent holds a read handle on it keeps
+    /// being served from the unlinked inode: the loss shows only once the
+    /// handle is closed or the file is truncated.
     FileError {
         /// The file involved, when known.
         path: Option<PathBuf>,
@@ -128,6 +164,37 @@ pub enum Event {
         torrent: InfoHashes,
         /// The error.
         message: String,
+    },
+    /// The router mapped a listen port (UPnP, PCP or NAT-PMP), or the
+    /// mapping's external address changed.
+    #[non_exhaustive]
+    PortMapped {
+        /// Transport protocol.
+        protocol: MapProtocol,
+        /// The method that made it.
+        method: MapMethod,
+        /// The public address and port (`0.0.0.0` when UPnP could not tell
+        /// the address).
+        external: SocketAddr,
+    },
+    /// Mapping or renewing a listen port failed; it is retried with a
+    /// backoff from 60 s up to 30 minutes.
+    PortMappingFailed {
+        /// Transport protocol.
+        protocol: MapProtocol,
+        /// The method that failed.
+        method: MapMethod,
+        /// Why.
+        message: String,
+    },
+    /// A source learned our external address, or a new one. See
+    /// [`Session::external_ip`](crate::Session::external_ip) for the best
+    /// estimate across sources.
+    ExternalIpChanged {
+        /// The address.
+        ip: IpAddr,
+        /// Who reported it.
+        source: ExternalIpSource,
     },
     /// The subscriber fell behind and `missed` events were dropped.
     Lagged {
@@ -153,13 +220,16 @@ bitflags::bitflags! {
         const STORAGE = 1 << 4;
         /// The session's DHT node.
         const DHT = 1 << 5;
+        /// Port mapping and the external address.
+        const NAT = 1 << 6;
         /// Every category.
         const ALL = Self::STATUS.bits()
             | Self::PIECE.bits()
             | Self::TRACKER.bits()
             | Self::PEER.bits()
             | Self::STORAGE.bits()
-            | Self::DHT.bits();
+            | Self::DHT.bits()
+            | Self::NAT.bits();
     }
 }
 
@@ -179,6 +249,9 @@ impl Event {
             | Event::PeersFound { .. } => EventMask::PEER,
             Event::DhtBootstrapped { .. } => EventMask::DHT,
             Event::FileError { .. } => EventMask::STORAGE,
+            Event::PortMapped { .. }
+            | Event::PortMappingFailed { .. }
+            | Event::ExternalIpChanged { .. } => EventMask::NAT,
             Event::Lagged { .. } => EventMask::ALL,
         }
     }

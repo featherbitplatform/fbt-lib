@@ -1,8 +1,10 @@
 # Live interop harness: fbt-example against qBittorrent-nox (libtorrent) and
-# Transmission, with opentracker as the tracker. Driven by run.sh, which
+# Transmission, with opentracker as the tracker, and against a second
+# fbt-example (`fbt-lsd`) for LSD. Driven by run.sh, which
 # exports INTEROP_DIR (target/interop, shared by every container as /interop)
 # and HOST_UID/HOST_GID (so files written there stay owned by the caller).
-# All services share one bridge network and reach each other by service name;
+# Every service is on the `swarm` bridge network and reaches the others by service
+# name; `fbt` and `fbt-lsd` are also on the `lan` network (multicast for LSD);
 # `dht-node` (our own bare DHT node) is the only DHT bootstrap for fbt-example
 # and qBittorrent; Transmission also lists the helper nodes.
 
@@ -40,6 +42,8 @@ services:
   tracker:
     build:
       context: tracker
+    # Also runs the one-shot `*-mcast-route` services below (busybox `ip`).
+    image: fbt-interop-tracker:local
     networks: [swarm]
 
   qbittorrent:
@@ -149,11 +153,66 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - ${INTEROP_DIR}:/interop
-    networks: [swarm]
+    networks: [swarm, lan]
+
+  # A second fbt-example host for the LSD scenario: same image and settings
+  # as `fbt`. Both are also on `lan`, where LSD multicast
+  # (239.192.152.143:6771) travels between them; run.sh checks that first
+  # with `fbt-example lsd-probe` in both.
+  fbt-lsd:
+    image: fbt-interop-fbt:local
+    pull_policy: never
+    init: true
+    user: "${HOST_UID}:${HOST_GID}"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ${INTEROP_DIR}:/interop
+    networks: [swarm, lan]
+
+  # One-shot: routes multicast (224.0.0.0/4) out of the `lan` interface of
+  # `fbt` and `fbt-lsd`. An internal network gives its containers no default
+  # route, so without this joining the LSD group fails with "No such
+  # device". The helper shares the target's network namespace and needs
+  # NET_ADMIN for that one route; `fbt` and `fbt-lsd` themselves stay
+  # unprivileged. run.sh waits until the route shows in /proc/net/route.
+  fbt-mcast-route: &mcast-route
+    image: fbt-interop-tracker:local
+    pull_policy: never
+    user: "0:0"
+    cap_add: [NET_ADMIN]
+    network_mode: service:fbt
+    depends_on:
+      fbt: {condition: service_started}
+    restart: "no"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        dev=$$(ip route show 10.143.152.0/24 | awk '{for (i = 1; i < NF; i++) if ($$i == "dev") print $$(i + 1)}')
+        [ -n "$$dev" ] || { echo "no interface on lan" >&2; exit 1; }
+        ip route add 224.0.0.0/4 dev "$$dev"
+  fbt-lsd-mcast-route:
+    <<: *mcast-route
+    network_mode: service:fbt-lsd
+    depends_on:
+      fbt-lsd: {condition: service_started}
 
 networks:
-  # No route out: nothing in the interop run (the DHT included) can reach a
-  # public host. run.sh talks to the containers through `docker compose exec`.
+  # No route out: nothing in the interop run (the DHT and LSD included) can
+  # reach a public host or the host's LAN, and there is no router (no UPnP or
+  # NAT-PMP answer is possible). run.sh talks to the containers through `docker compose exec`.
   swarm:
     driver: bridge
     internal: true
+  # LSD's segment, `fbt` and `fbt-lsd` only. Docker filters an internal
+  # bridge with iptables and drops every packet whose destination lies
+  # outside its subnet, multicast included, so LSD cannot cross `swarm`. An
+  # internal macvlan network hangs off a dummy parent interface (no uplink,
+  # no host address, no iptables) and passes multicast between its members.
+  lan:
+    driver: macvlan
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.143.152.0/24

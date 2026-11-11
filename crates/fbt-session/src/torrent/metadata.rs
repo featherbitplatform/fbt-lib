@@ -9,6 +9,13 @@
 //! that contradicts the advertised size, has the wrong length or was never
 //! requested, and a completed buffer that fails the info hash, make the
 //! peer [`FetchStep::Bad`].
+//!
+//! Pieces a source delivered before it was retired (timeout, reject,
+//! disconnect; not a ban) are kept in an [`Assembly`], and the next source
+//! of the same size asks only for the missing ones. A buffer built from
+//! more than one source that fails the hash bans nobody (the culprit is
+//! unknown): the assembly is dropped and the fetch goes on single-source,
+//! where a failure bans that one source.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -60,6 +67,40 @@ pub(super) enum FetchStep {
     Verify(PeerKey, Vec<u8>),
 }
 
+/// Pieces kept from retired sources, all of one advertised `size`. Never
+/// complete: a source always has a piece left to deliver, so the buffer it
+/// completes is hashed (and a failure of it is attributed to it only when
+/// it brought every piece itself).
+#[derive(Debug)]
+struct Assembly {
+    size: u32,
+    pieces: Vec<Option<Bytes>>,
+}
+
+impl Assembly {
+    fn count(&self) -> usize {
+        self.pieces.iter().flatten().count()
+    }
+}
+
+/// A complete buffer out for verification (deferred mode).
+#[derive(Debug, Clone, Copy)]
+struct Verifying {
+    /// Built with pieces from other sources.
+    mixed: bool,
+    /// The size its source advertised.
+    size: u32,
+}
+
+/// The verdict on a deferred buffer that failed the info hash.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct VerifyFailed {
+    /// The peer that sent the buffer is banned (it sent every piece).
+    pub ban: bool,
+    /// Requests for the next sources.
+    pub sends: Vec<(PeerKey, MetadataMsg)>,
+}
+
 /// One peer we fetch the whole metadata from.
 #[derive(Debug)]
 struct Source {
@@ -69,6 +110,8 @@ struct Source {
     /// Received pieces, by index.
     pieces: Vec<Option<Bytes>>,
     received: u32,
+    /// Started from the [`Assembly`]: some pieces came from other sources.
+    mixed: bool,
     /// Next piece to request.
     next: u32,
     /// Requested pieces and when each was asked for; `None` until the next
@@ -92,7 +135,11 @@ pub(super) struct MetadataFetch {
     /// and they become candidates again at the instant given.
     retired: HashMap<PeerKey, (u32, Instant)>,
     /// Complete buffers being verified (deferred mode).
-    verifying: HashSet<PeerKey>,
+    verifying: HashMap<PeerKey, Verifying>,
+    /// Delivered pieces of retired sources.
+    assembly: Option<Assembly>,
+    /// A mixed buffer failed: pieces are no longer shared between sources.
+    single_source: bool,
     /// Peers that sent bad metadata: never used again.
     banned: HashSet<PeerKey>,
     done: bool,
@@ -109,7 +156,9 @@ impl MetadataFetch {
             candidates: VecDeque::new(),
             sources: HashMap::new(),
             retired: HashMap::new(),
-            verifying: HashSet::new(),
+            verifying: HashMap::new(),
+            assembly: None,
+            single_source: false,
             banned: HashSet::new(),
             done: false,
             now: None,
@@ -140,7 +189,7 @@ impl MetadataFetch {
         now: Instant,
     ) -> Vec<(PeerKey, MetadataMsg)> {
         self.now = Some(now);
-        if self.done || self.banned.contains(&key) || self.verifying.contains(&key) {
+        if self.done || self.banned.contains(&key) || self.verifying.contains_key(&key) {
             return Vec::new();
         }
         if self.sources.contains_key(&key) || self.retired.contains_key(&key) {
@@ -174,7 +223,7 @@ impl MetadataFetch {
         self.now = Some(now);
         if self.done
             || self.banned.contains(&key)
-            || self.verifying.contains(&key)
+            || self.verifying.contains_key(&key)
             || self.retired.contains_key(&key)
         {
             // Late answers to requests we gave up on are not held against
@@ -231,39 +280,69 @@ impl MetadataFetch {
         let Some(src) = self.sources.remove(&key) else {
             return FetchStep::Nothing;
         };
+        let (size, mixed) = (src.size, src.mixed);
         let mut bytes = Vec::with_capacity(src.size as usize);
         for p in src.pieces.into_iter().flatten() {
             bytes.extend_from_slice(&p);
         }
         if self.deferred {
-            self.verifying.insert(key);
+            self.verifying.insert(key, Verifying { mixed, size });
             return FetchStep::Verify(key, bytes);
         }
         if hashes_match(&self.expected, &bytes) {
             self.finish();
             FetchStep::Done(bytes)
+        } else if mixed {
+            self.mixed_failed(key, size);
+            send_or_nothing(self.start_sources())
         } else {
             self.bad(key)
         }
     }
 
-    /// The peer disconnected: it is forgotten and the next candidate
-    /// starts.
+    /// The peer disconnected: it is forgotten (the pieces it delivered are
+    /// kept) and the next candidate starts.
     pub(super) fn on_peer_gone(&mut self, key: PeerKey) -> Vec<(PeerKey, MetadataMsg)> {
+        if let Some(src) = self.sources.remove(&key) {
+            self.keep_pieces(src);
+        }
         self.forget(key);
         self.banned.remove(&key);
         self.start_sources()
     }
 
-    /// A deferred buffer from `key` failed the info hash: `key` is banned.
-    /// A peer that disconnected meanwhile is not remembered (its key is
-    /// never reused).
-    pub(super) fn on_verify_failed(&mut self, key: PeerKey) -> Vec<(PeerKey, MetadataMsg)> {
-        if self.verifying.remove(&key) {
-            self.banned.insert(key);
+    /// A deferred buffer from `key` failed the info hash. `key` is banned
+    /// if it sent every piece; a buffer mixed from several sources bans
+    /// nobody (the assembly is dropped, the fetch goes single-source and
+    /// `key` stays a candidate). A peer that disconnected meanwhile is not
+    /// remembered (its key is never reused).
+    pub(super) fn on_verify_failed(&mut self, key: PeerKey) -> VerifyFailed {
+        let mut ban = false;
+        match self.verifying.remove(&key) {
+            Some(Verifying { mixed: true, size }) => self.mixed_failed(key, size),
+            Some(Verifying { mixed: false, .. }) => {
+                self.banned.insert(key);
+                ban = true;
+            }
+            None => {}
         }
-        self.forget(key);
-        self.start_sources()
+        if ban {
+            self.forget(key);
+        }
+        VerifyFailed {
+            ban,
+            sends: self.start_sources(),
+        }
+    }
+
+    /// A buffer mixed from several sources failed: nobody is banned, the
+    /// assembly goes and `key` may start over on its own.
+    fn mixed_failed(&mut self, key: PeerKey, size: u32) {
+        self.assembly = None;
+        self.single_source = true;
+        if self.candidates.len() < MAX_CANDIDATES {
+            self.candidates.push_back((key, size));
+        }
     }
 
     /// Drops sources (no ban) with a request unanswered for
@@ -311,6 +390,11 @@ impl MetadataFetch {
                 break;
             };
             let mut src = Source::new(size, self.now);
+            if !self.single_source
+                && let Some(a) = self.assembly.as_ref().filter(|a| a.size == size)
+            {
+                src.seed(a);
+            }
             out.extend(src.request_more(key, self.now));
             self.sources.insert(key, src);
         }
@@ -322,7 +406,41 @@ impl MetadataFetch {
     fn retire(&mut self, key: PeerKey, now: Instant) {
         if let Some(src) = self.sources.remove(&key) {
             self.retired.insert(key, (src.size, now + PIECE_TIMEOUT));
+            self.keep_pieces(src);
         }
+    }
+
+    /// Keeps the pieces `src` delivered for the next source of its size. An
+    /// assembly of another size is replaced only by one with more pieces;
+    /// the assembly never becomes complete (its last piece is left out, see
+    /// [`Assembly`]). Nothing is kept once the fetch is single-source.
+    fn keep_pieces(&mut self, src: Source) {
+        if self.single_source || self.done || src.received == 0 {
+            return;
+        }
+        let keep = |a: &Assembly| a.size == src.size;
+        let mut merged = match self.assembly.take() {
+            Some(a) if keep(&a) => a,
+            Some(a) if a.count() >= src.received as usize => {
+                self.assembly = Some(a);
+                return;
+            }
+            _ => Assembly {
+                size: src.size,
+                pieces: vec![None; src.pieces.len()],
+            },
+        };
+        for (slot, piece) in merged.pieces.iter_mut().zip(src.pieces) {
+            if slot.is_none() {
+                *slot = piece;
+            }
+        }
+        if merged.count() == merged.pieces.len()
+            && let Some(last) = merged.pieces.last_mut()
+        {
+            *last = None;
+        }
+        self.assembly = Some(merged);
     }
 
     /// `key` sent bad metadata: dropped and never used again.
@@ -345,6 +463,7 @@ impl MetadataFetch {
         self.sources.clear();
         self.retired.clear();
         self.verifying.clear();
+        self.assembly = None;
     }
 }
 
@@ -358,9 +477,22 @@ impl Source {
             num_pieces,
             pieces: vec![None; num_pieces as usize],
             received: 0,
+            mixed: false,
             next: 0,
             in_flight: BTreeMap::new(),
             started: now,
+        }
+    }
+
+    /// Starts from the pieces `a` holds (same size): only the missing ones
+    /// get requested.
+    fn seed(&mut self, a: &Assembly) {
+        for (slot, piece) in self.pieces.iter_mut().zip(&a.pieces) {
+            if piece.is_some() {
+                *slot = piece.clone();
+                self.received = self.received.saturating_add(1);
+                self.mixed = true;
+            }
         }
     }
 
@@ -389,9 +521,14 @@ impl Source {
     fn request_more(&mut self, key: PeerKey, now: Option<Instant>) -> Vec<(PeerKey, MetadataMsg)> {
         let mut out = Vec::new();
         while self.in_flight.len() < MAX_IN_FLIGHT && self.next < self.num_pieces {
-            self.in_flight.insert(self.next, now);
-            out.push((key, MetadataMsg::Request { piece: self.next }));
+            let piece = self.next;
             self.next += 1;
+            // Kept from an earlier source.
+            if self.pieces.get(piece as usize).is_some_and(Option::is_some) {
+                continue;
+            }
+            self.in_flight.insert(piece, now);
+            out.push((key, MetadataMsg::Request { piece }));
         }
         out
     }
@@ -512,7 +649,7 @@ mod tests {
             FetchStep::Verify(a, info.clone())
         );
         // A mismatch bans it; its late handshake is ignored.
-        assert!(f.on_verify_failed(a).is_empty());
+        assert!(f.on_verify_failed(a).sends.is_empty());
         assert!(f.on_ext_handshake(a, Some(20_000), true, now).is_empty());
         // B goes on.
         f.on_message(b, data(&info, 0), now);
@@ -539,12 +676,12 @@ mod tests {
         // Two buffers are out for verification: C waits.
         assert!(f.on_tick(now).is_empty());
         assert!(f.on_ext_handshake(c, Some(1000), true, now).is_empty());
-        assert_eq!(f.on_verify_failed(a), vec![req(3, 0)]);
+        assert_eq!(f.on_verify_failed(a).sends, vec![req(3, 0)]);
         // A peer gone while verifying frees its slot too, and is not
         // remembered as banned.
         f.on_peer_gone(b);
         assert!(!f.banned.contains(&b));
-        assert!(f.on_verify_failed(b).is_empty());
+        assert!(f.on_verify_failed(b).sends.is_empty());
         assert!(!f.banned.contains(&b));
     }
 
@@ -694,9 +831,10 @@ mod tests {
             f.on_message(k, data(&info, 0), later);
             f.on_message(k, data(&info, 1), later);
         }
-        // After the cool-down A is a candidate again: when B goes, A starts.
+        // After the cool-down A is a candidate again: when B goes, A starts
+        // and is not asked for the pieces B delivered.
         assert!(f.on_tick(now + PIECE_TIMEOUT).is_empty());
-        assert_eq!(f.on_peer_gone(b), vec![req(1, 0), req(1, 1)]);
+        assert_eq!(f.on_peer_gone(b), vec![req(1, 2), req(1, 3)]);
     }
 
     #[test]
@@ -715,7 +853,8 @@ mod tests {
             f.on_tick(t0 + PIECE_TIMEOUT - Duration::from_secs(1))
                 .is_empty()
         );
-        assert_eq!(f.on_tick(t0 + PIECE_TIMEOUT), vec![req(3, 0), req(3, 1)]);
+        // B's own piece 1 timed out too; its piece 0 is kept.
+        assert_eq!(f.on_tick(t0 + PIECE_TIMEOUT), vec![req(3, 1)]);
         assert_eq!(f.on_message(a, data(&info, 0), t1), FetchStep::Nothing);
     }
 
@@ -736,7 +875,8 @@ mod tests {
         f.on_message(PeerKey(2), data(&info, 0), t1);
         f.on_message(PeerKey(2), data(&info, 1), t1);
         let sends = f.on_tick(t0 + PIECE_TIMEOUT);
-        assert_eq!(sends, vec![req(3, 0), req(3, 1)], "A retired at 30 s");
+        // A's piece 0 was kept: C asks for the rest.
+        assert_eq!(sends, vec![req(3, 1), req(3, 2)], "A retired at 30 s");
         assert_eq!(f.on_message(a, data(&info, 1), t1), FetchStep::Nothing);
     }
 
@@ -772,21 +912,190 @@ mod tests {
             started_c = f.on_tick(t);
         }
         assert!(t >= deadline, "not before the deadline");
-        assert!(started_c.contains(&req(3, 0)), "{started_c:?}");
+        // The pieces the retired sources delivered are not asked for again.
+        assert!(started_c.iter().all(|(k, _)| *k == c), "{started_c:?}");
+        assert!(!started_c.contains(&req(3, 0)), "{started_c:?}");
         assert!(!f.banned.contains(&a) && !f.banned.contains(&b));
         assert!(f.retired.contains_key(&a) && f.retired.contains_key(&b));
         // C answers promptly and completes.
-        let mut piece = 0;
-        loop {
+        let mut asked: VecDeque<u32> = started_c
+            .iter()
+            .filter_map(|(_, m)| match m {
+                MetadataMsg::Request { piece } => Some(*piece),
+                _ => None,
+            })
+            .collect();
+        while let Some(piece) = asked.pop_front() {
             match f.on_message(c, data(&info, piece), t) {
                 FetchStep::Done(bytes) => {
                     assert_eq!(bytes, info);
-                    break;
+                    return;
                 }
-                FetchStep::Send(_) | FetchStep::Nothing => piece += 1,
+                FetchStep::Send(more) => {
+                    for (_, m) in more {
+                        if let MetadataMsg::Request { piece } = m {
+                            asked.push_back(piece);
+                        }
+                    }
+                }
+                FetchStep::Nothing => {}
                 other => panic!("{other:?}"),
             }
         }
+        panic!("C never completed");
+    }
+
+    /// Pieces of `info` that a poisoned peer would send: same size, other bytes.
+    fn poisoned(info: &[u8]) -> Vec<u8> {
+        info.iter().map(|b| b ^ 0xff).collect()
+    }
+
+    #[test]
+    fn retired_source_pieces_are_kept() {
+        let len = 4 * METADATA_PIECE_LEN;
+        let info = info(len);
+        let mut f = fetch_for(&info);
+        let t0 = Instant::now();
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        f.on_ext_handshake(a, Some(len as u32), true, t0);
+        f.on_message(a, data(&info, 0), t0);
+        f.on_message(a, data(&info, 1), t0);
+        // A never answers pieces 2 and 3.
+        assert!(f.on_tick(t0 + PIECE_TIMEOUT).is_empty());
+        assert!(f.retired.contains_key(&a) && !f.banned.contains(&a));
+        let t1 = t0 + PIECE_TIMEOUT;
+        assert_eq!(
+            f.on_ext_handshake(b, Some(len as u32), true, t1),
+            vec![req(2, 2), req(2, 3)]
+        );
+        assert_eq!(f.on_message(b, data(&info, 2), t1), FetchStep::Nothing);
+        assert_eq!(f.on_message(b, data(&info, 3), t1), FetchStep::Done(info));
+    }
+
+    #[test]
+    fn peer_gone_keeps_its_delivered_pieces() {
+        let len = 4 * METADATA_PIECE_LEN;
+        let info = info(len);
+        let mut f = fetch_for(&info);
+        let now = Instant::now();
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        f.on_ext_handshake(a, Some(len as u32), true, now);
+        f.on_message(a, data(&info, 0), now);
+        f.on_message(a, data(&info, 1), now);
+        f.on_peer_gone(a);
+        assert_eq!(
+            f.on_ext_handshake(b, Some(len as u32), true, now),
+            vec![req(2, 2), req(2, 3)]
+        );
+    }
+
+    #[test]
+    fn two_sources_cannot_complete_the_assembly_between_them() {
+        let len = 2 * METADATA_PIECE_LEN;
+        let info = info(len);
+        let mut f = fetch_for(&info);
+        let now = Instant::now();
+        let (a, b, c) = (PeerKey(1), PeerKey(2), PeerKey(3));
+        // A holds piece 0, B piece 1 (each asked for both; they answer one).
+        f.on_ext_handshake(a, Some(len as u32), true, now);
+        f.on_ext_handshake(b, Some(len as u32), true, now);
+        f.on_ext_handshake(c, Some(len as u32), true, now);
+        f.on_message(a, data(&info, 0), now);
+        f.on_message(b, data(&info, 1), now);
+        // A and B time out; C is not handed a complete table (the table
+        // would never be requested from, nor hashed), but one piece to ask for.
+        let asked = f.on_tick(now + PIECE_TIMEOUT);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked.iter().all(|(k, _)| *k == c));
+    }
+
+    #[test]
+    fn mixed_assembly_failure_bans_nobody_then_goes_single_source() {
+        let len = 4 * METADATA_PIECE_LEN;
+        let info = info(len);
+        let bad = poisoned(&info);
+        let mut f = fetch_for(&info);
+        let t0 = Instant::now();
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        f.on_ext_handshake(a, Some(len as u32), true, t0);
+        f.on_message(a, data(&bad, 0), t0);
+        f.on_message(a, data(&bad, 1), t0);
+        f.on_tick(t0 + PIECE_TIMEOUT);
+        let t1 = t0 + PIECE_TIMEOUT;
+        assert_eq!(
+            f.on_ext_handshake(b, Some(len as u32), true, t1),
+            vec![req(2, 2), req(2, 3)]
+        );
+        f.on_message(b, data(&info, 2), t1);
+        // The mixed buffer fails: nobody is banned, B starts over alone.
+        let step = f.on_message(b, data(&info, 3), t1);
+        assert_eq!(sent(step), vec![req(2, 0), req(2, 1)]);
+        assert!(f.banned.is_empty() && f.assembly.is_none());
+        // Single-source from now on: A's retired pieces are not shared, and a
+        // failure of B's own buffer bans B.
+        f.on_message(b, data(&bad, 0), t1);
+        f.on_message(b, data(&bad, 1), t1);
+        f.on_message(b, data(&bad, 2), t1);
+        assert_eq!(f.on_message(b, data(&bad, 3), t1), FetchStep::Bad(b));
+        assert!(f.banned.contains(&b) && !f.banned.contains(&a));
+    }
+
+    #[test]
+    fn mixed_assembly_failure_in_deferred_mode_does_not_ban() {
+        let len = 4 * METADATA_PIECE_LEN;
+        let info = info(len);
+        let bad = poisoned(&info);
+        let mut f = fetch_for(&info).deferred();
+        let t0 = Instant::now();
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        f.on_ext_handshake(a, Some(len as u32), true, t0);
+        f.on_message(a, data(&bad, 0), t0);
+        f.on_message(a, data(&bad, 1), t0);
+        f.on_tick(t0 + PIECE_TIMEOUT);
+        let t1 = t0 + PIECE_TIMEOUT;
+        f.on_ext_handshake(b, Some(len as u32), true, t1);
+        f.on_message(b, data(&info, 2), t1);
+        assert!(matches!(
+            f.on_message(b, data(&info, 3), t1),
+            FetchStep::Verify(k, _) if k == b
+        ));
+        let v = f.on_verify_failed(b);
+        assert!(!v.ban);
+        assert!(f.banned.is_empty());
+        assert_eq!(v.sends, vec![req(2, 0), req(2, 1)]);
+        // Alone, B's own bad buffer is its fault.
+        for p in 0..3 {
+            f.on_message(b, data(&bad, p), t1);
+        }
+        assert!(matches!(
+            f.on_message(b, data(&bad, 3), t1),
+            FetchStep::Verify(..)
+        ));
+        assert!(f.on_verify_failed(b).ban);
+        assert!(f.banned.contains(&b));
+    }
+
+    #[test]
+    fn different_size_source_does_not_mix() {
+        let big = info(4 * METADATA_PIECE_LEN);
+        let real = info(40_000);
+        let mut f = fetch_for(&real);
+        let t0 = Instant::now();
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        f.on_ext_handshake(a, Some(big.len() as u32), true, t0);
+        f.on_message(a, data(&big, 0), t0);
+        f.on_message(a, data(&big, 1), t0);
+        f.on_tick(t0 + PIECE_TIMEOUT);
+        let t1 = t0 + PIECE_TIMEOUT;
+        // B is asked for everything from piece 0 of its own size.
+        assert_eq!(
+            f.on_ext_handshake(b, Some(40_000), true, t1),
+            vec![req(2, 0), req(2, 1)]
+        );
+        f.on_message(b, data(&real, 0), t1);
+        f.on_message(b, data(&real, 1), t1);
+        assert_eq!(f.on_message(b, data(&real, 2), t1), FetchStep::Done(real));
+        assert!(f.banned.is_empty());
     }
 
     #[test]

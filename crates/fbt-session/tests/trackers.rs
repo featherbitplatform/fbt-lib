@@ -101,6 +101,27 @@ async fn seeder_and_leecher_meet_via_udp_tracker() {
     meet_via(FakeTracker::udp(Reply::Peers).await).await;
 }
 
+/// UDP announces leave from the shared socket, so the tracker sees the
+/// listen port as their source port (and the stopped announce still goes
+/// out at shutdown).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_tracker_sees_the_listen_port_as_source() {
+    let tracker = FakeTracker::udp(Reply::Peers).await;
+    let (m, payload) = torrent(vec![vec![tracker.url.clone()]]);
+    let (seed, _sh) = seeder(&m, &payload, &tracker.url).await;
+    let port = seed.local_addr().port();
+    let announces = tracker.announces();
+    assert!(!announces.is_empty());
+    for a in &announces {
+        assert_eq!(a.port, port);
+        assert_eq!(a.source.port(), port, "announce from {}", a.source);
+    }
+    assert!(seed.demux_stats()[0].1.tracker > 0);
+    seed.shutdown().await;
+    assert_eq!(tracker.events_of(port), ["started", "stopped"]);
+    assert!(tracker.announces().iter().all(|a| a.source.port() == port));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn announce_events_sequence() {
     let tracker = FakeTracker::http(Reply::Peers).await;

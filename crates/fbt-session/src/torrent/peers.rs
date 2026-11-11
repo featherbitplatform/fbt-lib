@@ -6,20 +6,27 @@ use std::net::SocketAddr;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
 use fbt_metainfo::Metainfo;
-use fbt_wire::{ExtHandshake, MetadataMsg, UT_METADATA, UT_PEX};
+use fbt_wire::{
+    ExtHandshake, HolepunchMsg, LT_DONTHAVE, MetadataMsg, UPLOAD_ONLY, UT_METADATA, UT_PEX,
+};
 use tokio::time::Instant;
 use tracing::debug;
 
 use super::actor::Actor;
 use super::data::Job;
+use super::holepunch::{RelayAction, relay};
 use super::metadata::{FetchStep, MAX_METADATA_REQUESTS_PER_PEER, serve_metadata};
-use super::pex::PexPeer;
-use super::swarm::BanTarget;
+use super::pex::{PexPeer, connectable_addr};
+use super::swarm::dialable;
+use super::swarm::{BanTarget, ConnectOutcome};
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
 use crate::peer::messages::{PeerCommand, PeerEvent, PeerPiecesOwned};
+use crate::peer::transport::Transport;
 use crate::picker::{PeerKey, PeerPieces, PiecePicker};
+use crate::session::HolepunchCounters;
+use crate::status::TorrentState;
 
 impl Actor {
     // ----- peer events --------------------------------------------------------
@@ -31,10 +38,13 @@ impl Actor {
                 peer_id,
                 addr,
                 encrypted,
+                transport,
                 ..
-            } => self.on_peer_connected(key, peer_id, addr, encrypted),
+            } => self.on_peer_connected(key, peer_id, addr, encrypted, transport),
             PeerEvent::Pieces { key, pieces } => self.on_pieces(key, pieces),
             PeerEvent::Have { key, piece } => self.on_have(key, piece),
+            PeerEvent::DontHave { key, piece } => self.on_donthave(key, piece),
+            PeerEvent::UploadOnly { key, on } => self.on_upload_only(key, on),
             PeerEvent::Choked { key } => {
                 if let Some(p) = self.peers.get_mut(&key) {
                     p.choked_us = true;
@@ -68,21 +78,34 @@ impl Actor {
                 self.fill(key);
             }
             PeerEvent::Request { key, block } => self.on_request(key, block),
+            PeerEvent::Snubbed { key, snubbed } => {
+                if let Some(p) = self.peers.get_mut(&key) {
+                    p.snubbed = snubbed;
+                    // Asked for at the old depth: the peer task asks again
+                    // for its single request.
+                    if snubbed {
+                        p.demand = 0;
+                    }
+                }
+            }
             // The peer task drops the cancelled request itself; an answer
             // already being read is discarded there.
             PeerEvent::Cancel { .. } => {}
+            PeerEvent::BlockSent { key, len, .. } => self.on_block_sent(key, len),
             PeerEvent::Wasted { bytes, .. } => {
                 self.counters.wasted = self.counters.wasted.saturating_add(bytes);
             }
             PeerEvent::ExtHandshake { key, hs } => self.on_ext_handshake(key, hs),
             PeerEvent::Metadata { key, msg } => self.on_metadata_msg(key, msg),
             PeerEvent::Pex { key, msg } => self.on_pex(key, msg),
+            PeerEvent::Holepunch { key, msg } => self.on_holepunch(key, msg),
             PeerEvent::DhtPort { key, port } => self.on_dht_port(key, port),
             PeerEvent::Disconnected {
                 key,
                 reason,
                 outstanding,
-            } => self.on_peer_disconnected(key, reason, &outstanding),
+                connect_failed,
+            } => self.on_peer_disconnected(key, reason, &outstanding, connect_failed),
         }
     }
 
@@ -94,8 +117,10 @@ impl Actor {
         peer_id: PeerId,
         addr: SocketAddr,
         encrypted: bool,
+        transport: Transport,
     ) {
-        if !self.on_connected(key, peer_id, addr, encrypted) {
+        let outcome = self.on_connected(key, peer_id, addr, encrypted, transport);
+        if outcome == ConnectOutcome::Dropped {
             return;
         }
         let Some(p) = self.peers.get_mut(&key) else {
@@ -116,10 +141,23 @@ impl Actor {
                 self.send(key, PeerCommand::Haves(missed));
             }
         }
-        debug!(%addr, encrypted, "peer connected");
+        debug!(%addr, encrypted, ?transport, "peer connected");
+        if outcome == ConnectOutcome::Replaced
+            && self.peers.get(&key).is_some_and(|p| p.reported.is_some())
+        {
+            // Reported when its first connection came up; the swap of
+            // connections is not a new peer (`transport` and `encrypted`
+            // of that report stay those of the first connection).
+            return;
+        }
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.reported = Some(addr);
+        }
         self.emit(Event::PeerConnected {
             torrent: self.ih,
             addr,
+            transport,
+            encrypted,
         });
     }
 
@@ -144,6 +182,7 @@ impl Actor {
         }
         self.update_interest(key);
         self.fill(key);
+        self.close_if_upload_only(key);
     }
 
     pub(super) fn on_have(&mut self, key: PeerKey, piece: u32) {
@@ -166,6 +205,140 @@ impl Actor {
             self.update_interest(key);
         }
         self.fill(key);
+        self.close_if_upload_only(key);
+    }
+
+    /// The remote retracted a piece (BEP 54): it no longer counts in the
+    /// availability, and our interest is re-evaluated. A `HaveAll` peer is
+    /// first turned into the equivalent full bitfield.
+    fn on_donthave(&mut self, key: PeerKey, piece: u32) {
+        let generation = self.generation;
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        if !p.has(piece) {
+            return;
+        }
+        let counted = p.generation == generation;
+        let picker = self.loaded.as_mut().and_then(|l| l.picker.as_mut());
+        let mut picker = picker.filter(|_| counted);
+        if p.seed {
+            let full = Bitfield::full(p.bits.len());
+            if let Some(pk) = picker.as_deref_mut() {
+                pk.remove_peer_pieces(PeerPieces::All);
+                pk.add_peer_pieces(PeerPieces::Some(&full));
+            }
+            p.seed = false;
+            p.bits = full;
+        }
+        p.bits.clear(piece);
+        if let Some(f) = p.fast_has.as_mut() {
+            f.clear(piece);
+        }
+        // Blocks asked of it for this piece will not come: back to the
+        // picker, and cancelled so the peer does not answer them.
+        let gone: Vec<BlockRef> = p
+            .requested
+            .iter()
+            .filter(|b| b.piece == piece)
+            .copied()
+            .collect();
+        for b in &gone {
+            p.requested.remove(b);
+        }
+        if let Some(pk) = picker {
+            pk.peer_lost(piece);
+            for b in &gone {
+                pk.release(key, *b);
+            }
+        }
+        for b in gone {
+            self.send(key, PeerCommand::Cancel(b));
+        }
+        self.update_interest(key);
+        self.top_up_all(None);
+    }
+
+    /// The remote is (no longer) upload-only (BEP 21).
+    fn on_upload_only(&mut self, key: PeerKey, on: bool) {
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        p.upload_only = on;
+        self.close_if_upload_only(key);
+    }
+
+    /// While we are finished and on disk, a peer that is a seed or
+    /// upload-only has nothing to trade with us: closed.
+    pub(super) fn close_if_upload_only(&mut self, key: PeerKey) {
+        if !self.upload_only_sent {
+            return;
+        }
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        if p.connected && p.tx.is_some() && (p.upload_only || p.is_seed()) {
+            debug!(key = key.0, "closing an upload-only peer while seeding");
+            p.close_reason = Some(DisconnectReason::UploadOnly);
+            self.close_peer(key);
+        }
+    }
+
+    /// Follows the seeding state: peers learn when we become (or stop
+    /// being) upload-only, and upload-only peers are dropped once we are.
+    /// "Finished" means seeding, with the data on disk, not merely every
+    /// piece verified.
+    pub(super) fn sync_upload_only(&mut self) {
+        let on = matches!(self.last_state, TorrentState::Seeding);
+        if on == self.upload_only_sent {
+            return;
+        }
+        self.upload_only_sent = on;
+        if !on {
+            // No longer finished: seeds we turned away may have what we
+            // lack, so they are dialled again.
+            self.seed_addrs.clear();
+        } else {
+            self.lost_files.clear();
+        }
+        let keys: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.connected && p.tx.is_some())
+            .map(|(k, _)| *k)
+            .collect();
+        for &key in &keys {
+            self.send(key, PeerCommand::UploadOnly(on));
+        }
+        if on {
+            for key in keys {
+                self.close_if_upload_only(key);
+            }
+        } else {
+            self.requeue_known();
+            self.try_connect();
+        }
+    }
+
+    /// Remembers the address of a seed or upload-only peer that is gone
+    /// while we are finished, so it is not redialled in a loop.
+    fn note_seed_gone(&mut self, p: &super::swarm::Peer) {
+        if !self.upload_only_sent
+            || !p.connected
+            || !(p.upload_only || p.is_seed())
+            || self.seed_addrs.len() >= super::swarm::MAX_KNOWN
+        {
+            return;
+        }
+        // An incoming peer is dialled at its listen address, if it has one.
+        let addr = if p.outgoing {
+            Some(p.addr)
+        } else {
+            p.listen_port.map(|port| SocketAddr::new(p.addr.ip(), port))
+        };
+        if let Some(a) = addr {
+            self.seed_addrs.insert(a);
+        }
     }
 
     pub(super) fn on_interested(&mut self, key: PeerKey, on: bool) {
@@ -192,6 +365,12 @@ impl Actor {
 
     /// Chokes or unchokes a peer, sending only on change.
     pub(super) fn set_choke(&mut self, key: PeerKey, choke: bool) {
+        self.set_choke_at(key, choke, Instant::now());
+    }
+
+    /// [`Self::set_choke`] at `now`: an unchoke starts the peer's turn
+    /// (`unchoked_since`, `uploaded_since_unchoke`).
+    fn set_choke_at(&mut self, key: PeerKey, choke: bool, now: Instant) {
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
@@ -199,6 +378,12 @@ impl Actor {
             return;
         }
         p.am_choking = choke;
+        if choke {
+            p.unchoked_since = None;
+        } else {
+            p.unchoked_since = Some(now);
+            p.uploaded_since_unchoke = 0;
+        }
         let cmd = if choke {
             PeerCommand::Choke
         } else {
@@ -207,13 +392,20 @@ impl Actor {
         self.send(key, cmd);
     }
 
-    /// Runs the choker over the connected peers: rate from each peer while
-    /// downloading, rate to it while seeding.
+    /// Runs the choker over the connected peers (see
+    /// [`Choker`](crate::choker::Choker)), then records who holds the
+    /// optimistic slots.
     pub(super) fn rechoke(&mut self) {
         if !self.active() {
             return;
         }
         let now = Instant::now();
+        let num_pieces = self.loaded.as_ref().map(|l| l.layout.num_pieces());
+        if let Some(l) = self.loaded.as_ref() {
+            let quota = u64::from(self.shared.settings.seeding_piece_quota)
+                .saturating_mul(u64::from(l.layout.piece_len()));
+            self.choker.set_piece_quota_bytes(quota);
+        }
         let infos: Vec<PeerChokeInfo> = self
             .peers
             .iter()
@@ -223,6 +415,11 @@ impl Actor {
                 interested: p.peer_interested,
                 rate_from_peer: p.from_rate.rate(now),
                 rate_to_peer: p.to_rate.rate(now),
+                snubbed: p.snubbed,
+                progress_ppm: progress_ppm(p, num_pieces),
+                unchoked_since: p.unchoked_since,
+                uploaded_since_unchoke: p.uploaded_since_unchoke,
+                last_optimistic: p.last_optimistic,
             })
             .collect();
         let seeding = self
@@ -230,9 +427,14 @@ impl Actor {
             .as_ref()
             .and_then(|l| l.picker.as_ref())
             .is_some_and(PiecePicker::is_finished);
-        let unchoke = self.choker.rechoke(&infos, seeding, &mut self.rng);
+        let unchoke = self.choker.rechoke(&infos, seeding, now, &mut self.rng);
         for info in infos {
-            self.set_choke(info.key, !unchoke.contains(&info.key));
+            self.set_choke_at(info.key, !unchoke.contains(&info.key), now);
+        }
+        for key in self.choker.optimistic() {
+            if let Some(p) = self.peers.get_mut(key) {
+                p.last_optimistic = Some(now);
+            }
         }
     }
 
@@ -256,10 +458,12 @@ impl Actor {
         key: PeerKey,
         reason: DisconnectReason,
         outstanding: &[BlockRef],
+        connect_failed: Option<Transport>,
     ) {
-        let Some((p, reason)) = self.on_disconnected(key, reason) else {
+        let Some((p, reason)) = self.on_disconnected(key, reason, connect_failed) else {
             return;
         };
+        self.note_seed_gone(&p);
         if let Some(m) = self.magnet.as_mut() {
             let sends = m.fetch.on_peer_gone(key);
             self.send_metadata(sends);
@@ -273,13 +477,134 @@ impl Actor {
             picker.release_peer(key);
             picker.remove_peer_pieces(p.pieces());
         }
-        self.emit(Event::PeerDisconnected {
-            torrent: self.ih,
-            addr: p.addr,
-            reason,
-        });
+        // `PeerDisconnected` stays paired with `PeerConnected`. A
+        // connection that got through reports its end only if it is the one
+        // `PeerConnected` named (a duplicate closed by the tie-break stays
+        // silent: the peer is still connected through the other). An
+        // attempt that never connected reports its failure, unless another
+        // connection to that address is the reported one (a holepunch dial
+        // that lost the race to the other side's).
+        let report = match p.reported {
+            Some(addr) => Some(addr),
+            None if !p.connected && !self.peers.values().any(|o| o.reported == Some(p.addr)) => {
+                Some(p.addr)
+            }
+            None => None,
+        };
+        if let Some(addr) = report {
+            self.emit(Event::PeerDisconnected {
+                torrent: self.ih,
+                addr,
+                reason,
+            });
+        }
         self.top_up_all(None);
         self.try_connect();
+    }
+
+    // ----- holepunch (BEP 55) ---------------------------------------------------
+
+    /// A `ut_holepunch` message from `key` (decoded only while we advertise
+    /// the extension). Ignored once holepunch no longer applies (a magnet
+    /// turned out private).
+    fn on_holepunch(&mut self, key: PeerKey, msg: HolepunchMsg) {
+        if !self.holepunch_active() {
+            return;
+        }
+        let Some(ip) = self
+            .peers
+            .get(&key)
+            .filter(|p| p.live())
+            .map(|p| p.addr.ip())
+        else {
+            return;
+        };
+        let now = Instant::now();
+        match msg {
+            HolepunchMsg::Rendezvous(target) => {
+                if !self.hp_limiter.allow(ip, now) {
+                    debug!(key = key.0, "rendezvous over the rate limit; ignored");
+                    return;
+                }
+                self.relay_rendezvous(key, target);
+            }
+            HolepunchMsg::Connect(addr) => {
+                // The answer to our own request (from the relay we asked),
+                // or an introduction a relay makes for another peer's
+                // request (rate-limited per relay IP).
+                if !dialable(&addr) {
+                    return;
+                }
+                if !self.hp_pending.take(&addr, key, now) && !self.hp_limiter.allow(ip, now) {
+                    debug!(
+                        key = key.0,
+                        "holepunch connect over the rate limit; ignored"
+                    );
+                    return;
+                }
+                if self.dial_holepunch(addr) {
+                    HolepunchCounters::bump(&self.shared.holepunch.connects_received);
+                }
+            }
+            HolepunchMsg::Error { addr, code } => {
+                // Only an answer from the relay we asked counts; normal
+                // retries go on either way.
+                if self.hp_pending.take(&addr, key, now) {
+                    debug!(key = key.0, %addr, code, "rendezvous refused by the relay");
+                }
+            }
+        }
+    }
+
+    /// Relays a `Rendezvous(target)` from `key`: both learn each other's
+    /// address, or `key` gets the BEP 55 error.
+    fn relay_rendezvous(&mut self, key: PeerKey, target: SocketAddr) {
+        let Some(requester) = self
+            .peers
+            .get(&key)
+            .map(|p| connectable_addr(p).unwrap_or(p.addr))
+        else {
+            return;
+        };
+        let target_peer = self
+            .peers
+            .iter()
+            .find(|(k, p)| **k != key && p.live() && connectable_addr(p) == Some(target))
+            .map(|(k, p)| (*k, p.supports_holepunch()));
+        let ours: Vec<SocketAddr> = self
+            .shared
+            .utp
+            .iter()
+            .map(fbt_utp::UtpSocket::local_addr)
+            .collect();
+        match relay(target, requester, &ours, target_peer) {
+            RelayAction::Connect {
+                to_target,
+                to_requester,
+            } => {
+                // `relay` connects only a target it was given.
+                let Some((target_key, _)) = target_peer else {
+                    return;
+                };
+                debug!(%target, %requester, "relaying a rendezvous");
+                HolepunchCounters::bump(&self.shared.holepunch.relayed);
+                self.send(
+                    target_key,
+                    PeerCommand::SendHolepunch(HolepunchMsg::Connect(to_target)),
+                );
+                self.send(
+                    key,
+                    PeerCommand::SendHolepunch(HolepunchMsg::Connect(to_requester)),
+                );
+            }
+            RelayAction::Error(code) => {
+                debug!(%target, code, "rendezvous refused");
+                self.send(
+                    key,
+                    PeerCommand::SendHolepunch(HolepunchMsg::Error { addr: target, code }),
+                );
+            }
+        }
     }
 
     // ----- metadata exchange (BEP 9) ------------------------------------------
@@ -300,6 +625,8 @@ impl Actor {
         let size = hs.metadata_size;
         let supports = hs.id_of(UT_METADATA).is_some();
         let pex = self.pex_active() && hs.id_of(UT_PEX).is_some();
+        // Its PEX address (or its PEX state) may change.
+        self.on_peer_set_changed();
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
@@ -310,7 +637,25 @@ impl Actor {
         } else if p.pex.is_none() {
             p.pex = Some(PexPeer::default());
         }
+        let ids = (
+            hs.id_of(UPLOAD_ONLY).is_some(),
+            hs.id_of(LT_DONTHAVE).is_some(),
+        );
         p.ext = Some(hs);
+        // The handshake we sent may predate the end of our download, and
+        // commands sent before the remote's ids were known were dropped:
+        // say it again now (a repeat is harmless).
+        if self.upload_only_sent && ids.0 {
+            self.send(key, PeerCommand::UploadOnly(true));
+        }
+        if ids.1 {
+            let lost: Vec<u32> = self.lost_pieces.iter().copied().collect();
+            for piece in lost {
+                if !self.send_lossy(key, PeerCommand::DontHave(piece)) {
+                    break;
+                }
+            }
+        }
         let Some(m) = self.magnet.as_mut() else {
             return;
         };
@@ -524,13 +869,22 @@ impl Actor {
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
-        let cap = partial_cap(l.layout.piece_len());
         let (Some(picker), Some(p)) = (l.picker.as_mut(), self.peers.get(&key)) else {
             return;
         };
+        let cap = partial_cap(
+            picker.num_in_progress(),
+            self.cache.partial_room(u64::from(l.layout.piece_len())),
+        );
         let evicted = evict_orphans(picker, cap, &mut l.bufs);
-        if evicted > 0 {
-            debug!(evicted, "dropped partial pieces no connected peer has");
+        if !evicted.is_empty() {
+            debug!(
+                evicted = evicted.len(),
+                "dropped partial pieces no connected peer has"
+            );
+            for piece in evicted {
+                self.cache.release_partial(piece);
+            }
         }
         if !p.connected || p.tx.is_none() || p.generation != generation {
             return;
@@ -539,7 +893,7 @@ impl Actor {
         if room == 0 {
             return;
         }
-        let blocks = if p.choked_us {
+        let mut blocks = if p.choked_us {
             let (true, Some(fast)) = (p.can_request_fast(), p.fast_has.as_ref()) else {
                 return;
             };
@@ -554,6 +908,28 @@ impl Actor {
         } else {
             pick_capped(picker, key, p.pieces(), room, cap, &mut self.rng)
         };
+        // Every piece started here reserves its buffer from the cache
+        // budget; one that cannot (the budget moved since `partial_room`)
+        // goes back to the picker.
+        let mut refused: Vec<u32> = Vec::new();
+        for b in &blocks {
+            if refused.contains(&b.piece) || self.cache.has_partial(b.piece) {
+                continue;
+            }
+            let size = u64::from(l.layout.piece_size(b.piece));
+            if !self.cache.reserve_partial(b.piece, size) {
+                refused.push(b.piece);
+            }
+        }
+        if !refused.is_empty() {
+            blocks.retain(|b| {
+                let keep = !refused.contains(&b.piece);
+                if !keep {
+                    picker.release(key, *b);
+                }
+                keep
+            });
+        }
         if blocks.is_empty() {
             return;
         }
@@ -578,17 +954,24 @@ impl Actor {
     }
 }
 
-/// Memory budget for pieces being downloaded (buffered in memory).
-const PARTIAL_BYTES: u64 = 64 * 1024 * 1024;
-/// Pieces in progress are never fewer than this, whatever the piece size.
-const MIN_PARTIAL_PIECES: usize = 8;
+/// The peer's share of the torrent's `num_pieces` pieces in parts per
+/// million; 0 while the metadata is pending.
+fn progress_ppm(p: &super::swarm::Peer, num_pieces: Option<u32>) -> u32 {
+    match num_pieces {
+        _ if p.seed => 1_000_000,
+        Some(n) if n > 0 => {
+            let have = u64::from(p.bits.count_ones().min(n));
+            u32::try_from(have * 1_000_000 / u64::from(n)).unwrap_or(1_000_000)
+        }
+        _ => 0,
+    }
+}
 
-/// Most pieces a torrent downloads at once: `max(8, 64 MiB / piece_len)`.
-pub(super) fn partial_cap(piece_len: u32) -> usize {
-    let by_bytes = PARTIAL_BYTES / u64::from(piece_len.max(1));
-    usize::try_from(by_bytes)
-        .unwrap_or(usize::MAX)
-        .max(MIN_PARTIAL_PIECES)
+/// Most pieces a torrent downloads at once: those already in progress
+/// plus the new buffers the cache budget has `room` for (see
+/// [`PieceCache::partial_room`](crate::storage::cache::PieceCache::partial_room)).
+pub(super) fn partial_cap(in_progress: usize, room: usize) -> usize {
+    in_progress.saturating_add(room)
 }
 
 fn peer_has(has: PeerPieces, piece: u32) -> bool {
@@ -635,14 +1018,15 @@ pub(super) fn pick_capped(
 
 /// At the cap, partial pieces no connected peer has (availability 0) can
 /// never complete and would block every new piece: they are failed back to
-/// unrequested and their buffers freed. Returns how many were evicted.
+/// unrequested and their buffers freed. Returns the evicted pieces, whose
+/// budget reservations the caller gives back.
 pub(super) fn evict_orphans(
     picker: &mut PiecePicker,
     cap: usize,
     bufs: &mut HashMap<u32, Vec<u8>>,
-) -> usize {
+) -> Vec<u32> {
     if picker.num_in_progress() < cap {
-        return 0;
+        return Vec::new();
     }
     let orphans: Vec<u32> = picker
         .partial_pieces()
@@ -652,7 +1036,7 @@ pub(super) fn evict_orphans(
         picker.piece_failed(piece);
         bufs.remove(&piece);
     }
-    orphans.len()
+    orphans
 }
 
 fn has_len(picker: &PiecePicker) -> u32 {
@@ -714,22 +1098,21 @@ mod tests {
         p.remove_peer_pieces(PeerPieces::Some(&a_has));
         // The cap is full of stranded partials: B gets nothing.
         assert!(pick_capped(&mut p, b, PeerPieces::Some(&b_has), 8, 3, &mut rng).is_empty());
-        assert_eq!(evict_orphans(&mut p, 3, &mut bufs), 3);
+        assert_eq!(evict_orphans(&mut p, 3, &mut bufs).len(), 3);
         assert!(bufs.is_empty());
         assert_eq!(p.num_in_progress(), 0);
         let blocks = pick_capped(&mut p, b, PeerPieces::Some(&b_has), 8, 3, &mut rng);
         assert_eq!(blocks.len(), 8);
         assert!(blocks.iter().all(|blk| blk.piece >= 10));
         // Below the cap nothing is evicted.
-        assert_eq!(evict_orphans(&mut p, 3, &mut bufs), 0);
+        assert!(evict_orphans(&mut p, 3, &mut bufs).is_empty());
     }
 
     #[test]
-    fn partial_cap_by_piece_size() {
-        assert_eq!(partial_cap(16_384), 4096);
-        assert_eq!(partial_cap(1 << 20), 64);
-        assert_eq!(partial_cap(16 << 20), 8);
-        assert_eq!(partial_cap(0), 64 * 1024 * 1024);
+    fn partial_cap_reads_the_budget_room() {
+        assert_eq!(partial_cap(3, 0), 3);
+        assert_eq!(partial_cap(3, 5), 8);
+        assert_eq!(partial_cap(usize::MAX, 5), usize::MAX);
     }
 
     #[test]
@@ -748,6 +1131,20 @@ mod tests {
         let more = pick_capped(&mut p, PeerKey(2), PeerPieces::All, 32, 8, &mut rng);
         assert_eq!(more.len(), 1);
         assert_eq!(p.num_in_progress(), 8);
+    }
+
+    /// A 500-deep pipeline asks for far more blocks than the cache budget
+    /// has pieces for: it gets only the blocks of `cap` pieces.
+    #[test]
+    fn deep_pipeline_stays_within_the_partial_cap() {
+        let mut rng = StdRng::seed_from_u64(4);
+        // Four blocks per piece, room for 5 pieces.
+        let mut p = picker(200, 65_536);
+        let got = pick_capped(&mut p, PeerKey(1), PeerPieces::All, 500, 5, &mut rng);
+        assert_eq!(got.len(), 20);
+        assert_eq!(pieces_of(&got).len(), 5);
+        assert_eq!(p.num_in_progress(), 5);
+        assert!(pick_capped(&mut p, PeerKey(2), PeerPieces::All, 500, 5, &mut rng).is_empty());
     }
 
     #[test]

@@ -34,5 +34,5 @@ pub use krpc::{
     MAX_VALUES, MAX_VERSION_LEN, Message, NodeInfo, Query, QueryMsg, Response, Want,
 };
 pub use lookup::PeerLookup;
-pub use node::{Dht, DhtConfig, DhtError, DhtStats};
+pub use node::{DHT_INPUT_QUEUE, Dht, DhtConfig, DhtError, DhtInput, DhtStats, ExternalIpVotes};
 pub use state::{DhtState, MAX_STATE_NODES};

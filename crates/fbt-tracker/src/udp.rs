@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use fbt_core::udp::{DatagramHandler, DatagramSender};
 use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
@@ -178,14 +179,59 @@ async fn recv_loop(socket: Arc<UdpSocket>, pending: Pending) {
             continue;
         };
         let Some(dgram) = buf.get(..n) else { continue };
-        let Some(tid) = be_u32(dgram, 4) else {
-            continue;
-        };
-        let mut map = lock(&pending);
-        if map.get(&tid).is_some_and(|(addr, _)| *addr == from)
-            && let Some((_, tx)) = map.remove(&tid)
-        {
-            let _ = tx.send(dgram.to_vec());
+        deliver(&pending, from, dgram);
+    }
+}
+
+/// Routes one datagram to its waiter: the transaction id must be pending and
+/// `from` must be the address the request went to; anything else is dropped.
+fn deliver(pending: &Pending, from: SocketAddr, dgram: &[u8]) {
+    let Some(tid) = be_u32(dgram, 4) else {
+        return;
+    };
+    let mut map = lock(pending);
+    if map.get(&tid).is_some_and(|(addr, _)| *addr == from)
+        && let Some((_, tx)) = map.remove(&tid)
+    {
+        let _ = tx.send(dgram.to_vec());
+    }
+}
+
+/// Receives tracker replies from the session's shared socket.
+#[derive(Debug)]
+struct SharedHandler {
+    pending: Pending,
+}
+
+impl DatagramHandler for SharedHandler {
+    fn handle(&self, from: SocketAddr, data: &[u8]) {
+        deliver(&self.pending, from, data);
+    }
+}
+
+/// Where a request is sent from and where its reply is matched.
+enum Endpoint<'a> {
+    Own(&'a Sock),
+    Shared(&'a Arc<dyn DatagramSender>, &'a Pending),
+}
+
+impl Endpoint<'_> {
+    fn pending(&self) -> &Pending {
+        match self {
+            Endpoint::Own(s) => &s.pending,
+            Endpoint::Shared(_, p) => p,
+        }
+    }
+
+    /// Sends one datagram. A full shared socket (`WouldBlock`) counts as a
+    /// lost packet: the retransmit timer covers it.
+    async fn send(&self, dgram: &[u8], addr: SocketAddr) -> std::io::Result<()> {
+        match self {
+            Endpoint::Own(s) => s.socket.send_to(dgram, addr).await.map(|_| ()),
+            Endpoint::Shared(s, _) => match s.send_to(dgram, addr) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                r => r.map(|_| ()),
+            },
         }
     }
 }
@@ -209,6 +255,9 @@ pub(crate) struct UdpClient {
     max_retries: u32,
     v4: OnceCell<Sock>,
     v6: OnceCell<Sock>,
+    shared_v4: Option<Arc<dyn DatagramSender>>,
+    shared_v6: Option<Arc<dyn DatagramSender>>,
+    shared_pending: Pending,
     conns: Mutex<ConnCache>,
 }
 
@@ -255,7 +304,8 @@ fn event_code(e: AnnounceEvent) -> u32 {
     }
 }
 
-fn build_announce(cid: u64, tid: u32, req: &AnnounceRequest) -> Vec<u8> {
+/// An announce over IPv6 (`ipv6`) or IPv4, carrying that family's port.
+fn build_announce(cid: u64, tid: u32, req: &AnnounceRequest, ipv6: bool) -> Vec<u8> {
     let num_want = req
         .num_want
         .and_then(|n| i32::try_from(n).ok())
@@ -273,7 +323,7 @@ fn build_announce(cid: u64, tid: u32, req: &AnnounceRequest) -> Vec<u8> {
     b.extend_from_slice(&0u32.to_be_bytes());
     b.extend_from_slice(&req.key.to_be_bytes());
     b.extend_from_slice(&num_want.to_be_bytes());
-    b.extend_from_slice(&req.port.to_be_bytes());
+    b.extend_from_slice(&req.port_for(ipv6).to_be_bytes());
     b
 }
 
@@ -305,7 +355,29 @@ fn parse_connect(buf: &[u8], tid: u32) -> Result<u64, TrackerError> {
 
 impl UdpClient {
     pub(crate) fn new(cfg: &TrackerConfig) -> UdpClient {
+        UdpClient::with_sockets(cfg, Vec::new())
+    }
+
+    /// Sends through the shared socket of each family; a family without one
+    /// binds its own socket lazily.
+    pub(crate) fn with_sockets(
+        cfg: &TrackerConfig,
+        sockets: Vec<Arc<dyn DatagramSender>>,
+    ) -> UdpClient {
+        let mut shared_v4 = None;
+        let mut shared_v6 = None;
+        for s in sockets {
+            let slot = if s.local_addr().is_ipv6() {
+                &mut shared_v6
+            } else {
+                &mut shared_v4
+            };
+            slot.get_or_insert(s);
+        }
         UdpClient {
+            shared_v4,
+            shared_v6,
+            shared_pending: Pending::default(),
             dns_timeout: cfg.http_timeout,
             base_timeout: cfg.udp_base_timeout,
             max_retries: cfg.udp_max_retries,
@@ -313,6 +385,12 @@ impl UdpClient {
             v6: OnceCell::new(),
             conns: Mutex::new(ConnCache::new()),
         }
+    }
+
+    pub(crate) fn handler(&self) -> Arc<dyn DatagramHandler> {
+        Arc::new(SharedHandler {
+            pending: self.shared_pending.clone(),
+        })
     }
 
     pub(crate) async fn announce(
@@ -352,15 +430,25 @@ impl UdpClient {
         req: &AnnounceRequest,
     ) -> Result<AnnounceResponse, TrackerError> {
         let ipv6 = addr.is_ipv6();
-        let sock = if ipv6 {
-            self.v6
-                .get_or_try_init(|| async { Sock::bind(true) })
-                .await?
+        let shared = if ipv6 {
+            &self.shared_v6
         } else {
-            self.v4
-                .get_or_try_init(|| async { Sock::bind(false) })
-                .await?
+            &self.shared_v4
         };
+        let sock = match shared {
+            Some(s) => Endpoint::Shared(s, &self.shared_pending),
+            None if ipv6 => Endpoint::Own(
+                self.v6
+                    .get_or_try_init(|| async { Sock::bind(true) })
+                    .await?,
+            ),
+            None => Endpoint::Own(
+                self.v4
+                    .get_or_try_init(|| async { Sock::bind(false) })
+                    .await?,
+            ),
+        };
+        let sock = &sock;
 
         let mut cached = lock(&self.conns).get(addr, Instant::now());
         loop {
@@ -368,8 +456,8 @@ impl UdpClient {
                 Some(id) => (id, true),
                 None => (self.connect(sock, addr).await?, false),
             };
-            let tid = new_tid(&sock.pending);
-            let dgram = build_announce(cid, tid, req);
+            let tid = new_tid(sock.pending());
+            let dgram = build_announce(cid, tid, req, ipv6);
             let resp = self.exchange(sock, addr, tid, &dgram).await?;
             match parse_udp_announce(&resp, tid, ipv6) {
                 // A cached connection id the tracker no longer knows:
@@ -382,8 +470,8 @@ impl UdpClient {
         }
     }
 
-    async fn connect(&self, sock: &Sock, addr: SocketAddr) -> Result<u64, TrackerError> {
-        let tid = new_tid(&sock.pending);
+    async fn connect(&self, sock: &Endpoint<'_>, addr: SocketAddr) -> Result<u64, TrackerError> {
+        let tid = new_tid(sock.pending());
         let resp = self.exchange(sock, addr, tid, &build_connect(tid)).await?;
         let id = parse_connect(&resp, tid)?;
         lock(&self.conns).put(addr, id, Instant::now());
@@ -394,19 +482,19 @@ impl UdpClient {
     /// doubling timeout.
     async fn exchange(
         &self,
-        sock: &Sock,
+        sock: &Endpoint<'_>,
         addr: SocketAddr,
         tid: u32,
         dgram: &[u8],
     ) -> Result<Vec<u8>, TrackerError> {
         let (tx, mut rx) = oneshot::channel();
-        lock(&sock.pending).insert(tid, (addr, tx));
+        lock(sock.pending()).insert(tid, (addr, tx));
         let _guard = Waiter {
-            pending: &sock.pending,
+            pending: sock.pending(),
             tid,
         };
         for n in 0..=self.max_retries {
-            sock.socket.send_to(dgram, addr).await?;
+            sock.send(dgram, addr).await?;
             let wait = self
                 .base_timeout
                 .saturating_mul(1u32 << n.min(MAX_BACKOFF_SHIFT));
@@ -462,6 +550,8 @@ mod tests {
             info_hash: [0xaa; 20],
             peer_id: PeerId([b'x'; 20]),
             port: 6881,
+            port_v4: None,
+            port_v6: None,
             uploaded: 1,
             downloaded: 2,
             left: 3,
@@ -470,6 +560,18 @@ mod tests {
             key: 0xbeef,
             tracker_id: None,
         }
+    }
+
+    #[test]
+    fn announce_carries_the_port_of_its_family() {
+        let port = |b: &[u8]| u16::from_be_bytes([b[96], b[97]]);
+        let mut req = request();
+        assert_eq!(port(&build_announce(1, 2, &req, false)), 6881);
+        assert_eq!(port(&build_announce(1, 2, &req, true)), 6881);
+        req.port_v4 = Some(7000);
+        req.port_v6 = Some(7001);
+        assert_eq!(port(&build_announce(1, 2, &req, false)), 7000);
+        assert_eq!(port(&build_announce(1, 2, &req, true)), 7001);
     }
 
     fn client() -> TrackerClient {
@@ -693,6 +795,113 @@ mod tests {
         let r = client().announce(&url, &request()).await.unwrap();
         assert_eq!(r.peers.len(), 2);
         assert_eq!(r.peers[0], "1.2.3.4:6881".parse::<SocketAddr>().unwrap());
+    }
+
+    /// A shared socket: sends on a real UDP socket, and a task feeds what it
+    /// receives to the client's handler.
+    #[derive(Debug)]
+    struct Shared(std::net::UdpSocket);
+
+    impl DatagramSender for Shared {
+        fn local_addr(&self) -> SocketAddr {
+            self.0.local_addr().unwrap()
+        }
+        fn send_to(&self, data: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+            self.0.send_to(data, to)
+        }
+    }
+
+    fn shared_socket(bind: &str) -> Option<(Arc<Shared>, std::net::UdpSocket)> {
+        let s = std::net::UdpSocket::bind(bind).ok()?;
+        let rx = s.try_clone().ok()?;
+        Some((Arc::new(Shared(s)), rx))
+    }
+
+    fn pump(rx: std::net::UdpSocket, h: Arc<dyn DatagramHandler>) {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = rx.recv_from(&mut buf) {
+                h.handle(from, &buf[..n]);
+            }
+        });
+    }
+
+    fn shared_client(socks: Vec<Arc<dyn DatagramSender>>) -> TrackerClient {
+        TrackerClient::with_udp_sockets(
+            TrackerConfig {
+                udp_base_timeout: Duration::from_millis(100),
+                ..TrackerConfig::default()
+            },
+            socks,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn udp_announce_through_shared_socket() {
+        let (sock, rx) = shared_socket("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().port();
+        let seen = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let s = seen.clone();
+        let url = fake(move |b, _, from| {
+            s.lock().unwrap().push(from.port());
+            if is_connect(b) {
+                vec![connect_reply(&b[12..16], CID)]
+            } else {
+                vec![announce_reply(&b[12..16], &PEERS)]
+            }
+        })
+        .await;
+        let cl = shared_client(vec![sock]);
+        pump(rx, cl.udp_handler());
+        let r = cl.announce(&url, &request()).await.unwrap();
+        assert_eq!(r.peers.len(), 2);
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty() && seen.iter().all(|p| *p == port));
+    }
+
+    #[tokio::test]
+    async fn shared_handler_ignores_wrong_source_and_unknown_tid() {
+        let cl = client();
+        let h = cl.udp_handler();
+        let pending = &cl.inner.udp.shared_pending;
+        let (tx, mut rx) = oneshot::channel();
+        let good: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        lock(pending).insert(5, (good, tx));
+        let tid = 5u32.to_be_bytes();
+        h.handle(other, &connect_reply(&tid, CID));
+        h.handle(good, &connect_reply(&6u32.to_be_bytes(), CID));
+        h.handle(good, &[1, 2, 3]);
+        assert!(rx.try_recv().is_err());
+        assert!(lock(pending).contains_key(&5));
+        h.handle(good, &connect_reply(&tid, CID));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn family_without_shared_socket_uses_its_own() {
+        let Ok(sock6) = UdpSocket::bind("[::1]:0").await else {
+            return;
+        };
+        let url = format!("udp://{}/announce", sock6.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = sock6.recv_from(&mut buf).await {
+                let b = &buf[..n];
+                let reply = if is_connect(b) {
+                    connect_reply(&b[12..16], CID)
+                } else {
+                    announce_reply(&b[12..16], &[0u8; 18])
+                };
+                let _ = sock6.send_to(&reply, from).await;
+            }
+        });
+        let (sock, rx) = shared_socket("127.0.0.1:0").unwrap();
+        let cl = shared_client(vec![sock]);
+        pump(rx, cl.udp_handler());
+        let r = cl.announce(&url, &request()).await.unwrap();
+        assert_eq!(r.peers.len(), 1);
     }
 
     #[test]

@@ -43,6 +43,7 @@ async fn seeder_with(st: Settings, m: &Metainfo, payload: &[u8]) -> (Session, To
 
 struct Pair {
     _seeder: Session,
+    seeder_events: EventStream,
     leecher: Session,
     handle: TorrentHandle,
     events: EventStream,
@@ -70,9 +71,11 @@ async fn pair(seed: EncryptionPolicy, leech: EncryptionPolicy) -> Pair {
     let handle = leecher.add_torrent(p).await.unwrap();
     assert!(wait_state(&handle, |s| *s == TorrentState::Downloading, T).await);
     let events = leecher.subscribe(EventMask::ALL);
+    let seeder_events = seeder.subscribe(EventMask::ALL);
     handle.add_peer(seeder.local_addr()).await.unwrap();
     Pair {
         _seeder: seeder,
+        seeder_events,
         leecher,
         handle,
         events,
@@ -172,6 +175,21 @@ async fn preferred_both_sides_downloads() {
     .await
     .expect("TorrentFinished");
     assert!(p.stored() == p.payload, "downloaded bytes differ");
+    p.leecher.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preferred_to_preferred_negotiates_rc4() {
+    let mut p = pair(EncryptionPolicy::Preferred, EncryptionPolicy::Preferred).await;
+    let connected = |e: &Event| matches!(e, Event::PeerConnected { .. });
+    for (side, events) in [("leecher", &mut p.events), ("seeder", &mut p.seeder_events)] {
+        let Some(Event::PeerConnected { encrypted, .. }) =
+            next_matching(events, connected, T).await
+        else {
+            panic!("{side}: no PeerConnected");
+        };
+        assert!(encrypted, "{side}: two preferred peers must negotiate RC4");
+    }
     p.leecher.shutdown().await;
 }
 
@@ -366,4 +384,125 @@ async fn incoming_mse_for_unknown_torrent_is_dropped() {
     .expect("refused promptly");
     assert!(r.is_err());
     s.shutdown().await;
+}
+
+/// The CLI race behind a CI hang: the leecher dials a seeder whose torrent
+/// is not accepting peers yet (still checking; here paused), so the first
+/// attempt ends right after the MSE handshake. The retry must come well
+/// before the full `peer_retry_delay` (60 s by default), or a lone explicit
+/// peer stalls the download for that long.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_retry_comes_soon_after_a_peer_that_was_not_ready() {
+    let delay = Duration::from_secs(12);
+    let mut st = settings(EncryptionPolicy::Forced);
+    st.peer_retry_delay = delay;
+    let (m, payload) = make_torrent(&[("a", 300_000)], 16_384);
+    let seeder = Session::new(st.clone()).await.unwrap();
+    let mut sp = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    sp.storage = Some(Arc::new(MemStorage::from_bytes(payload.clone())));
+    sp.paused = true;
+    let seed = seeder.add_torrent(sp).await.unwrap();
+    assert!(wait_state(&seed, |s| *s == TorrentState::Paused, T).await);
+
+    let leecher = Session::new(st).await.unwrap();
+    let storage = Arc::new(MemStorage::new(payload.len() as u64));
+    let mut lp = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    lp.storage = Some(storage.clone());
+    let handle = leecher.add_torrent(lp).await.unwrap();
+    assert!(wait_state(&handle, |s| *s == TorrentState::Downloading, T).await);
+    let mut events = leecher.subscribe(EventMask::ALL);
+    handle.add_peer(seeder.local_addr()).await.unwrap();
+
+    // The seeder drops the connection: one failed attempt.
+    next_matching(
+        &mut events,
+        |e| matches!(e, Event::PeerDisconnected { .. }),
+        T,
+    )
+    .await
+    .expect("first attempt fails");
+    seed.resume().await.unwrap();
+    // Well within the full delay, the retry connects and finishes.
+    next_matching(
+        &mut events,
+        |e| matches!(e, Event::TorrentFinished { .. }),
+        delay * 2 / 3,
+    )
+    .await
+    .expect("finished before the full retry delay");
+    let mut got = vec![0u8; payload.len()];
+    storage.read(0, &mut got).unwrap();
+    assert!(got == payload, "downloaded bytes differ");
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+/// A connection from `ip` to `to` that sends the 96 random bytes of a Ya
+/// and stalls; `None` if `ip` cannot be bound here.
+async fn stalled_mse(ip: [u8; 4], to: std::net::SocketAddr) -> Option<TcpStream> {
+    let sock = tokio::net::TcpSocket::new_v4().ok()?;
+    sock.bind(std::net::SocketAddr::from((ip, 0))).ok()?;
+    let mut tcp = sock.connect(to).await.ok()?;
+    tcp.write_all(&[0x55; 96]).await.ok()?;
+    Some(tcp)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_mse_handshakes_are_capped_per_ip() {
+    let mut st = settings(EncryptionPolicy::Preferred);
+    st.handshake_timeout = Duration::from_secs(3);
+    let (s, _h, ih) = seeder_for(st).await;
+    let addr = s.local_addr();
+    let mut stalled = Vec::new();
+    for _ in 0..20 {
+        stalled.push(stalled_mse([127, 0, 0, 1], addr).await.expect("loopback"));
+    }
+    // Let the accept loop admit (8) or drop (12) every one of them.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        fbt_wire::initiate(tcp, &ih, CryptoMethods::RC4, &handshake_bytes(ih)),
+    )
+    .await
+    .expect("refused promptly, not left waiting");
+    assert!(r.is_err(), "the 21st handshake from one IP is refused");
+
+    // Another IP is not affected (skipped where 127.0.0.2 does not bind, as on macOS).
+    if let Some(sock) = bind_other_loopback() {
+        let tcp = sock.connect(addr).await.unwrap();
+        let mut m = tokio::time::timeout(
+            Duration::from_secs(2),
+            fbt_wire::initiate(tcp, &ih, CryptoMethods::RC4, &handshake_bytes(ih)),
+        )
+        .await
+        .expect("accepted at once")
+        .expect("MSE handshake from another IP");
+        let back = read_handshake(&mut m).await.expect("handshake");
+        assert_eq!(back.info_hash, ih);
+    }
+
+    // Once the stalled ones time out, the IP is welcome again.
+    for mut raw in stalled {
+        assert!(closed_within(&mut raw, Duration::from_secs(5)).await);
+    }
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let mut m = tokio::time::timeout(
+        Duration::from_secs(5),
+        fbt_wire::initiate(tcp, &ih, CryptoMethods::RC4, &handshake_bytes(ih)),
+    )
+    .await
+    .expect("handshake in time")
+    .expect("accepted again");
+    let back = read_handshake(&mut m).await.expect("handshake");
+    assert_eq!(back.info_hash, ih);
+    s.shutdown().await;
+}
+
+/// A socket bound to 127.0.0.2, or `None` where that does not route.
+fn bind_other_loopback() -> Option<tokio::net::TcpSocket> {
+    let sock = tokio::net::TcpSocket::new_v4().ok()?;
+    sock.bind(std::net::SocketAddr::from(([127, 0, 0, 2], 0)))
+        .ok()?;
+    Some(sock)
 }
