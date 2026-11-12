@@ -26,7 +26,8 @@ impl Actor {
         let need_save = self.need_save_resume;
         let flow = self.apply_cmd(cmd).await;
         if self.need_save_resume != need_save {
-            // Whoever made the change reads the flag as soon as it returns.
+            // Commands that reply publish before replying; this covers the
+            // ones that do not reply.
             self.publish();
         }
         flow
@@ -54,6 +55,8 @@ impl Actor {
                 }
                 // Every verified piece is on disk before the reply.
                 self.flush_and_wait().await;
+                // The caller reads the status as soon as this returns.
+                self.publish();
                 let _ = tx.send(Ok(()));
             }
             Cmd::Resume(tx) => {
@@ -61,6 +64,7 @@ impl Actor {
                     self.need_save_resume = true;
                 }
                 self.resume();
+                self.publish();
                 let _ = tx.send(Ok(()));
             }
             Cmd::Recheck(tx) => {
@@ -87,6 +91,7 @@ impl Actor {
                 self.need_save_resume = true;
                 self.set_priorities(p);
                 self.apply_file_priorities().await;
+                self.publish();
                 let _ = tx.send(Ok(()));
             }
             Cmd::AddPeer(addr, tx) => {
