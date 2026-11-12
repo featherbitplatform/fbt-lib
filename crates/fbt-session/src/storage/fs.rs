@@ -645,7 +645,34 @@ fn move_file(from: &Path, to: &Path, copy: bool) -> io::Result<()> {
     copy_then_delete(from, to)
 }
 
+/// Whether `a` and `b` both exist and are the same file (two spellings,
+/// a case-insensitive filesystem, or a bind mount).
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // The final path of an open handle: a case variant or another
+        // spelling of the same file resolves to the same name.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
 fn copy_then_delete(from: &Path, to: &Path) -> io::Result<()> {
+    // Two names of one file: copying would truncate it and the delete
+    // would remove the only copy. It is already where it should be.
+    if same_file(from, to) {
+        return Ok(());
+    }
     let mut src = File::open(from).map_err(|e| at(from, e))?;
     let mut dst = OpenOptions::new()
         .write(true)
@@ -937,25 +964,32 @@ impl Storage for FsStorage {
             return Ok(());
         }
         let target = paths.at(save_path);
-        // Every non-pad file, then the part file: (here, there).
-        let mut plan: Vec<(PathBuf, PathBuf)> = self
+        // Every non-pad file, then the part file: (here, there, is the
+        // part file).
+        let mut plan: Vec<(PathBuf, PathBuf, bool)> = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, e)| !e.pad)
-            .map(|(i, _)| (paths.file(i), target.file(i)))
+            .map(|(i, _)| (paths.file(i), target.file(i), false))
             .collect();
-        plan.push((paths.part(), target.part()));
+        plan.push((paths.part(), target.part(), true));
         if mode == MoveMode::FailIfExists {
-            for (_, to) in &plan {
+            for (_, to, _) in &plan {
                 if exists(to)? {
                     return Err(at(to, io::ErrorKind::AlreadyExists.into()));
                 }
             }
         }
         // No handle of the old place survives (Windows cannot delete an
-        // open file); the part file is opened again where it ends up.
-        self.lock().open.clear();
+        // open file); the part file is opened again where it ends up. Files
+        // are sized again on their next write: a file kept at the target
+        // may be shorter than ours.
+        {
+            let mut st = self.lock();
+            st.open.clear();
+            st.sized.clear();
+        }
         let had_part = part.take().is_some();
         let copy = self.force_copy();
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -965,9 +999,13 @@ impl Storage for FsStorage {
             created.push(save_path.to_path_buf());
         }
         let mut failed = None;
-        for (from, to) in plan {
+        for (from, to, is_part) in plan {
             let step = (|| {
-                if !exists(&from)? || (mode == MoveMode::KeepExisting && exists(&to)?) {
+                // A part file at the target is an orphan of this torrent
+                // (its name holds the info hash): ours replaces it even
+                // under `KeepExisting`, so ours is never left behind.
+                let keep = mode == MoveMode::KeepExisting && !is_part;
+                if !exists(&from)? || (keep && exists(&to)?) {
                     return Ok(false);
                 }
                 created.extend(
@@ -985,11 +1023,21 @@ impl Storage for FsStorage {
                 }
             }
         }
-        if let Some(e) = failed {
+        if let Some(mut e) = failed {
+            let mut stranded = Vec::new();
             for (from, to) in moved.iter().rev() {
                 if let Err(back) = move_file(to, from, copy) {
                     tracing::warn!(from = %to.display(), to = %from.display(), error = %back, "cannot move a file back");
+                    stranded.push(format!("{} ({back})", to.display()));
                 }
+            }
+            if !stranded.is_empty() {
+                // The torrent runs from the old place: the caller learns
+                // which files did not make it back there.
+                e = io::Error::new(
+                    e.kind(),
+                    format!("{e}; not moved back: {}", stranded.join(", ")),
+                );
             }
             // Directories the move created, deepest first.
             created.sort_by(|a, b| {
@@ -1028,14 +1076,17 @@ impl Storage for FsStorage {
         }
         let from = paths.file(index);
         let to = paths.save_path.join(path.to_path_buf());
+        let on_disk = !routed && exists(&from)?;
+        // Whatever is at the target is not ours, unless it is this very
+        // file under another spelling (a case-insensitive or normalising
+        // filesystem): never written into or replaced, whether this file
+        // is on disk, in the part file or not created yet.
+        if exists(&to)? && !(on_disk && same_file(&from, &to)) {
+            return Err(at(&to, io::ErrorKind::AlreadyExists.into()));
+        }
         self.lock().open.remove(&index);
         // A file in the part file, or not created yet, only changes name.
-        if !routed && exists(&from)? {
-            // The same file on a case-insensitive or normalising
-            // filesystem when only the key matches.
-            if old.key() != path.key() && exists(&to)? {
-                return Err(at(&to, io::ErrorKind::AlreadyExists.into()));
-            }
+        if on_disk {
             // Directories created for it, deepest first, taken back on failure.
             let created: Vec<PathBuf> = dirs_below(&to, &paths.save_path)
                 .filter(|d| matches!(d.try_exists(), Ok(false)))
@@ -1231,6 +1282,134 @@ mod tests {
         let again = FsStorage::with_paths(dir.path().to_path_buf(), &m, &[(1, to)]);
         again.read(0, &mut out).unwrap();
         assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    fn rel(parts: &[&str]) -> RelPath {
+        fbt_metainfo::sanitize_path(parts.iter().map(|p| p.as_bytes())).unwrap()
+    }
+
+    /// A file at the target that is not this torrent's is never taken
+    /// over, whether the renamed file lives in the part file or was never
+    /// created.
+    #[test]
+    fn rename_never_takes_over_a_foreign_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = torrent(
+            "t",
+            &[(&["a"], 10, false), (&["b"], 10, false), (&["c"], 8, false)],
+            8,
+        );
+        let s = FsStorage::new(dir.path().to_path_buf(), &m);
+        // `a` skipped and missing: in the part file. `c` never written.
+        s.set_file_priorities(&[false, true, true]).unwrap();
+        s.write(0, &(1..=20).collect::<Vec<u8>>()).unwrap();
+        assert!(!dir.path().join("t/a").exists());
+        assert!(!dir.path().join("t/c").exists());
+        std::fs::write(dir.path().join("theirs"), b"theirs").unwrap();
+        for idx in [0, 2] {
+            let e = s.rename_file(idx, &rel(&["theirs"])).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "file {idx}");
+        }
+        assert_eq!(std::fs::read(dir.path().join("theirs")).unwrap(), b"theirs");
+        // Nothing changed: `a` still reads from the part file, and a write
+        // of `c` lands at its own path.
+        let mut out = [0u8; 20];
+        s.read(0, &mut out).unwrap();
+        assert_eq!(out.to_vec(), (1..=20).collect::<Vec<u8>>());
+        s.write(20, &[7; 8]).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("t/c")).unwrap(), [7; 8]);
+        assert_eq!(std::fs::read(dir.path().join("theirs")).unwrap(), b"theirs");
+    }
+
+    /// A case-only rename moves the file when the target is the same file
+    /// (case-insensitive filesystem), and is refused when it is another
+    /// one (case-sensitive filesystem).
+    #[test]
+    fn case_only_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = torrent("t", &[(&["b"], 4, false)], 4);
+        let s = FsStorage::new(dir.path().to_path_buf(), &m);
+        s.write(0, &[1, 2, 3, 4]).unwrap();
+        let upper = dir.path().join("t/B");
+        if upper.exists() {
+            s.rename_file(0, &rel(&["t", "B"])).unwrap();
+        } else {
+            std::fs::write(&upper, b"theirs").unwrap();
+            let e = s.rename_file(0, &rel(&["t", "B"])).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&upper).unwrap(), b"theirs");
+        }
+        let mut out = [0u8; 4];
+        s.read(0, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3, 4]);
+    }
+
+    /// Two names of one file: the copy fallback leaves it alone instead of
+    /// truncating it and deleting the only copy.
+    #[test]
+    fn copy_onto_the_same_file_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let file = dir.path().join("d").join("x");
+        std::fs::write(&file, b"data").unwrap();
+        let alias = dir.path().join("d").join(".").join("x");
+        move_file(&file, &alias, true).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"data");
+    }
+
+    /// A file renamed while it lives in the part file is exported to its
+    /// new path once it is wanted.
+    #[test]
+    fn renamed_part_file_file_exports_to_its_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = torrent("t", &[(&["a"], 10, false), (&["b"], 10, false)], 8);
+        let s = FsStorage::new(dir.path().to_path_buf(), &m);
+        s.set_file_priorities(&[false, true]).unwrap();
+        let data: Vec<u8> = (1..=20).collect();
+        s.write(0, &data).unwrap();
+        s.rename_file(0, &rel(&["x", "a2"])).unwrap();
+        assert!(
+            !dir.path().join("x/a2").exists(),
+            "a skipped file was created"
+        );
+        s.set_file_priorities(&[true, true]).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("x/a2")).unwrap(), &data[..10]);
+        assert!(!dir.path().join("t/a").exists());
+        assert!(!s.part_path().exists(), "the part file outlived its data");
+        let mut out = [0u8; 20];
+        s.read(0, &mut out).unwrap();
+        assert_eq!(out.as_slice(), data.as_slice());
+    }
+
+    /// `KeepExisting`: a shorter file kept at the target is extended by
+    /// the next write, and ours replaces an orphan part file there.
+    #[test]
+    fn keep_existing_sizes_kept_files_and_moves_the_part_file() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let m = torrent("t", &[(&["a"], 10, false), (&["b"], 10, false)], 8);
+        let s = FsStorage::new(old.path().to_path_buf(), &m);
+        s.set_file_priorities(&[false, true]).unwrap();
+        s.write(0, &(1..=20).collect::<Vec<u8>>()).unwrap();
+        let part_name = s.part_path().file_name().unwrap().to_owned();
+        std::fs::create_dir_all(new.path().join("t")).unwrap();
+        std::fs::write(new.path().join("t/b"), [9u8; 3]).unwrap();
+        std::fs::write(new.path().join(&part_name), b"orphan").unwrap();
+        s.move_to(new.path(), MoveMode::KeepExisting).unwrap();
+        assert!(
+            !old.path().join(&part_name).exists(),
+            "our part file stayed"
+        );
+        // Ours, not the orphan: `a`'s bytes read back.
+        let mut a = [0u8; 10];
+        s.read(0, &mut a).unwrap();
+        assert_eq!(a.to_vec(), (1..=10).collect::<Vec<u8>>());
+        // Theirs kept, then extended to the entry's length by a write.
+        s.write(19, &[5]).unwrap();
+        let b = std::fs::read(new.path().join("t/b")).unwrap();
+        assert_eq!(b.len(), 10);
+        assert_eq!(&b[..3], &[9, 9, 9]);
+        assert_eq!(b[9], 5);
     }
 
     #[test]

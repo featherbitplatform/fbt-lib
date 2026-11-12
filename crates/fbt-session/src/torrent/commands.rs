@@ -22,7 +22,7 @@ use crate::storage::cache::FlushReason;
 impl Actor {
     pub(super) async fn on_cmd(&mut self, cmd: Cmd) -> Flow {
         if self.storage_busy && cmd.waits_for_storage() {
-            self.deferred.push_back(cmd);
+            self.defer(cmd);
             return Flow::Continue;
         }
         match cmd {
@@ -35,17 +35,17 @@ impl Actor {
                 }
                 // Every verified piece is on disk before the reply.
                 self.flush_and_wait().await;
-                let _ = tx.send(());
+                let _ = tx.send(Ok(()));
             }
             Cmd::Resume(tx) => {
                 self.resume();
-                let _ = tx.send(());
+                let _ = tx.send(Ok(()));
             }
             Cmd::Recheck(tx) => {
                 // The check reads the disk: everything verified is there first.
                 self.flush_and_wait().await;
                 self.recheck();
-                let _ = tx.send(());
+                let _ = tx.send(Ok(()));
             }
             Cmd::Reannounce(tx) => {
                 self.signal(|s| {
@@ -64,7 +64,7 @@ impl Actor {
             Cmd::SetPriorities(p, tx) => {
                 self.set_priorities(p);
                 self.apply_file_priorities().await;
-                let _ = tx.send(());
+                let _ = tx.send(Ok(()));
             }
             Cmd::AddPeer(addr, tx) => {
                 if !self.refuse_blocked(addr)
@@ -289,6 +289,9 @@ impl Actor {
     /// short: data comes first.
     pub(super) async fn stop(&mut self, remove: Option<RemoveMode>) -> Result<(), SessionError> {
         let announce_deadline = Instant::now() + STOPPED_TIMEOUT;
+        // A storage operation still waiting to start never will: the
+        // storage is free again, so the verified pieces below are written.
+        self.abandon_storage_op();
         // Only a write that fails from here on is this stop's error.
         self.write_error = None;
         self.signal(|s| {

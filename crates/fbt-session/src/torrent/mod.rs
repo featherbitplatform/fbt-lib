@@ -69,13 +69,13 @@ const COMMAND_QUEUE: usize = 64;
 /// Handle to the actor, from the public handle and the listener.
 #[derive(Debug)]
 pub(crate) enum Cmd {
-    Pause(oneshot::Sender<()>),
-    Resume(oneshot::Sender<()>),
+    Pause(oneshot::Sender<Result<(), SessionError>>),
+    Resume(oneshot::Sender<Result<(), SessionError>>),
     Remove(RemoveMode, oneshot::Sender<Result<(), SessionError>>),
-    Recheck(oneshot::Sender<()>),
+    Recheck(oneshot::Sender<Result<(), SessionError>>),
     Reannounce(oneshot::Sender<()>),
     Scrape(oneshot::Sender<()>),
-    SetPriorities(Vec<Priority>, oneshot::Sender<()>),
+    SetPriorities(Vec<Priority>, oneshot::Sender<Result<(), SessionError>>),
     AddPeer(SocketAddr, oneshot::Sender<()>),
     Pieces(oneshot::Sender<Bitfield>),
     SetRateLimit(RateLimit, oneshot::Sender<()>),
@@ -232,12 +232,12 @@ impl TorrentHandle {
 
     /// Disconnects every peer and stops announcing.
     pub async fn pause(&self) -> Result<(), SessionError> {
-        self.call(Cmd::Pause).await
+        self.call(Cmd::Pause).await?
     }
 
     /// Undoes [`pause`](Self::pause); also clears a storage error.
     pub async fn resume(&self) -> Result<(), SessionError> {
-        self.call(Cmd::Resume).await
+        self.call(Cmd::Resume).await?
     }
 
     /// Removes the torrent from the session, optionally deleting its files.
@@ -256,7 +256,7 @@ impl TorrentHandle {
         if self.metainfo().is_none() {
             return Err(SessionError::NoMetadata);
         }
-        self.call(Cmd::Recheck).await
+        self.call(Cmd::Recheck).await?
     }
 
     /// Announces to the trackers now.
@@ -292,7 +292,7 @@ impl TorrentHandle {
                 got: p.len(),
             });
         }
-        self.call(|tx| Cmd::SetPriorities(p, tx)).await
+        self.call(|tx| Cmd::SetPriorities(p, tx)).await?
     }
 
     /// Connects to a peer.
@@ -378,6 +378,16 @@ impl TorrentHandle {
     /// [`io::ErrorKind::AlreadyExists`](std::io::ErrorKind::AlreadyExists)
     /// error for [`MoveMode::FailIfExists`] with a file at the target) and
     /// [`SessionError::Unsupported`] for a custom storage that cannot move.
+    ///
+    /// While the files move, [`pause`](Self::pause),
+    /// [`resume`](Self::resume), [`remove`](Self::remove),
+    /// [`force_recheck`](Self::force_recheck),
+    /// [`set_file_priorities`](Self::set_file_priorities), another
+    /// `move_storage` or [`rename_file`](Self::rename_file), and the
+    /// session's shutdown wait for it to finish (a copy across filesystems
+    /// can take minutes); they then run in the order they were made. Past
+    /// 64 such waiting commands a new one fails at once with
+    /// [`SessionError::Busy`]. Other methods, reads included, are not held.
     pub async fn move_storage(&self, path: PathBuf, mode: MoveMode) -> Result<(), SessionError> {
         self.call(|tx| Cmd::MoveStorage { path, mode, tx }).await?
     }

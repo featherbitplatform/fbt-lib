@@ -23,8 +23,8 @@ use crate::event::Event;
 use crate::storage::cache::FlushReason;
 use crate::storage::{MoveMode, Storage};
 
-/// Commands held while the storage is busy; further ones wait in the
-/// command channel.
+/// Commands held while the storage is busy; further ones fail with
+/// [`SessionError::Busy`] (the session's `Shutdown` is always held).
 pub(super) const MAX_DEFERRED_CMDS: usize = 64;
 
 /// Where an operation's answer goes.
@@ -65,7 +65,47 @@ impl Cmd {
     }
 }
 
+impl Cmd {
+    /// Answers a command that waits for the storage with
+    /// [`SessionError::Busy`].
+    fn reject_busy(self) {
+        let busy = || Err(SessionError::Busy);
+        match self {
+            Cmd::Pause(tx) | Cmd::Resume(tx) | Cmd::Recheck(tx) | Cmd::SetPriorities(_, tx) => {
+                let _ = tx.send(busy());
+            }
+            Cmd::Remove(_, tx) | Cmd::MoveStorage { tx, .. } | Cmd::RenameFile { tx, .. } => {
+                let _ = tx.send(busy());
+            }
+            // Never rejected (see `defer`); dropping answers it as gone.
+            _ => {}
+        }
+    }
+}
+
 impl Actor {
+    /// Holds `cmd` until the storage operation is done; past
+    /// `MAX_DEFERRED_CMDS` it fails with [`SessionError::Busy`] instead,
+    /// except the session's `Shutdown`.
+    pub(super) fn defer(&mut self, cmd: Cmd) {
+        if self.deferred.len() >= MAX_DEFERRED_CMDS && !matches!(cmd, Cmd::Shutdown(_)) {
+            cmd.reject_busy();
+        } else {
+            self.deferred.push_back(cmd);
+        }
+    }
+
+    /// The actor stops: an operation whose job has not started is dropped
+    /// (its caller learns the torrent is gone) and the storage is free, so
+    /// the stop writes every verified piece. A job already running ends on
+    /// its own and the stop handles its result.
+    pub(super) fn abandon_storage_op(&mut self) {
+        if self.storage_op.as_ref().is_some_and(|op| !op.spawned) {
+            self.storage_op = None;
+            self.storage_busy = false;
+        }
+    }
+
     pub(super) async fn on_move_storage(&mut self, path: PathBuf, mode: MoveMode, tx: Reply) {
         if self.loaded.is_none() {
             // A magnet without metadata has no files yet: only the place
@@ -388,5 +428,103 @@ mod tests {
         let r = a.jobs.join_next().await.expect("the held read");
         a.on_job_result(r);
         assert_eq!(a.reads_in_flight, 0);
+    }
+
+    /// While a move waits, storage commands queue up to
+    /// `MAX_DEFERRED_CMDS`; the next one fails with `Busy` at once, the
+    /// session's shutdown is still held, and the queued ones run in order
+    /// after the move.
+    #[tokio::test]
+    async fn queued_commands_past_the_cap_are_busy() {
+        let mut a = actor_with(&[4 * u64::from(PL)], PL, 0);
+        let storage = Arc::new(Gated {
+            inner: MemStorage::new(4 * u64::from(PL)),
+            gate: (Mutex::new(false), Condvar::new()),
+            moves: Mutex::new(Vec::new()),
+        });
+        a.storage = Some(Arc::clone(&storage) as Arc<dyn Storage>);
+        a.start_piece_read(1, 0, Vec::new());
+        let (tx, mut moved) = oneshot::channel();
+        a.on_move_storage(PathBuf::from("elsewhere"), MoveMode::FailIfExists, tx)
+            .await;
+        assert!(a.storage_busy);
+
+        let mut queued = Vec::new();
+        for i in 0..MAX_DEFERRED_CMDS {
+            let (tx, rx) = oneshot::channel();
+            let target = PathBuf::from(format!("then-{i}"));
+            let _ = a
+                .on_cmd(Cmd::MoveStorage {
+                    path: target,
+                    mode: MoveMode::FailIfExists,
+                    tx,
+                })
+                .await;
+            queued.push(rx);
+        }
+        assert_eq!(a.deferred.len(), MAX_DEFERRED_CMDS);
+        let (tx, mut over) = oneshot::channel();
+        let _ = a.on_cmd(Cmd::Recheck(tx)).await;
+        assert!(matches!(over.try_recv(), Ok(Err(SessionError::Busy))));
+        let (tx, mut shutdown) = oneshot::channel();
+        let _ = a.on_cmd(Cmd::Shutdown(tx)).await;
+        assert_eq!(a.deferred.len(), MAX_DEFERRED_CMDS + 1, "shutdown dropped");
+        assert!(matches!(shutdown.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            queued
+                .iter_mut()
+                .all(|rx| matches!(rx.try_recv(), Err(TryRecvError::Empty)))
+        );
+
+        storage.open();
+        while a.storage_busy {
+            let r = a.jobs.join_next().await.expect("a job");
+            a.on_job_result(r);
+        }
+        assert!(matches!(moved.try_recv(), Ok(Ok(()))));
+        // The run loop's turn: the queued commands run in order.
+        let first = a.deferred.pop_front().expect("queued");
+        let _ = a.on_cmd(first).await;
+        while a.storage_busy {
+            let r = a.jobs.join_next().await.expect("a job");
+            a.on_job_result(r);
+        }
+        assert!(matches!(queued[0].try_recv(), Ok(Ok(()))));
+        assert_eq!(
+            storage.moves(),
+            vec![PathBuf::from("elsewhere"), PathBuf::from("then-0")]
+        );
+    }
+
+    /// Every handle gone while a move still waits for a read: the stop
+    /// drops the move and writes the verified pieces.
+    #[tokio::test]
+    async fn stop_while_a_move_waits_writes_the_pieces() {
+        let mut a = actor_with(&[4 * u64::from(PL)], PL, 64 * u64::from(PL));
+        let storage = Arc::new(Gated {
+            inner: MemStorage::new(4 * u64::from(PL)),
+            gate: (Mutex::new(false), Condvar::new()),
+            moves: Mutex::new(Vec::new()),
+        });
+        a.storage = Some(Arc::clone(&storage) as Arc<dyn Storage>);
+        a.start_piece_read(1, 0, Vec::new());
+        let (tx, mut moved) = oneshot::channel();
+        a.on_move_storage(PathBuf::from("elsewhere"), MoveMode::FailIfExists, tx)
+            .await;
+        assert!(a.storage_busy);
+        // Verified while the move waits: held dirty.
+        let piece: Arc<[u8]> = vec![7u8; PL as usize].into();
+        a.cache.insert_dirty(2, piece, std::time::Instant::now());
+        storage.open();
+        let _ = a.stop(None).await;
+        assert!(!a.storage_busy);
+        assert!(storage.moves().is_empty(), "the move ran");
+        assert!(moved.try_recv().is_err(), "the move was answered as done");
+        let mut got = vec![0u8; PL as usize];
+        storage.inner.read(2 * u64::from(PL), &mut got).unwrap();
+        assert!(
+            got.iter().all(|&b| b == 7),
+            "the dirty piece was not written"
+        );
     }
 }

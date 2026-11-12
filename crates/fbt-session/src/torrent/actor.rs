@@ -32,7 +32,7 @@ use super::readers::Readers;
 use super::retries::Retries;
 use super::serve::PieceReads;
 use super::smartban::SmartBan;
-use super::storage_ops::{MAX_DEFERRED_CMDS, StorageOp};
+use super::storage_ops::StorageOp;
 use super::{Cmd, piece_priorities, same_state};
 use crate::bandwidth::BucketPair;
 use crate::choker::{Choker, ChokerConfig};
@@ -271,7 +271,7 @@ pub(crate) struct Actor {
     /// The storage operation under way.
     pub(super) storage_op: Option<StorageOp>,
     /// Commands that wait for the storage operation, in arrival order; at
-    /// most `MAX_DEFERRED_CMDS`.
+    /// most `MAX_DEFERRED_CMDS` (plus the session's one `Shutdown`).
     pub(super) deferred: VecDeque<Cmd>,
     /// A `KeepExisting` move is done: its recheck runs, then this answers.
     pub(super) recheck_after_move:
@@ -501,7 +501,7 @@ impl Actor {
                 }
             }
             tokio::select! {
-                cmd = self.cmds.recv(), if self.deferred.len() < MAX_DEFERRED_CMDS => {
+                cmd = self.cmds.recv() => {
                     let Some(cmd) = cmd else {
                         // Every handle is gone, the session included.
                         let _ = self.stop(None).await;

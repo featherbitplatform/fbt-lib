@@ -243,6 +243,14 @@ async fn move_to_same_path_is_a_noop() {
     assert_files(dir.path(), &payload);
     assert_eq!(h.status().save_path, dir.path());
     assert_eq!(h.status().state, TorrentState::Seeding);
+    // Another spelling of the same directory moves nothing either.
+    let spelled = dir.path().join(".");
+    h.move_storage(spelled.clone(), MoveMode::ReplaceExisting)
+        .await
+        .unwrap();
+    assert_files(dir.path(), &payload);
+    assert_eq!(h.status().save_path, spelled);
+    assert_eq!(h.status().state, TorrentState::Seeding);
     s.shutdown().await;
 }
 
@@ -452,10 +460,28 @@ async fn rename_file_then_serve() {
         "../x",
         "",
         "a//b",
+        "/x",
+        "a\\b",
+        "C:x",
+        "CON",
+        "a\0b",
     ] {
         let e = h.rename_file(1, bad).await.unwrap_err();
-        assert!(matches!(e, SessionError::InvalidPath(_)), "{bad}: {e:?}");
+        assert!(matches!(e, SessionError::InvalidPath(_)), "{bad:?}: {e:?}");
     }
+    assert!(std::fs::read(&moved).unwrap() == payload[A..]);
+    // A file that is not the torrent's is never taken over.
+    std::fs::write(dir.path().join("theirs"), b"theirs").unwrap();
+    let e = h.rename_file(1, "theirs").await.unwrap_err();
+    assert!(
+        matches!(&e, SessionError::Storage(io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+        "{e:?}"
+    );
+    assert!(matches!(
+        next_matching(&mut ev, |e| matches!(e, Event::FileRenameFailed { .. }), T).await,
+        Some(Event::FileRenameFailed { index: 1, .. })
+    ));
+    assert_eq!(std::fs::read(dir.path().join("theirs")).unwrap(), b"theirs");
     assert!(std::fs::read(&moved).unwrap() == payload[A..]);
 
     // A leecher downloads file 1 from its new place.

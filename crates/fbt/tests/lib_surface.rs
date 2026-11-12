@@ -157,6 +157,7 @@ async fn storage_methods(h: &TorrentHandle) {
     let _ = [
         SessionError::InvalidPath(String::new()),
         SessionError::Unsupported,
+        SessionError::Busy,
     ];
 }
 

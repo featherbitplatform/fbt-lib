@@ -73,6 +73,10 @@ pub enum SessionError {
     /// `rename_file`).
     #[error("the storage does not support this operation")]
     Unsupported,
+    /// The torrent's storage is moving and 64 commands already wait for
+    /// it (see [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage)).
+    #[error("too many commands wait for the storage move")]
+    Busy,
 }
 
 /// Why a [`FileReader`](crate::FileReader) read failed. It comes inside the
