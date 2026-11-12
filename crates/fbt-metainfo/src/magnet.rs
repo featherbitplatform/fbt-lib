@@ -12,8 +12,9 @@ use crate::path::sanitize_component;
 
 /// Longest accepted magnet URI, in bytes.
 pub const MAX_MAGNET_LEN: usize = 65_536;
-/// Most `tr` trackers kept; later ones are ignored.
-pub const MAX_MAGNET_TRACKERS: usize = 64;
+/// Most `tr` trackers kept; later ones are ignored (the metainfo's
+/// [`MAX_TRACKERS`](crate::MAX_TRACKERS)).
+pub const MAX_MAGNET_TRACKERS: usize = crate::metainfo::MAX_TRACKERS;
 /// Most `x.pe` peers kept; later ones are ignored.
 pub const MAX_MAGNET_PEERS: usize = 200;
 /// Most comma-separated entries accepted in `so`.

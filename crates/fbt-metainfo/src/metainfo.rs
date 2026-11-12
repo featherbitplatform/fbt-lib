@@ -17,8 +17,9 @@ pub(crate) const MAX_URL_LEN: usize = 2048;
 /// Deepest accepted file path, in components (including the root name).
 const MAX_PATH_DEPTH: usize = 256;
 const MAX_PIECE_LEN: i64 = 268_435_456;
-/// Most tracker URLs kept across all tiers; later ones are ignored.
-const MAX_TRACKERS: usize = 64;
+/// Most tracker URLs kept across all tiers; later ones are ignored. The
+/// session applies the same cap to trackers set by hand.
+pub const MAX_TRACKERS: usize = 64;
 /// Item cap when decoding an info dictionary received from a peer.
 const MAX_INFO_ITEMS: usize = 4_194_304;
 /// Nesting cap when decoding an info dictionary received from a peer.

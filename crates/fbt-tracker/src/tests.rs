@@ -451,3 +451,22 @@ async fn scrape_caps_hashes() {
     let got = tokio::time::timeout(Duration::from_millis(100), udp.recv_from(&mut buf)).await;
     assert!(got.is_err(), "no datagram sent");
 }
+
+#[test]
+fn http_scrape_counts_saturate() {
+    let body = scrape_files(&[([1; 20], i64::from(u32::MAX) + 1, i64::MAX, -5)]);
+    let got = parse_http_scrape(&body).unwrap();
+    assert_eq!(
+        (got[0].complete, got[0].downloaded, got[0].incomplete),
+        (u32::MAX, u32::MAX, 0)
+    );
+    let body = scrape_files(&[([1; 20], i64::from(u32::MAX), 0, 1)]);
+    assert_eq!(parse_http_scrape(&body).unwrap()[0].complete, u32::MAX);
+}
+
+#[test]
+fn http_scrape_output_is_capped() {
+    let entries: Vec<_> = (0..100u8).map(|i| ([i; 20], 1, 1, 1)).collect();
+    let body = scrape_files(&entries);
+    assert_eq!(parse_http_scrape(&body).unwrap().len(), MAX_SCRAPE_HASHES);
+}

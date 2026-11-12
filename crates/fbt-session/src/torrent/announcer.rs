@@ -41,7 +41,7 @@ use rand::RngExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::tiers::Tiers;
 use crate::event::Event;
@@ -59,9 +59,8 @@ const PEER_QUEUE: usize = 16;
 /// Peers taken from one reply.
 const MAX_PEERS_PER_REPLY: usize = 200;
 /// Trackers remembered as having taken a `started` in one run: the tracker
-/// cap of a torrent and of a magnet (64 URLs). A tracker beyond it is sent
-/// `started` again and never `stopped`.
-const MAX_STARTED_URLS: usize = 64;
+/// cap [`Tiers`] applies to every torrent, so never reached.
+const MAX_STARTED_URLS: usize = fbt_metainfo::MAX_TRACKERS;
 /// `left` reported while a magnet has no metadata, so trackers treat us as
 /// a leecher (what libtorrent reports).
 pub(super) const NO_METADATA_LEFT: u64 = 16_384;
@@ -458,20 +457,37 @@ impl Task {
     async fn stopped(&mut self, urls: &HashSet<String>, left: u64) {
         let base = self.request_template(AnnounceEvent::Stopped, left);
         let mut set = JoinSet::new();
+        let mut ids = HashMap::new();
         for url in urls {
             let mut req = request_for(url, &base, &self.tracker_ids);
             req.num_want = Some(0);
             let client = self.client.clone();
-            let url = url.clone();
-            set.spawn(async move {
-                let r = client.announce(&url, &req).await;
-                (url, r)
+            let task_url = url.clone();
+            let handle = set.spawn(async move {
+                let r = client.announce(&task_url, &req).await;
+                (task_url, r)
             });
+            ids.insert(handle.id(), url.clone());
         }
         let mut pending = urls.clone();
         let deadline = Instant::now() + STOPPED_TIMEOUT;
         while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, set.join_next()).await {
-            let Ok((url, r)) = joined else { continue };
+            let (url, r) = match joined {
+                Ok(done) => done,
+                Err(e) => {
+                    // The announce task panicked: not a timeout.
+                    if let Some(url) = ids.get(&e.id()).cloned() {
+                        pending.remove(&url);
+                        warn!(%url, error = %e, "stopped announce task failed");
+                        self.shared.emit(Event::TrackerError {
+                            torrent: self.ih,
+                            url,
+                            message: format!("stopped announce task failed: {e}"),
+                        });
+                    }
+                    continue;
+                }
+            };
             pending.remove(&url);
             match r {
                 Ok(resp) => self.shared.emit(Event::TrackerReply {

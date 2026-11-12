@@ -57,15 +57,17 @@ pub(crate) fn with_hashes(scrape: &str, hashes: &[[u8; 20]]) -> String {
     out
 }
 
+/// A scrape count: missing or negative reads 0, above `u32::MAX`
+/// saturates.
 fn count(v: Option<&Value<'_>>) -> u32 {
     v.and_then(Value::as_int)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0)
+        .map_or(0, |n| u32::try_from(n.max(0)).unwrap_or(u32::MAX))
 }
 
 /// Parses a bencoded HTTP scrape reply. Input is untrusted. Entries whose
 /// key is not a 20-byte hash or whose value is not a dictionary are
-/// skipped, a missing or invalid count reads 0, and at most
+/// skipped, a missing or negative count reads 0 and one above `u32::MAX`
+/// saturates, and at most
 /// [`MAX_SCRAPE_HASHES`] entries are kept.
 #[doc(hidden)]
 pub fn parse_http_scrape(body: &[u8]) -> Result<Vec<ScrapeInfo>, TrackerError> {
