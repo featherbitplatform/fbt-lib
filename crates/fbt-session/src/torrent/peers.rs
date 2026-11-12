@@ -943,12 +943,22 @@ impl Actor {
         }
         let max = self.shared.settings.max_outstanding_requests;
         let generation = self.generation;
+        let parole = self
+            .block_source(key)
+            .is_some_and(|s| self.smartban.on_parole(s));
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
         let (Some(picker), Some(p)) = (l.picker.as_mut(), self.peers.get(&key)) else {
             return;
         };
+        picker.set_parole(key, parole);
+        // Parole downloads given up half done: their partial data goes.
+        for piece in picker.take_forfeited() {
+            l.bufs.remove(&piece);
+            self.cache.release_partial(piece);
+            self.smartban.drop_attempt(piece);
+        }
         let cap = partial_cap(
             picker.num_in_progress(),
             self.cache.partial_room(u64::from(l.layout.piece_len())),

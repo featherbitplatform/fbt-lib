@@ -11,10 +11,18 @@
 //! banned, so a peer whose data never passes goes after its fourth failed
 //! piece.
 //!
+//! Every contributor of a failed piece is also put on parole (as
+//! libtorrent's `use_parole_mode`): until it contributes to a piece that
+//! passes, the picker gives it only whole pieces of its own. Without it, an
+//! honest peer that keeps sharing pieces with a liar loses trust at the
+//! liar's pace and is banned with it before any of those pieces passes;
+//! with it, each failure after the first has a single contributor, so the
+//! points land on the peer that sent the bad data.
+//!
 //! This is separate from the per-torrent ban of peers that sent bad
 //! metadata (`BanTarget`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 
 use crate::picker::PeerKey;
@@ -107,6 +115,10 @@ pub(super) struct SmartBan {
     failed_order: VecDeque<u32>,
     /// Trust points per sender, at most [`MAX_TRUST_ENTRIES`].
     trust: HashMap<BlockSource, i32>,
+    /// Senders on parole: each contributed to a failed piece and to no
+    /// piece that passed since. A subset of `trust`'s keys, so bounded as
+    /// it is.
+    parole: HashSet<BlockSource>,
 }
 
 impl SmartBan {
@@ -158,8 +170,10 @@ impl SmartBan {
         let mut banned = Vec::new();
         for s in contributors {
             if self.adjust(s, FAIL_POINTS) <= BAN_TRUST {
-                self.trust.remove(&s);
+                self.forget_sender(s);
                 banned.push(s);
+            } else {
+                self.parole.insert(s);
             }
         }
         banned
@@ -209,11 +223,12 @@ impl SmartBan {
             }
         }
         for s in &banned {
-            self.trust.remove(s);
+            self.forget_sender(*s);
         }
         for s in distinct(senders.iter().copied().flatten()) {
             if !banned.contains(&s) {
                 self.adjust(s, PASS_POINTS);
+                self.parole.remove(&s);
             }
         }
         banned
@@ -222,6 +237,24 @@ impl SmartBan {
     /// `s`'s trust points (0 for a sender never seen).
     pub(super) fn trust_of(&self, s: BlockSource) -> i32 {
         self.trust.get(&s).copied().unwrap_or(0)
+    }
+
+    /// Whether `s` is on parole: it contributed to a failed piece and to
+    /// no passed one since.
+    pub(super) fn on_parole(&self, s: BlockSource) -> bool {
+        self.parole.contains(&s)
+    }
+
+    /// Drops the blocks recorded for `piece`'s current attempt, which was
+    /// given up (a forfeited parole download); its failure record stays.
+    pub(super) fn drop_attempt(&mut self, piece: u32) {
+        self.senders.remove(&piece);
+    }
+
+    /// Forgets `s`'s trust and parole (it is banned, or makes room).
+    fn forget_sender(&mut self, s: BlockSource) {
+        self.trust.remove(&s);
+        self.parole.remove(&s);
     }
 
     /// Drops what is recorded of `piece`: its download was abandoned or it
@@ -233,7 +266,8 @@ impl SmartBan {
         }
     }
 
-    /// Drops every piece's records (a recheck, an error); trust stays.
+    /// Drops every piece's records (a recheck, an error); trust and
+    /// parole stay.
     pub(super) fn forget_all(&mut self) {
         self.senders.clear();
         self.failed.clear();
@@ -247,7 +281,7 @@ impl SmartBan {
             // Forget the most trusted sender: it is the least likely to be
             // banned.
             if let Some(top) = self.trust.iter().max_by_key(|&(_, &t)| t).map(|(&k, _)| k) {
-                self.trust.remove(&top);
+                self.forget_sender(top);
             }
         }
         let t = self.trust.entry(s).or_insert(0);
@@ -390,6 +424,31 @@ mod tests {
         assert_eq!(sb.trust_of(b), 0, "B's trust is back where it was");
         assert_eq!(sb.trust.get(&c), Some(&1));
         assert!(!sb.trust.contains_key(&a));
+    }
+
+    #[test]
+    fn contributors_of_a_failed_piece_are_on_parole_until_one_passes() {
+        let mut sb = SmartBan::default();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        sb.record_block(4, 0, a);
+        sb.record_block(4, 1, b);
+        assert!(sb.piece_failed(4, vec![h(9), h(2)]).is_empty());
+        assert!(sb.on_parole(a) && sb.on_parole(b));
+        assert!(!sb.on_parole(c));
+        // B passes a piece of its own: off parole. A stays on it.
+        assert!(pass_alone(&mut sb, 8, b).is_empty());
+        assert!(!sb.on_parole(b));
+        assert!(sb.on_parole(a));
+        // A dropped attempt keeps the failure record.
+        sb.record_block(4, 0, c);
+        sb.drop_attempt(4);
+        assert!(sb.wants_block_hashes(4));
+        // A banned sender is no longer on parole (it is gone).
+        for piece in 10..13 {
+            let banned = fail_alone(&mut sb, piece, a);
+            assert_eq!(banned.is_empty(), piece < 12, "piece {piece}");
+        }
+        assert!(!sb.on_parole(a));
     }
 
     #[test]

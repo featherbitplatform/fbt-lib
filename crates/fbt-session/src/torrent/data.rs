@@ -711,4 +711,107 @@ mod tests {
         assert_eq!(seen.state, TorrentState::Seeding);
         assert_eq!(actor.state(), TorrentState::Seeding);
     }
+
+    /// A liar (A, every block corrupt) and an honest seed (B) share a
+    /// piece: each round both ask for two of its four blocks, A first,
+    /// and every requested block is answered at once. The first attempt
+    /// mixes their blocks and fails, which puts both on parole; from then
+    /// on each attempt is one peer's alone, so only A loses trust for its
+    /// failures. The piece passes from B, A is banned and B never is.
+    /// Without parole every attempt mixes their blocks, and B's trust
+    /// falls with A's until both are banned together.
+    #[tokio::test]
+    async fn honest_co_contributor_of_a_failed_piece_is_not_banned() {
+        const PIECE: usize = 4 * BLOCK_SIZE as usize;
+        let payload: Vec<u8> = (0..PIECE).map(|i| (i % 251) as u8).collect();
+        let mut bytes =
+            format!("d4:infod6:lengthi{PIECE}e4:name1:a12:piece lengthi{PIECE}e6:pieces20:")
+                .into_bytes();
+        bytes.extend_from_slice(&sha1_piece(&payload));
+        bytes.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(PIECE as u64));
+        let mut actor = test_actor(meta, storage, 64 << 20);
+        EMITTED.take();
+
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        let a_addr = SocketAddr::from(([10, 0, 0, 1], 6881));
+        let b_addr = SocketAddr::from(([10, 0, 0, 2], 6881));
+        let mut rxs = Vec::new();
+        for (key, addr) in [(a, a_addr), (b, b_addr)] {
+            let (mut peer, rx) = seed_peer(&actor, 1);
+            peer.addr = addr;
+            peer.choked_us = false;
+            rxs.push(rx);
+            actor
+                .loaded
+                .as_mut()
+                .and_then(|l| l.picker.as_mut())
+                .expect("picker")
+                .add_peer_pieces(peer.pieces());
+            actor.peers.insert(key, peer);
+        }
+        let finished = |actor: &Actor| {
+            actor
+                .loaded
+                .as_ref()
+                .and_then(|l| l.picker.as_ref())
+                .is_some_and(crate::picker::PiecePicker::is_finished)
+        };
+        for _ in 0..32 {
+            if finished(&actor) {
+                break;
+            }
+            for key in [a, b] {
+                if let Some(p) = actor.peers.get_mut(&key) {
+                    p.demand = 2;
+                }
+                actor.fill(key);
+            }
+            for key in [a, b] {
+                let Some(p) = actor.peers.get(&key) else {
+                    continue;
+                };
+                let mut asked: Vec<BlockRef> = p.requested.iter().copied().collect();
+                asked.sort_unstable();
+                for blk in asked {
+                    let start = blk.offset as usize;
+                    let end = start + blk.len as usize;
+                    let mut data = payload[start..end].to_vec();
+                    if key == a {
+                        data.iter_mut().for_each(|x| *x ^= 0xff);
+                    }
+                    actor.on_block(key, blk, Bytes::from(data));
+                }
+            }
+            while let Some(r) = actor.jobs.join_next().await {
+                actor.on_job_result(r);
+            }
+            for rx in &mut rxs {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+
+        let log = EMITTED.take();
+        let banned: Vec<SocketAddr> = log
+            .iter()
+            .filter_map(|(e, _)| match e {
+                Event::PeerBlocked { addr, .. } => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        let failures = log
+            .iter()
+            .filter(|(e, _)| matches!(e, Event::HashFailed { .. }))
+            .count();
+        assert!(!banned.contains(&b_addr), "B was banned: {banned:?}");
+        assert_eq!(banned, vec![a_addr], "A is banned");
+        assert!(finished(&actor), "the piece passes ({failures} failures)");
+        // B lost 2 for the mixed failure, got them back when the piece
+        // passed, and 1 for the pass.
+        let b_trust = actor.smartban.trust_of(actor.peer_block_source(b_addr));
+        assert_eq!(b_trust, 1);
+        // The first, mixed attempt and at least one of A's alone.
+        assert!(failures >= 2, "{failures} failures");
+    }
 }
