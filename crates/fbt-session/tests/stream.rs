@@ -343,8 +343,8 @@ async fn waiting_read_is_answered_from_the_hash_pass() {
         .unwrap()
         .unwrap()
         .unwrap();
-    // Every write is still held: the bytes came from memory.
-    assert!(gate.load(Ordering::SeqCst));
+    // Every write is still held (the storage is all zeros), so bytes that
+    // match the payload came from memory.
     assert!(got == payload[5 * PL..5 * PL + 4096]);
     gate.store(false, Ordering::SeqCst);
     next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
@@ -529,7 +529,22 @@ async fn pause_serves_have_pieces_and_waits_for_missing() {
 async fn recheck_keeps_waiters() {
     let (m, payload) = torrent();
     let half = partial_seeder(&m, &payload, 16).await;
-    let (l, lh) = leech(&m).await;
+    // Write-through, so a read of a piece we have goes to the disk; and
+    // reads that the test can hold there.
+    let gate = Arc::new(AtomicBool::new(false));
+    let storage = Arc::new(GatedReadStorage::new(
+        payload.len() as u64,
+        Arc::clone(&gate),
+    ));
+    let mut st = settings();
+    st.cache_size = 0;
+    let (l, lh) = session_with(
+        st,
+        &m,
+        Arc::clone(&storage) as Arc<dyn Storage>,
+        TorrentState::Downloading,
+    )
+    .await;
     lh.add_peer(half.local_addr()).await.unwrap();
     wait_pieces(&lh, 16).await;
     let mut missing = lh.open_file(2).await.unwrap();
@@ -537,10 +552,27 @@ async fn recheck_keeps_waiters() {
     let waiting = tokio::spawn(async move { read_at(&mut missing, offset, 4096).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!waiting.is_finished());
-    // A read of a piece we have, issued just before the recheck.
+    // A read of a piece we have, its whole-piece disk read held in flight
+    // when the recheck drops it.
+    gate.store(true, Ordering::SeqCst);
     let mut have = lh.open_file(0).await.unwrap();
     let have_read = tokio::spawn(async move { read_at(&mut have, 7 * PL as u64, 4096).await });
+    let piece_7 = 7 * PL as u64;
+    assert!(
+        wait_until(
+            || storage.offsets().contains(&piece_7),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the disk read of piece 7 started"
+    );
     lh.force_recheck().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !have_read.is_finished(),
+        "the read waits through the recheck"
+    );
+    gate.store(false, Ordering::SeqCst);
     let got = tokio::time::timeout(T, have_read)
         .await
         .unwrap()

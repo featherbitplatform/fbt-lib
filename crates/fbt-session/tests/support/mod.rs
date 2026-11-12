@@ -933,3 +933,50 @@ impl Storage for GatedWriteStorage {
         self.inner.delete_files()
     }
 }
+
+/// Zeroed memory storage whose reads block while `gate` is set (polled
+/// every 10 ms) and that logs each read's offset as it starts: a test
+/// holds a disk read in flight and knows when it is.
+#[derive(Debug)]
+pub struct GatedReadStorage {
+    inner: MemStorage,
+    gate: Arc<AtomicBool>,
+    log: Mutex<Vec<u64>>,
+}
+
+impl GatedReadStorage {
+    pub fn new(len: u64, gate: Arc<AtomicBool>) -> Self {
+        GatedReadStorage {
+            inner: MemStorage::new(len),
+            gate,
+            log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The offset of every read started so far, in order.
+    pub fn offsets(&self) -> Vec<u64> {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Storage for GatedReadStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(offset);
+        while self.gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}

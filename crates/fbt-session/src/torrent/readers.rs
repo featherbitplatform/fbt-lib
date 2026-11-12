@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use super::ReaderId;
 use super::actor::{Actor, Phase};
 use super::data::Job;
-use super::serve::{MAX_PIECE_READS, WHOLE_PIECE_READ_MAX, Waiter};
+use super::serve::{MAX_PIECE_READS, WHOLE_PIECE_READ_MAX, Waiter, read_guarded};
 use crate::error::{SessionError, StreamError};
 use crate::stream::reader::{MAX_READ_CHUNK, MAX_READERS, READ_PREFETCH_PIECES, ReaderLink};
 use crate::stream::window::window;
@@ -267,14 +267,22 @@ impl Actor {
     /// Reads a reader's chunk alone.
     fn read_chunk(&mut self, req: ReadReq) {
         let Some(storage) = self.storage.clone() else {
-            self.wait_read(req);
+            // Unreachable (storage comes with the metadata); see
+            // `start_piece_read`.
+            let _ = req.3.send(Err(StreamError::TorrentError(
+                "the torrent has no storage".to_owned(),
+            )));
             return;
         };
         let generation = self.generation;
         let (reader, offset, len, tx) = req;
         self.shared.disk.spawn(&mut self.jobs, move || {
-            let mut buf = vec![0u8; len as usize];
-            let result = storage.read(offset, &mut buf).map(|()| buf);
+            // A seek dropped the answer before the read started: skip it.
+            let result = if tx.is_closed() {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                read_guarded(&*storage, offset, len as usize)
+            };
             Job::ReadChunk {
                 generation,
                 reader,
@@ -292,6 +300,11 @@ impl Actor {
         req: ReadReq,
         result: io::Result<Vec<u8>>,
     ) {
+        // Nobody waits for it (a seek dropped it): nothing to answer, and a
+        // skipped read says nothing about the storage.
+        if req.3.is_closed() {
+            return;
+        }
         if generation != self.generation || !matches!(self.phase, Phase::Ready) {
             // Stale: served again as things are now.
             self.serve_read(req);
@@ -301,7 +314,10 @@ impl Actor {
             Ok(buf) if buf.len() == req.2 as usize => {
                 let _ = req.3.send(Ok(Bytes::from(buf)));
             }
-            Ok(_) => self.wait_read(req),
+            // Unreachable (the buffer is sized before the read): served
+            // again rather than parked in `waiting`, which a piece we have
+            // never leaves.
+            Ok(_) => self.serve_read(req),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let piece = self
                     .loaded
@@ -325,6 +341,18 @@ impl Actor {
         for w in waiting {
             if let Waiter::Reader(req) = w {
                 self.serve_read(req);
+            }
+        }
+    }
+
+    /// Readers among `waiting` fail with `message`; peers' requests are
+    /// dropped.
+    pub(super) fn fail_reads(&mut self, waiting: Vec<Waiter>, message: &str) {
+        for w in waiting {
+            if let Waiter::Reader(req) = w {
+                let _ = req
+                    .3
+                    .send(Err(StreamError::TorrentError(message.to_owned())));
             }
         }
     }
@@ -537,6 +565,54 @@ mod tests {
             rx.try_recv(),
             Ok(Err(SessionError::TooManyReaders))
         ));
+    }
+
+    /// A storage that panics while reading is an I/O error, so the job
+    /// keeps its identity and its waiters are answered.
+    #[test]
+    fn a_panicking_read_is_an_io_error() {
+        #[derive(Debug)]
+        struct Panics;
+        impl crate::storage::Storage for Panics {
+            fn read(&self, _: u64, _: &mut [u8]) -> io::Result<()> {
+                panic!("broken storage");
+            }
+            fn write(&self, _: u64, _: &[u8]) -> io::Result<()> {
+                Ok(())
+            }
+            fn flush(&self) -> io::Result<()> {
+                Ok(())
+            }
+            fn delete_files(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let e = read_guarded(&Panics, 0, 16).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+    }
+
+    /// A seek drops the reader's pending read: the tick drops that read
+    /// and keeps the reader, its window and its slot.
+    #[tokio::test]
+    async fn tick_drops_a_closed_waiter_and_keeps_its_reader() {
+        let mut a = actor_with(&[8 * u64::from(PL)], PL, 0);
+        let (id, _link) = open(&mut a, 0, 0);
+        let (tx, rx) = oneshot::channel();
+        a.on_read(id, 3 * u64::from(PL), 100, tx);
+        assert_eq!(a.readers.waiting[&3].len(), 1);
+        let deadlines = a.debug_deadlines().len();
+        assert!(deadlines > 0);
+        // Abandoned by a seek; the link (the `FileReader`) lives on.
+        drop(rx);
+        a.readers_tick();
+        assert!(a.readers.waiting.is_empty());
+        assert!(a.readers.open.contains_key(&id));
+        assert_eq!(a.debug_deadlines().len(), deadlines);
+        // Its next read waits as usual.
+        let (tx, mut rx) = oneshot::channel();
+        a.on_read(id, 4 * u64::from(PL), 100, tx);
+        assert_eq!(a.readers.waiting[&4].len(), 1);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[tokio::test]

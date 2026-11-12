@@ -20,7 +20,7 @@ use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
 use crate::storage::cache::{CacheBudget, CacheKind};
-use crate::storage::error_path;
+use crate::storage::{Storage, error_path};
 
 impl Actor {
     /// A peer requests `block`: served only if we have the piece, the block
@@ -79,8 +79,7 @@ impl Actor {
         }
         let offset = l.layout.piece_offset(block.piece) + u64::from(block.offset);
         self.shared.disk.spawn(&mut self.jobs, move || {
-            let mut buf = vec![0u8; block.len as usize];
-            let result = storage.read(offset, &mut buf).map(|()| buf);
+            let result = read_guarded(&*storage, offset, block.len as usize);
             Job::Read {
                 generation,
                 key,
@@ -94,8 +93,11 @@ impl Actor {
     /// `reserved` bytes (its size, or 0: not kept).
     pub(super) fn start_piece_read(&mut self, piece: u32, reserved: u64, waiting: Vec<Waiter>) {
         let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
+            // Unreachable (storage comes with the metadata). Serving the
+            // readers again would come straight back here, and waiting
+            // would hang them: they get an error.
             self.cache.release_clean(reserved);
-            self.wait_reads(waiting);
+            self.fail_reads(waiting, "the torrent has no storage");
             return;
         };
         let storage = Arc::clone(storage);
@@ -111,8 +113,7 @@ impl Actor {
             },
         );
         self.shared.disk.spawn(&mut self.jobs, move || {
-            let mut buf = vec![0u8; size as usize];
-            let result = storage.read(offset, &mut buf).map(|()| buf);
+            let result = read_guarded(&*storage, offset, size as usize);
             Job::ReadPiece {
                 generation,
                 piece,
@@ -464,6 +465,18 @@ impl Actor {
         let waiting = self.piece_reads.take_all();
         self.wait_reads(waiting);
     }
+}
+
+/// Reads `len` bytes at `offset` on a disk thread. A panicking storage is
+/// an I/O error like any other, so the job still comes back with its
+/// identity (its waiters, its reader's answer) instead of a bare
+/// `JoinError` that leaves them waiting.
+pub(super) fn read_guarded(storage: &dyn Storage, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut buf = vec![0u8; len];
+        storage.read(offset, &mut buf).map(|()| buf)
+    }))
+    .unwrap_or_else(|_| Err(io::Error::other("the storage panicked while reading")))
 }
 
 /// The bytes of `block` within its piece's `data`.
