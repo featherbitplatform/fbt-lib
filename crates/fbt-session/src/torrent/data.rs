@@ -618,27 +618,30 @@ mod tests {
         actor.on_block(key, blocks[1], block(blocks[1]));
         actor.set_priorities(vec![Priority::Normal, Priority::Skip]);
         // The job results, reordered so the hash lands when `lands` says.
+        // A held job is handled as soon as its condition clears. For
+        // `DuringTheFlush` the flush's own result is also held until the
+        // hash has been handled, so the hash always lands while the flush
+        // runs, however the two jobs finish.
         let mut held: Vec<Job> = Vec::new();
+        let mut hashed = false;
+        let hold = |actor: &Actor, job: &Job, hashed: bool| match (lands, job) {
+            (HashLands::BeforeTheWrite, Job::WroteRun { .. }) => actor.hashing > 0,
+            (HashLands::DuringTheFlush, Job::Hashed { .. }) => !actor.finish_flush,
+            (HashLands::DuringTheFlush, Job::Flushed { .. }) => !hashed,
+            _ => false,
+        };
         while let Some(r) = actor.jobs.join_next().await {
             let job = r.expect("job");
-            let hold = match (lands, &job) {
-                (HashLands::BeforeTheWrite, Job::WroteRun { .. }) => actor.hashing > 0,
-                (HashLands::DuringTheFlush, Job::Hashed { .. }) => !actor.finish_flush,
-                _ => false,
-            };
-            if hold {
+            if hold(&actor, &job, hashed) {
                 held.push(job);
                 continue;
             }
+            hashed |= matches!(job, Job::Hashed { .. });
             actor.on_job(job);
-            let release = match lands {
-                HashLands::BeforeTheWrite => actor.hashing == 0,
-                HashLands::DuringTheFlush => actor.finish_flush,
-            };
-            if release {
-                for job in std::mem::take(&mut held) {
-                    actor.on_job(job);
-                }
+            while let Some(i) = held.iter().position(|j| !hold(&actor, j, hashed)) {
+                let job = held.remove(i);
+                hashed |= matches!(job, Job::Hashed { .. });
+                actor.on_job(job);
             }
         }
         assert!(held.is_empty(), "{held:?}");
