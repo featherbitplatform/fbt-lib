@@ -12,7 +12,9 @@ use fbt_metainfo::{Metainfo, MetainfoError};
 use tokio::time::Instant;
 use tracing::debug;
 
+use super::ReaderId;
 use super::actor::{Actor, Phase};
+use super::readers::Answer;
 use super::swarm::BanTarget;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
@@ -74,6 +76,16 @@ pub(crate) enum Job {
         block: BlockRef,
         result: io::Result<Vec<u8>>,
     },
+    /// A reader's chunk was read on its own (its piece is too large to
+    /// read whole, or too many whole-piece reads run).
+    ReadChunk {
+        generation: u64,
+        reader: ReaderId,
+        offset: u64,
+        len: u32,
+        tx: Answer,
+        result: io::Result<Vec<u8>>,
+    },
 }
 
 impl Actor {
@@ -106,7 +118,15 @@ impl Actor {
                 key,
                 block,
                 result,
-            } => self.on_read(generation, key, block, result),
+            } => self.on_read_block(generation, key, block, result),
+            Job::ReadChunk {
+                generation,
+                reader,
+                offset,
+                len,
+                tx,
+                result,
+            } => self.on_read_chunk(generation, (reader, offset, len, tx), result),
             Job::Flushed { generation, result } => {
                 // A check since then starts its own finish.
                 if generation == self.generation {
@@ -218,13 +238,20 @@ impl Actor {
             self.top_up_all(None);
             return;
         }
-        let Some(picker) = l.picker.as_mut() else {
+        if l.picker.is_none() {
             return;
-        };
+        }
         // Verified: ours from now on, served from memory until written.
+        // Waiting readers get it first, before any write.
+        let data: Arc<[u8]> = data.into();
+        self.answer_piece(piece, &data);
+        self.deadlines.piece_done(piece);
         let on_floor = self.cache.holds_floor(piece);
         self.cache
-            .insert_dirty(piece, data.into(), Instant::now().into_std());
+            .insert_dirty(piece, data, Instant::now().into_std());
+        let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) else {
+            return;
+        };
         picker.piece_passed(piece);
         self.lost_pieces.remove(&piece);
         let finished = picker.is_finished();
@@ -251,9 +278,10 @@ impl Actor {
             self.finished_emitted = true;
             self.finish_pending = true;
         }
-        if just_finished || !self.active() {
-            // Finished, or paused while the hash ran: nothing more is coming
-            // soon, so nothing waits in memory.
+        if finished || !self.active() {
+            // Finished (now, or earlier and this is a piece of a file
+            // skipped while it was hashed), or paused while the hash ran:
+            // nothing more is coming soon, so nothing waits in memory.
             self.flush(FlushReason::All);
         } else if on_floor || self.cache.over_budget() {
             // Running on the floor: written at once, so the floor comes
@@ -348,6 +376,15 @@ impl Actor {
                 .as_ref()
                 .and_then(|l| l.picker.as_ref())
                 .is_some_and(crate::picker::PiecePicker::is_finished);
+        if finished && !self.cache.is_idle() {
+            // A piece passed after this flush started (one of a file
+            // skipped while it was hashed): the finish waits for its write
+            // and a flush of its own, so `Seeding` still comes first.
+            self.finish_pending = true;
+            self.maybe_finish();
+            self.refresh_state();
+            return;
+        }
         // Seeding now (unless paused).
         self.refresh_state();
         if !finished {
@@ -390,29 +427,23 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, watch};
 
     use super::*;
-    use crate::session::{AddTorrent, Shared};
+    use crate::session::{AddTorrent, Priority, Shared};
     use crate::settings::Settings;
     use crate::status::{TorrentState, TorrentStatus};
     use crate::storage::{MemStorage, Storage};
     use crate::torrent::actor::EMITTED;
-    use crate::torrent::swarm::Peer;
+    use crate::torrent::peer::Peer;
 
-    /// Whoever reacts to `TorrentFinished` reads the final status: every
-    /// downloaded byte counted and the torrent seeding, not the last tick's
-    /// snapshot.
-    #[tokio::test]
-    async fn torrent_finished_sees_the_final_status() {
-        const LEN: usize = 32_768;
-        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
-        let mut bytes =
-            format!("d4:infod6:lengthi{LEN}e4:name1:a12:piece lengthi{LEN}e6:pieces20:")
-                .into_bytes();
-        bytes.extend_from_slice(&sha1_piece(&payload));
-        bytes.extend_from_slice(b"ee");
-        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+    /// An actor for `meta` over `storage`, checked with nothing on disk,
+    /// with a session cache of `cache_size` bytes whose dirty pieces expire
+    /// after ten minutes.
+    fn test_actor(meta: Metainfo, storage: Arc<dyn Storage>, cache_size: u64) -> Actor {
+        let pieces = meta.info.pieces.len();
         let settings = Settings {
             dht_enabled: false,
             dht_bootstrap_nodes: Vec::new(),
+            cache_size,
+            cache_expiry: std::time::Duration::from_secs(600),
             ..Settings::default()
         };
         let tracker = TrackerClient::new(settings.tracker.clone()).expect("tracker client");
@@ -431,14 +462,13 @@ mod tests {
             dht_addrs: Vec::new(),
             utp: Vec::new(),
             disk: crate::disk::DiskPool::new(1, 1),
-            cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
+            cache: Arc::new(crate::storage::cache::CacheBudget::new(cache_size)),
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
             holepunch: Default::default(),
             lsd: crate::net::LsdHub::disabled(),
             portmap: None,
             external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
         });
-        let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(LEN as u64));
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
         add.storage = Some(Arc::clone(&storage));
         let ih = add.source.info_hashes();
@@ -453,19 +483,45 @@ mod tests {
             cmd_rx,
             status_tx,
         );
-        actor.on_checked(actor.generation, Ok(Bitfield::new(1)));
+        let n = u32::try_from(pieces).expect("piece count");
+        actor.on_checked(actor.generation, Ok(Bitfield::new(n)));
+        actor
+    }
 
-        let key = PeerKey(0);
-        let (tx, _peer_rx) = mpsc::channel(16);
+    /// A connected seed of a torrent of `num_pieces`, and the receiver of
+    /// the commands sent to it.
+    fn seed_peer(actor: &Actor, num_pieces: u32) -> (Peer, mpsc::Receiver<PeerCommand>) {
+        let (tx, rx) = mpsc::channel(64);
         let mut peer = Peer::new(
             SocketAddr::from(([10, 0, 0, 1], 6881)),
             tx,
             actor.generation,
-            1,
+            num_pieces,
             crate::peer::transport::Transport::Tcp,
         );
         peer.connected = true;
         peer.seed = true;
+        (peer, rx)
+    }
+
+    /// Whoever reacts to `TorrentFinished` reads the final status: every
+    /// downloaded byte counted and the torrent seeding, not the last tick's
+    /// snapshot.
+    #[tokio::test]
+    async fn torrent_finished_sees_the_final_status() {
+        const LEN: usize = 32_768;
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let mut bytes =
+            format!("d4:infod6:lengthi{LEN}e4:name1:a12:piece lengthi{LEN}e6:pieces20:")
+                .into_bytes();
+        bytes.extend_from_slice(&sha1_piece(&payload));
+        bytes.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(LEN as u64));
+        let mut actor = test_actor(meta, storage, 0);
+
+        let key = PeerKey(0);
+        let (mut peer, _peer_rx) = seed_peer(&actor, 1);
         let blocks = actor
             .loaded
             .as_mut()
@@ -493,5 +549,110 @@ mod tests {
         assert_eq!(seen.total_downloaded, LEN as u64);
         assert_eq!(seen.total_wasted, 0);
         assert_eq!(seen.state, TorrentState::Seeding);
+    }
+
+    /// When the hash of a skipped file's piece returns, relative to the
+    /// finish that skipping the file started.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HashLands {
+        /// Before the other piece's write lands.
+        BeforeTheWrite,
+        /// While the storage flush of the finish runs.
+        DuringTheFlush,
+    }
+
+    /// Skipping the rest finishes the torrent; a piece of a skipped file
+    /// that was being hashed then passes afterwards. It is written at once
+    /// like every other piece of the finished torrent, not held in the
+    /// cache until it expires, which would hold `Seeding` back as long;
+    /// and `TorrentFinished` waits for it, still after `Seeding`.
+    #[tokio::test]
+    async fn piece_passing_after_skip_finished_before_the_write() {
+        skip_while_hashing(HashLands::BeforeTheWrite).await;
+    }
+
+    #[tokio::test]
+    async fn piece_passing_after_skip_finished_during_the_flush() {
+        skip_while_hashing(HashLands::DuringTheFlush).await;
+    }
+
+    async fn skip_while_hashing(lands: HashLands) {
+        const PIECE: usize = 16_384;
+        let payload: Vec<u8> = (0..2 * PIECE).map(|i| (i % 251) as u8).collect();
+        let mut bytes = format!(
+            "d4:infod5:filesld6:lengthi{PIECE}e4:pathl1:aeed6:lengthi{PIECE}e4:pathl1:beee\
+             4:name1:t12:piece lengthi{PIECE}e6:pieces40:"
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&sha1_piece(&payload[..PIECE]));
+        bytes.extend_from_slice(&sha1_piece(&payload[PIECE..]));
+        bytes.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(2 * PIECE as u64));
+        // Room for both pieces: neither is written for cache pressure.
+        let mut actor = test_actor(meta, storage, 64 << 20);
+        let key = PeerKey(0);
+        let (mut peer, _peer_rx) = seed_peer(&actor, 2);
+        let mut blocks = actor
+            .loaded
+            .as_mut()
+            .and_then(|l| l.picker.as_mut())
+            .expect("picker")
+            .pick(key, peer.pieces(), 16, &mut actor.rng);
+        blocks.sort_unstable_by_key(|b| b.piece);
+        assert_eq!(blocks.len(), 2);
+        peer.requested.extend(blocks.iter().copied());
+        actor.peers.insert(key, peer);
+        let block = |b: BlockRef| {
+            let start = b.piece as usize * PIECE + b.offset as usize;
+            Bytes::copy_from_slice(&payload[start..start + b.len as usize])
+        };
+        // File a's piece passes and is held dirty.
+        actor.on_block(key, blocks[0], block(blocks[0]));
+        while let Some(r) = actor.jobs.join_next().await {
+            actor.on_job_result(r);
+        }
+        assert!(!actor.cache.is_idle());
+        // File b's piece arrives and goes to its hash; meanwhile b is
+        // skipped, which finishes the torrent.
+        actor.on_block(key, blocks[1], block(blocks[1]));
+        actor.set_priorities(vec![Priority::Normal, Priority::Skip]);
+        // The job results, reordered so the hash lands when `lands` says.
+        // A held job is handled as soon as its condition clears. For
+        // `DuringTheFlush` the flush's own result is also held until the
+        // hash has been handled, so the hash always lands while the flush
+        // runs, however the two jobs finish.
+        let mut held: Vec<Job> = Vec::new();
+        let mut hashed = false;
+        let hold = |actor: &Actor, job: &Job, hashed: bool| match (lands, job) {
+            (HashLands::BeforeTheWrite, Job::WroteRun { .. }) => actor.hashing > 0,
+            (HashLands::DuringTheFlush, Job::Hashed { .. }) => !actor.finish_flush,
+            (HashLands::DuringTheFlush, Job::Flushed { .. }) => !hashed,
+            _ => false,
+        };
+        while let Some(r) = actor.jobs.join_next().await {
+            let job = r.expect("job");
+            if hold(&actor, &job, hashed) {
+                held.push(job);
+                continue;
+            }
+            hashed |= matches!(job, Job::Hashed { .. });
+            actor.on_job(job);
+            while let Some(i) = held.iter().position(|j| !hold(&actor, j, hashed)) {
+                let job = held.remove(i);
+                hashed |= matches!(job, Job::Hashed { .. });
+                actor.on_job(job);
+            }
+        }
+        assert!(held.is_empty(), "{held:?}");
+
+        assert!(actor.cache.is_idle(), "a passed piece is still held dirty");
+        let log = EMITTED.take();
+        let (_, seen) = log
+            .iter()
+            .find(|(e, _)| matches!(e, Event::TorrentFinished { .. }))
+            .expect("TorrentFinished");
+        assert_eq!(seen.state, TorrentState::Seeding);
+        assert_eq!(actor.state(), TorrentState::Seeding);
     }
 }

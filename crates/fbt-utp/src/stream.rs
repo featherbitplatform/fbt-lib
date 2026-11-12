@@ -102,7 +102,14 @@ impl AsyncRead for UtpStream {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        let n = s.conn.read(buf.initialize_unfilled());
+        // Initialise only what this read can fill, not the whole buffer.
+        let readable = s.conn.readable_bytes();
+        let n = if readable == 0 {
+            0
+        } else {
+            s.conn
+                .read(buf.initialize_unfilled_to(buf.remaining().min(readable)))
+        };
         if n > 0 {
             buf.advance(n);
             // Reading may reopen our window: let the peer know.

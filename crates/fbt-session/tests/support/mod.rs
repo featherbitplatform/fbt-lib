@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fbt_bencode::{DictBuilder, OwnedValue, encode};
-use fbt_core::PeerId;
+use fbt_core::{BlockRef, PeerId};
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage, sha1_piece};
 use fbt_session::{Event, EventStream, Settings, TorrentHandle, TorrentState};
@@ -23,6 +23,9 @@ use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
+
+/// How long a test waits for something that should happen.
+pub const T: Duration = Duration::from_secs(30);
 
 /// Settings for tests: loopback listener on a free port, fast status
 /// updates, and no DHT, LSD, UPnP or NAT-PMP (so no test ever contacts a public DHT node
@@ -88,6 +91,67 @@ fn build_torrent(files: &[(&str, usize)], piece_len: u32, private: bool) -> (Met
     if private {
         info.insert(b"private", 1i64);
     }
+    let mut root = DictBuilder::new();
+    root.insert(b"info", info.build());
+    let bytes = encode(&root.build());
+    let m = Metainfo::from_bytes(&bytes).expect("valid generated torrent");
+    (m, payload)
+}
+
+/// A multi-file torrent like [`make_torrent`], with a BEP 47 pad file
+/// (`attr: "p"`, zero bytes up to the next piece boundary, at least one)
+/// inserted after file `pad_after`. Returns the metainfo and the payload,
+/// pad bytes included.
+pub fn make_torrent_with_pad(
+    files: &[(&str, usize)],
+    pad_after: usize,
+    piece_len: u32,
+) -> (Metainfo, Vec<u8>) {
+    let before: usize = files.iter().take(pad_after + 1).map(|f| f.1).sum();
+    let pad_len = match before % piece_len as usize {
+        0 => piece_len as usize,
+        r => piece_len as usize - r,
+    };
+    let mut entries: Vec<(String, usize, bool)> = Vec::new();
+    for (i, (name, len)) in files.iter().enumerate() {
+        entries.push(((*name).to_owned(), *len, false));
+        if i == pad_after {
+            entries.push((format!(".pad/{pad_len}"), pad_len, true));
+        }
+    }
+    let total: usize = entries.iter().map(|e| e.1).sum();
+    let mut payload = vec![0u8; total];
+    let mut off = 0;
+    for (_, len, pad) in &entries {
+        if !pad {
+            rand::rng().fill(&mut payload[off..off + len]);
+        }
+        off += len;
+    }
+    let mut pieces = Vec::new();
+    for chunk in payload.chunks(piece_len as usize) {
+        pieces.extend_from_slice(&sha1_piece(chunk));
+    }
+    let file_list = entries
+        .iter()
+        .map(|(name, len, pad)| {
+            let mut f = DictBuilder::new();
+            if *pad {
+                f.insert(b"attr", "p");
+            }
+            f.insert(b"length", *len as i64);
+            f.insert(
+                b"path",
+                OwnedValue::List(name.split('/').map(OwnedValue::from).collect::<Vec<_>>()),
+            );
+            f.build()
+        })
+        .collect();
+    let mut info = DictBuilder::new();
+    info.insert(b"files", OwnedValue::List(file_list));
+    info.insert(b"name", "torrent");
+    info.insert(b"piece length", i64::from(piece_len));
+    info.insert(b"pieces", pieces);
     let mut root = DictBuilder::new();
     root.insert(b"info", info.build());
     let bytes = encode(&root.build());
@@ -249,8 +313,7 @@ impl ScriptedPeer {
         .await;
     }
 
-    /// The payload of the next extended message with `id` within five
-    /// seconds.
+    /// The payload of the next extended message with `id` within [`T`].
     pub async fn next_ext(&mut self, id: u8) -> Option<Bytes> {
         match self
             .next_matching(|m| matches!(m, Message::Extended { id: i, .. } if *i == id))
@@ -261,9 +324,19 @@ impl ScriptedPeer {
         }
     }
 
-    /// The next message matching `pred` within five seconds.
+    /// The next message matching `pred` within [`T`] (30 s).
     pub async fn next_matching(&mut self, pred: impl Fn(&Message) -> bool) -> Option<Message> {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        self.next_matching_within(T, pred).await
+    }
+
+    /// The next message matching `pred` within `timeout`: for checks that
+    /// expect none, which wait out the whole timeout.
+    pub async fn next_matching_within(
+        &mut self,
+        timeout: Duration,
+        pred: impl Fn(&Message) -> bool,
+    ) -> Option<Message> {
+        tokio::time::timeout(timeout, async {
             while let Some(Ok(m)) = self.framed.next().await {
                 if pred(&m) {
                     return Some(m);
@@ -307,6 +380,58 @@ impl ScriptedPeer {
                 if self.framed.send(piece).await.is_err() {
                     return;
                 }
+            }
+        }
+    }
+}
+
+impl ScriptedPeer {
+    /// [`serve`](Self::serve) that also logs every `Request` it receives
+    /// into `log`.
+    pub async fn serve_recording(
+        &mut self,
+        payload: &[u8],
+        piece_len: u32,
+        log: Arc<Mutex<Vec<BlockRef>>>,
+    ) {
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        let answer = Arc::new(AtomicBool::new(true));
+        self.serve_recording_with(payload, piece_len, log, cancels, answer)
+            .await;
+    }
+
+    /// Logs every `Request` into `log` and every `Cancel` into `cancels`,
+    /// and answers requests with the matching bytes of `payload` while
+    /// `answer` is set (a request that arrives while it is clear stays
+    /// unanswered), until the connection closes.
+    pub async fn serve_recording_with(
+        &mut self,
+        payload: &[u8],
+        piece_len: u32,
+        log: Arc<Mutex<Vec<BlockRef>>>,
+        cancels: Arc<Mutex<Vec<BlockRef>>>,
+        answer: Arc<AtomicBool>,
+    ) {
+        while let Some(Ok(m)) = self.framed.next().await {
+            match m {
+                Message::Request(b) => {
+                    log.lock().unwrap().push(b);
+                    if !answer.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let start = b.piece as usize * piece_len as usize + b.offset as usize;
+                    let data = Bytes::copy_from_slice(&payload[start..start + b.len as usize]);
+                    let piece = Message::Piece {
+                        piece: b.piece,
+                        offset: b.offset,
+                        data,
+                    };
+                    if self.framed.send(piece).await.is_err() {
+                        return;
+                    }
+                }
+                Message::Cancel(b) => cancels.lock().unwrap().push(b),
+                _ => {}
             }
         }
     }
@@ -751,5 +876,171 @@ async fn udp_loop(
             continue;
         }
         let _ = sock.send_to(&out, from).await;
+    }
+}
+
+/// Memory storage that counts its reads and logs each read's offset.
+#[derive(Debug)]
+pub struct CountingStorage {
+    inner: MemStorage,
+    log: Mutex<Vec<u64>>,
+}
+
+impl CountingStorage {
+    pub fn new(data: Vec<u8>) -> Self {
+        CountingStorage {
+            inner: MemStorage::from_bytes(data),
+            log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Reads so far.
+    pub fn reads(&self) -> usize {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// The offset of every read so far, in order.
+    pub fn offsets(&self) -> Vec<u64> {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Forgets the reads so far.
+    pub fn reset(&self) {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+impl Storage for CountingStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(offset);
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// Zeroed memory storage whose writes fail while `fail` is set.
+#[derive(Debug)]
+pub struct FailWritesStorage {
+    inner: MemStorage,
+    fail: Arc<AtomicBool>,
+}
+
+impl FailWritesStorage {
+    pub fn new(len: u64, fail: Arc<AtomicBool>) -> Self {
+        FailWritesStorage {
+            inner: MemStorage::new(len),
+            fail,
+        }
+    }
+}
+
+impl Storage for FailWritesStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"));
+        }
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// Zeroed memory storage whose writes block while `gate` is set (polled
+/// every 10 ms): a test holds every write and decides when they land.
+#[derive(Debug)]
+pub struct GatedWriteStorage {
+    inner: MemStorage,
+    gate: Arc<AtomicBool>,
+}
+
+impl GatedWriteStorage {
+    pub fn new(len: u64, gate: Arc<AtomicBool>) -> Self {
+        GatedWriteStorage {
+            inner: MemStorage::new(len),
+            gate,
+        }
+    }
+}
+
+impl Storage for GatedWriteStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        while self.gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// Zeroed memory storage whose reads block while `gate` is set (polled
+/// every 10 ms) and that logs each read's offset as it starts: a test
+/// holds a disk read in flight and knows when it is.
+#[derive(Debug)]
+pub struct GatedReadStorage {
+    inner: MemStorage,
+    gate: Arc<AtomicBool>,
+    log: Mutex<Vec<u64>>,
+}
+
+impl GatedReadStorage {
+    pub fn new(len: u64, gate: Arc<AtomicBool>) -> Self {
+        GatedReadStorage {
+            inner: MemStorage::new(len),
+            gate,
+            log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The offset of every read started so far, in order.
+    pub fn offsets(&self) -> Vec<u64> {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Storage for GatedReadStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(offset);
+        while self.gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
     }
 }

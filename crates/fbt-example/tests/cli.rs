@@ -423,3 +423,115 @@ fn listen_flag_accepts_two_addresses() {
         read_tree(&seed_dir.join("payload"))
     );
 }
+
+/// Runs `stream` (60 s limit) with stdout and stderr captured.
+fn run_stream(args: &[&str]) -> std::process::Output {
+    let child = Command::new(BIN)
+        .arg("stream")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stream");
+    let mut child = Kill(child);
+    let mut stdout = child.0.stdout.take().expect("stdout");
+    let mut stderr = child.0.stderr.take().expect("stderr");
+    let out_thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut v);
+        v
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut v);
+        v
+    });
+    let status = wait_exit(&mut child.0, Duration::from_secs(60));
+    std::process::Output {
+        status,
+        stdout: out_thread.join().expect("stdout reader"),
+        stderr: err_thread.join().expect("stderr reader"),
+    }
+}
+
+#[test]
+fn stream_to_a_path_matches_the_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (torrent_path, seed_dir, _) = seed_fixture(tmp.path());
+    let (_seed, port) = spawn_seed(&torrent_path, &seed_dir, &[]);
+    let peer = format!("127.0.0.1:{port}");
+    let out_dir = tmp.path().join("out");
+    let to = tmp.path().join("out.bin");
+    let out = run_stream(&[
+        torrent_path.to_str().expect("utf8"),
+        "--file",
+        "1",
+        "--out",
+        out_dir.to_str().expect("utf8"),
+        "--port",
+        "0",
+        "--no-dht",
+        "--to",
+        to.to_str().expect("utf8"),
+        "--peer",
+        &peer,
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read(&to).expect("out.bin"),
+        std::fs::read(seed_dir.join("payload/sub/b.bin")).expect("file 1")
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stream: 70001 bytes from 0 in "),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn stream_with_seek_and_length_to_stdout() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (torrent_path, seed_dir, _) = seed_fixture(tmp.path());
+    let (_seed, port) = spawn_seed(&torrent_path, &seed_dir, &[]);
+    let peer = format!("127.0.0.1:{port}");
+    let out_dir = tmp.path().join("out");
+    let out = run_stream(&[
+        torrent_path.to_str().expect("utf8"),
+        "--file",
+        "0",
+        "--out",
+        out_dir.to_str().expect("utf8"),
+        "--port",
+        "0",
+        "--no-dht",
+        "--seek",
+        "30000",
+        "--length",
+        "70000",
+        "--peer",
+        &peer,
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let file = std::fs::read(seed_dir.join("payload/a.bin")).expect("file 0");
+    assert_eq!(out.stdout, file[30000..100_000]);
+}
+
+#[test]
+fn stream_bad_file_index_is_a_clean_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (torrent_path, _seed_dir, _) = seed_fixture(tmp.path());
+    let out_dir = tmp.path().join("out");
+    let out = run_stream(&[
+        torrent_path.to_str().expect("utf8"),
+        "--file",
+        "9",
+        "--out",
+        out_dir.to_str().expect("utf8"),
+        "--port",
+        "0",
+        "--no-dht",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("file 9"), "{stderr}");
+}

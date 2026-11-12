@@ -10,11 +10,11 @@
 //! bytes and [`MAX_REORDER_SPAN`] packets, unacked data by `send_buffer`
 //! bytes and [`MAX_IN_FLIGHT_PACKETS`] packets.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 
 use crate::UtpError;
 use crate::ledbat::Ledbat;
@@ -34,6 +34,12 @@ pub const DUP_ACK_THRESHOLD: u32 = 3;
 /// hole fits: at least the largest payload seen and 1472 bytes (an
 /// Ethernet-MTU UDP payload, above libtorrent's 1452-byte uTP packets).
 pub const HOLE_RESERVE: usize = 1472;
+/// Received payloads shorter than this are copied and merged instead of
+/// kept as slices of their datagram: a tiny payload never pins a whole
+/// datagram (up to 20 + 8 x 257 header bytes), and every chunk of the
+/// in-order buffer but the first holds at least this many bytes, so it
+/// holds at most `recv_buffer / MERGE_BELOW + 1` chunks.
+const MERGE_BELOW: usize = 1024;
 /// Sequence numbers a SACK mask can describe (bits of [`MAX_SACK_LEN`]).
 const SACK_BITS: usize = MAX_SACK_LEN * 8;
 /// Sequence number of the initiator's SYN (BEP 29).
@@ -111,6 +117,8 @@ pub enum ConnState {
 /// A packet we sent and the peer has not acknowledged yet.
 #[derive(Debug)]
 struct Sent {
+    /// Position in the send order: one more than the previous packet's.
+    ord: u64,
     seq: u16,
     ty: PacketType,
     payload: Bytes,
@@ -141,8 +149,17 @@ pub struct Connection {
     // Send side.
     /// Sequence number of the next packet we create.
     seq_nr: u16,
-    unsent: VecDeque<u8>,
+    unsent: BytesMut,
     outstanding: VecDeque<Sent>,
+    /// Ordinal the next packet pushed to `outstanding` gets.
+    next_ord: u64,
+    /// Ordinal of `outstanding.front()` (`next_ord` when it is empty).
+    front_ord: u64,
+    /// Ordinals of the outstanding packets lost and not acked: waiting to be
+    /// (re)sent, oldest first.
+    to_send: BTreeSet<u64>,
+    /// Outstanding packets neither acked nor lost.
+    live_packets: usize,
     /// Payload bytes of outstanding packets neither acked nor lost.
     flight: usize,
     /// Payload bytes of outstanding packets not acked.
@@ -172,8 +189,14 @@ pub struct Connection {
     // Receive side.
     /// Last in-order sequence number received.
     ack_nr: u16,
-    inbox: VecDeque<u8>,
-    ooo: BTreeMap<u16, Vec<u8>>,
+    /// In-order bytes waiting for `read`, oldest first; every chunk but
+    /// the first holds at least [`MERGE_BELOW`] bytes.
+    inbox: VecDeque<Bytes>,
+    /// Short in-order payloads merged after `inbox`, read after it.
+    inbox_tail: BytesMut,
+    /// Bytes in `inbox` and `inbox_tail`.
+    inbox_len: usize,
+    ooo: BTreeMap<u16, Bytes>,
     ooo_bytes: usize,
     /// Largest DATA payload received, for the hole reserve.
     max_recv_payload: usize,
@@ -216,8 +239,12 @@ impl Connection {
             mss,
             min_payload,
             seq_nr: SYN_SEQ,
-            unsent: VecDeque::new(),
+            unsent: BytesMut::new(),
             outstanding: VecDeque::new(),
+            next_ord: 0,
+            front_ord: 0,
+            to_send: BTreeSet::new(),
+            live_packets: 0,
             flight: 0,
             unacked_bytes: 0,
             closing: false,
@@ -238,6 +265,8 @@ impl Connection {
             last_data_send: now,
             ack_nr: 0,
             inbox: VecDeque::new(),
+            inbox_tail: BytesMut::new(),
+            inbox_len: 0,
             ooo: BTreeMap::new(),
             ooo_bytes: 0,
             max_recv_payload: 0,
@@ -316,7 +345,7 @@ impl Connection {
 
     /// The peer's FIN was reached and every byte before it was read.
     pub fn is_eof(&self) -> bool {
-        self.eof && self.inbox.is_empty()
+        self.eof && self.inbox_len == 0
     }
 
     /// The peer proved it saw our side of the handshake: the initiator got
@@ -341,7 +370,7 @@ impl Connection {
     /// In-order bytes waiting for `read`.
     #[doc(hidden)]
     pub fn readable_bytes(&self) -> usize {
-        self.inbox.len()
+        self.inbox_len
     }
 
     /// Bytes `write` would accept now.
@@ -358,7 +387,7 @@ impl Connection {
     /// Out-of-order plus unread in-order receive bytes.
     #[doc(hidden)]
     pub fn buffered_bytes(&self) -> usize {
-        self.ooo_bytes + self.inbox.len()
+        self.ooo_bytes + self.inbox_len
     }
 
     /// Current congestion window in bytes.
@@ -376,8 +405,11 @@ impl Connection {
         tracing::debug!(recv_id = self.recv_id, error = %e, "utp connection failed");
         self.state = ConnState::Closed;
         self.error = Some(e);
-        self.unsent = VecDeque::new();
+        self.unsent = BytesMut::new();
         self.outstanding.clear();
+        self.front_ord = self.next_ord;
+        self.to_send.clear();
+        self.live_packets = 0;
         self.ooo.clear();
         self.ooo_bytes = 0;
         self.flight = 0;
@@ -398,17 +430,41 @@ impl Connection {
             .send_buffer
             .saturating_sub(self.unsent.len() + self.unacked_bytes);
         let n = data.len().min(room);
-        self.unsent.extend(data.iter().take(n));
+        self.unsent.extend_from_slice(data.get(..n).unwrap_or(data));
         n
     }
 
     /// Copies in-order received bytes into `out`. 0 means nothing to read
     /// (or end of stream, see [`Connection::is_eof`]).
     pub fn read(&mut self, out: &mut [u8]) -> usize {
-        let n = out.len().min(self.inbox.len());
-        for (o, b) in out.iter_mut().zip(self.inbox.drain(..n)) {
-            *o = b;
+        let mut n = 0;
+        loop {
+            let dst = out.get_mut(n..).unwrap_or_default();
+            if dst.is_empty() {
+                break;
+            }
+            let k = match self.inbox.front_mut() {
+                Some(front) => {
+                    let k = copy_prefix(dst, front);
+                    if k == front.len() {
+                        self.inbox.pop_front();
+                    } else {
+                        front.advance(k);
+                    }
+                    k
+                }
+                None => {
+                    let k = copy_prefix(dst, &self.inbox_tail);
+                    self.inbox_tail.advance(k);
+                    k
+                }
+            };
+            if k == 0 {
+                break;
+            }
+            n += k;
         }
+        self.inbox_len = self.inbox_len.saturating_sub(n);
         // Tell a sender stalled on our window that it opened again.
         if n > 0 && self.last_adv_wnd < self.mss && self.adv_wnd() >= self.mss {
             self.ack_now = true;
@@ -453,7 +509,7 @@ impl Connection {
     fn has_pending_send(&self) -> bool {
         !self.unsent.is_empty()
             || (self.closing && self.fin_seq.is_none())
-            || self.outstanding.iter().any(|s| s.lost && !s.acked)
+            || !self.to_send.is_empty()
     }
 
     /// Runs the timers due at `now`.
@@ -508,11 +564,11 @@ impl Connection {
             self.ledbat.on_timeout();
         }
         self.rtt.backoff();
-        for s in self.outstanding.iter_mut() {
-            if !s.acked && !s.lost {
-                s.lost = true;
-                self.flight = self.flight.saturating_sub(s.payload.len());
+        for i in 0..self.outstanding.len() {
+            if self.live_packets == 0 {
+                break;
             }
+            self.mark_lost(i);
         }
         self.dup_acks = 0;
         self.bypass_peer_wnd = true;
@@ -586,16 +642,32 @@ impl Connection {
         else {
             return;
         };
-        if let Some(s) = self.outstanding.get_mut(i)
-            && !s.acked
-            && !s.lost
-        {
-            s.lost = true;
-            self.flight = self.flight.saturating_sub(s.payload.len());
-        }
-        if !self.outstanding.iter().any(|s| !s.acked && !s.lost) {
+        self.mark_lost(i);
+        if self.live_packets == 0 {
             self.rto_at = None;
         }
+    }
+
+    /// Marks the outstanding packet at `i` lost unless it is acked or
+    /// already lost: out of flight and queued for resending.
+    fn mark_lost(&mut self, i: usize) -> bool {
+        let Some(s) = self.outstanding.get_mut(i) else {
+            return false;
+        };
+        if s.acked || s.lost {
+            return false;
+        }
+        s.lost = true;
+        self.flight = self.flight.saturating_sub(s.payload.len());
+        self.live_packets = self.live_packets.saturating_sub(1);
+        self.to_send.insert(s.ord);
+        true
+    }
+
+    /// Index in `outstanding` of the packet with ordinal `ord`.
+    fn ord_index(&self, ord: u64) -> Option<usize> {
+        let i = usize::try_from(ord.checked_sub(self.front_ord)?).ok()?;
+        (i < self.outstanding.len()).then_some(i)
     }
 
     fn check_closed(&mut self) {
@@ -626,8 +698,11 @@ impl Connection {
         if self.probe_seq == Some(s.seq) {
             self.probe_seq = None;
         }
-        if !s.lost {
+        if s.lost {
+            self.to_send.remove(&s.ord);
+        } else {
             self.flight = self.flight.saturating_sub(len);
+            self.live_packets = self.live_packets.saturating_sub(1);
         }
         self.unacked_bytes = self.unacked_bytes.saturating_sub(len);
         if Some(s.seq) == self.fin_seq {
@@ -656,7 +731,9 @@ impl Connection {
                 newly += 1;
                 sample = s.or(sample);
             }
-            self.outstanding.pop_front();
+            if self.outstanding.pop_front().is_some() {
+                self.front_ord += 1;
+            }
         }
         let mut sacked: Vec<u16> = Vec::new();
         if let Some(mask) = p.sack.as_deref() {
@@ -696,10 +773,7 @@ impl Connection {
                 self.ledbat
                     .on_ack(c(acked_bytes), p.timestamp_diff_us, c(flight_before), now);
             }
-            self.rto_at = self
-                .outstanding
-                .iter()
-                .any(|s| !s.acked && !s.lost)
+            self.rto_at = (self.live_packets > 0)
                 .then(|| after(now, self.rtt.rto()))
                 .flatten();
         }
@@ -710,19 +784,22 @@ impl Connection {
         let mut lost_any = false;
         if self.dup_acks >= DUP_ACK_THRESHOLD {
             self.dup_acks = 0;
-            if let Some(s) = self.outstanding.iter_mut().find(|s| !s.acked)
+            if let Some(i) = self.outstanding.iter().position(|s| !s.acked)
+                && let Some(s) = self.outstanding.get_mut(i)
                 && !s.lost
                 && !s.fast_resent
             {
-                s.lost = true;
                 s.fast_resent = true;
-                self.flight = self.flight.saturating_sub(s.payload.len());
-                lost_any = true;
+                lost_any |= self.mark_lost(i);
             }
         }
         if !sacked.is_empty() {
             // `sacked` is in ascending sequence order (from ack_nr + 2 on).
-            for s in self.outstanding.iter_mut() {
+            // A bounded scan (`MAX_IN_FLIGHT_PACKETS`) that stops early.
+            for i in 0..self.outstanding.len() {
+                let Some(s) = self.outstanding.get_mut(i) else {
+                    break;
+                };
                 if s.acked || s.lost || s.fast_resent {
                     continue;
                 }
@@ -730,10 +807,8 @@ impl Connection {
                 if later < DUP_ACK_THRESHOLD as usize {
                     break; // later packets have even fewer acked after them
                 }
-                s.lost = true;
                 s.fast_resent = true;
-                self.flight = self.flight.saturating_sub(s.payload.len());
-                lost_any = true;
+                lost_any |= self.mark_lost(i);
             }
         }
         if lost_any {
@@ -746,7 +821,7 @@ impl Connection {
                 self.ledbat.on_loss();
                 self.last_loss = Some(now);
             }
-            if !self.outstanding.iter().any(|s| !s.acked && !s.lost) {
+            if self.live_packets == 0 {
                 self.rto_at = None;
             }
         }
@@ -787,7 +862,7 @@ impl Connection {
                 self.ack_now = true; // no room: the ack shows our window
                 return;
             }
-            self.inbox.extend(p.payload.iter());
+            self.push_inbox(&p.payload);
             self.ack_nr = p.seq_nr;
             let had_holes = !self.ooo.is_empty();
             self.advance_in_order();
@@ -815,7 +890,34 @@ impl Connection {
             return;
         }
         self.ooo_bytes += len;
-        self.ooo.insert(p.seq_nr, p.payload.to_vec());
+        let payload = if len >= MERGE_BELOW {
+            p.payload.clone()
+        } else {
+            Bytes::copy_from_slice(&p.payload)
+        };
+        self.ooo.insert(p.seq_nr, payload);
+    }
+
+    /// Appends in-order payload. A payload of at least [`MERGE_BELOW`]
+    /// bytes is kept as is (a slice of its datagram, no copy); a shorter
+    /// one, and anything after it until the tail reaches `MERGE_BELOW`
+    /// bytes, is copied into the tail, so every chunk queued holds at least
+    /// `MERGE_BELOW` bytes.
+    fn push_inbox(&mut self, payload: &Bytes) {
+        let len = payload.len();
+        if len == 0 {
+            return;
+        }
+        self.inbox_len += len;
+        if len >= MERGE_BELOW && self.inbox_tail.is_empty() {
+            self.inbox.push_back(payload.clone());
+            return;
+        }
+        self.inbox_tail.extend_from_slice(payload);
+        if self.inbox_tail.len() >= MERGE_BELOW {
+            let chunk = self.inbox_tail.split().freeze();
+            self.inbox.push_back(chunk);
+        }
     }
 
     fn advance_in_order(&mut self) {
@@ -831,7 +933,7 @@ impl Connection {
             match self.ooo.remove(&next) {
                 Some(v) => {
                     self.ooo_bytes = self.ooo_bytes.saturating_sub(v.len());
-                    self.inbox.extend(v.iter());
+                    self.push_inbox(&v);
                     self.ack_nr = next;
                 }
                 None => return,
@@ -870,7 +972,11 @@ impl Connection {
         let seq = self.seq_nr;
         self.seq_nr = self.seq_nr.wrapping_add(1);
         self.unacked_bytes += payload.len();
+        let ord = self.next_ord;
+        self.next_ord += 1;
+        self.to_send.insert(ord);
         self.outstanding.push_back(Sent {
+            ord,
             seq,
             ty,
             payload,
@@ -978,7 +1084,8 @@ impl Connection {
 
     /// Sends the oldest packet waiting for (re)transmission, if it fits.
     fn transmit_outstanding(&mut self, now: Instant) -> Option<Vec<u8>> {
-        let i = self.outstanding.iter().position(|s| s.lost && !s.acked)?;
+        let ord = *self.to_send.first()?;
+        let i = self.ord_index(ord)?;
         let (len, ty, seq, payload) = {
             let s = self.outstanding.get(i)?;
             (s.payload.len(), s.ty, s.seq, s.payload.clone())
@@ -991,6 +1098,8 @@ impl Connection {
         }
         let s = self.outstanding.get_mut(i)?;
         s.lost = false;
+        self.to_send.remove(&ord);
+        self.live_packets += 1;
         s.transmissions = s.transmissions.saturating_add(1);
         s.sent_at = now;
         self.flight += len;
@@ -1011,9 +1120,7 @@ impl Connection {
     /// Turns unsent bytes (then the FIN) into one new outstanding packet
     /// when it fits the windows; `transmit_outstanding` then sends it.
     fn packetize(&mut self) {
-        if self.outstanding.iter().any(|s| s.lost && !s.acked)
-            || self.outstanding.len() >= MAX_IN_FLIGHT_PACKETS
-        {
+        if !self.to_send.is_empty() || self.outstanding.len() >= MAX_IN_FLIGHT_PACKETS {
             return;
         }
         if !self.unsent.is_empty() {
@@ -1034,8 +1141,8 @@ impl Connection {
             if !self.fits(len) {
                 return;
             }
-            let payload: Vec<u8> = self.unsent.drain(..len).collect();
-            self.push_outstanding(PacketType::Data, Bytes::from(payload));
+            let payload = self.unsent.split_to(len).freeze();
+            self.push_outstanding(PacketType::Data, payload);
             return;
         }
         if self.closing && self.fin_seq.is_none() {
@@ -1043,6 +1150,72 @@ impl Connection {
             self.fin_seq = Some(seq);
         }
     }
+
+    /// Recomputes every incrementally kept count with a full scan and
+    /// reports the first mismatch. For tests and fuzzing only.
+    #[doc(hidden)]
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let mut to_send = BTreeSet::new();
+        let (mut live, mut flight, mut unacked) = (0usize, 0usize, 0usize);
+        for (i, s) in self.outstanding.iter().enumerate() {
+            let want = self.front_ord + i as u64;
+            if s.ord != want {
+                return Err(format!("outstanding[{i}] has ord {}, want {want}", s.ord));
+            }
+            if !s.acked {
+                unacked += s.payload.len();
+                if s.lost {
+                    to_send.insert(s.ord);
+                } else {
+                    live += 1;
+                    flight += s.payload.len();
+                }
+            }
+        }
+        let next = self.front_ord + self.outstanding.len() as u64;
+        if next != self.next_ord {
+            return Err(format!(
+                "next_ord {} but front + len = {next}",
+                self.next_ord
+            ));
+        }
+        if to_send != self.to_send {
+            return Err(format!(
+                "to_send {:?}, scan gives {to_send:?}",
+                self.to_send
+            ));
+        }
+        let inbox_len = self.inbox.iter().map(Bytes::len).sum::<usize>() + self.inbox_tail.len();
+        let ooo_bytes = self.ooo.values().map(Bytes::len).sum::<usize>();
+        for (name, kept, scanned) in [
+            ("live_packets", self.live_packets, live),
+            ("flight", self.flight, flight),
+            ("unacked_bytes", self.unacked_bytes, unacked),
+            ("inbox_len", self.inbox_len, inbox_len),
+            ("ooo_bytes", self.ooo_bytes, ooo_bytes),
+        ] {
+            if kept != scanned {
+                return Err(format!("{name} is {kept}, scan gives {scanned}"));
+            }
+        }
+        let max_chunks = self.cfg.recv_buffer / MERGE_BELOW + 1;
+        if self.inbox.len() > max_chunks {
+            return Err(format!(
+                "inbox holds {} chunks, max {max_chunks}",
+                self.inbox.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Copies as much of `src` as fits into the start of `dst`; returns how much.
+fn copy_prefix(dst: &mut [u8], src: &[u8]) -> usize {
+    let k = dst.len().min(src.len());
+    if let (Some(d), Some(s)) = (dst.get_mut(..k), src.get(..k)) {
+        d.copy_from_slice(s);
+    }
+    k
 }
 
 #[cfg(test)]

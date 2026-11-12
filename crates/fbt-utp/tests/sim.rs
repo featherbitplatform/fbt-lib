@@ -140,6 +140,8 @@ struct Side {
     keep_received: bool,
     received_len: usize,
     closed: bool,
+    /// Run `check_invariants` after every event on this side.
+    check: bool,
 }
 
 impl Side {
@@ -153,10 +155,25 @@ impl Side {
             keep_received: true,
             received_len: 0,
             closed: false,
+            check: false,
+        }
+    }
+
+    fn check(&self, what: &str) {
+        if let Some(c) = self.conn.as_ref()
+            && self.check
+            && let Err(e) = c.check_invariants()
+        {
+            panic!("{what}: {e}");
         }
     }
 
     fn pump_app(&mut self) {
+        self.pump_app_inner();
+        self.check("pump_app");
+    }
+
+    fn pump_app_inner(&mut self) {
         let Some(c) = self.conn.as_mut() else { return };
         if self.endless {
             while c.write(&self.data) > 0 {}
@@ -223,18 +240,24 @@ async fn run(
                 }
                 None => {}
             }
+            sides[to].check("on_packet");
         }
         for s in sides.iter_mut() {
             if let Some(c) = s.conn.as_mut()
                 && c.next_deadline().is_some_and(|d| d <= t)
             {
                 c.on_timer(t);
+                s.check("on_timer");
             }
             s.pump_app();
         }
         for (i, s) in sides.iter_mut().enumerate() {
+            let check = s.check;
             if let Some(c) = s.conn.as_mut() {
                 while let Some(d) = c.poll_transmit(t) {
+                    if check && let Err(e) = c.check_invariants() {
+                        panic!("poll_transmit: {e}");
+                    }
                     net.send(t, 1 - i, d);
                 }
                 assert_eq!(c.error(), None, "side {i} in {:?}", c.state());
@@ -283,6 +306,9 @@ async fn transfer_survives_loss_reorder_and_duplication() {
         let d0 = random_bytes(&mut data_rng, LEN);
         let d1 = random_bytes(&mut data_rng, LEN);
         let mut sides = [Side::new(d0.clone()), Side::new(d1.clone())];
+        for s in sides.iter_mut() {
+            s.check = true;
+        }
         let mut net = SimNet::new(seed, LinkCfg::lossy(0.10, 0.05));
         let out = run(
             &UtpConfig::default(),
@@ -413,6 +439,9 @@ async fn sequence_numbers_wrap_both_ways() {
     let d0 = random_bytes(&mut data_rng, LEN);
     let d1 = random_bytes(&mut data_rng, LEN);
     let mut sides = [Side::new(d0.clone()), Side::new(d1.clone())];
+    for s in sides.iter_mut() {
+        s.check = true;
+    }
     let mut net = SimNet::new(99, LinkCfg::lossy(0.02, 0.02));
     let out = run(&cfg, &mut net, &mut sides, Duration::from_secs(3600), |s| {
         eof(&s[0]) && eof(&s[1])

@@ -49,6 +49,18 @@
   at the `fbt` container (`torrents/addPeers`). It must reach progress 1 with
   matching hashes, and the seed's log must show qBittorrent connecting
   `via utp`. qBittorrent then goes back to `bittorrent_protocol` 0.
+- **Streaming with seeks:** Transmission stops its copy of the first
+  torrent, so qBittorrent (back on protocol 0) is the only source.
+  `fbt-example stream --file <beta.bin's index> --out /interop/fbt-stream
+  --port 6899 --no-dht` runs three times over the same `--out`: `--seek
+  12000000 --length 3000000` (a range from the middle; `beta.bin` starts at
+  30,000,000, not on a piece boundary, so both boundary pieces straddle its
+  neighbours), then `--seek 0` (the whole file: the first range is read back
+  from disk, the rest comes from qBittorrent), then `--seek 24999000` (the
+  last 1,000 bytes, all on disk by then). Each output's SHA-1 must equal the
+  matching range of `beta.bin`, the logs of the first two must show
+  `peer connected <qbittorrent>:6882`, and qBittorrent's `uploaded` must
+  grow. The logs are `logs/fbt-stream-{mid,all,tail}.log`.
 - **LSD:** a fifth trackerless torrent moves between two of our own
   processes: `fbt-lsd` seeds it (`--lsd --no-dht --no-pex --port 6897`) and
   `fbt` downloads it (`--lsd --no-dht --no-pex --port 6898`, no `--peer`).
@@ -65,8 +77,9 @@ prints `interop: download OK (qbittorrent, transmission)`,
 `interop: seed OK (transmission)`,
 `interop: encryption OK (qbittorrent, transmission)`,
 `interop: magnet via DHT OK`, `interop: PEX OK`,
-`interop: uTP download OK (qbittorrent)`, `interop: uTP seed OK (qbittorrent)`
-and `interop: LSD OK`, and exits 0. It also prints how long the DHT took to
+`interop: uTP download OK (qbittorrent)`, `interop: uTP seed OK (qbittorrent)`,
+`interop: stream with seeks OK (qbittorrent)` and `interop: LSD OK`, and
+exits 0. It also prints how long the DHT took to
 join and the total time. CI runs it as the `interop` job (55-minute timeout).
 
 ## Layout
@@ -96,7 +109,7 @@ outcome.
 | `transmission` | Transmission daemon, `transmission/settings.json` | peers 51413, RPC 9091 |
 | `dht-node` | `fbt-example dht-node` (same image as `fbt`): the private DHT's bootstrap node | DHT 6881 UDP |
 | `dht-helper-1` to `dht-helper-11` | the same, bootstrapped from `dht-node:6881`; one container (and address) each | DHT 6881 UDP |
-| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe) |
+| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe, then the stream scenario) |
 | `fbt-lsd` | the same image, idle like `fbt`; on `swarm` and `lan` | 6897 (LSD seed), 6899 (LSD probe) |
 | `fbt-mcast-route`, `fbt-lsd-mcast-route` | one-shot, in the network namespace of `fbt` / `fbt-lsd`: routes 224.0.0.0/4 out of the `lan` interface | none |
 
@@ -220,8 +233,12 @@ uid/gid, so the directory stays removable. On failure it writes
 example `RUST_LOG=debug`) to raise `fbt-example`'s log level.
 
 To chase one scenario, `INTEROP_ONLY` takes a comma-separated list of
-`download`, `seed`, `encryption`, `magnet`, `pex`, `utp` and `lsd`; the
-shared setup and the uTP scenarios always run, the others only when named.
+`download`, `seed`, `encryption`, `magnet`, `pex`, `utp`, `lsd` and `stream`;
+an unknown name fails at once with `interop: unknown scenario '<name>' (known:
+...)`, before the setup. The shared setup and the uTP scenarios always run,
+the others only when named. A partial run ends with `interop: selected
+scenarios passed (<list>) ...`; only a full run prints `interop: all
+scenarios passed ...`.
 `FBT_RUST_LOG` sets `RUST_LOG` for the uTP download alone (its tracing goes
 to `fbt-download-utp.log`), for example
 `INTEROP_ONLY=utp FBT_RUST_LOG=info,fbt_utp=debug,fbt_session=debug`. The

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::{SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -10,9 +11,10 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fbt::{
     AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, Magnet, MapMethod, MapProtocol,
-    Metainfo, PeerSource, RateLimit, Session, Settings, TorrentHandle, TorrentState, TorrentStatus,
-    Transport,
+    Metainfo, PeerSource, Priority, RateLimit, ReadAhead, Session, SessionError, Settings,
+    TorrentHandle, TorrentState, TorrentStatus, Transport,
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
 #[derive(Parser)]
@@ -168,6 +170,39 @@ enum Command {
         #[command(flatten)]
         net: NetArgs,
     },
+    /// Read one file of a torrent while it downloads, fetching only what is
+    /// read plus the read-ahead window.
+    Stream {
+        /// The .torrent file.
+        torrent: PathBuf,
+        /// Index of the file to stream (see `info`; pad files count).
+        #[arg(long, value_name = "INDEX")]
+        file: usize,
+        /// Directory the torrent's data goes into.
+        #[arg(long)]
+        out: PathBuf,
+        /// TCP port to listen on (default 6881; 0 picks a free one).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Write the bytes here instead of to stdout.
+        #[arg(long, value_name = "PATH")]
+        to: Option<PathBuf>,
+        /// Start reading at this offset in the file.
+        #[arg(long, value_name = "BYTES", default_value_t = 0)]
+        seek: u64,
+        /// Read this many bytes (default: to the end of the file).
+        #[arg(long, value_name = "BYTES")]
+        length: Option<u64>,
+        /// The stream's bytes per second (suffixes K and M); sizes the
+        /// read-ahead window as a time budget.
+        #[arg(long, value_name = "BYTES/S", value_parser = parse_rate)]
+        bitrate: Option<u64>,
+        /// Extra peer to connect to; may be repeated.
+        #[arg(long, value_name = "ADDR")]
+        peer: Vec<SocketAddr>,
+        #[command(flatten)]
+        net: NetArgs,
+    },
     /// Seed a torrent whose data is already on disk.
     Seed {
         /// The .torrent file.
@@ -223,6 +258,9 @@ enum Command {
         /// How long the idle torrents run.
         #[arg(long, value_name = "S", default_value_t = 60)]
         idle_secs: u64,
+        /// Stream the `--size` payload while it downloads (TCP), then seek.
+        #[arg(long)]
+        stream: bool,
     },
     /// Print what a .torrent file contains.
     Info {
@@ -283,12 +321,35 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             let source = Source::File(load(&torrent)?);
             transfer(source, data, port, seed_for, &[], false, &net).await
         }
+        Command::Stream {
+            torrent,
+            file,
+            out,
+            port,
+            to,
+            seek,
+            length,
+            bitrate,
+            peer,
+            net,
+        } => {
+            let args = StreamArgs {
+                file,
+                port,
+                to,
+                seek,
+                length,
+                bitrate,
+            };
+            stream(load(&torrent)?, out, args, &peer, &net).await
+        }
         Command::Bench {
             size,
             transport,
             torrents,
             idle_secs,
-        } => bench(size, transport, torrents, idle_secs).await,
+            stream,
+        } => bench(size, transport, torrents, idle_secs, stream).await,
         Command::LsdProbe { port, timeout_secs } => lsd_probe(port, timeout_secs).await,
         Command::DhtNode {
             port,
@@ -411,6 +472,120 @@ async fn transfer(
     .await;
     session.shutdown().await;
     Ok(code)
+}
+
+/// What `stream` reads, and where it goes.
+struct StreamArgs {
+    file: usize,
+    port: Option<u16>,
+    to: Option<PathBuf>,
+    seek: u64,
+    length: Option<u64>,
+    bitrate: Option<u64>,
+}
+
+/// Prints a line to stderr, or to stdout when `to_stderr` is false.
+fn say(to_stderr: bool, line: &str) {
+    if to_stderr {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+}
+
+/// The `stream` subcommand: only the streamed file is wanted (every other
+/// file is `Skip`), so what is fetched is what is read, the read-ahead
+/// window and the boundary pieces.
+async fn stream(
+    meta: Metainfo,
+    dir: PathBuf,
+    args: StreamArgs,
+    peers: &[SocketAddr],
+    net: &NetArgs,
+) -> Result<ExitCode, Error> {
+    let mut settings = Settings::default();
+    net.apply(&mut settings);
+    if let Some(port) = args.port
+        && net.listen.is_empty()
+    {
+        settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];
+    }
+    let session = Session::new(settings).await?;
+    // With stdout as the sink, every other line goes to stderr.
+    let to_stderr = args.to.is_none();
+    say(to_stderr, &format!("listening on {}", session.local_addr()));
+    let mut events = session.subscribe(EventMask::PEER);
+    let priorities = (0..meta.info.files.len())
+        .map(|i| {
+            if i == args.file {
+                Priority::Normal
+            } else {
+                Priority::Skip
+            }
+        })
+        .collect();
+    let mut params = AddTorrent::new(meta, dir);
+    params.file_priorities = priorities;
+    let handle = session.add_torrent(params).await?;
+    let mut reader = match handle.open_file(args.file).await {
+        Ok(r) => r,
+        Err(e @ SessionError::InvalidFileIndex { .. }) => {
+            eprintln!("error: {e}");
+            session.shutdown().await;
+            return Ok(ExitCode::from(2));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(bitrate) = args.bitrate {
+        let mut ahead = ReadAhead::default();
+        ahead.bitrate = Some(bitrate);
+        reader.set_read_ahead(ahead)?;
+    }
+    for peer in peers {
+        handle.add_peer(*peer).await?;
+    }
+    let mut sink: Box<dyn Write> = match &args.to {
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let start = Instant::now();
+    reader.seek(SeekFrom::Start(args.seek)).await?;
+    let mut left = args.length.unwrap_or(u64::MAX);
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let want = usize::try_from(left).map_or(buf.len(), |l| l.min(buf.len()));
+        let Some(slot) = buf.get_mut(..want) else {
+            break;
+        };
+        let n = tokio::select! {
+            r = reader.read(slot) => r?,
+            Some(ev) = events.recv() => {
+                if let Event::PeerConnected { addr, .. } = ev {
+                    say(to_stderr, &format!("peer connected {addr}"));
+                }
+                continue;
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if let Some(chunk) = buf.get(..n) {
+            sink.write_all(chunk)?;
+        }
+        total += n as u64;
+        left = left.saturating_sub(n as u64);
+    }
+    sink.flush()?;
+    drop(sink);
+    eprintln!(
+        "stream: {total} bytes from {} in {:.2} s",
+        args.seek,
+        start.elapsed().as_secs_f64()
+    );
+    drop(reader);
+    session.shutdown().await;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Piece length of the benchmark torrents.
@@ -575,6 +750,71 @@ async fn bench_transfer(size_mib: u64, transport: TransportChoice) -> Result<(),
     Ok(())
 }
 
+/// Streams `size_mib` MiB front to back while the leech downloads it from a
+/// seed in this process (loopback, TCP, in-memory leech storage), then reads
+/// 64 KiB at ten pseudo-random offsets.
+async fn bench_stream(size_mib: u64) -> Result<(), Error> {
+    let len = size_mib.saturating_mul(1024 * 1024);
+    if len < 1024 * 1024 {
+        return Err("bench --stream needs --size of at least 1".into());
+    }
+    let m = bench_torrent("bench", len, BENCH_PIECE_LEN)?;
+    let seed = Session::new(bench_settings(TransportChoice::Tcp)).await?;
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(std::sync::Arc::new(BenchStorage { discard: false }));
+    let seed_handle = seed.add_torrent(p).await?;
+    wait_seeding(&[seed_handle], Duration::from_secs(300)).await?;
+    let leech = Session::new(bench_settings(TransportChoice::Tcp)).await?;
+    let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+    p.storage = Some(std::sync::Arc::new(fbt::MemStorage::new(len)));
+    let handle = leech.add_torrent(p).await?;
+    let mut reader = handle.open_file(0).await?;
+    println!("bench: start");
+    let t0 = Instant::now();
+    handle.add_peer(seed.local_addr()).await?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(300), reader.read(&mut buf))
+            .await
+            .map_err(|_| "timed out reading the stream")??;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+    }
+    if total != len {
+        return Err(format!("read {total} of {len} bytes").into());
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let mbit = len as f64 * 8.0 / 1e6 / secs;
+    println!("bench: stream {size_mib} MiB in {secs:.2} s = {mbit:.0} Mbit/s");
+    // Fixed-seed xorshift64: `fbt-example` has no `rand` dependency.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let span = len - 64 * 1024;
+    let mut times = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    for _ in 0..10 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let t = Instant::now();
+        reader.seek(SeekFrom::Start(x % span)).await?;
+        tokio::time::timeout(Duration::from_secs(60), reader.read_exact(&mut chunk))
+            .await
+            .map_err(|_| "timed out after a seek")??;
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(f64::total_cmp);
+    let at = |q: usize| times.get(q).copied().unwrap_or(0.0);
+    println!("bench: stream seek p50 {:.2} ms p90 {:.2} ms", at(4), at(8));
+    drop(reader);
+    tokio::time::sleep(BENCH_SETTLE).await;
+    leech.shutdown().await;
+    seed.shutdown().await;
+    Ok(())
+}
+
 /// Seeds `count` small torrents with no peers for `idle_secs`.
 async fn bench_idle(count: u32, idle_secs: u64) -> Result<(), Error> {
     let session = Session::new(bench_settings(TransportChoice::Both)).await?;
@@ -600,9 +840,12 @@ async fn bench(
     transport: TransportChoice,
     torrents: u32,
     idle_secs: u64,
+    stream: bool,
 ) -> Result<ExitCode, Error> {
     println!("bench: pid {}", std::process::id());
-    if size_mib > 0 {
+    if stream {
+        bench_stream(size_mib).await?;
+    } else if size_mib > 0 {
         bench_transfer(size_mib, transport).await?;
     }
     if torrents > 0 {

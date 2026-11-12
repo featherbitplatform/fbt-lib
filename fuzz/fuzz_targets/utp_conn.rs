@@ -14,7 +14,8 @@ const MAX_TRANSMITS_PER_ROUND: usize = 1 << 16;
 // byte followed by that many bytes: the first byte of a chunk is the number
 // of milliseconds the clock advances, the rest is a datagram fed to
 // `on_packet`. After each chunk the timer fires and the outgoing queue is
-// drained; the receive buffer bound must hold throughout.
+// drained; the receive buffer bound and the connection's incremental
+// counts (`check_invariants`) must hold throughout.
 fuzz_target!(|data: &[u8]| {
     let mut cfg = UtpConfig::default();
     cfg.recv_buffer = RECV_BUFFER;
@@ -39,6 +40,11 @@ fuzz_target!(|data: &[u8]| {
     let mut now = t0;
     let mut rest = data;
     let mut out = [0u8; 4096];
+    let check = |c: &Connection, what: &str| {
+        if let Err(e) = c.check_invariants() {
+            panic!("{what}: {e}");
+        }
+    };
     while let Some((&len, tail)) = rest.split_first() {
         let n = usize::from(len).min(tail.len());
         let (chunk, next) = tail.split_at(n);
@@ -49,17 +55,21 @@ fuzz_target!(|data: &[u8]| {
         now += Duration::from_millis(u64::from(ms));
         if let Ok(p) = Packet::decode(&Bytes::copy_from_slice(dgram)) {
             c.on_packet(&p, now);
+            check(&c, "on_packet");
         }
         // Before any read: unread inbox plus out-of-order data stay bounded.
         assert!(c.buffered_bytes() <= cfg.recv_buffer);
         c.on_timer(now);
+        check(&c, "on_timer");
         assert!(c.buffered_bytes() <= cfg.recv_buffer);
         let mut sent = 0;
         while c.poll_transmit(now).is_some() {
+            check(&c, "poll_transmit");
             sent += 1;
             assert!(sent < MAX_TRANSMITS_PER_ROUND, "poll_transmit never ends");
         }
         while c.read(&mut out) > 0 {}
+        check(&c, "read");
         assert!(c.buffered_bytes() <= cfg.recv_buffer);
     }
 });

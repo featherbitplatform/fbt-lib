@@ -389,7 +389,13 @@ mod tests {
             if let Ok(p) = Packet::decode(&Bytes::from(bytes)) {
                 let mut out = Vec::new();
                 p.encode(&mut out);
-                prop_assert_eq!(Packet::decode(&Bytes::from(out)).unwrap(), p);
+                // A SACK shorter than a multiple of 4 is zero-padded on
+                // encode, so it comes back padded.
+                let mut want = p.clone();
+                if let Some(s) = want.sack.as_mut() {
+                    s.resize(s.len().div_ceil(4) * 4, 0);
+                }
+                prop_assert_eq!(Packet::decode(&Bytes::from(out)).unwrap(), want);
             }
         }
 

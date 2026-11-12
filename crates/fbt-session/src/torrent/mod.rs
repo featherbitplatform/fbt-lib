@@ -1,8 +1,9 @@
 //! One torrent: its public handle and the actor task behind it.
 //!
 //! - `actor`: the event loop, commands, state and status.
-//! - `swarm`: addresses to connect to, connections within the limits,
-//!   sending to and closing peers.
+//! - `swarm`: connections within the limits, sending to and closing peers.
+//! - `known`, `retries`, `peer`: the addresses to connect to, their retries
+//!   and fallbacks, and one connection's state.
 //! - `peers`: peer events, interest, choking and block requests.
 //! - `data`: block buffering, piece verification and writes.
 //! - `serve`: answering block requests from peers.
@@ -11,37 +12,50 @@
 //! - `announcer`, `tiers`: announcing to the trackers (BEP 12 tiers).
 //! - `dht`: looking up and announcing on the session's DHT.
 //! - `pex`: peer exchange (BEP 11) with connected peers.
+//! - `deadline`: the pieces open file readers wait for, and when.
+//! - `readers`: open file readers, their reads and read-ahead.
 
 mod actor;
 mod announcer;
 mod check;
 mod commands;
 mod data;
+mod deadline;
 mod dht;
 mod holepunch;
+mod known;
 mod magnet;
 mod metadata;
+mod peer;
 mod peers;
 mod pex;
+mod readers;
+mod retries;
 mod serve;
 mod swarm;
 mod tiers;
 
+pub(crate) use deadline::ReaderId;
+
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
 
+use bytes::Bytes;
 use fbt_core::{Bitfield, InfoHashes};
 use fbt_metainfo::Metainfo;
 use fbt_wire::Handshake;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::bandwidth::RateLimit;
-use crate::error::SessionError;
+use crate::error::{SessionError, StreamError};
 use crate::event::PeerSource;
 use crate::peer::conn::PeerStream;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::Storage;
+use crate::stream::reader::ReaderLink;
+use crate::stream::{FileReader, ReadAhead};
 
 /// Capacity of a torrent's command channel.
 const COMMAND_QUEUE: usize = 64;
@@ -68,6 +82,26 @@ pub(crate) enum Cmd {
         addr: SocketAddr,
     },
     Shutdown(oneshot::Sender<()>),
+    /// A [`FileReader`] opens on file `file`, sharing `link`.
+    OpenReader {
+        file: usize,
+        link: Arc<ReaderLink>,
+        tx: oneshot::Sender<Result<ReaderId, SessionError>>,
+    },
+    /// A reader's link moved (seek, new piece or new read-ahead).
+    ReaderMoved(ReaderId),
+    /// A reader was dropped.
+    CloseReader(ReaderId),
+    /// `len` bytes at the torrent-global `offset`, within one piece; at
+    /// most one in flight per reader.
+    Read {
+        reader: ReaderId,
+        offset: u64,
+        len: u32,
+        tx: oneshot::Sender<Result<Bytes, StreamError>>,
+    },
+    /// Tests: the merged deadlines.
+    DebugDeadlines(oneshot::Sender<Vec<(u32, Duration)>>),
 }
 
 #[derive(Debug)]
@@ -239,7 +273,69 @@ impl TorrentHandle {
         self.call(|tx| Cmd::SetRateLimit(limit, tx)).await
     }
 
-    fn gone(&self) -> SessionError {
+    /// Opens file `index` for reading while the torrent downloads, with
+    /// [`Settings::read_ahead`](crate::Settings::read_ahead).
+    ///
+    /// Fails with [`SessionError::NoMetadata`] for a magnet whose metadata
+    /// has not arrived, [`SessionError::InvalidFileIndex`] for an index out
+    /// of range or naming a pad file, and [`SessionError::TooManyReaders`]
+    /// when the torrent has 16 open readers.
+    pub async fn open_file(&self, index: usize) -> Result<FileReader, SessionError> {
+        let read_ahead = self.inner.shared.settings.read_ahead;
+        self.open_file_with(index, read_ahead).await
+    }
+
+    /// [`open_file`](Self::open_file) with its own read-ahead; fails with
+    /// [`SessionError::InvalidSettings`] for a zero `time` or `bitrate`.
+    pub async fn open_file_with(
+        &self,
+        index: usize,
+        read_ahead: ReadAhead,
+    ) -> Result<FileReader, SessionError> {
+        let meta = self.metainfo().ok_or(SessionError::NoMetadata)?;
+        let files = meta.info.files.len();
+        let invalid = SessionError::InvalidFileIndex { index, files };
+        if meta.info.files.get(index).is_none_or(|f| f.pad) {
+            return Err(invalid);
+        }
+        read_ahead
+            .validate()
+            .map_err(SessionError::InvalidSettings)?;
+        let file = meta.file_layout().file_range(index).ok_or(invalid)?;
+        let link = Arc::new(ReaderLink::new(file.start, read_ahead));
+        let shared = Arc::clone(&link);
+        let id = self
+            .call(|tx| Cmd::OpenReader {
+                file: index,
+                link: shared,
+                tx,
+            })
+            .await??;
+        let piece_len = meta.piece_layout().piece_len();
+        Ok(FileReader::new(
+            self.clone(),
+            id,
+            link,
+            index,
+            file,
+            piece_len,
+        ))
+    }
+
+    /// Tests: the pieces open readers wait for, earliest deadline first,
+    /// with the time left until each is due; empty once the torrent is gone.
+    #[doc(hidden)]
+    pub async fn debug_deadlines(&self) -> Vec<(u32, Duration)> {
+        self.call(Cmd::DebugDeadlines).await.unwrap_or_default()
+    }
+
+    /// The torrent's command channel, for its readers.
+    pub(crate) fn cmd_sender(&self) -> mpsc::Sender<Cmd> {
+        self.inner.cmds.clone()
+    }
+
+    /// The error for a torrent whose actor is gone.
+    pub(crate) fn gone(&self) -> SessionError {
         if self.inner.shared.is_shutdown() {
             SessionError::Shutdown
         } else {

@@ -49,12 +49,12 @@ bash dev/release-version.sh --notes   # the current version's CHANGELOG section
 bash dev/sast.sh              # everything
 bash dev/sast.sh semgrep      # one tool
 
-# Loopback throughput and idle-torrent benchmark; appends a row to docs/benchmarks.md
+# Loopback throughput, streaming (front to back, then seeks) and idle-torrent benchmark; appends a row to docs/benchmarks.md
 bash dev/bench.sh
 
 # Live interop vs qBittorrent-nox and Transmission via opentracker, plus magnet via DHT, forced
-# encryption, PEX, uTP with qBittorrent and LSD between two fbt-example containers, on isolated
-# networks with our own dht-node (Docker; see dev/interop/README.md)
+# encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent and LSD between two
+# fbt-example containers, on isolated networks with our own dht-node (Docker; see dev/interop/README.md)
 bash dev/interop/run.sh
 
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec

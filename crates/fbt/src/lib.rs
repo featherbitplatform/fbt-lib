@@ -189,6 +189,59 @@
 //! # }
 //! ```
 //!
+//! # Streaming
+//!
+//! [`TorrentHandle::open_file`] returns a [`FileReader`] for one file of a
+//! torrent that is still downloading. It implements tokio's `AsyncRead` and
+//! `AsyncSeek`, so a player, an HTTP range server or a plain
+//! `tokio::io::copy` can read it. The reader's position sets deadlines on
+//! the pieces of its read-ahead window, and the torrent fetches those first,
+//! from the fastest peers, whatever the file's [`Priority`] (a `Skip` file
+//! still gets its window and nothing more). Seeking replaces the deadlines.
+//!
+//! The window is [`ReadAhead`]: at least `bytes` (16 MiB by default), or
+//! `time` (10 s) of playback at `bitrate` when that is more. A client that
+//! knows the stream's bitrate passes it
+//! ([`FileReader::set_read_ahead`], [`TorrentHandle::open_file_with`],
+//! [`Settings::read_ahead`]); without one the bitrate implied is
+//! `bytes / time`.
+//!
+//! A read of a piece that is not there yet waits instead of failing; it
+//! returns only bytes that passed their piece's hash check. A read fails
+//! only with a [`StreamError`]: the torrent was removed, the session shut
+//! down, or the torrent stopped with an error (an `io::Error` of kind
+//! `NotFound`, `ConnectionAborted` or `Other`). The reader is not poisoned:
+//! after a resume the next read works. There is no read timeout; wrap reads
+//! in `tokio::time::timeout`. A paused torrent serves the pieces it has and
+//! leaves the others waiting until it resumes.
+//!
+//! The choker and the rate limits are unchanged: the choker governs our
+//! uploads, and deadline blocks count against every rate limit like any
+//! other block, so a download limit below the stream's bitrate makes reads
+//! wait. A torrent has at most 16 open readers
+//! ([`SessionError::TooManyReaders`]); their deadlines merge by the earliest
+//! per piece.
+//!
+//! ```no_run
+//! use std::io::SeekFrom;
+//! use fbt::{AddTorrent, Metainfo, Session, Settings};
+//! use tokio::io::{AsyncReadExt, AsyncSeekExt};
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let metainfo = Metainfo::from_bytes(&std::fs::read("example.torrent")?)?;
+//! let session = Session::new(Settings::default()).await?;
+//! let torrent = session
+//!     .add_torrent(AddTorrent::new(metainfo, "downloads".into()))
+//!     .await?;
+//!
+//! let mut file = torrent.open_file(0).await?;
+//! file.seek(SeekFrom::Start(1 << 20)).await?;
+//! tokio::io::copy(&mut file.take(1 << 20), &mut tokio::io::sink()).await?;
+//! session.shutdown().await;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Features
 //!
 //! - `tls` (default): HTTPS trackers over rustls with the `ring` provider,
@@ -210,10 +263,11 @@ pub use fbt_metainfo::{FileEntry, Info, Magnet, MagnetError, Metainfo, MetainfoE
 pub use fbt_session::storage::{FsStorage, MemStorage, Storage};
 pub use fbt_session::{
     AddTorrent, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtStats, DisconnectReason,
-    EncryptionPolicy, Event, EventMask, EventStream, ExternalIpSource, ListenError,
+    EncryptionPolicy, Event, EventMask, EventStream, ExternalIpSource, FileReader, ListenError,
     MAX_METADATA_SIZE, MapMethod, MapProtocol, MixedMode, PeerClassLimits, PeerSource, Priority,
-    RateLimit, RemoveMode, SeedChokingAlgorithm, Session, SessionError, Settings, StorageError,
-    TorrentHandle, TorrentSource, TorrentState, TorrentStatus, Transport,
+    RateLimit, ReadAhead, RemoveMode, SeedChokingAlgorithm, Session, SessionError, Settings,
+    StorageError, StreamError, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
+    Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

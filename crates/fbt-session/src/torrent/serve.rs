@@ -2,7 +2,7 @@
 //! the write-back cache (a verified piece not written yet, or a clean
 //! entry) or read through the session's disk pool, and sent back with
 //! `SendBlock`. A miss reads the whole piece and keeps it clean when the
-//! budget allows.
+//! budget allows. File readers share those whole-piece reads.
 
 use std::collections::HashMap;
 use std::io;
@@ -15,11 +15,12 @@ use tracing::{debug, warn};
 
 use super::actor::{Actor, Phase};
 use super::data::Job;
+use super::readers::ReadReq;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
 use crate::storage::cache::{CacheBudget, CacheKind};
-use crate::storage::error_path;
+use crate::storage::{Storage, error_path};
 
 impl Actor {
     /// A peer requests `block`: served only if we have the piece, the block
@@ -55,9 +56,9 @@ impl Actor {
             return;
         }
         if let Some(read) = self.piece_reads.get_mut(&block.piece)
-            && read.waiting.len() < MAX_PIECE_READ_WAITERS
+            && read.peer_waiters() < MAX_PIECE_READ_WAITERS
         {
-            read.waiting.push((key, block));
+            read.waiting.push(Waiter::Peer(key, block));
             return;
         }
         let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
@@ -73,31 +74,12 @@ impl Actor {
             && !self.piece_reads.contains_key(&block.piece)
             && self.cache.reserve_clean(u64::from(size))
         {
-            let offset = l.layout.piece_offset(block.piece);
-            let piece = block.piece;
-            self.piece_reads.insert(
-                piece,
-                PieceRead {
-                    generation,
-                    reserved: u64::from(size),
-                    waiting: vec![(key, block)],
-                },
-            );
-            self.shared.disk.spawn(&mut self.jobs, move || {
-                let mut buf = vec![0u8; size as usize];
-                let result = storage.read(offset, &mut buf).map(|()| buf);
-                Job::ReadPiece {
-                    generation,
-                    piece,
-                    result,
-                }
-            });
+            self.start_piece_read(block.piece, u64::from(size), vec![Waiter::Peer(key, block)]);
             return;
         }
         let offset = l.layout.piece_offset(block.piece) + u64::from(block.offset);
         self.shared.disk.spawn(&mut self.jobs, move || {
-            let mut buf = vec![0u8; block.len as usize];
-            let result = storage.read(offset, &mut buf).map(|()| buf);
+            let result = read_guarded(&*storage, offset, block.len as usize);
             Job::Read {
                 generation,
                 key,
@@ -107,8 +89,43 @@ impl Actor {
         });
     }
 
-    /// A whole piece was read: kept clean if the budget allows, and every
-    /// request waiting on it is served.
+    /// Reads `piece` whole for `waiting`, under a clean reservation of
+    /// `reserved` bytes (its size, or 0: not kept).
+    pub(super) fn start_piece_read(&mut self, piece: u32, reserved: u64, waiting: Vec<Waiter>) {
+        let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
+            // Unreachable (storage comes with the metadata). Serving the
+            // readers again would come straight back here, and waiting
+            // would hang them: they get an error.
+            self.cache.release_clean(reserved);
+            self.fail_reads(waiting, "the torrent has no storage");
+            return;
+        };
+        let storage = Arc::clone(storage);
+        let generation = self.generation;
+        let size = l.layout.piece_size(piece);
+        let offset = l.layout.piece_offset(piece);
+        self.piece_reads.insert(
+            piece,
+            PieceRead {
+                generation,
+                reserved,
+                waiting,
+            },
+        );
+        self.shared.disk.spawn(&mut self.jobs, move || {
+            let result = read_guarded(&*storage, offset, size as usize);
+            Job::ReadPiece {
+                generation,
+                piece,
+                result,
+            }
+        });
+    }
+
+    /// A whole piece was read: kept clean if it was reserved, and every
+    /// request waiting on it is served. Whatever stops that sends the
+    /// readers among them back to wait or to be served again; no reader's
+    /// answer is dropped.
     pub(super) fn on_read_piece(
         &mut self,
         generation: u64,
@@ -127,10 +144,15 @@ impl Actor {
         let Some(read) = self.piece_reads.remove(&piece) else {
             return;
         };
+        let size = self
+            .loaded
+            .as_ref()
+            .map_or(0, |l| u64::from(l.layout.piece_size(piece)));
         let data: Arc<[u8]> = match result {
-            Ok(buf) if buf.len() as u64 == read.reserved => buf.into(),
+            Ok(buf) if buf.len() as u64 == size => buf.into(),
             Ok(_) => {
                 self.cache.release_clean(read.reserved);
+                self.wait_reads(read.waiting);
                 return;
             }
             Err(e) => {
@@ -138,23 +160,34 @@ impl Actor {
                 let current = generation == self.generation && matches!(self.phase, Phase::Ready);
                 if e.kind() != io::ErrorKind::NotFound {
                     self.fail(&e, "reading a block");
+                    // Failed with the torrent's error.
+                    self.serve_reads(read.waiting);
                 } else if current {
                     self.piece_lost(piece, &e, read.waiting);
+                } else {
+                    // A stale read (the torrent was rechecked or stopped
+                    // since) says nothing about the piece now.
+                    self.serve_reads(read.waiting);
                 }
-                // A stale read (the torrent was rechecked or stopped since)
-                // says nothing about the piece now.
                 return;
             }
         };
         if generation != self.generation || !matches!(self.phase, Phase::Ready) {
             self.cache.release_clean(read.reserved);
+            self.serve_reads(read.waiting);
             return;
         }
-        self.cache.insert_reserved_clean(piece, Arc::clone(&data));
-        let waiting = read.waiting;
-        for (key, block) in waiting {
-            if let Some(bytes) = block_of(&data, block) {
-                self.deliver(key, block, bytes);
+        if read.reserved > 0 {
+            self.cache.insert_reserved_clean(piece, Arc::clone(&data));
+        }
+        for w in read.waiting {
+            match w {
+                Waiter::Peer(key, block) => {
+                    if let Some(bytes) = block_of(&data, block) {
+                        self.deliver(key, block, bytes);
+                    }
+                }
+                Waiter::Reader(req) => self.answer_read(req, &data),
             }
         }
     }
@@ -185,7 +218,7 @@ impl Actor {
         }
     }
 
-    pub(super) fn on_read(
+    pub(super) fn on_read_block(
         &mut self,
         generation: u64,
         key: PeerKey,
@@ -198,20 +231,21 @@ impl Actor {
         match result {
             Ok(buf) => self.deliver(key, block, Bytes::from(buf)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.piece_lost(block.piece, &e, vec![(key, block)]);
+                self.piece_lost(block.piece, &e, vec![Waiter::Peer(key, block)]);
             }
             Err(e) => self.fail(&e, "reading a block"),
         }
     }
 
     /// A piece we have is gone from disk (BEP 54): it is wanted again, our
-    /// peers are told, the requests waiting on it are rejected and
+    /// peers are told, the peer requests waiting on it are rejected (the
+    /// readers wait for its download) and
     /// `FileError` reports the file; the torrent keeps running. Every piece
     /// of the failing file we have is given up in the same pass (one
     /// `FileError` per file, one batch of `DontHave`s, one refresh), not
     /// one request at a time. A piece already given up (a second read
     /// failing) is only rejected.
-    fn piece_lost(&mut self, piece: u32, e: &io::Error, waiting: Vec<(PeerKey, BlockRef)>) {
+    pub(super) fn piece_lost(&mut self, piece: u32, e: &io::Error, waiting: Vec<Waiter>) {
         let path = error_path(e).map(Path::to_path_buf);
         let range = self.file_pieces(path.as_deref(), piece);
         let mut lost = Vec::new();
@@ -239,8 +273,13 @@ impl Actor {
                 self.send_lossy(key, PeerCommand::DontHave(i));
             }
         }
-        for (key, block) in waiting {
-            self.send(key, PeerCommand::Reject(block));
+        for w in waiting {
+            match w {
+                Waiter::Peer(key, block) => {
+                    self.send(key, PeerCommand::Reject(block));
+                }
+                Waiter::Reader(req) => self.wait_read(req),
+            }
         }
         if lost.is_empty() {
             return;
@@ -298,22 +337,42 @@ impl Actor {
 }
 
 /// Pieces up to this size are read whole on a cache miss; larger ones only
-/// the requested block.
-const WHOLE_PIECE_READ_MAX: u32 = 4 * 1024 * 1024;
+/// the requested block (or a reader's chunk).
+pub(super) const WHOLE_PIECE_READ_MAX: u32 = 4 * 1024 * 1024;
 /// Whole-piece reads one torrent runs at once; further misses read only
 /// their block.
 pub(super) const MAX_PIECE_READS: usize = 4;
-/// Requests waiting on one whole-piece read; further ones read their block.
+/// Peer requests waiting on one whole-piece read; further ones read their
+/// block. Readers' reads (at most one per reader) do not count.
 pub(super) const MAX_PIECE_READ_WAITERS: usize = 256;
+
+/// Who waits on a whole-piece read.
+#[derive(Debug)]
+pub(super) enum Waiter {
+    /// A peer's block request.
+    Peer(PeerKey, BlockRef),
+    /// A file reader's read.
+    Reader(ReadReq),
+}
 
 /// A whole-piece read in flight and the requests waiting on it.
 #[derive(Debug)]
 pub(super) struct PieceRead {
     /// The generation it was started in.
     pub generation: u64,
-    /// Clean bytes reserved for the piece before the read.
+    /// Clean bytes reserved for the piece before the read; 0 when it is
+    /// read without a reservation and not kept.
     pub reserved: u64,
-    pub waiting: Vec<(PeerKey, BlockRef)>,
+    pub waiting: Vec<Waiter>,
+}
+
+impl PieceRead {
+    fn peer_waiters(&self) -> usize {
+        self.waiting
+            .iter()
+            .filter(|w| matches!(w, Waiter::Peer(..)))
+            .count()
+    }
 }
 
 /// The whole-piece reads of one torrent, by piece. Each holds a clean
@@ -349,15 +408,37 @@ impl PieceReads {
         self.reads.len()
     }
 
-    pub(super) fn insert(&mut self, piece: u32, read: PieceRead) {
-        if let Some(old) = self.reads.insert(piece, read) {
+    /// Adds a read; one it replaces gives back its reservation and hands
+    /// its waiters to the new one.
+    pub(super) fn insert(&mut self, piece: u32, mut read: PieceRead) {
+        if let Some(old) = self.reads.remove(&piece) {
             self.budget.release(CacheKind::Clean, old.reserved);
+            read.waiting.extend(old.waiting);
         }
+        self.reads.insert(piece, read);
     }
 
     /// Takes the entry out; its reservation is the caller's now.
     pub(super) fn remove(&mut self, piece: &u32) -> Option<PieceRead> {
         self.reads.remove(piece)
+    }
+
+    /// Keeps only the waiters `keep` accepts; the reads go on.
+    pub(super) fn retain_waiters(&mut self, mut keep: impl FnMut(&Waiter) -> bool) {
+        for r in self.reads.values_mut() {
+            r.waiting.retain(&mut keep);
+        }
+    }
+
+    /// Forgets every read, giving their reservations back, and returns
+    /// their waiters; the reads' results are then ignored.
+    pub(super) fn take_all(&mut self) -> Vec<Waiter> {
+        let mut waiting = Vec::new();
+        for (_, r) in self.reads.drain() {
+            self.budget.release(CacheKind::Clean, r.reserved);
+            waiting.extend(r.waiting);
+        }
+        waiting
     }
 
     /// Forgets every read, giving their reservations back; their results
@@ -377,10 +458,25 @@ impl Drop for PieceReads {
 
 impl Actor {
     /// Forgets every whole-piece read in flight, giving their reservations
-    /// back; their results are then ignored.
+    /// back; their results are then ignored. Their peer requests are
+    /// dropped; their readers wait again (a check or the download answers
+    /// them, a storage error fails them).
     pub(super) fn drop_piece_reads(&mut self) {
-        self.piece_reads.clear();
+        let waiting = self.piece_reads.take_all();
+        self.wait_reads(waiting);
     }
+}
+
+/// Reads `len` bytes at `offset` on a disk thread. A panicking storage is
+/// an I/O error like any other, so the job still comes back with its
+/// identity (its waiters, its reader's answer) instead of a bare
+/// `JoinError` that leaves them waiting.
+pub(super) fn read_guarded(storage: &dyn Storage, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut buf = vec![0u8; len];
+        storage.read(offset, &mut buf).map(|()| buf)
+    }))
+    .unwrap_or_else(|_| Err(io::Error::other("the storage panicked while reading")))
 }
 
 /// The bytes of `block` within its piece's `data`.

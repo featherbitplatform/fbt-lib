@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `fbt-session`: `FileReader`, a seekable tokio `AsyncRead` and `AsyncSeek` over one file of a torrent that is still downloading, opened with the async `TorrentHandle::open_file` and `open_file_with`; a read of a missing piece waits and returns only hash-verified bytes ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-session`: `ReadAhead` (bytes, time and optional bitrate) and `Settings::read_ahead`, and `StreamError` for failed reads ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-session`: the deadline picker: pieces in a reader's window are fetched first, from the fastest peers, with late blocks duplicated to a second peer, and a seek replaces the window ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-session`: `PiecePicker::{pick_piece, progress, abandon}` and `PieceProgress` ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-session`: a sequential read cache: a piece a reader has left is demoted to the front of the clean LRU, and the next pieces are prefetched ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-core`: `FileLayout::file_range` ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-example`: the `stream` subcommand and `bench --stream` ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- Interop scenario: streaming with seeks from qBittorrent-nox ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `dev/bench.sh` and `docs/benchmarks.md`: "Stream Mbit/s" and "Seek p50 ms" columns ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+
+### Changed
+
+- `fbt-session`: new `SessionError` variants `InvalidFileIndex` and `TooManyReaders` ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-session`: `RateMeter::rate` no longer dilutes its first five seconds, so status rates and the request pipeline ramp up faster ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-session`: repeated drops of a productive peer back off up to 30 minutes ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-utp`: sends, acks and reads without per-byte copies or window scans (an O(1) send index, chunked payload buffers, no zero-fill per read); measured on Darwin arm64, uTP stays at about 579 Mbit/s and 42.7 % of a core per 100 Mbit/s because about 90 % of the time is system calls ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-session`: while a reader is open on a file with missing pieces, a finished torrent stays interested in seeds and does not announce upload-only ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+
+### Fixed
+
+- `fbt-session`: skipping the files still missing while a piece of one of them was being hashed no longer leaves that piece in the write-back cache until `cache_expiry`, which held `Seeding` back as long (or reported `TorrentFinished` before it) ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- Interop: `INTEROP_ONLY` no longer reports "all scenarios passed" for a partial run and rejects unknown names ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-utp`: datagrams that fail to decode are traced, and the half-open eviction order on a lost re-check is fixed ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+
 ## [0.3.0] - 2026-11-11
 
 ### Added

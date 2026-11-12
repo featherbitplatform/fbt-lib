@@ -32,6 +32,16 @@ pub struct BlockResult {
     pub cancel: Vec<PeerKey>,
 }
 
+/// Download progress of one piece, from [`PiecePicker::progress`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PieceProgress {
+    /// Blocks neither received nor outstanding from any peer.
+    pub free: usize,
+    /// Peers holding an unreceived block of the piece, sorted, each once.
+    pub owners: Vec<PeerKey>,
+}
+
 /// Default piece priority.
 const DEFAULT_PRIORITY: u8 = 4;
 /// Highest piece priority.
@@ -268,6 +278,119 @@ impl PiecePicker {
             self.take_endgame(peer, has, max_blocks, &mut out);
         }
         out
+    }
+
+    /// Picks up to `max_blocks` blocks of `piece` for `peer`, whatever the
+    /// piece's priority (0 included), and records them as outstanding from
+    /// it: first its free blocks (starting the piece if it is unrequested),
+    /// then blocks whose single owner is in `late` and is not `peer`. An
+    /// empty `late` takes no duplicate, and no block gets more than two
+    /// owners (the end-game cap). Nothing for a piece we have, one pending
+    /// its hash check, or out of range.
+    ///
+    /// A priority-0 piece started here never enters the partial set or the
+    /// buckets, so [`pick`](Self::pick) never continues it: only
+    /// `pick_piece` does.
+    pub fn pick_piece(
+        &mut self,
+        peer: PeerKey,
+        piece: u32,
+        max_blocks: usize,
+        late: &[PeerKey],
+    ) -> Vec<BlockRef> {
+        let mut out = Vec::new();
+        if max_blocks == 0 || piece >= self.layout.num_pieces() {
+            return out;
+        }
+        match self.state_of(piece) {
+            PieceState::Unrequested => self.start_piece(piece),
+            PieceState::Partial => {}
+            PieceState::PendingHash | PieceState::Have => return out,
+        }
+        self.take_free(peer, piece, max_blocks, &mut out);
+        if out.len() >= max_blocks || late.is_empty() {
+            return out;
+        }
+        let Some(d) = self.downloading.get_mut(&piece) else {
+            return out;
+        };
+        let mut taken = Vec::new();
+        for (bi, slot) in (0u32..).zip(d.blocks.iter_mut()) {
+            if out.len() + taken.len() >= max_blocks {
+                break;
+            }
+            let late_owner = match slot.owners.as_slice() {
+                [owner] => *owner != peer && late.contains(owner),
+                _ => false,
+            };
+            if !slot.received && late_owner {
+                slot.owners.push(peer);
+                taken.push(bi);
+            }
+        }
+        self.assign(peer, piece, &taken, &mut out);
+        out
+    }
+
+    /// Download progress of `piece`: its free blocks and the peers holding
+    /// the rest. `None` for a piece we have, one pending its hash check, or
+    /// out of range.
+    pub fn progress(&self, piece: u32) -> Option<PieceProgress> {
+        if piece >= self.layout.num_pieces() {
+            return None;
+        }
+        match self.state_of(piece) {
+            PieceState::Unrequested => Some(PieceProgress {
+                free: self.layout.blocks_in_piece(piece) as usize,
+                owners: Vec::new(),
+            }),
+            PieceState::Partial => {
+                let d = self.downloading.get(&piece)?;
+                let mut owners: Vec<PeerKey> = d
+                    .blocks
+                    .iter()
+                    .filter(|b| !b.received)
+                    .flat_map(|b| b.owners.iter().copied())
+                    .collect();
+                owners.sort_unstable();
+                owners.dedup();
+                Some(PieceProgress {
+                    free: d.free,
+                    owners,
+                })
+            }
+            PieceState::PendingHash | PieceState::Have => None,
+        }
+    }
+
+    /// Drops a partial piece's download progress, as
+    /// [`piece_failed`](Self::piece_failed) does, and returns the blocks
+    /// that were outstanding (by peer, then block), for the caller to
+    /// cancel. A wanted piece goes back to the new-piece candidates; a
+    /// priority-0 one is left alone. Nothing for a piece not partial
+    /// (unrequested, pending its hash check, passed or out of range).
+    pub fn abandon(&mut self, piece: u32) -> Vec<(PeerKey, BlockRef)> {
+        if self.state_of(piece) != PieceState::Partial {
+            return Vec::new();
+        }
+        let layout = self.layout;
+        let mut cancel: Vec<(PeerKey, BlockRef)> = self
+            .downloading
+            .get(&piece)
+            .map(|d| {
+                (0u32..)
+                    .zip(&d.blocks)
+                    .flat_map(|(bi, slot)| {
+                        slot.owners
+                            .iter()
+                            .map(move |&o| (o, layout.block(piece, bi)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        cancel.sort_unstable();
+        self.piece_failed(piece);
+        cancel
     }
 
     /// A block arrived from `peer`. Accepted only if it was outstanding from
@@ -1013,6 +1136,141 @@ mod tests {
         assert!(!p.on_block(PeerKey(1), got[0]).accepted);
     }
 
+    #[test]
+    fn pick_piece_starts_a_skipped_piece() {
+        let mut p = picker(4, 2);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_piece_priorities(&[4, 4, 4, 0]);
+        assert_eq!(p.pick_piece(PeerKey(1), 3, 1, &[]), vec![blk(3, 0)]);
+        assert!(p.is_in_progress(3));
+        check_invariants(&p, &[0, 0, 0, 0], 1);
+        // Neither the normal pick nor end-game continues it.
+        for peer in 2..5 {
+            let got = p.pick(PeerKey(peer), PeerPieces::All, 100, &mut rng());
+            assert!(got.iter().all(|b| b.piece != 3), "{got:?}");
+        }
+        assert!(p.is_endgame());
+        check_invariants(&p, &[0, 0, 0, 0], 1);
+        // Only `pick_piece` does.
+        assert_eq!(p.pick_piece(PeerKey(1), 3, 10, &[]), vec![blk(3, 1)]);
+        // Nothing for a piece out of range, one pending its hash, or one we have.
+        assert!(p.pick_piece(PeerKey(1), 99, 10, &[]).is_empty());
+        assert!(p.on_block(PeerKey(1), blk(3, 0)).accepted);
+        assert!(p.on_block(PeerKey(1), blk(3, 1)).piece_complete);
+        assert!(p.pick_piece(PeerKey(2), 3, 10, &[PeerKey(1)]).is_empty());
+        p.piece_passed(3);
+        assert!(p.pick_piece(PeerKey(2), 3, 10, &[]).is_empty());
+        check_invariants(&p, &[0, 0, 0, 0], 1);
+    }
+
+    #[test]
+    fn pick_piece_duplicates_once() {
+        let (a, b, c) = (PeerKey(1), PeerKey(2), PeerKey(3));
+        let mut p = picker(1, 2);
+        p.add_peer_pieces(PeerPieces::All);
+        let all = vec![blk(0, 0), blk(0, 1)];
+        assert_eq!(p.pick(a, PeerPieces::All, 2, &mut rng()), all);
+        // A late owner never duplicates to itself.
+        assert!(p.pick_piece(a, 0, 10, &[a]).is_empty());
+        assert_eq!(p.pick_piece(b, 0, 10, &[a]), all);
+        // Two owners: no third copy, late or not.
+        assert!(p.pick_piece(c, 0, 10, &[a]).is_empty());
+        assert!(p.pick_piece(c, 0, 10, &[a, b]).is_empty());
+        assert!(p.pick_piece(c, 0, 10, &[]).is_empty());
+        check_invariants(&p, &[0], 1);
+        let r = p.on_block(b, blk(0, 0));
+        assert!(r.accepted);
+        assert_eq!(r.cancel, vec![a]);
+        check_invariants(&p, &[0], 1);
+    }
+
+    #[test]
+    fn pick_piece_duplicates_only_late_owners() {
+        let (a, b, d) = (PeerKey(1), PeerKey(2), PeerKey(4));
+        let mut p = picker(1, 4);
+        p.add_peer_pieces(PeerPieces::All);
+        assert_eq!(p.pick_piece(a, 0, 2, &[]), vec![blk(0, 0), blk(0, 1)]);
+        assert_eq!(p.pick_piece(d, 0, 2, &[]), vec![blk(0, 2), blk(0, 3)]);
+        assert_eq!(p.pick_piece(b, 0, 10, &[a]), vec![blk(0, 0), blk(0, 1)]);
+        // `max_blocks` bounds the duplicates too.
+        assert_eq!(p.pick_piece(b, 0, 1, &[d]), vec![blk(0, 2)]);
+        check_invariants(&p, &[0], 1);
+    }
+
+    #[test]
+    fn progress_lists_owners_and_free() {
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        let mut p = picker(2, 4);
+        p.add_peer_pieces(PeerPieces::All);
+        assert_eq!(
+            p.progress(0),
+            Some(PieceProgress {
+                free: 4,
+                owners: vec![]
+            })
+        );
+        assert_eq!(p.pick_piece(b, 0, 1, &[]), vec![blk(0, 0)]);
+        assert_eq!(p.pick_piece(a, 0, 2, &[]), vec![blk(0, 1), blk(0, 2)]);
+        // Sorted, and A once although it holds two blocks.
+        assert_eq!(
+            p.progress(0),
+            Some(PieceProgress {
+                free: 1,
+                owners: vec![a, b]
+            })
+        );
+        // A received block has no owner any more.
+        assert!(p.on_block(b, blk(0, 0)).accepted);
+        assert_eq!(
+            p.progress(0),
+            Some(PieceProgress {
+                free: 1,
+                owners: vec![a]
+            })
+        );
+        assert_eq!(p.progress(99), None);
+        // Pending its hash, then passed: no progress to report.
+        assert_eq!(p.pick_piece(b, 1, 4, &[]).len(), 4);
+        for i in 0..4 {
+            assert!(p.on_block(b, blk(1, i)).accepted);
+        }
+        assert_eq!(p.progress(1), None);
+        p.piece_passed(1);
+        assert_eq!(p.progress(1), None);
+    }
+
+    #[test]
+    fn abandon_returns_outstanding_and_requeues() {
+        let (a, b, c) = (PeerKey(1), PeerKey(2), PeerKey(3));
+        let mut p = picker(3, 2);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_piece_priorities(&[4, 0, 4]);
+        assert_eq!(p.pick_piece(a, 0, 1, &[]), vec![blk(0, 0)]);
+        assert_eq!(p.pick_piece(b, 0, 1, &[]), vec![blk(0, 1)]);
+        assert!(p.on_block(b, blk(0, 1)).accepted);
+        assert_eq!(p.abandon(0), vec![(a, blk(0, 0))]);
+        assert!(!p.is_in_progress(0));
+        check_invariants(&p, &[0, 0, 0], 1);
+        // The cancelled block is refused; the piece is picked afresh.
+        assert!(!p.on_block(a, blk(0, 0)).accepted);
+        p.set_sequential(true);
+        let got = p.pick(c, PeerPieces::All, 2, &mut rng());
+        assert_eq!(got, vec![blk(0, 0), blk(0, 1)]);
+        // A skipped piece goes back to nothing, not to the buckets.
+        assert_eq!(p.pick_piece(a, 1, 2, &[]), vec![blk(1, 0), blk(1, 1)]);
+        assert_eq!(p.abandon(1), vec![(a, blk(1, 0)), (a, blk(1, 1))]);
+        check_invariants(&p, &[0, 0, 0], 1);
+        assert!(
+            p.pick(c, PeerPieces::All, 10, &mut rng())
+                .iter()
+                .all(|b| b.piece != 1)
+        );
+        // Nothing to abandon: unstarted, out of range.
+        assert!(p.abandon(1).is_empty());
+        assert!(p.abandon(99).is_empty());
+        check_invariants(&p, &[0, 0, 0], 1);
+    }
+
     /// Checks every internal invariant of the picker against the expected
     /// availability (`avail` from bitfields, `seeds` from `HaveAll`).
     fn check_invariants(p: &PiecePicker, avail: &[u32], seeds: u32) {
@@ -1097,6 +1355,12 @@ mod tests {
                 "partial set, piece {i}"
             );
         }
+        // No stale key: a started priority-0 piece (from `pick_piece`) or a
+        // re-prioritised one is never left in `partial` under another priority.
+        for &(Reverse(pr), i) in &p.partial {
+            assert_eq!(pr, p.prio_of(i), "partial key of {i}");
+            assert!(pr > 0, "skipped piece {i} in partial");
+        }
         assert!(p.buckets.values().all(|b| !b.is_empty()), "empty bucket");
         let queued: usize = p.buckets.values().map(Vec::len).sum();
         assert_eq!(queued, p.seq.len());
@@ -1179,13 +1443,15 @@ mod tests {
             for _ in 0..80 {
                 let k = r.random_range(0..peers.len());
                 let key = PeerKey(k as u64);
-                match r.random_range(0..12u32) {
+                match r.random_range(0..14u32) {
                     0 | 1 => {
                         let max = r.random_range(1..=8);
                         let got = p.pick(key, peers[k].pieces(), max, &mut r);
                         assert!(got.len() <= max);
                         for b in &got {
                             assert!(peer_has_piece(peers[k].pieces(), b.piece));
+                            // `pick` never continues a skipped piece, even in end-game.
+                            assert!(p.prio_of(b.piece) > 0, "{b:?} of a skipped piece");
                         }
                     }
                     2 | 3 => {
@@ -1225,6 +1491,63 @@ mod tests {
                         p.set_piece_priorities(&prio);
                     }
                     8 => p.set_sequential(r.random_bool(0.5)),
+                    12 => {
+                        let i = r.random_range(0..n + 1);
+                        let max = r.random_range(0..=8);
+                        let late: Vec<PeerKey> = (0..peers.len() as u64)
+                            .filter(|_| r.random_bool(0.4))
+                            .map(PeerKey)
+                            .collect();
+                        let before: Vec<(bool, Vec<PeerKey>)> = (0..blocks_per_piece)
+                            .map(|bi| {
+                                p.downloading
+                                    .get(&i)
+                                    .and_then(|d| d.blocks.get(bi as usize))
+                                    .map_or_else(
+                                        || (false, Vec::new()),
+                                        |s| (s.received, s.owners.clone()),
+                                    )
+                            })
+                            .collect();
+                        let got = p.pick_piece(key, i, max, &late);
+                        assert!(got.len() <= max);
+                        for b in &got {
+                            assert_eq!(b.piece, i);
+                            // Not received, and free before or held by one late owner only.
+                            let (received, owners) = &before[(b.offset / B) as usize];
+                            assert!(!received, "{b:?} was received");
+                            assert!(
+                                owners.is_empty()
+                                    || (owners.len() == 1
+                                        && owners[0] != key
+                                        && late.contains(&owners[0])),
+                                "{b:?} owned by {owners:?}"
+                            );
+                        }
+                    }
+                    13 => {
+                        let i = r.random_range(0..n + 1);
+                        let held: Vec<(PeerKey, BlockRef)> = p
+                            .outstanding
+                            .iter()
+                            .flat_map(|(&k, set)| {
+                                set.iter()
+                                    .filter(|&&(pi, _)| pi == i)
+                                    .map(move |&(pi, bi)| (k, pi, bi))
+                            })
+                            .map(|(k, pi, bi)| (k, p.layout.block(pi, bi)))
+                            .collect();
+                        let mut held = held;
+                        held.sort_unstable();
+                        let state = p.state_of(i);
+                        let got = p.abandon(i);
+                        if state == PieceState::Partial {
+                            assert_eq!(got, held);
+                            assert!(!p.is_in_progress(i));
+                        } else {
+                            assert!(got.is_empty());
+                        }
+                    }
                     9 => {
                         let sp = &mut peers[k];
                         if sp.counted {

@@ -105,6 +105,18 @@ impl Actor {
                 let _ = tx.send(());
                 return Flow::Exit;
             }
+            Cmd::OpenReader { file, link, tx } => self.on_open_reader(file, link, tx),
+            Cmd::ReaderMoved(id) => self.on_reader_moved(id),
+            Cmd::CloseReader(id) => self.on_close_reader(id),
+            Cmd::Read {
+                reader,
+                offset,
+                len,
+                tx,
+            } => self.on_read(reader, offset, len, tx),
+            Cmd::DebugDeadlines(tx) => {
+                let _ = tx.send(self.debug_deadlines());
+            }
         }
         Flow::Continue
     }
@@ -112,6 +124,10 @@ impl Actor {
     pub(super) fn resume(&mut self) {
         let was_error = matches!(self.phase, Phase::Error(_));
         self.paused = false;
+        if matches!(self.phase, Phase::Ready) {
+            // Kept while paused; due relative to now again.
+            self.sync_all_readers();
+        }
         if was_error && self.loaded.is_none() {
             // Bad metadata: fetch it again from scratch.
             let max = self.shared.settings.max_metadata_size;
@@ -170,10 +186,14 @@ impl Actor {
         l.total_wanted = wanted_bytes(&l.layout, &l.piece_prio);
         if let Some(picker) = l.picker.as_mut() {
             picker.set_piece_priorities(&l.piece_prio);
-            // Partial pieces no longer wanted give back their buffers.
+            // Partial pieces no longer wanted give back their buffers,
+            // unless a reader's window holds them.
             let skipped: Vec<u32> = picker
                 .partial_pieces()
-                .filter(|&i| l.piece_prio.get(i as usize).is_some_and(|&p| p == 0))
+                .filter(|&i| {
+                    l.piece_prio.get(i as usize).is_some_and(|&p| p == 0)
+                        && !self.deadlines.contains(i)
+                })
                 .collect();
             for piece in skipped {
                 picker.piece_failed(piece);
@@ -193,6 +213,11 @@ impl Actor {
         if self.finish_pending {
             self.flush(FlushReason::All);
             self.maybe_finish();
+        } else if self.finished_emitted && !self.cache.is_idle() {
+            // Still finished, and a dirty skipped piece may be wanted now:
+            // it goes to disk at once (`state` counts a finished torrent's
+            // dirty pieces as skipped ones).
+            self.flush(FlushReason::All);
         }
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {

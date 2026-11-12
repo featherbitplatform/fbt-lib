@@ -22,14 +22,19 @@ use tracing::{debug, warn};
 
 use super::announcer::{self, Announcer, Signals};
 use super::data::Job;
+use super::deadline::Deadlines;
 use super::dht::{self, DhtAnnouncer, DhtParams};
+use super::known::{Known, dialable};
 use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
+use super::peer::Peer;
+use super::readers::Readers;
+use super::retries::Retries;
 use super::serve::PieceReads;
-use super::swarm::{Known, Peer, Retries, dialable};
 use super::{Cmd, piece_priorities, same_state};
 use crate::bandwidth::BucketPair;
 use crate::choker::{Choker, ChokerConfig};
+use crate::error::StreamError;
 use crate::event::{Event, PeerSource};
 use crate::peer::messages::PeerEvent;
 use crate::picker::{PeerKey, PiecePicker};
@@ -226,6 +231,12 @@ pub(crate) struct Actor {
     pub(super) piece_reads: PieceReads,
     /// The torrent's own rate limit buckets, chained by its peers.
     pub(super) rate: BucketPair,
+    /// Open file readers and their waiting reads. After `cmds`, so a
+    /// reader whose answer is dropped when the actor exits sees the
+    /// command channel closed.
+    pub(super) readers: Readers,
+    /// The readers' windows: the missing pieces they wait for, and when.
+    pub(super) deadlines: Deadlines,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -360,6 +371,8 @@ impl Actor {
             piece_reads,
             write_error: None,
             rate,
+            readers: Readers::default(),
+            deadlines: Deadlines::default(),
             #[cfg(test)]
             pex_live_builds: 0,
             #[cfg(test)]
@@ -427,6 +440,7 @@ impl Actor {
                 _ = tick.tick() => {
                     self.flush(FlushReason::Expired);
                     self.release_stale_partials();
+                    self.readers_tick();
                     self.top_up_all(None);
                     self.metadata_tick();
                     self.pex_tick();
@@ -533,11 +547,15 @@ impl Actor {
                     .as_ref()
                     .and_then(|l| l.picker.as_ref())
                     .is_some_and(PiecePicker::is_finished)
-                    && self.cache.is_idle()
+                    && (self.cache.is_idle() || self.finished_emitted)
                     && !self.finish_pending
                     && !self.finish_flush
                 {
-                    // Complete on disk, not only in the cache.
+                    // Complete on disk, not only in the cache. Once the
+                    // finish's flush is back (`finished_emitted` and no
+                    // finish under way), whatever is dirty passed after it:
+                    // skipped pieces (a reader's window), which do not
+                    // make the torrent downloading again.
                     TorrentState::Seeding
                 } else {
                     TorrentState::Downloading
@@ -706,6 +724,7 @@ impl Actor {
         }
         warn!(torrent = %self.name(), error = %e, "storage error while {during}");
         let message = format!("{during}: {e}");
+        let reader_error = StreamError::TorrentError(message.clone());
         self.cancel_check();
         self.phase = Phase::Error(message.clone());
         // A failed metadata check ends the announce like any other error.
@@ -717,6 +736,9 @@ impl Actor {
         });
         self.close_all();
         self.clear_bufs();
+        // Waiting reads (those of the dropped whole-piece reads included)
+        // fail; the readers stay open.
+        self.fail_readers(reader_error);
         // The pieces not written yet are lost; the next resume rechecks.
         self.cache.discard_all();
         self.finish_pending = false;
