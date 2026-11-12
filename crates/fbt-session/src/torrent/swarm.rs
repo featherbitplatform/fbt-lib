@@ -836,6 +836,8 @@ pub(super) mod tests {
             external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
             ip_filter: Default::default(),
             bans: Default::default(),
+            queue: Default::default(),
+            queue_dirty: Default::default(),
         })
     }
 

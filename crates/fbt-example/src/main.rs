@@ -408,7 +408,8 @@ fn human_bytes(n: u64) -> String {
 fn state_name(state: TorrentState) -> &'static str {
     match state {
         TorrentState::DownloadingMetadata => "metadata",
-        TorrentState::QueuedForChecking => "queued",
+        TorrentState::QueuedForChecking => "check-queued",
+        TorrentState::Queued => "queued",
         TorrentState::CheckingFiles { .. } => "checking",
         TorrentState::Downloading => "downloading",
         TorrentState::Seeding => "seeding",
@@ -679,7 +680,8 @@ fn bench_torrent(name: &str, len: u64, piece_len: u32) -> Result<Metainfo, Error
 }
 
 /// Settings for a benchmark session: loopback only, and no DHT, LSD, UPnP,
-/// NAT-PMP, PEX or holepunching, so nothing leaves this machine.
+/// NAT-PMP, PEX or holepunching, so nothing leaves this machine; no queue
+/// limits, so the idle row measures 1,000 running seeds.
 fn bench_settings(transport: TransportChoice) -> Settings {
     let mut s = Settings::default();
     s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
@@ -690,6 +692,9 @@ fn bench_settings(transport: TransportChoice) -> Settings {
     s.enable_natpmp = false;
     s.pex_enabled = false;
     s.enable_holepunch = false;
+    s.queue.active_downloads = None;
+    s.queue.active_seeds = None;
+    s.queue.active_limit = None;
     transport.apply(&mut s);
     s
 }

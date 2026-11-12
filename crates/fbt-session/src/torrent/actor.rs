@@ -203,7 +203,23 @@ pub(crate) struct Actor {
     /// Bumped on recheck; jobs and peers of older generations are stale.
     pub(super) generation: u64,
     pub(super) phase: Phase,
+    /// Paused by the user.
     pub(super) paused: bool,
+    /// Held back by the session's queue (see [`Actor::stopped`]).
+    pub(super) queued: bool,
+    /// A `SetQueued` that arrived while the storage moved: applied once it
+    /// is done, the last one winning.
+    pub(super) queue_pending: Option<bool>,
+    /// The torrent's place in the session's queue, as the scheduler last
+    /// said.
+    pub(super) queue_position: usize,
+    /// Under the queue's control; seed limits apply only then.
+    pub(super) auto_managed: bool,
+    /// Time spent running, and seeding, up to `time_mark`.
+    pub(super) active_time: Duration,
+    pub(super) seeding_time: Duration,
+    /// When `active_time` and `seeding_time` were last brought up to date.
+    pub(super) time_mark: Instant,
     pub(super) peers: HashMap<PeerKey, Peer>,
     pub(super) next_key: u64,
     /// Addresses waiting for a connection slot.
@@ -405,6 +421,13 @@ impl Actor {
             generation: 0,
             phase,
             paused: params.paused,
+            queued: false,
+            queue_pending: None,
+            queue_position: 0,
+            auto_managed: params.auto_managed,
+            active_time: Duration::ZERO,
+            seeding_time: Duration::ZERO,
+            time_mark: Instant::now(),
             peers: HashMap::new(),
             next_key: 0,
             candidates: VecDeque::new(),
@@ -489,6 +512,10 @@ impl Actor {
         rechoke.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             if !self.storage_busy {
+                if let Some(queued) = self.queue_pending.take() {
+                    self.set_queued(queued).await;
+                    continue;
+                }
                 if self.recheck_after_move.is_some() {
                     self.finish_keep_existing().await;
                     continue;
@@ -532,6 +559,8 @@ impl Actor {
                     self.lsd_tick();
                     self.queue_retries();
                     self.try_connect();
+                    self.account_time();
+                    self.check_seed_limits();
                     self.publish();
                 }
                 _ = rechoke.tick() => self.rechoke(),
@@ -588,15 +617,21 @@ impl Actor {
         self.shared.emit(ev);
     }
 
-    /// Ready and not paused: data may flow.
+    /// Paused by the user or held back by the queue: both stop the torrent
+    /// the same way (no peers, `stopped` announced).
+    pub(super) fn stopped(&self) -> bool {
+        self.paused || self.queued
+    }
+
+    /// Ready and not stopped: data may flow.
     pub(super) fn active(&self) -> bool {
-        matches!(self.phase, Phase::Ready) && !self.paused
+        matches!(self.phase, Phase::Ready) && !self.stopped()
     }
 
     /// Peers may connect: ready, or a magnet fetching its metadata, and not
-    /// paused.
+    /// stopped.
     pub(super) fn connectable(&self) -> bool {
-        matches!(self.phase, Phase::Ready | Phase::Metadata) && !self.paused
+        matches!(self.phase, Phase::Ready | Phase::Metadata) && !self.stopped()
     }
 
     /// What the announcer is told: announcing while peers may connect, and
@@ -609,13 +644,14 @@ impl Actor {
                     self.phase,
                     Phase::Checking { .. } | Phase::QueuedForCheck { .. }
                 )
-                && !self.paused)
+                && !self.stopped())
     }
 
     pub(super) fn state(&self) -> TorrentState {
         match &self.phase {
             Phase::Error(_) => TorrentState::Error,
-            Phase::Metadata if self.paused => TorrentState::Paused,
+            Phase::Metadata | Phase::Ready if self.paused => TorrentState::Paused,
+            Phase::Metadata | Phase::Ready if self.queued => TorrentState::Queued,
             Phase::Metadata => TorrentState::DownloadingMetadata,
             Phase::QueuedForCheck { .. } => TorrentState::QueuedForChecking,
             Phase::Checking { done, .. } => {
@@ -627,7 +663,6 @@ impl Actor {
                 };
                 TorrentState::CheckingFiles { progress }
             }
-            Phase::Ready if self.paused => TorrentState::Paused,
             Phase::Ready => {
                 if self
                     .loaded
@@ -698,7 +733,65 @@ impl Actor {
                 _ => None,
             },
             save_path: self.save_path.clone(),
+            queue_position: self.queue_position,
+            auto_managed: self.auto_managed,
+            active_time: self.active_time,
+            seeding_time: self.seeding_time,
         }
+    }
+
+    /// Adds the time since the last call to `active_time` (while running)
+    /// and `seeding_time` (while seeding).
+    pub(super) fn account_time(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.time_mark);
+        self.time_mark = now;
+        if self.running() {
+            self.active_time = self.active_time.saturating_add(elapsed);
+        }
+        if self.state() == TorrentState::Seeding {
+            self.seeding_time = self.seeding_time.saturating_add(elapsed);
+        }
+    }
+
+    /// An auto-managed seed past [`Settings::seed_ratio_limit`] or
+    /// [`Settings::seed_time_limit`] pauses, leaves the queue's control
+    /// (so resuming it seeds on) and emits `SeedLimitReached`. Ratio:
+    /// uploaded over the larger of downloaded and wanted bytes.
+    ///
+    /// [`Settings::seed_ratio_limit`]: crate::Settings::seed_ratio_limit
+    /// [`Settings::seed_time_limit`]: crate::Settings::seed_time_limit
+    fn check_seed_limits(&mut self) {
+        if !self.auto_managed || self.stopped() || self.state() != TorrentState::Seeding {
+            return;
+        }
+        let s = &self.shared.settings;
+        let base = self
+            .counters
+            .downloaded
+            .max(self.loaded.as_ref().map_or(0, |l| l.total_wanted));
+        let ratio_hit = s
+            .seed_ratio_limit
+            .is_some_and(|limit| base > 0 && self.counters.uploaded as f64 / base as f64 >= limit);
+        let time_hit = s
+            .seed_time_limit
+            .is_some_and(|limit| self.seeding_time >= limit);
+        if !(ratio_hit || time_hit) {
+            return;
+        }
+        debug!(torrent = %self.name(), ratio_hit, time_hit, "seed limit reached");
+        self.auto_managed = false;
+        if let Some(session) = self.session.upgrade() {
+            session.set_auto_managed(&self.ih, false);
+        }
+        // The pause path; nobody waits for the flush.
+        self.paused = true;
+        self.metadata_check = false;
+        self.close_all();
+        self.flush(FlushReason::All);
+        self.emit(Event::SeedLimitReached { torrent: self.ih });
+        self.refresh_state();
+        self.publish();
     }
 
     /// Publishes the status if it changed.
@@ -718,10 +811,14 @@ impl Actor {
     /// changed; other changes wait for the next status tick. The announcer
     /// learns whether to run.
     pub(super) fn refresh_state(&mut self) {
+        self.account_time();
         let state = self.state();
         if !same_state(&state, &self.last_state) {
             self.publish();
             self.last_state = state;
+            // Pauses, resumes, finishes and errors change what the queue
+            // counts.
+            self.shared.queue_dirty.notify_one();
             self.emit(Event::StateChanged {
                 torrent: self.ih,
                 state,

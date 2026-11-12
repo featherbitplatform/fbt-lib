@@ -11,6 +11,7 @@ use fbt_tracker::TrackerConfig;
 
 use crate::bandwidth::{MixedMode, PeerClassLimits, RateLimit};
 use crate::choker::{ChokingAlgorithm, SeedChokingAlgorithm};
+use crate::queue::QueueSettings;
 use crate::stream::ReadAhead;
 
 /// Largest accepted [`Settings::event_queue`]; the queue is allocated up
@@ -62,7 +63,8 @@ pub enum EncryptionPolicy {
 /// 16 KiB..=[`MAX_METADATA_SIZE`], a DHT bootstrap entry that is not
 /// `host:port`, an empty or duplicated `listen_addrs`, every transport
 /// switched off, `disk_threads` or `max_active_checks` outside 1..=64, a zero
-/// `max_peers_per_ip`, a zero `read_ahead.time` or `read_ahead.bitrate`) with
+/// `max_peers_per_ip`, a zero `read_ahead.time` or `read_ahead.bitrate`, a
+/// zero `queue.interval`, a negative or non-finite `seed_ratio_limit`) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -386,6 +388,22 @@ pub struct Settings {
     ///
     /// Listening is unchanged: incoming connections never use the proxy.
     pub proxy: ProxyConfig,
+    /// How many auto-managed torrents run at once; the rest wait as
+    /// [`TorrentState::Queued`](crate::TorrentState::Queued). Changed at
+    /// runtime with
+    /// [`Session::set_queue_settings`](crate::Session::set_queue_settings).
+    pub queue: QueueSettings,
+    /// An auto-managed seed whose share ratio reaches this pauses, stops
+    /// being auto-managed and emits
+    /// [`Event::SeedLimitReached`](crate::Event::SeedLimitReached) (`None`,
+    /// the default: no limit). The ratio is `total_uploaded / max(
+    /// total_downloaded, total_wanted)`, so a torrent added complete counts
+    /// its whole size as downloaded. Finite and not negative.
+    pub seed_ratio_limit: Option<f64>,
+    /// An auto-managed seed that has seeded this long in all
+    /// ([`TorrentStatus::seeding_time`](crate::TorrentStatus::seeding_time))
+    /// stops likewise (`None`, the default: no limit).
+    pub seed_time_limit: Option<Duration>,
 }
 
 impl Settings {
@@ -478,6 +496,13 @@ impl Settings {
                 "dht_bootstrap_nodes entries must be host:port, got {bad:?}"
             ));
         }
+        if self
+            .seed_ratio_limit
+            .is_some_and(|r| !r.is_finite() || r < 0.0)
+        {
+            return Err("seed_ratio_limit must be finite and not negative".to_owned());
+        }
+        self.queue.validate()?;
         self.proxy.validate().map_err(|e| format!("proxy: {e}"))?;
         self.read_ahead.validate()
     }
@@ -576,6 +601,9 @@ impl Default for Settings {
             mixed_mode: MixedMode::default(),
             read_ahead: ReadAhead::default(),
             proxy: ProxyConfig::default(),
+            queue: QueueSettings::default(),
+            seed_ratio_limit: None,
+            seed_time_limit: None,
         }
     }
 }
@@ -600,6 +628,28 @@ mod tests {
             "read_ahead.bitrate must be greater than zero"
         );
         s.read_ahead = ReadAhead::new(16 << 20, Duration::from_secs(10), Some(1));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn queue_and_seed_limits_are_validated() {
+        let mut s = Settings::default();
+        assert_eq!(s.queue, QueueSettings::default());
+        assert_eq!(s.queue.active_downloads, Some(3));
+        assert_eq!(s.queue.active_seeds, Some(5));
+        assert_eq!(s.queue.active_limit, Some(500));
+        assert_eq!((s.seed_ratio_limit, s.seed_time_limit), (None, None));
+        s.queue.interval = Duration::ZERO;
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "queue.interval must be greater than zero"
+        );
+        s.queue = QueueSettings::default();
+        for bad in [-0.1, f64::NAN, f64::INFINITY] {
+            s.seed_ratio_limit = Some(bad);
+            assert!(s.validate().is_err(), "{bad}");
+        }
+        s.seed_ratio_limit = Some(0.0);
         assert!(s.validate().is_ok());
     }
 }

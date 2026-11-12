@@ -496,6 +496,51 @@ mod tests {
         );
     }
 
+    /// The queue's `SetQueued` during a move never grows the deferred
+    /// queue, however often the scheduler repeats it: the last one is held
+    /// and applied once the move is done.
+    #[tokio::test]
+    async fn queue_changes_during_a_move_are_held_not_deferred() {
+        let mut a = actor_with(&[4 * u64::from(PL)], PL, 0);
+        let storage = Arc::new(Gated {
+            inner: MemStorage::new(4 * u64::from(PL)),
+            gate: (Mutex::new(false), Condvar::new()),
+            moves: Mutex::new(Vec::new()),
+        });
+        a.storage = Some(Arc::clone(&storage) as Arc<dyn Storage>);
+        a.start_piece_read(1, 0, Vec::new());
+        let (tx, mut moved) = oneshot::channel();
+        a.on_move_storage(PathBuf::from("elsewhere"), MoveMode::FailIfExists, tx)
+            .await;
+        assert!(a.storage_busy);
+        for i in 0..(2 * MAX_DEFERRED_CMDS) {
+            let _ = a.on_cmd(Cmd::SetQueued(i % 2 == 0)).await;
+        }
+        let _ = a.on_cmd(Cmd::SetQueued(true)).await;
+        assert!(a.deferred.is_empty());
+        assert_eq!(a.queue_pending, Some(true));
+        assert!(!a.queued, "applied during the move");
+        assert!(a.connectable());
+        // A user command still finds room.
+        let (tx, mut paused) = oneshot::channel();
+        let _ = a.on_cmd(Cmd::Pause(tx)).await;
+        assert_eq!(a.deferred.len(), 1);
+        assert!(matches!(paused.try_recv(), Err(TryRecvError::Empty)));
+
+        storage.open();
+        while a.storage_busy {
+            let r = a.jobs.join_next().await.expect("a job");
+            a.on_job_result(r);
+        }
+        assert!(matches!(moved.try_recv(), Ok(Ok(()))));
+        // The run loop's turn: the held change first.
+        let q = a.queue_pending.take().expect("held");
+        a.set_queued(q).await;
+        assert!(a.queued);
+        assert!(!a.connectable());
+        assert_eq!(a.state(), crate::status::TorrentState::Queued);
+    }
+
     /// Every handle gone while a move still waits for a read: the stop
     /// drops the move and writes the verified pieces.
     #[tokio::test]

@@ -11,7 +11,7 @@ use fbt::{
     SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
     TrackerConfig, TrackerError, Transport,
 };
-use fbt::{BlockReason, IpFilter, MoveMode};
+use fbt::{BlockReason, IpFilter, MoveMode, QueueSettings};
 use fbt::{
     CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
     PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
@@ -81,6 +81,7 @@ fn names(
     _: Option<IpFilter>,
     _: Option<BlockReason>,
     _: Option<MoveMode>,
+    _: Option<QueueSettings>,
 ) {
 }
 
@@ -193,4 +194,45 @@ async fn filter_methods(s: &Session, f: IpFilter) {
     s.set_ip_filter(f).await;
     let _: IpFilter = s.ip_filter();
     let _: Vec<std::net::SocketAddr> = s.banned_peers();
+}
+
+/// Queueing and seed limits.
+async fn queue_methods(s: &Session, h: &TorrentHandle, e: &Event) {
+    let mut q = QueueSettings::default();
+    let _: (Option<usize>, Option<usize>, Option<usize>, bool) = (
+        q.active_downloads,
+        q.active_seeds,
+        q.active_limit,
+        q.dont_count_slow_torrents,
+    );
+    let _: (u64, u64, std::time::Duration, std::time::Duration) = (
+        q.inactive_down_rate,
+        q.inactive_up_rate,
+        q.startup_grace,
+        q.interval,
+    );
+    q.active_downloads = None;
+    let _: Result<(), SessionError> = s.set_queue_settings(q);
+    let mut settings = Settings::default();
+    settings.queue = QueueSettings::default();
+    settings.seed_ratio_limit = Some(2.0);
+    settings.seed_time_limit = Some(std::time::Duration::from_secs(3600));
+    let _: Result<(), SessionError> = h.set_auto_managed(true).await;
+    let _: Result<(), SessionError> = h.set_queue_position(usize::MAX).await;
+    let st = h.status();
+    let _: (usize, bool, std::time::Duration, std::time::Duration) = (
+        st.queue_position,
+        st.auto_managed,
+        st.active_time,
+        st.seeding_time,
+    );
+    let _ = TorrentState::Queued;
+    if let Event::SeedLimitReached { torrent } = e {
+        let _: &InfoHashes = torrent;
+    }
+    let mut p = AddTorrent::new(
+        Metainfo::from_bytes(b"").unwrap(),
+        std::path::PathBuf::new(),
+    );
+    p.auto_managed = false;
 }

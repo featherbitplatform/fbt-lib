@@ -55,6 +55,7 @@ mod listener;
 mod net;
 mod peer;
 pub mod picker;
+mod queue;
 pub mod rate;
 mod session;
 pub mod settings;
@@ -74,6 +75,7 @@ pub use fbt_net::proxy::{ProxyConfig, ProxyKind};
 pub use fbt_net::{MapMethod, MapProtocol};
 pub use net::ListenError;
 pub use peer::{DisconnectReason, Transport};
+pub use queue::QueueSettings;
 pub use rate::RateMeter;
 pub use session::{AddTorrent, Priority, RemoveMode, Session, TorrentSource};
 pub use settings::{

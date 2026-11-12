@@ -34,7 +34,8 @@ pub const T: Duration = Duration::from_secs(30);
 /// tests bootstrap from a loopback node). Transports as by default: uTP
 /// first, TCP fallback. Smart bans name one endpoint, not the whole IP:
 /// every test peer shares `127.0.0.1`, so banning a corrupt seeder's IP
-/// would ban the honest ones too.
+/// would ban the honest ones too. No queue limits, so every torrent a test
+/// adds runs (the queue tests set their own).
 pub fn test_settings() -> Settings {
     let mut s = Settings::default();
     s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
@@ -45,6 +46,9 @@ pub fn test_settings() -> Settings {
     s.enable_upnp = false;
     s.enable_natpmp = false;
     s.ban_endpoints = true;
+    s.queue.active_downloads = None;
+    s.queue.active_seeds = None;
+    s.queue.active_limit = None;
     s
 }
 

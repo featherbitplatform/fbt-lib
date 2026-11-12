@@ -5,7 +5,8 @@
 //! channel and receives peers through a bounded channel it polls. Transfer
 //! totals come from the torrent's status watch.
 //!
-//! - `started` when the torrent becomes active (after checking, on resume;
+//! - `started` when the torrent becomes active (after checking, on resume
+//!   or when the session's queue starts it;
 //!   a magnet at once, and it keeps running through the check that follows
 //!   its metadata). `started` is per tracker, as libtorrent's `start_sent`:
 //!   a tracker that has not answered a `started` in the current run gets
@@ -14,7 +15,8 @@
 //! - `none` after the tracker's `interval`, or on a forced re-announce once
 //!   `min interval` has passed since the last announce;
 //! - `completed` once, when the torrent finished during this session;
-//! - `stopped` when it stops being active (pause, error, remove, shutdown):
+//! - `stopped` when it stops being active (pause, queued, seed limit,
+//!   error, remove, shutdown):
 //!   one attempt to every tracker that answered a `started` in the run, in
 //!   parallel under one 5 s timeout; trackers that never answered get
 //!   nothing.
@@ -68,7 +70,7 @@ pub(super) const NO_METADATA_LEFT: u64 = 16_384;
 /// What the actor wants from the announcer.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Signals {
-    /// The torrent is announced: not paused and not in error, and either
+    /// The torrent is announced: neither paused nor queued nor in error, and either
     /// ready, fetching a magnet's metadata, or checking the files right
     /// after that metadata arrived (`Actor::running`).
     pub running: bool,

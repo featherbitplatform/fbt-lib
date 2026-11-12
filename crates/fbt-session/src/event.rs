@@ -89,6 +89,14 @@ pub enum Event {
         /// The torrent.
         torrent: InfoHashes,
     },
+    /// An auto-managed seed reached
+    /// [`Settings::seed_ratio_limit`](crate::Settings::seed_ratio_limit) or
+    /// [`Settings::seed_time_limit`](crate::Settings::seed_time_limit): it
+    /// is paused and no longer auto-managed.
+    SeedLimitReached {
+        /// The torrent.
+        torrent: InfoHashes,
+    },
     /// A tracker answered an announce.
     TrackerReply {
         /// The torrent.
@@ -284,7 +292,7 @@ bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct EventMask: u32 {
         /// Torrent added/removed, state changes, metadata received, torrent
-        /// finished.
+        /// finished, seed limit reached.
         const STATUS = 1;
         /// Piece finished, hash failed.
         const PIECE = 1 << 1;
@@ -317,7 +325,8 @@ impl Event {
             | Event::TorrentRemoved { .. }
             | Event::StateChanged { .. }
             | Event::MetadataReceived { .. }
-            | Event::TorrentFinished { .. } => EventMask::STATUS,
+            | Event::TorrentFinished { .. }
+            | Event::SeedLimitReached { .. } => EventMask::STATUS,
             Event::PieceFinished { .. } | Event::HashFailed { .. } => EventMask::PIECE,
             Event::TrackerReply { .. }
             | Event::TrackerError { .. }

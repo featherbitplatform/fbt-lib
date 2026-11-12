@@ -28,9 +28,14 @@ impl Actor {
         match cmd {
             Cmd::Pause(tx) => {
                 if !self.paused {
+                    // The time so far counts as it was spent.
+                    self.account_time();
+                    let was_stopped = self.stopped();
                     self.paused = true;
                     self.metadata_check = false;
-                    self.close_all();
+                    if !was_stopped {
+                        self.close_all();
+                    }
                     self.refresh_state();
                 }
                 // Every verified piece is on disk before the reply.
@@ -146,17 +151,68 @@ impl Actor {
             }
             Cmd::MoveStorage { path, mode, tx } => self.on_move_storage(path, mode, tx).await,
             Cmd::RenameFile { index, path, tx } => self.on_rename_file(index, path, tx).await,
+            Cmd::SetQueued(queued) => {
+                if self.storage_busy {
+                    // Stopping flushes, which waits for the move: held
+                    // until it is done, without growing the deferred queue.
+                    self.queue_pending = Some(queued);
+                } else {
+                    self.set_queued(queued).await;
+                }
+            }
+            Cmd::SetQueuePosition(position) => {
+                self.queue_position = position;
+                self.publish();
+            }
+            Cmd::SetAutoManaged(on, tx) => {
+                self.auto_managed = on;
+                if !on {
+                    if self.storage_busy {
+                        self.queue_pending = Some(false);
+                    } else {
+                        self.queue_pending = None;
+                        self.set_queued(false).await;
+                    }
+                }
+                self.publish();
+                let _ = tx.send(());
+            }
+            Cmd::Sync(tx) => {
+                self.publish();
+                let _ = tx.send(());
+            }
         }
         Flow::Continue
     }
 
+    /// The queue stops the torrent (`true`) the way `pause` does: peers
+    /// closed, `stopped` announced, every verified piece written before
+    /// this returns; or lets it run again (`false`) the way `resume` does,
+    /// unless the user paused it. Either way the user's pause is untouched.
+    pub(super) async fn set_queued(&mut self, queued: bool) {
+        if queued == self.queued {
+            return;
+        }
+        self.account_time();
+        if queued {
+            let was_stopped = self.stopped();
+            self.queued = true;
+            if !was_stopped {
+                self.metadata_check = false;
+                self.close_all();
+            }
+            self.refresh_state();
+            self.flush_and_wait().await;
+        } else {
+            self.queued = false;
+            self.restart();
+        }
+    }
+
     pub(super) fn resume(&mut self) {
         let was_error = matches!(self.phase, Phase::Error(_));
+        self.account_time();
         self.paused = false;
-        if matches!(self.phase, Phase::Ready) {
-            // Kept while paused; due relative to now again.
-            self.sync_all_readers();
-        }
         if was_error && self.loaded.is_none() {
             // Bad metadata: fetch it again from scratch.
             let max = self.shared.settings.max_metadata_size;
@@ -173,6 +229,16 @@ impl Actor {
             self.close_all();
             self.clear_bufs();
             self.start_check();
+        }
+        self.restart();
+    }
+
+    /// After a resume or unqueue: readers' deadlines from now, the new
+    /// state, and the known peers dialled again (while not stopped).
+    fn restart(&mut self) {
+        if matches!(self.phase, Phase::Ready) && !self.stopped() {
+            // Kept while stopped; due relative to now again.
+            self.sync_all_readers();
         }
         self.refresh_state();
         self.requeue_known();

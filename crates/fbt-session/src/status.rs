@@ -1,6 +1,7 @@
 //! Plain-data torrent status snapshots.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use fbt_core::InfoHashes;
 
@@ -28,6 +29,11 @@ pub enum TorrentState {
     Seeding,
     /// Stopped by the user: no peers, no announces.
     Paused,
+    /// Auto-managed and waiting for a slot of the session's queue
+    /// ([`Settings::queue`](crate::Settings::queue)): stopped like
+    /// [`Paused`](Self::Paused) until the queue starts it. A torrent both
+    /// paused and queued shows as `Paused`.
+    Queued,
     /// Stopped by a storage error or invalid metadata; see
     /// [`TorrentStatus::error`].
     Error,
@@ -72,6 +78,17 @@ pub struct TorrentStatus {
     /// The directory the torrent's files are below, as added and changed
     /// by [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage).
     pub save_path: PathBuf,
+    /// Its place in the session's queue, from 0 (runs first); dense over
+    /// the session's torrents.
+    pub queue_position: usize,
+    /// Under the queue's control
+    /// ([`AddTorrent::auto_managed`](crate::AddTorrent::auto_managed)).
+    pub auto_managed: bool,
+    /// Time spent running (neither paused, queued nor in error) since it
+    /// was added.
+    pub active_time: Duration,
+    /// Time spent running as a seed since it was added.
+    pub seeding_time: Duration,
 }
 
 impl TorrentStatus {
@@ -99,6 +116,10 @@ impl TorrentStatus {
             num_seeds: 0,
             error: None,
             save_path: PathBuf::new(),
+            queue_position: 0,
+            auto_managed: false,
+            active_time: Duration::ZERO,
+            seeding_time: Duration::ZERO,
         }
     }
 }

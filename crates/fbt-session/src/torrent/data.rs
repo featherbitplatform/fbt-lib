@@ -524,6 +524,8 @@ mod tests {
             external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
             ip_filter: Default::default(),
             bans: Default::default(),
+            queue: Default::default(),
+            queue_dirty: Default::default(),
         });
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
         add.storage = Some(Arc::clone(&storage));

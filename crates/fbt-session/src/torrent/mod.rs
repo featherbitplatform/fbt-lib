@@ -129,6 +129,26 @@ pub(crate) enum Cmd {
         path: RelPath,
         tx: oneshot::Sender<Result<(), SessionError>>,
     },
+    /// The queue scheduler: stay stopped (`true`, the pause path) or run
+    /// (`false`, the resume path). Held while the storage moves, the last
+    /// one winning.
+    SetQueued(bool),
+    /// The queue scheduler: the torrent's queue position.
+    SetQueuePosition(usize),
+    /// Puts the torrent under the queue's control or takes it out (which
+    /// unqueues it).
+    SetAutoManaged(bool, oneshot::Sender<()>),
+    /// Answers once every earlier command is applied, with the status
+    /// published.
+    Sync(oneshot::Sender<()>),
+}
+
+/// Where an added torrent starts in the session's queue.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueueStart {
+    /// The queue's first pass keeps it stopped.
+    pub queued: bool,
+    pub position: usize,
 }
 
 #[derive(Debug)]
@@ -140,6 +160,8 @@ struct HandleInner {
     cmds: mpsc::Sender<Cmd>,
     status: watch::Receiver<TorrentStatus>,
     shared: Arc<Shared>,
+    /// The session's registry, which holds the queue.
+    session: Weak<SessionInner>,
 }
 
 /// A torrent in a [`Session`](crate::Session).
@@ -156,6 +178,7 @@ pub struct TorrentHandle {
 pub(crate) fn spawn(
     params: AddTorrent,
     storage: Option<Arc<dyn Storage>>,
+    queue: QueueStart,
     shared: Arc<Shared>,
     session: Weak<SessionInner>,
 ) -> TorrentHandle {
@@ -168,6 +191,8 @@ pub(crate) fn spawn(
         }
     };
     initial.save_path = params.save_path.clone();
+    initial.queue_position = queue.position;
+    initial.auto_managed = params.auto_managed;
     let (status_tx, status_rx) = watch::channel(initial);
     let metainfo = Arc::new(OnceLock::new());
     let handle = TorrentHandle {
@@ -177,11 +202,14 @@ pub(crate) fn spawn(
             cmds: cmd_tx,
             status: status_rx,
             shared: Arc::clone(&shared),
+            session: session.clone(),
         }),
     };
-    let actor = actor::Actor::new(
+    let mut actor = actor::Actor::new(
         params, storage, metainfo, shared, session, cmd_rx, status_tx,
     );
+    actor.queued = queue.queued;
+    actor.queue_position = queue.position;
     tokio::spawn(actor.run());
     handle
 }
@@ -417,6 +445,49 @@ impl TorrentHandle {
         }
         let path = plain_rel_path(path)?;
         self.call(|tx| Cmd::RenameFile { index, path, tx }).await?
+    }
+
+    /// Puts the torrent under the session's queue ([`Settings::queue`](crate::Settings::queue))
+    /// or takes it out of it. Taken out, a queued torrent starts at once
+    /// and the queue never stops it; put back, the queue may stop it at
+    /// once. Returns once the queue has applied the change.
+    pub async fn set_auto_managed(&self, auto_managed: bool) -> Result<(), SessionError> {
+        let session = self.session()?;
+        session.set_auto_managed(&self.inner.info_hashes, auto_managed);
+        self.call(|tx| Cmd::SetAutoManaged(auto_managed, tx))
+            .await?;
+        session.queue_pass();
+        self.call(Cmd::Sync).await
+    }
+
+    /// Moves the torrent to `position` in the session's queue (0 runs
+    /// first; past the end, `usize::MAX` say, is the bottom). The torrents
+    /// in between shift by one, and the queue starts and stops torrents
+    /// for their new order. Returns once this torrent's
+    /// [`TorrentStatus::queue_position`] shows the new place.
+    pub async fn set_queue_position(&self, position: usize) -> Result<(), SessionError> {
+        if self.inner.shared.is_shutdown() {
+            return Err(SessionError::Shutdown);
+        }
+        self.session()?
+            .move_in_queue(&self.inner.info_hashes, position)?;
+        self.call(Cmd::Sync).await
+    }
+
+    /// The session, while this torrent is in it.
+    fn session(&self) -> Result<Arc<SessionInner>, SessionError> {
+        self.inner.session.upgrade().ok_or_else(|| self.gone())
+    }
+
+    /// Reads the latest status without copying it.
+    pub(crate) fn with_status<R>(&self, f: impl FnOnce(&TorrentStatus) -> R) -> R {
+        f(&self.inner.status.borrow())
+    }
+
+    /// Sends `cmd` without waiting; false if the queue is full or the
+    /// actor is gone.
+    pub(crate) fn try_cmd(&self, cmd: Cmd) -> bool {
+        self.inner.cmds.try_send(cmd).is_ok()
     }
 
     /// Tests: the pieces open readers wait for, earliest deadline first,

@@ -17,7 +17,7 @@ use fbt_net::proxy::{ProxyKind, udp_associate};
 use fbt_tracker::TrackerClient;
 use fbt_utp::UtpSocket;
 use fbt_wire::req2_hash;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{Notify, broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -31,6 +31,7 @@ use crate::net::{
     Endpoint, ExternalIp, ListenError, LsdHub, bind_all, spawn_lsd_task, spawn_nat_task,
     start_port_mapping, utp_for, utp_sockets,
 };
+use crate::queue::{QueueEntry, QueueSettings, plan};
 use crate::settings::Settings;
 use crate::status::TorrentStatus;
 use crate::storage::cache::{CacheBudget, CacheStats};
@@ -119,6 +120,11 @@ pub struct AddTorrent {
     /// [`Settings::rate_limit_local_peers`]. Changed at runtime with
     /// [`TorrentHandle::set_rate_limit`].
     pub rate_limit: RateLimit,
+    /// Under the session's queue ([`Settings::queue`]; true): it may be
+    /// added [`Queued`](crate::TorrentState::Queued) and is started and
+    /// stopped as slots free and fill. Changed with
+    /// [`TorrentHandle::set_auto_managed`].
+    pub auto_managed: bool,
 }
 
 impl AddTorrent {
@@ -143,6 +149,7 @@ impl AddTorrent {
             file_priorities: Vec::new(),
             storage: None,
             rate_limit: RateLimit::default(),
+            auto_managed: true,
         }
     }
 }
@@ -195,6 +202,10 @@ pub(crate) struct Shared {
     pub ip_filter: RwLock<Arc<IpFilter>>,
     /// Peers banned for the rest of the session (smart ban).
     pub bans: Mutex<BanList>,
+    /// The queue's limits ([`Session::set_queue_settings`]).
+    pub queue: Mutex<QueueSettings>,
+    /// Wakes the queue scheduler for a pass now.
+    pub queue_dirty: Notify,
 }
 
 /// BEP 55 holepunch messages handled, over every torrent of the session.
@@ -287,6 +298,14 @@ impl Shared {
     pub(crate) fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
+
+    /// The queue's current limits.
+    pub(crate) fn queue_settings(&self) -> QueueSettings {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Takes one unit of `counter` if it is below `max`.
@@ -308,11 +327,21 @@ pub(crate) fn release(counter: &AtomicUsize) {
 pub(crate) struct TorrentEntry {
     pub handle: TorrentHandle,
     pub wire_hash: [u8; 20],
+    /// Under the queue's control.
+    pub auto_managed: bool,
+    /// What the scheduler last told the actor: stay queued.
+    pub queued: bool,
+    /// The position the actor was last told.
+    pub position_sent: Option<usize>,
+    /// When the queue last saw it start running; `None` while it is not.
+    pub running_since: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     pub torrents: HashMap<InfoHashes, TorrentEntry>,
+    /// Every torrent in queue order: an index is a queue position.
+    pub order: Vec<InfoHashes>,
     pub by_wire: HashMap<[u8; 20], InfoHashes>,
     /// `HASH('req2', wire hash)` to the wire hash (the MSE `SKEY`), kept
     /// with `by_wire`, so an MSE responder finds its torrent in one lookup.
@@ -348,10 +377,102 @@ impl SessionInner {
             Some(e) => {
                 reg.by_wire.remove(&e.wire_hash);
                 reg.by_req2.remove(&req2_hash(&e.wire_hash));
+                reg.order.retain(|o| o != ih);
+                // Positions behind it moved up, and a slot may be free.
+                self.shared.queue_dirty.notify_one();
                 true
             }
             None => false,
         }
+    }
+
+    /// One scheduler pass: every torrent's queue entry from its status, the
+    /// plan, and `SetQueued` / `SetQueuePosition` to the torrents whose
+    /// answer or position changed. Never waits: a torrent whose command
+    /// queue is full (or that is moving its storage, which holds the change
+    /// until the move is done) keeps its old record and is retried on the
+    /// next pass.
+    pub(crate) fn queue_pass(&self) {
+        let cfg = self.shared.queue_settings();
+        let mut reg = self.registry();
+        let reg = &mut *reg;
+        let now = std::time::Instant::now();
+        let mut entries = Vec::with_capacity(reg.order.len());
+        for (position, ih) in reg.order.iter().enumerate() {
+            let Some(e) = reg.torrents.get(ih) else {
+                continue;
+            };
+            entries.push((*ih, queue_entry(e, position)));
+        }
+        let run = if cfg.unlimited() {
+            // Nothing is queued: skip the sort.
+            entries
+                .iter()
+                .map(|(_, q)| q.auto_managed && !q.user_paused)
+                .collect()
+        } else {
+            let only: Vec<QueueEntry> = entries.iter().map(|(_, q)| q.clone()).collect();
+            plan(&only, &cfg, now)
+        };
+        for ((ih, q), run) in entries.into_iter().zip(run) {
+            let Some(e) = reg.torrents.get_mut(&ih) else {
+                continue;
+            };
+            if e.position_sent != Some(q.position)
+                && e.handle.try_cmd(torrent::Cmd::SetQueuePosition(q.position))
+            {
+                e.position_sent = Some(q.position);
+            }
+            // The user's pause and errors are not the queue's to change.
+            if !e.auto_managed || q.user_paused {
+                e.running_since = None;
+                continue;
+            }
+            let queued = !run;
+            if e.queued != queued && e.handle.try_cmd(torrent::Cmd::SetQueued(queued)) {
+                e.queued = queued;
+            }
+            e.running_since = if e.queued {
+                None
+            } else {
+                e.running_since.or(Some(now))
+            };
+        }
+    }
+
+    /// Moves `ih` to `position` in the queue (clamped to the last place)
+    /// and runs a pass. Fails with [`SessionError::TorrentNotFound`].
+    pub(crate) fn move_in_queue(
+        &self,
+        ih: &InfoHashes,
+        position: usize,
+    ) -> Result<(), SessionError> {
+        {
+            let mut reg = self.registry();
+            let at = reg
+                .order
+                .iter()
+                .position(|o| o == ih)
+                .ok_or(SessionError::TorrentNotFound)?;
+            let ih = reg.order.remove(at);
+            let to = position.min(reg.order.len());
+            reg.order.insert(to, ih);
+        }
+        self.queue_pass();
+        Ok(())
+    }
+
+    /// Records whether `ih` is auto-managed. Clearing it also clears the
+    /// queue's record: the actor unqueues itself.
+    pub(crate) fn set_auto_managed(&self, ih: &InfoHashes, on: bool) {
+        if let Some(e) = self.registry().torrents.get_mut(ih) {
+            e.auto_managed = on;
+            if !on {
+                e.queued = false;
+                e.running_since = None;
+            }
+        }
+        self.shared.queue_dirty.notify_one();
     }
 
     /// Stops every accept loop (dropping its listener).
@@ -480,6 +601,7 @@ impl Session {
         let (lsd, lsd_found) = LsdHub::start(&settings);
         let (portmap, map_events) = start_port_mapping(&settings, &local_addrs).unzip();
         let external_ip = Arc::new(ExternalIp::new(events.clone()));
+        let queue = Mutex::new(settings.queue.clone());
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -503,6 +625,8 @@ impl Session {
             external_ip,
             ip_filter: RwLock::new(Arc::new(IpFilter::default())),
             bans: Mutex::new(BanList::default()),
+            queue,
+            queue_dirty: Notify::new(),
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -546,6 +670,10 @@ impl Session {
         if let Some(rx) = map_events {
             tasks.push(spawn_nat_task(rx, Arc::downgrade(&shared)));
         }
+        tasks.push(tokio::spawn(run_queue(
+            Arc::downgrade(&inner),
+            Arc::clone(&shared),
+        )));
         *inner.listeners.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
         Ok(Session { inner })
     }
@@ -601,6 +729,19 @@ impl Session {
     /// [`Settings::cache_size`].
     pub fn cache_stats(&self) -> CacheStats {
         self.inner.shared.cache.stats()
+    }
+
+    /// Replaces the queue's limits ([`Settings::queue`]) and runs a
+    /// scheduler pass at once: torrents start or stop within it. Fails with
+    /// [`SessionError::InvalidSettings`] for a zero `interval`.
+    pub fn set_queue_settings(&self, queue: QueueSettings) -> Result<(), SessionError> {
+        queue.validate().map_err(SessionError::InvalidSettings)?;
+        let shared = &self.inner.shared;
+        *shared.queue.lock().unwrap_or_else(PoisonError::into_inner) = queue;
+        // The scheduler also picks up the new interval.
+        shared.queue_dirty.notify_one();
+        self.inner.queue_pass();
+        Ok(())
     }
 
     /// Sets the session-wide rate limit ([`Settings::rate_limit`]); it
@@ -735,6 +876,37 @@ impl Session {
         if reg.torrents.contains_key(&ih) || reg.by_wire.contains_key(&wire_hash) {
             return Err(SessionError::DuplicateTorrent);
         }
+        // The queue's first pass for it runs before its actor starts, so an
+        // auto-managed torrent beyond the limits starts queued: no
+        // `started`/`stopped` pair. Its data is unknown yet: it counts as a
+        // download until its check says otherwise (the check's end wakes
+        // the scheduler).
+        let position = reg.order.len();
+        let queued = params.auto_managed && !params.paused && {
+            let cfg = shared.queue_settings();
+            !cfg.unlimited() && {
+                let mut entries: Vec<QueueEntry> = reg
+                    .order
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, o)| reg.torrents.get(o).map(|e| queue_entry(e, i)))
+                    .collect();
+                entries.push(QueueEntry {
+                    position,
+                    seeding: false,
+                    running_since: None,
+                    down_rate: 0,
+                    up_rate: 0,
+                    user_paused: false,
+                    auto_managed: true,
+                });
+                !plan(&entries, &cfg, std::time::Instant::now())
+                    .last()
+                    .copied()
+                    .unwrap_or(true)
+            }
+        };
+        let auto_managed = params.auto_managed;
         // A magnet's storage is built once its metadata is known.
         let storage: Option<Arc<dyn Storage>> = match (&params.source, params.storage.clone()) {
             (TorrentSource::Magnet(_), _) => None,
@@ -747,18 +919,26 @@ impl Session {
         let handle = torrent::spawn(
             params,
             storage,
+            torrent::QueueStart { queued, position },
             Arc::clone(shared),
             Arc::downgrade(&self.inner),
         );
         reg.by_wire.insert(wire_hash, ih);
         reg.by_req2.insert(req2_hash(&wire_hash), wire_hash);
+        reg.order.push(ih);
         reg.torrents.insert(
             ih,
             TorrentEntry {
                 handle: handle.clone(),
                 wire_hash,
+                auto_managed,
+                queued,
+                position_sent: Some(position),
+                running_since: None,
             },
         );
+        drop(reg);
+        shared.queue_dirty.notify_one();
         Ok(handle)
     }
 
@@ -771,12 +951,12 @@ impl Session {
             .map(|e| e.handle.clone())
     }
 
-    /// Every torrent in the session.
+    /// Every torrent in the session, in queue order.
     pub fn torrents(&self) -> Vec<TorrentHandle> {
-        self.inner
-            .registry()
-            .torrents
-            .values()
+        let reg = self.inner.registry();
+        reg.order
+            .iter()
+            .filter_map(|ih| reg.torrents.get(ih))
             .map(|e| e.handle.clone())
             .collect()
     }
@@ -806,6 +986,7 @@ impl Session {
             let mut reg = self.inner.registry();
             reg.by_wire.clear();
             reg.by_req2.clear();
+            reg.order.clear();
             reg.torrents.drain().map(|(_, e)| e.handle).collect()
         };
         let mut waits: Vec<oneshot::Receiver<()>> = Vec::new();
@@ -832,6 +1013,41 @@ impl Session {
         }
         // Last: the `stopped` announces and the DHT used these sockets.
         self.inner.close_udp();
+    }
+}
+
+/// A torrent as the queue sees it, at `position`, from its latest status.
+fn queue_entry(e: &TorrentEntry, position: usize) -> QueueEntry {
+    e.handle.with_status(|st| QueueEntry {
+        position,
+        seeding: st.has_metadata && st.progress >= 1.0,
+        running_since: e.running_since,
+        down_rate: st.download_rate,
+        up_rate: st.upload_rate,
+        user_paused: matches!(
+            st.state,
+            crate::status::TorrentState::Paused | crate::status::TorrentState::Error
+        ),
+        auto_managed: e.auto_managed,
+    })
+}
+
+/// The queue scheduler: a pass every [`QueueSettings::interval`] and
+/// whenever `queue_dirty` is notified, until the session is gone.
+async fn run_queue(inner: std::sync::Weak<SessionInner>, shared: Arc<Shared>) {
+    loop {
+        let interval = shared.queue_settings().interval;
+        tokio::select! {
+            () = shared.queue_dirty.notified() => {}
+            () = tokio::time::sleep(interval) => {}
+        }
+        if shared.is_shutdown() {
+            return;
+        }
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        inner.queue_pass();
     }
 }
 
@@ -1006,6 +1222,8 @@ mod tests {
             external_ip: Arc::new(ExternalIp::new(broadcast::channel(1).0)),
             ip_filter: RwLock::new(Arc::new(IpFilter::default())),
             bans: Mutex::new(BanList::default()),
+            queue: Mutex::new(QueueSettings::default()),
+            queue_dirty: Notify::new(),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();
