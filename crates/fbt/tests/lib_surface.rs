@@ -12,8 +12,8 @@ use fbt::{
     TrackerConfig, TrackerError, Transport,
 };
 use fbt::{
-    CacheStats, ChokingAlgorithm, ExternalIpSource, MapMethod, MapProtocol, MixedMode,
-    PeerClassLimits, RateLimit, SeedChokingAlgorithm, StorageError,
+    CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
+    PeerClassLimits, RateLimit, ReadAhead, SeedChokingAlgorithm, StorageError, StreamError,
 };
 
 fn names(
@@ -71,6 +71,9 @@ fn names(
     _: Option<MapMethod>,
     _: Option<ExternalIpSource>,
     _: Option<&dyn Storage>,
+    _: Option<FileReader>,
+    _: Option<ReadAhead>,
+    _: Option<StreamError>,
 ) {
 }
 
