@@ -12,12 +12,10 @@ use crate::stream::window::MAX_DEADLINE_PIECES;
 
 /// Identifies one reader of a torrent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
 pub(crate) struct ReaderId(pub u64);
 
 /// Every reader's window, merged.
 #[derive(Debug, Default)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
 pub(super) struct Deadlines {
     /// Per reader: its window, one entry per piece, at most
     /// [`MAX_DEADLINE_PIECES`].
@@ -28,7 +26,6 @@ pub(super) struct Deadlines {
     ordered: Vec<(u32, Instant)>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
 impl Deadlines {
     /// Replaces `reader`'s window; returns the pieces no reader holds any more.
     pub fn set(&mut self, reader: ReaderId, mut window: Vec<(u32, Instant)>) -> Vec<u32> {
@@ -63,6 +60,7 @@ impl Deadlines {
     }
 
     /// The earliest deadline of `piece` over the readers holding it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 6"))]
     pub fn deadline(&self, piece: u32) -> Option<Instant> {
         self.merged.get(&piece).map(|&(t, _)| t)
     }
@@ -97,6 +95,7 @@ impl Deadlines {
     }
 
     /// No reader holds any piece.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 6"))]
     pub fn is_empty(&self) -> bool {
         self.merged.is_empty()
     }

@@ -45,4 +45,53 @@ pub enum SessionError {
     /// supported yet.
     #[error("v2-only torrents are not supported")]
     V2OnlyUnsupported,
+    /// The file index is out of range or names a pad file.
+    #[error("file {index} cannot be opened (the torrent has {files} files)")]
+    InvalidFileIndex {
+        /// The index given.
+        index: usize,
+        /// Files in the torrent, pad files included.
+        files: usize,
+    },
+    /// The torrent has as many open [`FileReader`](crate::FileReader)s as
+    /// it allows (16).
+    #[error("too many open file readers")]
+    TooManyReaders,
+}
+
+/// Why a [`FileReader`](crate::FileReader) read failed. It comes inside the
+/// [`io::Error`] the read returns ([`io::Error::get_ref`] downcasts to it),
+/// with the kind given on each variant. A reader is never poisoned: after
+/// [`TorrentHandle::resume`](crate::TorrentHandle::resume) the next read
+/// works.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StreamError {
+    /// The torrent was removed ([`io::ErrorKind::NotFound`]).
+    #[error("torrent removed")]
+    TorrentRemoved,
+    /// The session shut down ([`io::ErrorKind::ConnectionAborted`]).
+    #[error("session shut down")]
+    Shutdown,
+    /// The torrent stopped with an error, such as a storage failure
+    /// ([`io::ErrorKind::Other`]); the message is the torrent's.
+    #[error("torrent error: {0}")]
+    TorrentError(String),
+}
+
+impl StreamError {
+    /// The [`io::ErrorKind`] a read failing with this error has.
+    pub(crate) fn kind(&self) -> io::ErrorKind {
+        match self {
+            StreamError::TorrentRemoved => io::ErrorKind::NotFound,
+            StreamError::Shutdown => io::ErrorKind::ConnectionAborted,
+            StreamError::TorrentError(_) => io::ErrorKind::Other,
+        }
+    }
+}
+
+impl From<StreamError> for io::Error {
+    fn from(e: StreamError) -> Self {
+        io::Error::new(e.kind(), e)
+    }
 }

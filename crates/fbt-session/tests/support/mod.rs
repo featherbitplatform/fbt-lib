@@ -95,6 +95,67 @@ fn build_torrent(files: &[(&str, usize)], piece_len: u32, private: bool) -> (Met
     (m, payload)
 }
 
+/// A multi-file torrent like [`make_torrent`], with a BEP 47 pad file
+/// (`attr: "p"`, zero bytes up to the next piece boundary, at least one)
+/// inserted after file `pad_after`. Returns the metainfo and the payload,
+/// pad bytes included.
+pub fn make_torrent_with_pad(
+    files: &[(&str, usize)],
+    pad_after: usize,
+    piece_len: u32,
+) -> (Metainfo, Vec<u8>) {
+    let before: usize = files.iter().take(pad_after + 1).map(|f| f.1).sum();
+    let pad_len = match before % piece_len as usize {
+        0 => piece_len as usize,
+        r => piece_len as usize - r,
+    };
+    let mut entries: Vec<(String, usize, bool)> = Vec::new();
+    for (i, (name, len)) in files.iter().enumerate() {
+        entries.push(((*name).to_owned(), *len, false));
+        if i == pad_after {
+            entries.push((format!(".pad/{pad_len}"), pad_len, true));
+        }
+    }
+    let total: usize = entries.iter().map(|e| e.1).sum();
+    let mut payload = vec![0u8; total];
+    let mut off = 0;
+    for (_, len, pad) in &entries {
+        if !pad {
+            rand::rng().fill(&mut payload[off..off + len]);
+        }
+        off += len;
+    }
+    let mut pieces = Vec::new();
+    for chunk in payload.chunks(piece_len as usize) {
+        pieces.extend_from_slice(&sha1_piece(chunk));
+    }
+    let file_list = entries
+        .iter()
+        .map(|(name, len, pad)| {
+            let mut f = DictBuilder::new();
+            if *pad {
+                f.insert(b"attr", "p");
+            }
+            f.insert(b"length", *len as i64);
+            f.insert(
+                b"path",
+                OwnedValue::List(name.split('/').map(OwnedValue::from).collect::<Vec<_>>()),
+            );
+            f.build()
+        })
+        .collect();
+    let mut info = DictBuilder::new();
+    info.insert(b"files", OwnedValue::List(file_list));
+    info.insert(b"name", "torrent");
+    info.insert(b"piece length", i64::from(piece_len));
+    info.insert(b"pieces", pieces);
+    let mut root = DictBuilder::new();
+    root.insert(b"info", info.build());
+    let bytes = encode(&root.build());
+    let m = Metainfo::from_bytes(&bytes).expect("valid generated torrent");
+    (m, payload)
+}
+
 /// Writes `payload` as the torrent's files below `save_path`.
 pub fn write_payload(save_path: &Path, m: &Metainfo, payload: &[u8]) {
     let mut off = 0usize;
@@ -751,5 +812,124 @@ async fn udp_loop(
             continue;
         }
         let _ = sock.send_to(&out, from).await;
+    }
+}
+
+/// Memory storage that counts its reads and logs each read's offset.
+#[derive(Debug)]
+pub struct CountingStorage {
+    inner: MemStorage,
+    log: Mutex<Vec<u64>>,
+}
+
+impl CountingStorage {
+    pub fn new(data: Vec<u8>) -> Self {
+        CountingStorage {
+            inner: MemStorage::from_bytes(data),
+            log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Reads so far.
+    pub fn reads(&self) -> usize {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// The offset of every read so far, in order.
+    pub fn offsets(&self) -> Vec<u64> {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Forgets the reads so far.
+    pub fn reset(&self) {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+impl Storage for CountingStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(offset);
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// Zeroed memory storage whose writes fail while `fail` is set.
+#[derive(Debug)]
+pub struct FailWritesStorage {
+    inner: MemStorage,
+    fail: Arc<AtomicBool>,
+}
+
+impl FailWritesStorage {
+    pub fn new(len: u64, fail: Arc<AtomicBool>) -> Self {
+        FailWritesStorage {
+            inner: MemStorage::new(len),
+            fail,
+        }
+    }
+}
+
+impl Storage for FailWritesStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"));
+        }
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
+    }
+}
+
+/// Zeroed memory storage whose writes block while `gate` is set (polled
+/// every 10 ms): a test holds every write and decides when they land.
+#[derive(Debug)]
+pub struct GatedWriteStorage {
+    inner: MemStorage,
+    gate: Arc<AtomicBool>,
+}
+
+impl GatedWriteStorage {
+    pub fn new(len: u64, gate: Arc<AtomicBool>) -> Self {
+        GatedWriteStorage {
+            inner: MemStorage::new(len),
+            gate,
+        }
+    }
+}
+
+impl Storage for GatedWriteStorage {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, buf)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        while self.gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.inner.write(offset, data)
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn delete_files(&self) -> io::Result<()> {
+        self.inner.delete_files()
     }
 }

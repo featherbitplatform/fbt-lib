@@ -127,6 +127,10 @@ impl Actor {
                 self.phase = Phase::Ready;
                 self.metadata_check = false;
                 self.maybe_finish();
+                // Windows hold missing pieces only now; reads of pieces
+                // the check found are answered.
+                self.sync_all_readers();
+                self.serve_waiting_reads();
                 self.refresh_state();
                 self.catch_up_peers();
                 self.requeue_known();

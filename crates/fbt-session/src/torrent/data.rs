@@ -12,7 +12,9 @@ use fbt_metainfo::{Metainfo, MetainfoError};
 use tokio::time::Instant;
 use tracing::debug;
 
+use super::ReaderId;
 use super::actor::{Actor, Phase};
+use super::readers::Answer;
 use super::swarm::BanTarget;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
@@ -74,6 +76,16 @@ pub(crate) enum Job {
         block: BlockRef,
         result: io::Result<Vec<u8>>,
     },
+    /// A reader's chunk was read on its own (its piece is too large to
+    /// read whole, or too many whole-piece reads run).
+    ReadChunk {
+        generation: u64,
+        reader: ReaderId,
+        offset: u64,
+        len: u32,
+        tx: Answer,
+        result: io::Result<Vec<u8>>,
+    },
 }
 
 impl Actor {
@@ -106,7 +118,15 @@ impl Actor {
                 key,
                 block,
                 result,
-            } => self.on_read(generation, key, block, result),
+            } => self.on_read_block(generation, key, block, result),
+            Job::ReadChunk {
+                generation,
+                reader,
+                offset,
+                len,
+                tx,
+                result,
+            } => self.on_read_chunk(generation, (reader, offset, len, tx), result),
             Job::Flushed { generation, result } => {
                 // A check since then starts its own finish.
                 if generation == self.generation {
@@ -218,13 +238,20 @@ impl Actor {
             self.top_up_all(None);
             return;
         }
-        let Some(picker) = l.picker.as_mut() else {
+        if l.picker.is_none() {
             return;
-        };
+        }
         // Verified: ours from now on, served from memory until written.
+        // Waiting readers get it first, before any write.
+        let data: Arc<[u8]> = data.into();
+        self.answer_piece(piece, &data);
+        self.deadlines.piece_done(piece);
         let on_floor = self.cache.holds_floor(piece);
         self.cache
-            .insert_dirty(piece, data.into(), Instant::now().into_std());
+            .insert_dirty(piece, data, Instant::now().into_std());
+        let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) else {
+            return;
+        };
         picker.piece_passed(piece);
         self.lost_pieces.remove(&piece);
         let finished = picker.is_finished();

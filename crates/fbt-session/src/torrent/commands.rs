@@ -105,6 +105,18 @@ impl Actor {
                 let _ = tx.send(());
                 return Flow::Exit;
             }
+            Cmd::OpenReader { file, link, tx } => self.on_open_reader(file, link, tx),
+            Cmd::ReaderMoved(id) => self.on_reader_moved(id),
+            Cmd::CloseReader(id) => self.on_close_reader(id),
+            Cmd::Read {
+                reader,
+                offset,
+                len,
+                tx,
+            } => self.on_read(reader, offset, len, tx),
+            Cmd::DebugDeadlines(tx) => {
+                let _ = tx.send(self.debug_deadlines());
+            }
         }
         Flow::Continue
     }

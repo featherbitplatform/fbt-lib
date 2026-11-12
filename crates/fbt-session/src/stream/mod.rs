@@ -1,11 +1,15 @@
-//! Streaming while downloading: how far ahead of a reader the torrent
-//! fetches.
+//! Streaming while downloading: [`FileReader`] reads one file of a torrent
+//! while it downloads, and [`ReadAhead`] sets how far ahead of a reader the
+//! torrent fetches.
 //!
 //! A reader's position sets deadlines on the pieces of its read-ahead
-//! window ([`ReadAhead`]): the piece under the position is due now, each
-//! later one when a player at the stream's bitrate would reach it.
+//! window: the piece under the position is due now, each later one when a
+//! player at the stream's bitrate would reach it.
 
+pub(crate) mod reader;
 pub(crate) mod window;
+
+pub use reader::FileReader;
 
 use std::time::Duration;
 

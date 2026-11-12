@@ -661,32 +661,24 @@ pub(super) mod tests {
         SocketAddr::from((std::net::Ipv4Addr::from(0x0a00_0000 + i), 6881))
     }
 
-    /// An actor for a one-piece torrent, with nothing connected.
-    pub(in crate::torrent) fn actor() -> Actor {
-        use std::path::PathBuf;
+    /// The session state of a test actor, with a cache budget of
+    /// `cache_size`.
+    fn shared(cache_size: u64) -> Arc<crate::session::Shared> {
         use std::sync::atomic::{AtomicBool, AtomicUsize};
-        use std::sync::{OnceLock, Weak};
 
-        use fbt_metainfo::Metainfo;
         use fbt_tracker::TrackerClient;
-        use tokio::sync::{broadcast, watch};
+        use tokio::sync::broadcast;
 
-        use crate::session::{AddTorrent, Shared};
+        use crate::session::Shared;
         use crate::settings::Settings;
-        use crate::status::TorrentStatus;
 
-        let mut bytes =
-            b"d4:infod6:lengthi16384e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
-        bytes.extend_from_slice(&[0u8; 20]);
-        bytes.extend_from_slice(b"ee");
-        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
         let settings = Settings {
             dht_enabled: false,
             dht_bootstrap_nodes: Vec::new(),
             ..Settings::default()
         };
         let tracker = TrackerClient::new(settings.tracker.clone()).expect("tracker client");
-        let shared = Arc::new(Shared {
+        Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
             listen_port: 6881,
@@ -701,26 +693,97 @@ pub(super) mod tests {
             dht_addrs: Vec::new(),
             utp: Vec::new(),
             disk: crate::disk::DiskPool::new(1, 1),
-            cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
+            cache: Arc::new(crate::storage::cache::CacheBudget::new(cache_size)),
             bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
             holepunch: Default::default(),
             lsd: crate::net::LsdHub::disabled(),
             portmap: None,
             external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
-        });
-        let add = AddTorrent::new(meta, PathBuf::from("unused"));
+        })
+    }
+
+    /// An actor for `meta` on `storage`, as spawned (checking).
+    fn new_actor(
+        meta: fbt_metainfo::Metainfo,
+        storage: Option<Arc<dyn crate::storage::Storage>>,
+        cache_size: u64,
+    ) -> Actor {
+        use std::path::PathBuf;
+        use std::sync::{OnceLock, Weak};
+
+        use tokio::sync::watch;
+
+        use crate::session::AddTorrent;
+        use crate::status::TorrentStatus;
+
+        let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
+        add.storage = storage.clone();
         let ih = add.source.info_hashes();
         let (status_tx, _) = watch::channel(TorrentStatus::initial(ih, "a".into(), true));
         let (_cmd_tx, cmd_rx) = mpsc::channel(1);
         Actor::new(
             add,
-            None,
+            storage,
             Arc::new(OnceLock::new()),
-            shared,
+            shared(cache_size),
             Weak::new(),
             cmd_rx,
             status_tx,
         )
+    }
+
+    /// An actor for a one-piece torrent, with nothing connected.
+    pub(in crate::torrent) fn actor() -> Actor {
+        use fbt_metainfo::Metainfo;
+
+        let mut bytes =
+            b"d4:infod6:lengthi16384e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bytes.extend_from_slice(&[0u8; 20]);
+        bytes.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+        new_actor(meta, None, 0)
+    }
+
+    /// A ready actor (not paused) for a torrent of files of `files` bytes
+    /// in pieces of `piece_len`, over zeroed memory storage, with no piece
+    /// yet, a picker, and a cache budget of `cache_size`. Nothing is
+    /// connected; peers are added as `pex.rs`'s `actor_with_peers` does.
+    pub(in crate::torrent) fn actor_with(files: &[u64], piece_len: u32, cache_size: u64) -> Actor {
+        use fbt_core::Bitfield;
+        use fbt_metainfo::Metainfo;
+
+        use crate::picker::PiecePicker;
+        use crate::storage::MemStorage;
+        use crate::torrent::actor::Phase;
+
+        let total: u64 = files.iter().sum();
+        let pieces = total.div_ceil(u64::from(piece_len)) as usize;
+        let mut b = b"d4:infod5:filesl".to_vec();
+        for (i, len) in files.iter().enumerate() {
+            let name = format!("f{i}");
+            b.extend_from_slice(
+                format!("d6:lengthi{len}e4:pathl{}:{name}ee", name.len()).as_bytes(),
+            );
+        }
+        b.extend_from_slice(
+            format!(
+                "e4:name1:t12:piece lengthi{piece_len}e6:pieces{}:",
+                pieces * 20
+            )
+            .as_bytes(),
+        );
+        b.extend(std::iter::repeat_n(0u8, pieces * 20));
+        b.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&b).expect("metainfo");
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(MemStorage::new(total));
+        let mut a = new_actor(meta, Some(storage), cache_size);
+        let l = a.loaded.as_mut().expect("loaded");
+        let mut picker = PiecePicker::new(l.layout, &Bitfield::new(l.layout.num_pieces()));
+        picker.set_piece_priorities(&l.piece_prio);
+        l.picker = Some(picker);
+        a.phase = Phase::Ready;
+        a.paused = false;
+        a
     }
 
     /// A TCP connection that got through after a failed uTP connect clears

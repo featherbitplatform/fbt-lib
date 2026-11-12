@@ -301,6 +301,12 @@ impl CacheBudget {
         Some(data)
     }
 
+    /// Tests: the clean entry evicted next.
+    #[cfg(test)]
+    pub(crate) fn next_clean_victim(&self) -> Option<(u64, u32)> {
+        self.lru().order.first_key_value().map(|(_, &k)| k)
+    }
+
     fn clean_demote(&self, key: CleanKey) {
         self.lru().demote(key);
     }
@@ -471,7 +477,6 @@ impl PieceCache {
     /// A clean entry of `piece` becomes the session's next eviction (after
     /// the entries demoted before it): a sequential reader left it behind.
     /// Dirty pieces and pieces being written are unaffected.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
     pub(crate) fn demote(&mut self, piece: u32) {
         if self.dirty.contains_key(&piece) || self.writing.contains_key(&piece) {
             return;
@@ -481,7 +486,6 @@ impl PieceCache {
 
     /// The piece's verified bytes are here (dirty, being written or clean),
     /// without counting as a use of a clean entry.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
     pub(crate) fn is_cached(&self, piece: u32) -> bool {
         self.dirty.contains_key(&piece)
             || self.writing.contains_key(&piece)

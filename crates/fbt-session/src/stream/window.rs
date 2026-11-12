@@ -12,7 +12,6 @@ use super::ReadAhead;
 /// Most pieces in one reader's window. The torrent's merged deadlines can
 /// hold up to this many per reader; the number of readers is capped
 /// separately.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
 pub(crate) const MAX_DEADLINE_PIECES: usize = 512;
 
 /// The latest deadline: a delay beyond it (a tiny bitrate, a huge piece)
@@ -29,7 +28,6 @@ const FAR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 ///
 /// Integer, saturating arithmetic only: no value of `ra` (validated or
 /// not) or of `file` makes it panic.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
 pub(crate) fn window(
     file: Range<u64>,
     pos: u64,
