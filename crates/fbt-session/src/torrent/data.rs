@@ -15,7 +15,9 @@ use tracing::debug;
 use super::ReaderId;
 use super::actor::{Actor, Phase};
 use super::readers::Answer;
+use super::smartban::BlockSource;
 use super::swarm::BanTarget;
+use super::webseed::FetchError;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
@@ -91,6 +93,14 @@ pub(crate) enum Job {
     },
     /// The storage operation (move or rename) returned.
     StorageOp { result: io::Result<()> },
+    /// A web seed's request for `blocks`, issued under `generation`,
+    /// returned their data (one buffer per block) or failed.
+    WebSeed {
+        key: PeerKey,
+        generation: u64,
+        blocks: Vec<BlockRef>,
+        result: Result<Vec<Bytes>, FetchError>,
+    },
 }
 
 impl Actor {
@@ -150,30 +160,59 @@ impl Actor {
                 }
             }
             Job::Metadata { key, ban, result } => self.on_metadata_job(key, ban, result),
+            Job::WebSeed {
+                key,
+                generation,
+                blocks,
+                result,
+            } => self.on_web_seed_job(key, generation, blocks, result),
         }
         // Whatever returned may have been the last thing a storage
         // operation waited for.
         self.try_start_storage_job();
     }
 
-    /// A block we requested arrived from `key`.
+    /// A block we requested arrived from peer `key`: accepted (see
+    /// [`accept_block`](Self::accept_block)) only from a connection of the
+    /// current generation that is still open.
     pub(super) fn on_block(&mut self, key: PeerKey, block: BlockRef, data: Bytes) {
         let len = data.len() as u64;
         let source = self.block_source(key);
         let generation = self.generation;
-        let Some(p) = self.peers.get_mut(&key) else {
-            self.counters.wasted = self.counters.wasted.saturating_add(len);
-            return;
+        let current = match self.peers.get_mut(&key) {
+            Some(p) => {
+                p.requested.remove(&block);
+                p.generation == generation && p.tx.is_some()
+            }
+            None => false,
         };
-        p.requested.remove(&block);
-        let current = p.generation == generation && p.tx.is_some();
-        let ready = matches!(self.phase, Phase::Ready);
+        match source {
+            Some(source) if current => self.accept_block(key, block, data, source, generation),
+            _ => self.counters.wasted = self.counters.wasted.saturating_add(len),
+        }
+    }
+
+    /// `block`, requested from `key` under `generation`, arrived from
+    /// `source` (a peer or a web seed): kept if the picker accepts it
+    /// (outstanding from `key`, not received before) while the torrent is
+    /// ready and still in that generation, else counted as wasted. The last
+    /// block of a piece sends it to its hash check.
+    pub(super) fn accept_block(
+        &mut self,
+        key: PeerKey,
+        block: BlockRef,
+        data: Bytes,
+        source: BlockSource,
+        generation: u64,
+    ) {
+        let len = data.len() as u64;
+        let current = generation == self.generation && matches!(self.phase, Phase::Ready);
         let Some(l) = self.loaded.as_mut() else {
             self.counters.wasted = self.counters.wasted.saturating_add(len);
             return;
         };
         let picker = match l.picker.as_mut() {
-            Some(pk) if current && ready => pk,
+            Some(pk) if current => pk,
             _ => {
                 self.counters.wasted = self.counters.wasted.saturating_add(len);
                 return;
@@ -196,10 +235,8 @@ impl Actor {
             return;
         };
         dst.copy_from_slice(&data);
-        if let Some(source) = source {
-            self.smartban
-                .record_block(block.piece, block.offset / BLOCK_SIZE, source);
-        }
+        self.smartban
+            .record_block(block.piece, block.offset / BLOCK_SIZE, source);
         self.counters.downloaded = self.counters.downloaded.saturating_add(len);
         self.counters.dl.record(len);
         if let Some(p) = self.peers.get_mut(&key) {

@@ -182,6 +182,19 @@ impl Actor {
                 self.publish();
                 let _ = tx.send(());
             }
+            Cmd::AddWebSeed(url, tx) => {
+                let r = self.add_web_seed(url);
+                self.publish();
+                let _ = tx.send(r);
+            }
+            Cmd::RemoveWebSeed(url, tx) => {
+                self.remove_web_seed(&url);
+                self.publish();
+                let _ = tx.send(());
+            }
+            Cmd::WebSeeds(tx) => {
+                let _ = tx.send(self.web_seeds.urls());
+            }
         }
         Flow::Continue
     }

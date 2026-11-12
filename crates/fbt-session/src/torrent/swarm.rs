@@ -567,7 +567,9 @@ impl Actor {
         closed
     }
 
+    /// Closes every peer and cancels every web seed request.
     pub(super) fn close_all(&mut self) {
+        self.cancel_web_seeds();
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
             self.close_peer(key);

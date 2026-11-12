@@ -139,6 +139,23 @@ pub enum Event {
         /// What went wrong.
         message: String,
     },
+    /// A web seed (BEP 19) request failed. With `retired` false the seed
+    /// backs off (30 s, doubling per failure in a row, up to 30 minutes)
+    /// and is tried again; with `retired` true (a 4xx status other than
+    /// 408 and 429, a URL that cannot work, or data that failed a hash
+    /// check, found by smart ban) it is never asked again, until
+    /// [`TorrentHandle::add_web_seed`](crate::TorrentHandle::add_web_seed)
+    /// adds it back.
+    WebSeedError {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The web seed's URL, as added.
+        url: String,
+        /// What went wrong.
+        message: String,
+        /// The seed is retired.
+        retired: bool,
+    },
     /// A batch of peer addresses arrived for a torrent.
     PeersFound {
         /// The torrent.
@@ -298,7 +315,8 @@ bitflags::bitflags! {
         const PIECE = 1 << 1;
         /// Tracker replies and errors, scrapes included.
         const TRACKER = 1 << 2;
-        /// Peer connects and disconnects, peers found, peers blocked.
+        /// Peer connects and disconnects, peers found, peers blocked, web
+        /// seed errors.
         const PEER = 1 << 3;
         /// Storage errors, storage moves and file renames.
         const STORAGE = 1 << 4;
@@ -335,7 +353,8 @@ impl Event {
             Event::PeerConnected { .. }
             | Event::PeerDisconnected { .. }
             | Event::PeersFound { .. }
-            | Event::PeerBlocked { .. } => EventMask::PEER,
+            | Event::PeerBlocked { .. }
+            | Event::WebSeedError { .. } => EventMask::PEER,
             Event::DhtBootstrapped { .. } => EventMask::DHT,
             Event::FileError { .. }
             | Event::StorageMoved { .. }

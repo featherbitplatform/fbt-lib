@@ -806,7 +806,8 @@ impl Actor {
         BlockSource::Peer(BanList::key(addr, self.shared.settings.ban_endpoints))
     }
 
-    /// Bans a source of bad blocks (smart ban). A peer key goes into the
+    /// Bans a source of bad blocks (smart ban). A web seed is retired
+    /// ([`Event::WebSeedError`] with `retired: true`). A peer key goes into the
     /// session's ban list and every matching peer is closed with
     /// `Blocked(Banned)` and reported ([`Event::PeerBlocked`]), or the key
     /// is reported if none is connected here. Unlike [`ban`](Self::ban)
@@ -830,8 +831,8 @@ impl Actor {
                 }
             }
             BlockSource::WebSeed(key) => {
-                // Retiring the web seed comes with web seeds (Task 11).
                 debug!(torrent = %self.name(), ?key, "a web seed sent bad blocks");
+                self.retire_web_seed(key, "sent data that failed a hash check".to_owned());
             }
         }
     }

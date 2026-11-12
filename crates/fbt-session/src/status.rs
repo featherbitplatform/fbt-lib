@@ -73,6 +73,9 @@ pub struct TorrentStatus {
     pub num_peers: u32,
     /// Connected peers that have every piece.
     pub num_seeds: u32,
+    /// Web seeds (BEP 19) in use: those not retired. See
+    /// [`TorrentHandle::web_seeds`](crate::TorrentHandle::web_seeds).
+    pub num_web_seeds: u32,
     /// The storage or metadata error that stopped the torrent.
     pub error: Option<String>,
     /// The directory the torrent's files are below, as added and changed
@@ -115,6 +118,7 @@ impl TorrentStatus {
             upload_rate: 0,
             num_peers: 0,
             num_seeds: 0,
+            num_web_seeds: 0,
             error: None,
             save_path: PathBuf::new(),
             queue_position: 0,

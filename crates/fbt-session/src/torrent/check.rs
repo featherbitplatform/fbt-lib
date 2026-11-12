@@ -133,6 +133,8 @@ impl Actor {
                 self.finished_emitted = picker.is_finished();
                 self.finish_pending = finishing && picker.is_finished();
                 l.picker = Some(picker);
+                // Web seeds not retired are `HaveAll` peers of it.
+                self.count_web_seeds();
                 self.phase = Phase::Ready;
                 self.metadata_check = false;
                 self.maybe_finish();

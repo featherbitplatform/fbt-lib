@@ -33,8 +33,9 @@ use super::retries::Retries;
 use super::serve::PieceReads;
 use super::smartban::SmartBan;
 use super::storage_ops::StorageOp;
+use super::webseed::WebSeeds;
 use super::{Cmd, piece_priorities, same_state};
-use crate::bandwidth::BucketPair;
+use crate::bandwidth::{BucketPair, Throttle};
 use crate::choker::{Choker, ChokerConfig};
 use crate::error::StreamError;
 use crate::event::{Event, PeerSource};
@@ -317,6 +318,11 @@ pub(crate) struct Actor {
     /// Who sent the blocks of pieces in progress and of failed pieces,
     /// and each sender's trust.
     pub(super) smartban: SmartBan,
+    /// The torrent's web seeds (BEP 19).
+    pub(super) web_seeds: WebSeeds,
+    /// What web seed downloads are charged to: the torrent's and the
+    /// session's download limits.
+    pub(super) web_seed_throttle: Throttle,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -337,17 +343,20 @@ impl Actor {
         let ih = params.source.info_hashes();
         let rate = BucketPair::new(params.rate_limit);
         let save_path = params.save_path.clone();
-        let (loaded, magnet, trackers) = match params.source {
+        let web_seed_throttle = shared.bandwidth.web_seed(&rate);
+        let (loaded, magnet, trackers, web_seed_urls) = match params.source {
             TorrentSource::Metainfo(m) => {
                 let trackers = m.trackers.clone();
+                let urls = m.web_seeds.clone();
                 let meta = Arc::new(*m);
                 let _ = metainfo_cell.set(Arc::clone(&meta));
                 let loaded = Loaded::new(meta, params.file_priorities, params.sequential);
-                (Some(loaded), None, trackers)
+                (Some(loaded), None, trackers, urls)
             }
             TorrentSource::Magnet(magnet) => {
                 // One tier per `tr`, in order.
                 let trackers = magnet.trackers.iter().map(|t| vec![t.clone()]).collect();
+                let urls = magnet.web_seeds.clone();
                 let fetch =
                     MetadataFetch::new(magnet.info_hashes, shared.settings.max_metadata_size)
                         .deferred();
@@ -358,7 +367,7 @@ impl Actor {
                     storage: params.storage,
                     sequential: params.sequential,
                 };
-                (None, Some(Box::new(state)), trackers)
+                (None, Some(Box::new(state)), trackers, urls)
             }
         };
         let phase = if loaded.is_some() {
@@ -468,11 +477,14 @@ impl Actor {
             readers: Readers::default(),
             deadlines: Deadlines::default(),
             smartban: SmartBan::default(),
+            web_seeds: WebSeeds::default(),
+            web_seed_throttle,
             #[cfg(test)]
             pex_live_builds: 0,
             #[cfg(test)]
             pex_scans: 0,
         };
+        actor.init_web_seeds(web_seed_urls);
         if actor.magnet.is_some() {
             actor.last_state = actor.state();
         }
@@ -554,6 +566,7 @@ impl Actor {
                     self.expire_parole_pieces();
                     self.readers_tick();
                     self.top_up_all(None);
+                    self.web_seed_tick();
                     self.metadata_tick();
                     self.pex_tick();
                     self.lsd_tick();
@@ -728,6 +741,7 @@ impl Actor {
             upload_rate: self.counters.ul.rate(now),
             num_peers,
             num_seeds,
+            num_web_seeds: self.web_seeds.num_active(),
             error: match &self.phase {
                 Phase::Error(e) => Some(e.clone()),
                 _ => None,

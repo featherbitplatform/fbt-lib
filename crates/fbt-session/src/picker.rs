@@ -455,6 +455,51 @@ impl PiecePicker {
         out
     }
 
+    /// For a web seed: every block of consecutive unstarted pieces, from
+    /// the first one at or after `first_free`, each taken whole through
+    /// [`pick_piece`](Self::pick_piece) and recorded as outstanding from
+    /// `peer`. The run stops before a piece that is started (by anyone),
+    /// passed, pending its hash or skipped (priority 0), at the end of the
+    /// torrent, or once it holds `max_bytes`; it never stops before its
+    /// first piece, so a piece larger than `max_bytes` is still fetched.
+    /// The pieces are so one byte range, and only `peer` holds their
+    /// blocks: a run never joins a piece another peer started, reserved
+    /// ones (parole) included. Empty when nothing from `first_free` on is
+    /// unstarted.
+    pub fn pick_run(&mut self, peer: PeerKey, first_free: u32, max_bytes: u64) -> Vec<BlockRef> {
+        let n = self.layout.num_pieces();
+        let mut out = Vec::new();
+        let Some(start) = (first_free..n).find(|&i| self.unstarted_wanted(i)) else {
+            return out;
+        };
+        let mut bytes = 0u64;
+        for piece in start..n {
+            if !self.unstarted_wanted(piece) {
+                break;
+            }
+            let size = u64::from(self.layout.piece_size(piece));
+            if !out.is_empty() && bytes.saturating_add(size) > max_bytes {
+                break;
+            }
+            let blocks = self.layout.blocks_in_piece(piece) as usize;
+            let got = self.pick_piece(peer, piece, blocks, &[]);
+            if got.is_empty() {
+                break;
+            }
+            out.extend(got);
+            bytes = bytes.saturating_add(size);
+            if bytes >= max_bytes {
+                break;
+            }
+        }
+        out
+    }
+
+    /// A wanted piece nobody has started.
+    fn unstarted_wanted(&self, piece: u32) -> bool {
+        self.state_of(piece) == PieceState::Unrequested && self.prio_of(piece) > 0
+    }
+
     /// Download progress of `piece`: its free blocks and the peers holding
     /// the rest. `None` for a piece we have, one pending its hash check, or
     /// out of range.
@@ -1820,6 +1865,59 @@ mod tests {
             assert!(p.is_finished(), "seed {seed}: picker never finished");
             assert_eq!(p.wanted_left_bytes(), 0, "seed {seed}");
         }
+    }
+
+    #[test]
+    fn pick_run_takes_consecutive_unstarted_pieces() {
+        let (w, peer) = (PeerKey(9), PeerKey(1));
+        // 8 pieces of 2 blocks (32 KiB each).
+        let mut p = picker(8, 2);
+        p.add_peer_pieces(PeerPieces::All);
+        // A peer starts piece 3; piece 5 is skipped.
+        assert_eq!(p.pick_piece(peer, 3, 1, &[]), vec![blk(3, 0)]);
+        let mut prio = vec![4u8; 8];
+        prio[5] = 0;
+        p.set_piece_priorities(&prio);
+        // From 1: pieces 1 and 2, then the started piece 3 ends the run.
+        let run = p.pick_run(w, 1, u64::MAX);
+        assert_eq!(run, vec![blk(1, 0), blk(1, 1), blk(2, 0), blk(2, 1)]);
+        // Every block is the web seed's: nobody else joins those pieces.
+        assert!(p.pick_piece(peer, 1, 4, &[]).is_empty());
+        // From 3: the first unstarted piece at or after it is 4, and the
+        // skipped piece 5 ends that run.
+        assert_eq!(p.pick_run(w, 3, u64::MAX), vec![blk(4, 0), blk(4, 1)]);
+        // `max_bytes` stops a run at whole pieces, but always takes one.
+        let run = p.pick_run(w, 6, 1);
+        assert_eq!(run, vec![blk(6, 0), blk(6, 1)]);
+        // Piece 1 is started: from 0 the run is piece 0 alone.
+        assert_eq!(
+            p.pick_run(w, 0, 2 * 2 * u64::from(B)),
+            vec![blk(0, 0), blk(0, 1)]
+        );
+        assert_eq!(p.pick_run(w, 7, u64::MAX), vec![blk(7, 0), blk(7, 1)]);
+        // Nothing unstarted is left.
+        assert!(p.pick_run(w, 0, u64::MAX).is_empty());
+        assert!(p.pick_run(w, 100, u64::MAX).is_empty());
+        // Released, a piece is unstarted again.
+        p.release_peer(w);
+        assert_eq!(
+            p.pick_run(w, 0, 2 * 2 * u64::from(B)),
+            vec![blk(0, 0), blk(0, 1), blk(1, 0), blk(1, 1)]
+        );
+    }
+
+    #[test]
+    fn pick_run_never_takes_a_reserved_piece() {
+        let (w, liar) = (PeerKey(9), PeerKey(1));
+        let mut p = picker(3, 2);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_parole(liar, true);
+        // The peer on parole starts a piece and keeps it to itself.
+        let got = p.pick(liar, PeerPieces::All, 1, &mut rng());
+        let reserved = got[0].piece;
+        let run = p.pick_run(w, 0, u64::MAX);
+        assert!(run.iter().all(|b| b.piece != reserved), "{run:?}");
+        assert!(!run.is_empty());
     }
 
     #[test]

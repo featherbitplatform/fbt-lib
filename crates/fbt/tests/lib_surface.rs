@@ -236,3 +236,25 @@ async fn queue_methods(s: &Session, h: &TorrentHandle, e: &Event) {
     );
     p.auto_managed = false;
 }
+
+/// Web seeds (BEP 19).
+async fn web_seed_methods(h: &TorrentHandle, e: &Event, m: &Metainfo, mg: &Magnet) {
+    let _: Result<(), SessionError> = h.add_web_seed(String::new()).await;
+    let _: Result<(), SessionError> = h.remove_web_seed("").await;
+    let _: Result<Vec<String>, SessionError> = h.web_seeds().await;
+    let _: u32 = h.status().num_web_seeds;
+    let _: (&Vec<String>, &Vec<String>) = (&m.web_seeds, &mg.web_seeds);
+    let _ = [
+        SessionError::InvalidUrl(String::new()),
+        SessionError::TooManyWebSeeds,
+    ];
+    if let Event::WebSeedError {
+        torrent,
+        url,
+        message,
+        retired,
+    } = e
+    {
+        let _: (&InfoHashes, &String, &String, &bool) = (torrent, url, message, retired);
+    }
+}

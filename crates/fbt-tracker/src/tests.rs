@@ -470,3 +470,55 @@ fn http_scrape_output_is_capped() {
     let body = scrape_files(&entries);
     assert_eq!(parse_http_scrape(&body).unwrap().len(), MAX_SCRAPE_HASHES);
 }
+
+#[test]
+fn content_range_parsing() {
+    // Valid, with and without a known length, and any case of the unit.
+    assert_eq!(
+        parse_content_range("bytes 0-99/1000"),
+        Some((0, 99, Some(1000)))
+    );
+    assert_eq!(parse_content_range("bytes 5-5/*"), Some((5, 5, None)));
+    assert_eq!(
+        parse_content_range("Bytes 10-19/20"),
+        Some((10, 19, Some(20)))
+    );
+    // `*` alone is an unsatisfied range, not one we can use.
+    assert_eq!(parse_content_range("bytes */1000"), None);
+    // Malformed.
+    for bad in [
+        "",
+        "bytes",
+        "bytes ",
+        "bytes 0-99",
+        "bytes 0-/100",
+        "bytes -99/100",
+        "bytes 9-0/100",
+        "bytes 0-99/99",
+        "bytes 0-99/0",
+        "items 0-99/100",
+        "bytes0-99/100",
+        "bytes +0-99/100",
+        "bytes 0-+99/100",
+        "bytes 0-99/+100",
+        "bytes 0x0-99/100",
+        "bytes 0-99/100/1",
+        "bytes 0 -99/100",
+    ] {
+        assert_eq!(parse_content_range(bad), None, "{bad:?}");
+    }
+    // Overflow.
+    assert_eq!(parse_content_range("bytes 0-18446744073709551616/*"), None);
+    assert_eq!(
+        parse_content_range("bytes 0-18446744073709551614/18446744073709551615"),
+        Some((0, u64::MAX - 1, Some(u64::MAX)))
+    );
+    assert_eq!(
+        parse_content_range("bytes 0-1/99999999999999999999999999"),
+        None
+    );
+    assert_eq!(
+        parse_content_range(&format!("bytes {}-1/2", "9".repeat(10_000))),
+        None
+    );
+}

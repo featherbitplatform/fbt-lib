@@ -58,6 +58,7 @@ jobs:
           - socks5
           - http_connect
           - scrape
+          - web_seed_head
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

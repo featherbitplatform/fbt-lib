@@ -77,6 +77,16 @@ pub enum SessionError {
     /// it (see [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage)).
     #[error("too many commands wait for the storage move")]
     Busy,
+    /// A web seed URL given to
+    /// [`TorrentHandle::add_web_seed`](crate::TorrentHandle::add_web_seed)
+    /// is not `http://` or `https://`, or is longer than 2048 bytes; the
+    /// message is the URL.
+    #[error("invalid web seed url: {0}")]
+    InvalidUrl(String),
+    /// The torrent already has
+    /// [`MAX_WEB_SEEDS`](fbt_metainfo::MAX_WEB_SEEDS) web seeds.
+    #[error("too many web seeds")]
+    TooManyWebSeeds,
 }
 
 /// Why a [`FileReader`](crate::FileReader) read failed. It comes inside the

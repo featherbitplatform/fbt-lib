@@ -17,6 +17,7 @@
 //! - `deadline`: the pieces open file readers wait for, and when.
 //! - `readers`: open file readers, their reads and read-ahead.
 //! - `storage_ops`: moving the storage and renaming files.
+//! - `webseed`: web seeds (BEP 19), fetched from as pseudo-peers.
 
 mod actor;
 mod announcer;
@@ -39,6 +40,7 @@ mod smartban;
 mod storage_ops;
 mod swarm;
 mod tiers;
+mod webseed;
 
 pub(crate) use deadline::ReaderId;
 
@@ -141,6 +143,12 @@ pub(crate) enum Cmd {
     /// Answers once every earlier command is applied, with the status
     /// published.
     Sync(oneshot::Sender<()>),
+    /// Adds a web seed (or revives a retired one).
+    AddWebSeed(String, oneshot::Sender<Result<(), SessionError>>),
+    /// Removes a web seed.
+    RemoveWebSeed(String, oneshot::Sender<()>),
+    /// Every web seed's URL.
+    WebSeeds(oneshot::Sender<Vec<String>>),
 }
 
 /// Where an added torrent starts in the session's queue.
@@ -454,6 +462,38 @@ impl TorrentHandle {
         }
         let path = plain_rel_path(path)?;
         self.call(|tx| Cmd::RenameFile { index, path, tx }).await?
+    }
+
+    /// Adds the web seed (BEP 19) `url`, an `http://` or `https://` URL as
+    /// in a `.torrent`'s `url-list`: a URL ending in `/` is the directory
+    /// the torrent's name (and, for a multi-file torrent, its paths) are
+    /// below. It is fetched from while the torrent is downloading and
+    /// active (never while paused or queued), private torrents included,
+    /// with [`Settings::proxy`](crate::Settings::proxy) applying as for
+    /// peers (`proxy_peers`) and the download limits as for peers. Adding
+    /// a URL already there does nothing, except that a retired one is
+    /// taken back into use.
+    ///
+    /// Fails with [`SessionError::InvalidUrl`] for anything but an `http`
+    /// or `https` URL of at most 2048 bytes, and with
+    /// [`SessionError::TooManyWebSeeds`] when the torrent has
+    /// [`MAX_WEB_SEEDS`](fbt_metainfo::MAX_WEB_SEEDS) (16).
+    pub async fn add_web_seed(&self, url: String) -> Result<(), SessionError> {
+        self.call(|tx| Cmd::AddWebSeed(url, tx)).await?
+    }
+
+    /// Removes the web seed `url`, cancelling its request in flight;
+    /// nothing if there is none.
+    pub async fn remove_web_seed(&self, url: &str) -> Result<(), SessionError> {
+        let url = url.to_owned();
+        self.call(|tx| Cmd::RemoveWebSeed(url, tx)).await
+    }
+
+    /// The torrent's web seeds, in the order added (the `.torrent`'s or
+    /// magnet's first), retired ones included
+    /// ([`TorrentStatus::num_web_seeds`] counts those in use).
+    pub async fn web_seeds(&self) -> Result<Vec<String>, SessionError> {
+        self.call(Cmd::WebSeeds).await
     }
 
     /// Puts the torrent under the session's queue ([`Settings::queue`](crate::Settings::queue))

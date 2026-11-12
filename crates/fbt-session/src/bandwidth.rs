@@ -560,6 +560,16 @@ impl Bandwidth {
         });
     }
 
+    /// The download throttle of a torrent's web seeds: the session's
+    /// global download limit, then the torrent's `torrent`. Web seeds are
+    /// not peers: no transport class, no local exemption, not counted for
+    /// mixed mode.
+    pub(crate) fn web_seed(&self, torrent: &BucketPair) -> Throttle {
+        Throttle {
+            chain: vec![Arc::clone(&self.global.down), Arc::clone(&torrent.down)],
+        }
+    }
+
     /// The throttles of a connection over `transport` to `ip`, for a
     /// torrent with the buckets `torrent`. A peer the global limit applies
     /// to is counted for mixed mode while the result lives.

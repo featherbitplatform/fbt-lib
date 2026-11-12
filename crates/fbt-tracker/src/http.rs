@@ -1,10 +1,11 @@
 //! HTTP(S) announce: request building, redirect handling, capped body read
-//! and untrusted-response parsing.
+//! and untrusted-response parsing; byte-range fetches for web seeds.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::Range;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use fbt_bencode::{Value, ValueKind, decode};
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, Uri, header};
@@ -23,13 +24,18 @@ use crate::{
 
 const MAX_REDIRECTS: usize = 3;
 const MIN_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// Most bytes reserved up front for a range body; it grows past this only
+/// as bytes arrive.
+const MAX_RANGE_PREALLOC: usize = 1 << 20;
+
+/// An HTTP client with its pooled connections.
+type HttpPool = Client<Connector, Empty<Bytes>>;
 
 pub(crate) struct HttpClient {
     /// For announces: through the proxy with `proxy_trackers`.
-    trackers: Client<Connector, Empty<Bytes>>,
+    trackers: HttpPool,
     /// For web seeds: through the proxy with `proxy_peers`.
-    #[expect(dead_code, reason = "the web seed fetcher is its first user")]
-    web_seeds: Client<Connector, Empty<Bytes>>,
+    web_seeds: HttpPool,
     user_agent: String,
     timeout: Duration,
     max_bytes: usize,
@@ -88,42 +94,145 @@ impl HttpClient {
         }
     }
 
-    async fn fetch(&self, mut url: String) -> Result<Vec<u8>, TrackerError> {
+    async fn fetch(&self, url: String) -> Result<Vec<u8>, TrackerError> {
+        let resp = self.follow(&self.trackers, url, None).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(TrackerError::HttpStatus(status.as_u16()));
+        }
+        self.read_capped(resp.into_body()).await
+    }
+
+    /// GETs `url` through `client` (with `range` as its `Range` header),
+    /// following at most [`MAX_REDIRECTS`] redirects (never from `https`
+    /// to `http`), and returns the final response, whatever its status.
+    /// Each request waits at most the configured timeout for its response
+    /// head.
+    async fn follow(
+        &self,
+        client: &HttpPool,
+        mut url: String,
+        range: Option<&str>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, TrackerError> {
         let mut redirects = 0;
         loop {
             let uri = check_uri(&url)?;
-            let request = Request::get(uri.clone())
-                .header(header::USER_AGENT, &self.user_agent)
+            let mut builder =
+                Request::get(uri.clone()).header(header::USER_AGENT, &self.user_agent);
+            if let Some(r) = range {
+                builder = builder.header(header::RANGE, r);
+            }
+            let request = builder
                 .body(Empty::<Bytes>::new())
                 .map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
-            let resp = self
-                .trackers
-                .request(request)
+            let resp = tokio::time::timeout(self.timeout, client.request(request))
                 .await
+                .map_err(|_| TrackerError::Timeout)?
                 .map_err(request_error)?;
-            let status = resp.status();
-            if status.is_redirection() {
-                redirects += 1;
-                if redirects > MAX_REDIRECTS {
-                    return Err(TrackerError::TooManyRedirects);
-                }
-                let location = resp
-                    .headers()
-                    .get(header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or(TrackerError::InvalidResponse("redirect without location"))?;
-                let next = resolve_location(&uri, location)?;
-                if uri.scheme_str() == Some("https") && next.starts_with("http://") {
-                    return Err(TrackerError::InvalidResponse("insecure redirect"));
-                }
-                url = next;
-                continue;
+            if !resp.status().is_redirection() {
+                return Ok(resp);
             }
-            if !status.is_success() {
-                return Err(TrackerError::HttpStatus(status.as_u16()));
+            redirects += 1;
+            if redirects > MAX_REDIRECTS {
+                return Err(TrackerError::TooManyRedirects);
             }
-            return self.read_capped(resp.into_body()).await;
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or(TrackerError::InvalidResponse("redirect without location"))?;
+            let next = resolve_location(&uri, location)?;
+            if uri.scheme_str() == Some("https") && next.starts_with("http://") {
+                return Err(TrackerError::InvalidResponse("insecure redirect"));
+            }
+            url = next;
         }
+    }
+
+    /// The bytes `range` of `url` (a web seed's file), through the web
+    /// seed client. See [`TrackerClient::fetch_range`](crate::TrackerClient::fetch_range).
+    pub(crate) async fn fetch_range(
+        &self,
+        url: &str,
+        range: Range<u64>,
+    ) -> Result<Bytes, TrackerError> {
+        let len = range.end.saturating_sub(range.start);
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+        let last = range.end - 1;
+        let header = format!("bytes={}-{last}", range.start);
+        let resp = self
+            .follow(&self.web_seeds, url.to_owned(), Some(&header))
+            .await?;
+        let status = resp.status();
+        match status.as_u16() {
+            206 => {
+                let got = resp
+                    .headers()
+                    .get(header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_content_range)
+                    .ok_or(TrackerError::InvalidResponse(
+                        "206 without a valid Content-Range",
+                    ))?;
+                if (got.0, got.1) != (range.start, last) {
+                    return Err(TrackerError::InvalidResponse(
+                        "Content-Range does not match the request",
+                    ));
+                }
+            }
+            200 => {
+                // The whole file: our range only if it is the whole file.
+                let whole = resp
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                if range.start != 0 || whole != Some(len) {
+                    return Err(TrackerError::InvalidResponse(
+                        "the server ignored the range",
+                    ));
+                }
+            }
+            code if !status.is_success() => return Err(TrackerError::HttpStatus(code)),
+            _ => {
+                return Err(TrackerError::InvalidResponse(
+                    "unexpected status for a range request",
+                ));
+            }
+        }
+        self.read_exact(resp.into_body(), len).await
+    }
+
+    /// Reads a body that must be exactly `len` bytes: a byte more is an
+    /// error at once, so at most `len + 1` bytes are ever taken in, and
+    /// no wait for the next frame may exceed the configured timeout (a
+    /// slow but live server is not cut).
+    async fn read_exact(
+        &self,
+        mut body: hyper::body::Incoming,
+        len: u64,
+    ) -> Result<Bytes, TrackerError> {
+        let cap = usize::try_from(len).map_err(|_| TrackerError::ResponseTooLarge)?;
+        let mut out = BytesMut::with_capacity(cap.min(MAX_RANGE_PREALLOC));
+        loop {
+            let frame = match tokio::time::timeout(self.timeout, body.frame()).await {
+                Err(_) => return Err(TrackerError::Timeout),
+                Ok(None) => break,
+                Ok(Some(frame)) => frame.map_err(|e| TrackerError::Io(std::io::Error::other(e)))?,
+            };
+            if let Some(data) = frame.data_ref() {
+                if out.len().saturating_add(data.len()) > cap {
+                    return Err(TrackerError::ResponseTooLarge);
+                }
+                out.extend_from_slice(data);
+            }
+        }
+        if out.len() != cap {
+            return Err(TrackerError::InvalidResponse("body shorter than the range"));
+        }
+        Ok(out.freeze())
     }
 
     async fn read_capped(&self, mut body: hyper::body::Incoming) -> Result<Vec<u8>, TrackerError> {
@@ -139,6 +248,37 @@ impl HttpClient {
         }
         Ok(out)
     }
+}
+
+/// Parses a `Content-Range` header value, `bytes a-b/total` or
+/// `bytes a-b/*`, into `(a, b, total)`: `a <= b`, and `b < total` when the
+/// total is known. Anything else (an unsatisfied `*/total`, signs, spaces
+/// inside numbers, overflow) is `None`. Input is untrusted.
+#[doc(hidden)]
+pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let (unit, rest) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim_start().split_once('/')?;
+    let (a, b) = range.split_once('-')?;
+    let (a, b) = (decimal(a)?, decimal(b)?);
+    let total = match total {
+        "*" => None,
+        t => Some(decimal(t)?),
+    };
+    if a > b || total.is_some_and(|t| b >= t) {
+        return None;
+    }
+    Some((a, b, total))
+}
+
+/// A non-empty run of ASCII digits that fits a `u64`.
+fn decimal(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 /// A failed request: [`TrackerError::Proxy`] when the proxy failed (a

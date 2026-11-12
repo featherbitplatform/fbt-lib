@@ -58,8 +58,7 @@ const BAN_TRUST: i32 = -7;
 pub(super) enum BlockSource {
     /// A peer, by its ban key: port 0 (its whole IP) unless `ban_endpoints`.
     Peer(SocketAddr),
-    /// A web seed.
-    #[allow(dead_code, reason = "web seeds (Task 11) are its first producer")]
+    /// A web seed, by its key.
     WebSeed(PeerKey),
 }
 

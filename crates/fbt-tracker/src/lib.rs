@@ -19,13 +19,16 @@ mod types;
 mod udp;
 mod urlencode;
 
+use std::ops::Range;
 use std::sync::Arc;
+
+use bytes::Bytes;
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_net::proxy::ProxyConfig;
 
 #[doc(hidden)]
-pub use http::parse_http_announce;
+pub use http::{parse_content_range, parse_http_announce};
 #[doc(hidden)]
 pub use scrape::{parse_http_scrape, parse_udp_scrape};
 pub use types::{
@@ -108,6 +111,27 @@ impl TrackerClient {
             "udp" => self.inner.udp.announce(url, req).await,
             other => Err(TrackerError::UnsupportedScheme(other.to_owned())),
         }
+    }
+
+    /// Fetches the bytes `range` of `url` (a BEP 19 web seed's file) with
+    /// a `Range: bytes=a-b` header, over the web seed client: through the
+    /// proxy when it sets `proxy_peers`, with keep-alive and TLS as for
+    /// announces, following at most 3 redirects (never from `https` to
+    /// `http`).
+    ///
+    /// The answer must be `206` with a `Content-Range` naming exactly the
+    /// range, or `200` only when the range starts at 0 and the
+    /// `Content-Length` is its length (the whole file); a range the server
+    /// ignored is [`TrackerError::InvalidResponse`], a non-success status
+    /// [`TrackerError::HttpStatus`]. At most `range.end - range.start + 1`
+    /// bytes of the body are read, whatever `max_response_bytes` says: a
+    /// longer body is [`TrackerError::ResponseTooLarge`], a shorter one
+    /// [`TrackerError::InvalidResponse`]. `http_timeout` bounds each wait
+    /// (for the response head, then for each piece of the body), not the
+    /// whole transfer, so a slow but live server is never cut. An empty
+    /// range returns no bytes without a request.
+    pub async fn fetch_range(&self, url: &str, range: Range<u64>) -> Result<Bytes, TrackerError> {
+        self.inner.http.fetch_range(url, range).await
     }
 
     /// Scrapes `url` for `hashes` (BEP 48 over HTTP, BEP 15 action 2 over

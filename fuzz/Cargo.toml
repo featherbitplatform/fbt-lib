@@ -168,3 +168,10 @@ path = "fuzz_targets/scrape.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "web_seed_head"
+path = "fuzz_targets/web_seed_head.rs"
+test = false
+doc = false
+bench = false
