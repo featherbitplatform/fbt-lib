@@ -65,7 +65,8 @@ pub struct Magnet {
     pub display_name: Option<String>,
     /// `tr` trackers, de-duplicated, in order.
     pub trackers: Vec<String>,
-    /// `ws` web seeds: `http` and `https` URLs, de-duplicated, at most
+    /// `ws` web seeds: `http` and `https` URLs, de-duplicated (malformed values
+    /// are dropped, not errors), at most
     /// [`MAX_WEB_SEEDS`](crate::MAX_WEB_SEEDS).
     pub web_seeds: Vec<String>,
     /// `x.pe` peers that are IP literals with a non-zero port.
@@ -130,8 +131,11 @@ impl Magnet {
                     }
                 }
                 k if is_indexed(k, "ws") => {
-                    let url = utf8(percent_decode(value, false)?)?;
-                    if web_seeds.len() < MAX_WEB_SEEDS {
+                    // A web seed is an optional hint: a malformed value is
+                    // dropped instead of failing the magnet (unlike `tr`).
+                    if let Some(url) = percent_decode(value, false).ok().and_then(|b| utf8(b).ok())
+                        && web_seeds.len() < MAX_WEB_SEEDS
+                    {
                         for u in clean_web_seeds([url.as_str()]) {
                             if !web_seeds.contains(&u) {
                                 web_seeds.push(u);

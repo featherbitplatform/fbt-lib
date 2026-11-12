@@ -161,3 +161,14 @@ fn ws_round_trips() {
     let m = Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}{many}")).unwrap();
     assert_eq!(m.web_seeds.len(), fbt_metainfo::MAX_WEB_SEEDS);
 }
+
+#[test]
+fn malformed_ws_is_dropped_not_fatal() {
+    let m = Magnet::parse(&format!(
+        "magnet:?xt=urn:btih:{HEX}&ws=http%3A%2F%2F%ZZ&ws=http%3A%2F%2F%FF&ws=http%3A%2F%2Fok.example%2F"
+    ))
+    .unwrap();
+    assert_eq!(m.web_seeds, ["http://ok.example/"]);
+    // `tr` still fails the magnet.
+    assert!(Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}&tr=%ZZ")).is_err());
+}

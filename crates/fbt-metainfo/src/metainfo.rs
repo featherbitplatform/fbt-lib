@@ -9,12 +9,12 @@ use crate::collide::resolve_collisions;
 use crate::magnet::Magnet;
 use crate::path::{RelPath, sanitize_component, sanitize_path};
 
-/// Deepest accepted file path, in components (including the root name).
 /// Most web seed URLs kept (`url-list` here, `ws` in a magnet); later ones are
 /// ignored.
 pub const MAX_WEB_SEEDS: usize = 16;
 /// Longest web seed URL kept, in bytes.
 pub(crate) const MAX_URL_LEN: usize = 2048;
+/// Deepest accepted file path, in components (including the root name).
 const MAX_PATH_DEPTH: usize = 256;
 const MAX_PIECE_LEN: i64 = 268_435_456;
 /// Most tracker URLs kept across all tiers; later ones are ignored.
