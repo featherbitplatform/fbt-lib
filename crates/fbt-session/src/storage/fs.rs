@@ -423,6 +423,7 @@ impl FsStorage {
         };
         let plen = u64::from(self.pieces.piece_len());
         let (first, last) = (range.start / plen, (range.end - 1) / plen);
+        let mut exported = None;
         for p in first..=last {
             let Ok(piece) = u32::try_from(p) else {
                 break;
@@ -443,6 +444,11 @@ impl FsStorage {
             // by the first export, as by a first write.
             let file = self.handle(idx, true)?;
             write_all_at(&file, &buf, lo - range.start).map_err(|e| at(self.path_of(idx), e))?;
+            exported = Some(file);
+        }
+        // On disk before the caller frees the slots it came from.
+        if let Some(file) = exported {
+            file.sync_data().map_err(|e| at(self.path_of(idx), e))?;
         }
         Ok(())
     }
@@ -673,6 +679,7 @@ impl Storage for FsStorage {
         let want = |i: usize| wanted.get(i).copied().unwrap_or(true);
         let mut guard = self.write_routing();
         let Routing { routed, part } = &mut *guard;
+        let first = part.is_none();
         let part = match part {
             Some(p) => p,
             None => {
@@ -687,6 +694,15 @@ impl Storage for FsStorage {
         };
         let part = part.get_mut().unwrap_or_else(|e| e.into_inner());
         routed.resize(self.entries.len(), false);
+        if first {
+            // A part file left by an earlier instance may hold the bytes of
+            // any file missing from disk, whatever the priorities were then:
+            // every such file starts routed, so the loop below exports the
+            // wanted ones instead of freeing their slots.
+            for (e, r) in self.entries.iter().zip(routed.iter_mut()) {
+                *r = !e.pad && e.len > 0 && matches!(e.path.try_exists(), Ok(false));
+            }
+        }
         {
             let mut st = self.lock();
             st.wanted = (0..self.entries.len()).map(want).collect();

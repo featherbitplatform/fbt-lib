@@ -44,11 +44,12 @@ pub trait Storage: Send + Sync + std::fmt::Debug + 'static {
     /// Removes the torrent's data.
     fn delete_files(&self) -> io::Result<()>;
     /// Which files are wanted: one flag per file (pad files included),
-    /// `false` for a skipped file. The session calls it on the disk pool
-    /// before every check and after every change of the file priorities,
-    /// once the pieces written under the old ones are on disk. The default
-    /// does nothing; [`FsStorage`] keeps skipped files that do not exist out
-    /// of the filesystem (its part file).
+    /// `false` for a skipped file. The session calls it on a blocking
+    /// thread right before every check reads the data (the check's own
+    /// thread), and on the disk pool after every change of the file
+    /// priorities, once the pieces written under the old ones are on disk.
+    /// The default does nothing; [`FsStorage`] keeps skipped files that do
+    /// not exist out of the filesystem (its part file).
     fn set_file_priorities(&self, wanted: &[bool]) -> io::Result<()> {
         let _ = wanted;
         Ok(())

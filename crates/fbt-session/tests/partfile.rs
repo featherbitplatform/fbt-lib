@@ -8,7 +8,6 @@
 
 mod support;
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -169,6 +168,8 @@ async fn unskipping_exports_from_the_part_file() {
     finished(&mut ev).await;
     assert!(!file(dir.path(), "a").exists());
     assert!(part_path(dir.path(), &m).exists());
+    assert!(requests_of(&log, 1, 0) > 0, "piece 1 came from the seed");
+    let before = log.lock().unwrap().len();
 
     h.set_file_priorities(vec![Priority::Normal, Priority::Normal, Priority::Skip])
         .await
@@ -180,17 +181,101 @@ async fn unskipping_exports_from_the_part_file() {
     // Piece 3 still holds C's bytes.
     assert!(part_path(dir.path(), &m).exists());
     // Piece 1 came from the part file, not the seed.
-    let piece1: Vec<BlockRef> = log
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|b| b.piece == 1)
-        .copied()
-        .collect();
-    let distinct: HashSet<u32> = piece1.iter().map(|b| b.offset).collect();
-    assert_eq!(piece1.len(), distinct.len(), "piece 1 requested again");
-    assert_eq!(distinct.len(), (PL / 16_384) as usize);
+    assert_eq!(requests_of(&log, 1, before), 0, "piece 1 requested again");
     s.shutdown().await;
+}
+
+/// Requests for `piece` logged from entry `from` on.
+fn requests_of(log: &Mutex<Vec<BlockRef>>, piece: u32, from: usize) -> usize {
+    let log = log.lock().unwrap();
+    log.get(from..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|b| b.piece == piece)
+        .count()
+}
+
+/// The part file outlives its session: a restart with the same priorities
+/// keeps the boundary pieces, and one with A wanted exports A's bytes from
+/// the part file instead of discarding them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn part_file_survives_a_restart() {
+    let (m, payload) = make_torrent(&FILES, PL);
+    let (seed, log) = recording_seed(&payload).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (s, h, mut ev) = leecher(dial_tcp(settings()), &m, dir.path(), skip_a_and_c()).await;
+    h.add_peer(seed).await.unwrap();
+    finished(&mut ev).await;
+    assert!(requests_of(&log, 1, 0) > 0);
+    s.shutdown().await;
+    let before = log.lock().unwrap().len();
+
+    // Same priorities, no peers: the check finds 1 and 3 in the part file.
+    let (s, h, _ev) = leecher(dial_tcp(settings()), &m, dir.path(), skip_a_and_c()).await;
+    assert_eq!(have(&h).await, vec![1, 2, 3]);
+    assert!(!file(dir.path(), "a").exists());
+    s.shutdown().await;
+
+    // A wanted at add: its bytes in piece 1 are exported, not freed.
+    let prio = vec![Priority::Normal, Priority::Normal, Priority::Skip];
+    let (s, h, mut ev) = leecher(dial_tcp(settings()), &m, dir.path(), prio).await;
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+    assert!(
+        h.pieces().await.unwrap().get(1),
+        "piece 1 lost at the restart"
+    );
+    h.add_peer(seed).await.unwrap();
+    finished(&mut ev).await;
+    assert_eq!(have(&h).await, vec![0, 1, 2, 3]);
+    assert!(std::fs::read(file(dir.path(), "a")).unwrap() == payload[..A]);
+    assert!(!file(dir.path(), "c").exists());
+    assert_eq!(requests_of(&log, 1, before), 0, "piece 1 requested again");
+    s.shutdown().await;
+}
+
+/// A corrupt part file found at add is set aside as `.parts.bad`; the
+/// torrent downloads its boundary pieces again and finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_part_file_at_add_is_set_aside() {
+    let (m, payload) = make_torrent(&FILES, PL);
+    let seed = seeder(&m, &payload).await;
+    let dir = tempfile::tempdir().unwrap();
+    let part = part_path(dir.path(), &m);
+    let junk = b"FBTPART1\xff\xff\xff\xffjunk".to_vec();
+    std::fs::write(&part, &junk).unwrap();
+    let (s, h, mut ev) = leecher(settings(), &m, dir.path(), skip_a_and_c()).await;
+    h.add_peer(seed.local_addr()).await.unwrap();
+    finished(&mut ev).await;
+    assert_eq!(have(&h).await, vec![1, 2, 3]);
+    let mut bad = part.clone().into_os_string();
+    bad.push(".bad");
+    assert_eq!(std::fs::read(&bad).unwrap(), junk);
+    assert!(part.exists(), "a fresh part file holds the boundary bytes");
+    assert!(!file(dir.path(), "a").exists());
+    s.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// A zero-length skipped file is never created; once wanted, it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_length_skipped_file_is_never_created() {
+    let (m, payload) = make_torrent(&[("a", A), ("e", 0), ("b", B)], PL);
+    let seed = seeder(&m, &payload).await;
+    let dir = tempfile::tempdir().unwrap();
+    let prio = vec![Priority::Normal, Priority::Skip, Priority::Normal];
+    let (s, h, mut ev) = leecher(settings(), &m, dir.path(), prio).await;
+    h.add_peer(seed.local_addr()).await.unwrap();
+    finished(&mut ev).await;
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    let e = file(dir.path(), "e");
+    assert!(file(dir.path(), "a").exists());
+    assert!(!e.exists(), "skipped empty file created");
+    h.set_file_priorities(vec![Priority::Normal; 3])
+        .await
+        .unwrap();
+    assert!(e.exists(), "wanted empty file missing");
+    s.shutdown().await;
+    seed.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -302,6 +387,7 @@ async fn lost_skipped_piece_does_not_refinish() {
     // A reader brings piece 4 (wholly in C) into the part file.
     assert!(read_file(&h, 2, 0, C).await == payload[A + B..]);
     // On disk, then gone: the part file keeps its header and table only.
+    // (Pieces 1 and 3 lose their bytes too, but nothing reads them here.)
     let part = part_path(dir.path(), &m);
     // Pieces 1 and 3 took slots 0 and 1, piece 4 slot 2.
     let written = (16 + 5 * 4 + 2 * PL as usize + (A + B + C - 4 * PL as usize)) as u64;
