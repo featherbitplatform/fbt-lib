@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `fbt-session`: skipping the files still missing while a piece of one of them was being hashed no longer leaves that piece in the write-back cache until `cache_expiry`, which held `Seeding` back as long (or reported `TorrentFinished` before it)
+
 ## [0.3.0] - 2026-11-11
 
 ### Added
