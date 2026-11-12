@@ -11,7 +11,7 @@ use fbt::{
     SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
     TrackerConfig, TrackerError, Transport,
 };
-use fbt::{BlockReason, IpFilter};
+use fbt::{BlockReason, IpFilter, MoveMode};
 use fbt::{
     CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
     PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
@@ -80,6 +80,7 @@ fn names(
     _: Option<ProxyKind>,
     _: Option<IpFilter>,
     _: Option<BlockReason>,
+    _: Option<MoveMode>,
 ) {
 }
 
@@ -137,6 +138,52 @@ fn peer_blocked(e: &Event) -> Option<(Option<InfoHashes>, std::net::SocketAddr, 
             reason,
         } => Some((*torrent, *addr, *reason)),
         _ => None,
+    }
+}
+
+/// Moving the storage and renaming files.
+async fn storage_methods(h: &TorrentHandle) {
+    let _ = [
+        MoveMode::FailIfExists,
+        MoveMode::ReplaceExisting,
+        MoveMode::KeepExisting,
+    ];
+    assert_eq!(MoveMode::default(), MoveMode::FailIfExists);
+    let _: Result<(), SessionError> = h
+        .move_storage(std::path::PathBuf::new(), MoveMode::default())
+        .await;
+    let _: Result<(), SessionError> = h.rename_file(0, "x").await;
+    let _: std::path::PathBuf = h.status().save_path;
+    let _ = [
+        SessionError::InvalidPath(String::new()),
+        SessionError::Unsupported,
+    ];
+}
+
+/// The fields the storage events carry.
+fn storage_events(e: &Event) {
+    match e {
+        Event::StorageMoved { torrent, path } => {
+            let _: (&InfoHashes, &std::path::PathBuf) = (torrent, path);
+        }
+        Event::StorageMoveFailed { torrent, message } => {
+            let _: (&InfoHashes, &String) = (torrent, message);
+        }
+        Event::FileRenamed {
+            torrent,
+            index,
+            path,
+        } => {
+            let _: (&InfoHashes, &usize, &String) = (torrent, index, path);
+        }
+        Event::FileRenameFailed {
+            torrent,
+            index,
+            message,
+        } => {
+            let _: (&InfoHashes, &usize, &String) = (torrent, index, message);
+        }
+        _ => {}
     }
 }
 

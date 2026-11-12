@@ -271,6 +271,11 @@ impl Actor {
             self.answer_read(req, &data);
             return;
         }
+        if self.storage_busy {
+            // The files are moving: served once they are in place.
+            self.readers.waiting.entry(piece).or_default().push(req);
+            return;
+        }
         let size = layout.piece_size(piece);
         if size <= WHOLE_PIECE_READ_MAX {
             if let Some(read) = self.piece_reads.get_mut(&piece) {
@@ -302,6 +307,7 @@ impl Actor {
         };
         let generation = self.generation;
         let (reader, offset, len, tx) = req;
+        self.reads_in_flight = self.reads_in_flight.saturating_add(1);
         self.shared.disk.spawn(&mut self.jobs, move || {
             // A seek dropped the answer before the read started: skip it.
             let result = if tx.is_closed() {
@@ -520,7 +526,7 @@ impl Actor {
     /// Reads up to [`READ_PREFETCH_PIECES`] pieces we have after `q` in
     /// `file` into the clean cache, when the budget allows.
     fn prefetch_after(&mut self, q: u32, file: &Range<u64>) {
-        if !matches!(self.phase, Phase::Ready) {
+        if !matches!(self.phase, Phase::Ready) || self.storage_busy {
             return;
         }
         let Some(l) = self.loaded.as_ref() else {
@@ -972,6 +978,7 @@ mod tests {
                 generation: a.generation,
                 reserved: 0,
                 waiting: vec![Waiter::Reader((id, 5 * u64::from(PL), 100, tx))],
+                started: true,
             },
         );
         a.drop_piece_reads();

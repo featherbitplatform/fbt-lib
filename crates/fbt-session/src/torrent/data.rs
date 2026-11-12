@@ -89,6 +89,8 @@ pub(crate) enum Job {
         tx: Answer,
         result: io::Result<Vec<u8>>,
     },
+    /// The storage operation (move or rename) returned.
+    StorageOp { result: io::Result<()> },
 }
 
 impl Actor {
@@ -116,13 +118,19 @@ impl Actor {
                 generation,
                 piece,
                 result,
-            } => self.on_read_piece(generation, piece, result),
+            } => {
+                self.reads_in_flight = self.reads_in_flight.saturating_sub(1);
+                self.on_read_piece(generation, piece, result);
+            }
             Job::Read {
                 generation,
                 key,
                 block,
                 result,
-            } => self.on_read_block(generation, key, block, result),
+            } => {
+                self.reads_in_flight = self.reads_in_flight.saturating_sub(1);
+                self.on_read_block(generation, key, block, result);
+            }
             Job::ReadChunk {
                 generation,
                 reader,
@@ -130,7 +138,11 @@ impl Actor {
                 len,
                 tx,
                 result,
-            } => self.on_read_chunk(generation, (reader, offset, len, tx), result),
+            } => {
+                self.reads_in_flight = self.reads_in_flight.saturating_sub(1);
+                self.on_read_chunk(generation, (reader, offset, len, tx), result);
+            }
+            Job::StorageOp { result } => self.on_storage_done(result),
             Job::Flushed { generation, result } => {
                 // A check since then starts its own finish.
                 if generation == self.generation {
@@ -139,6 +151,9 @@ impl Actor {
             }
             Job::Metadata { key, ban, result } => self.on_metadata_job(key, ban, result),
         }
+        // Whatever returned may have been the last thing a storage
+        // operation waited for.
+        self.try_start_storage_job();
     }
 
     /// A block we requested arrived from `key`.
@@ -330,6 +345,11 @@ impl Actor {
 
     /// Hands the dirty pieces `reason` selects to writes on the disk pool.
     pub(super) fn flush(&mut self, reason: FlushReason) {
+        // The files are moving: verified pieces stay dirty until they are
+        // in place.
+        if self.storage_busy {
+            return;
+        }
         let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
             return;
         };
@@ -376,7 +396,7 @@ impl Actor {
     /// Once a finished torrent's pieces are all written, the storage is
     /// flushed; `TorrentFinished` follows the flush.
     pub(super) fn maybe_finish(&mut self) {
-        if !self.finish_pending || !self.cache.is_idle() {
+        if !self.finish_pending || !self.cache.is_idle() || self.storage_busy {
             return;
         }
         self.finish_pending = false;

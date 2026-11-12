@@ -8,11 +8,30 @@ mod mem;
 mod part;
 
 use std::io;
+use std::path::Path;
+
+use fbt_metainfo::RelPath;
 
 pub use cache::CacheStats;
 pub use check::{check_pieces, sha1_piece};
 pub use fs::{FsStorage, StorageError, error_path};
 pub use mem::MemStorage;
+
+/// What [`Storage::move_to`] does with files that already exist at the
+/// target.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MoveMode {
+    /// Checks every target first and moves nothing if any exists.
+    #[default]
+    FailIfExists,
+    /// Overwrites files at the target.
+    ReplaceExisting,
+    /// Keeps the files at the target (ours stay at the old path); the
+    /// session rechecks the torrent afterwards.
+    KeepExisting,
+}
 
 /// Random-access storage for the concatenated torrent content.
 ///
@@ -53,6 +72,23 @@ pub trait Storage: Send + Sync + std::fmt::Debug + 'static {
     fn set_file_priorities(&self, wanted: &[bool]) -> io::Result<()> {
         let _ = wanted;
         Ok(())
+    }
+    /// Moves the torrent's data below `save_path`, per `mode`. The session
+    /// calls it on the disk pool with no read or write of this storage
+    /// running, every verified piece written first. A failure must leave
+    /// the data usable where it was. The default fails with
+    /// [`io::ErrorKind::Unsupported`].
+    fn move_to(&self, save_path: &Path, mode: MoveMode) -> io::Result<()> {
+        let _ = (save_path, mode);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Gives file `index` the path `path`, relative to the save path, with
+    /// the same guarantees as [`move_to`](Self::move_to). The session has
+    /// checked that `path` collides with no other file. The default fails
+    /// with [`io::ErrorKind::Unsupported`].
+    fn rename_file(&self, index: usize, path: &RelPath) -> io::Result<()> {
+        let _ = (index, path);
+        Err(io::ErrorKind::Unsupported.into())
     }
 }
 

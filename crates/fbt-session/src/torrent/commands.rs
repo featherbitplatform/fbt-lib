@@ -21,6 +21,10 @@ use crate::storage::cache::FlushReason;
 
 impl Actor {
     pub(super) async fn on_cmd(&mut self, cmd: Cmd) -> Flow {
+        if self.storage_busy && cmd.waits_for_storage() {
+            self.deferred.push_back(cmd);
+            return Flow::Continue;
+        }
         match cmd {
             Cmd::Pause(tx) => {
                 if !self.paused {
@@ -140,6 +144,8 @@ impl Actor {
             Cmd::DebugDeadlines(tx) => {
                 let _ = tx.send(self.debug_deadlines());
             }
+            Cmd::MoveStorage { path, mode, tx } => self.on_move_storage(path, mode, tx).await,
+            Cmd::RenameFile { index, path, tx } => self.on_rename_file(index, path, tx).await,
         }
         Flow::Continue
     }
@@ -325,7 +331,8 @@ impl Actor {
         // Pending jobs finish before files are flushed or deleted. A hash
         // that passes meanwhile is written too; reads and checks are moot.
         while let Some(r) = self.jobs.join_next().await {
-            if let Ok(job @ (Job::Hashed { .. } | Job::WroteRun { .. })) = r {
+            if let Ok(job @ (Job::Hashed { .. } | Job::WroteRun { .. } | Job::StorageOp { .. })) = r
+            {
                 self.on_job(job);
             }
             if !delete {

@@ -204,6 +204,43 @@ pub enum Event {
         /// The error.
         message: String,
     },
+    /// [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage)
+    /// finished: the torrent's files are below `path` now.
+    StorageMoved {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The new save path.
+        path: PathBuf,
+    },
+    /// [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage)
+    /// failed; whatever it moved was moved back, and the torrent keeps
+    /// running from the old save path.
+    StorageMoveFailed {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The error.
+        message: String,
+    },
+    /// [`TorrentHandle::rename_file`](crate::TorrentHandle::rename_file)
+    /// finished.
+    FileRenamed {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The file's index.
+        index: usize,
+        /// Its new path, relative to the save path, `/`-separated.
+        path: String,
+    },
+    /// [`TorrentHandle::rename_file`](crate::TorrentHandle::rename_file)
+    /// failed; the file keeps its path.
+    FileRenameFailed {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The file's index.
+        index: usize,
+        /// The error.
+        message: String,
+    },
     /// The router mapped a listen port (UPnP, PCP or NAT-PMP), or the
     /// mapping's external address changed.
     #[non_exhaustive]
@@ -255,7 +292,7 @@ bitflags::bitflags! {
         const TRACKER = 1 << 2;
         /// Peer connects and disconnects, peers found, peers blocked.
         const PEER = 1 << 3;
-        /// Storage errors.
+        /// Storage errors, storage moves and file renames.
         const STORAGE = 1 << 4;
         /// The session's DHT node.
         const DHT = 1 << 5;
@@ -291,7 +328,11 @@ impl Event {
             | Event::PeersFound { .. }
             | Event::PeerBlocked { .. } => EventMask::PEER,
             Event::DhtBootstrapped { .. } => EventMask::DHT,
-            Event::FileError { .. } => EventMask::STORAGE,
+            Event::FileError { .. }
+            | Event::StorageMoved { .. }
+            | Event::StorageMoveFailed { .. }
+            | Event::FileRenamed { .. }
+            | Event::FileRenameFailed { .. } => EventMask::STORAGE,
             Event::PortMapped { .. }
             | Event::PortMappingFailed { .. }
             | Event::ExternalIpChanged { .. } => EventMask::NAT,

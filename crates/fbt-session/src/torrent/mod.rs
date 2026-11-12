@@ -16,6 +16,7 @@
 //! - `pex`: peer exchange (BEP 11) with connected peers.
 //! - `deadline`: the pieces open file readers wait for, and when.
 //! - `readers`: open file readers, their reads and read-ahead.
+//! - `storage_ops`: moving the storage and renaming files.
 
 mod actor;
 mod announcer;
@@ -35,18 +36,20 @@ mod readers;
 mod retries;
 mod serve;
 mod smartban;
+mod storage_ops;
 mod swarm;
 mod tiers;
 
 pub(crate) use deadline::ReaderId;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
 use fbt_core::{Bitfield, InfoHashes};
-use fbt_metainfo::Metainfo;
+use fbt_metainfo::{Metainfo, RelPath, sanitize_path};
 use fbt_wire::Handshake;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -56,7 +59,7 @@ use crate::event::PeerSource;
 use crate::peer::conn::PeerStream;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
-use crate::storage::Storage;
+use crate::storage::{MoveMode, Storage};
 use crate::stream::reader::ReaderLink;
 use crate::stream::{FileReader, ReadAhead};
 
@@ -113,6 +116,19 @@ pub(crate) enum Cmd {
     },
     /// Tests: the merged deadlines.
     DebugDeadlines(oneshot::Sender<Vec<(u32, Duration)>>),
+    /// Moves the storage below `path`.
+    MoveStorage {
+        path: PathBuf,
+        mode: MoveMode,
+        tx: oneshot::Sender<Result<(), SessionError>>,
+    },
+    /// Renames file `index` to `path` (relative to the save path, already
+    /// sanitised; the actor checks collisions).
+    RenameFile {
+        index: usize,
+        path: RelPath,
+        tx: oneshot::Sender<Result<(), SessionError>>,
+    },
 }
 
 #[derive(Debug)]
@@ -145,12 +161,13 @@ pub(crate) fn spawn(
 ) -> TorrentHandle {
     let ih = params.source.info_hashes();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
-    let initial = match &params.source {
+    let mut initial = match &params.source {
         TorrentSource::Metainfo(m) => TorrentStatus::initial(ih, m.info.name.clone(), true),
         TorrentSource::Magnet(m) => {
             TorrentStatus::initial(ih, m.display_name.clone().unwrap_or_default(), false)
         }
     };
+    initial.save_path = params.save_path.clone();
     let (status_tx, status_rx) = watch::channel(initial);
     let metainfo = Arc::new(OnceLock::new());
     let handle = TorrentHandle {
@@ -344,6 +361,54 @@ impl TorrentHandle {
         ))
     }
 
+    /// Moves the torrent's files below `path` (libtorrent's
+    /// `move_storage`). Every verified piece is written first; reads wait
+    /// while the files move and then continue from the new place. `mode`
+    /// says what happens to files already at the target;
+    /// [`MoveMode::KeepExisting`] rechecks the torrent afterwards. Returns
+    /// once the move is done, with
+    /// [`Event::StorageMoved`](crate::Event::StorageMoved) or
+    /// [`Event::StorageMoveFailed`](crate::Event::StorageMoveFailed)
+    /// ([`EventMask::STORAGE`](crate::EventMask::STORAGE)) emitted. A
+    /// failed move puts back what it moved and the torrent keeps running
+    /// from the old path. Moving to the current path does nothing. Before a
+    /// magnet's metadata arrives only the save path changes.
+    ///
+    /// Fails with [`SessionError::Storage`] when the move fails (an
+    /// [`io::ErrorKind::AlreadyExists`](std::io::ErrorKind::AlreadyExists)
+    /// error for [`MoveMode::FailIfExists`] with a file at the target) and
+    /// [`SessionError::Unsupported`] for a custom storage that cannot move.
+    pub async fn move_storage(&self, path: PathBuf, mode: MoveMode) -> Result<(), SessionError> {
+        self.call(|tx| Cmd::MoveStorage { path, mode, tx }).await?
+    }
+
+    /// Gives file `index` the path `path`, relative to the save path (not
+    /// to the torrent's directory, as libtorrent), `/`-separated. Returns
+    /// once the file is renamed, with
+    /// [`Event::FileRenamed`](crate::Event::FileRenamed) or
+    /// [`Event::FileRenameFailed`](crate::Event::FileRenameFailed)
+    /// emitted; reads wait meanwhile, as for
+    /// [`move_storage`](Self::move_storage).
+    ///
+    /// Fails with [`SessionError::InvalidPath`] for a path that is not a
+    /// plain relative one (empty, `.`, `..` or empty components, or any
+    /// name the torrent path sanitiser would change) or that collides with
+    /// another file (the same path ignoring case and Unicode normalisation,
+    /// or one being a directory of the other);
+    /// [`SessionError::InvalidFileIndex`] for an index out of range or
+    /// naming a pad file; [`SessionError::NoMetadata`] before a magnet's
+    /// metadata; [`SessionError::Storage`] when the rename fails (a file
+    /// not ours at the target is never overwritten).
+    pub async fn rename_file(&self, index: usize, path: &str) -> Result<(), SessionError> {
+        let meta = self.metainfo().ok_or(SessionError::NoMetadata)?;
+        let files = meta.info.files.len();
+        if meta.info.files.get(index).is_none_or(|f| f.pad) {
+            return Err(SessionError::InvalidFileIndex { index, files });
+        }
+        let path = plain_rel_path(path)?;
+        self.call(|tx| Cmd::RenameFile { index, path, tx }).await?
+    }
+
     /// Tests: the pieces open readers wait for, earliest deadline first,
     /// with the time left until each is due; empty once the torrent is gone.
     #[doc(hidden)]
@@ -441,6 +506,23 @@ impl TorrentHandle {
         self.inner.cmds.send(Cmd::Shutdown(tx)).await.ok()?;
         Some(rx)
     }
+}
+
+/// `path` split on `/` as a sanitised relative path, refused when
+/// sanitising would change it.
+fn plain_rel_path(path: &str) -> Result<RelPath, SessionError> {
+    let invalid = || SessionError::InvalidPath(path.to_owned());
+    let raw: Vec<&str> = path.split('/').collect();
+    let rel = sanitize_path(raw.iter().map(|c| c.as_bytes())).map_err(|_| invalid())?;
+    if rel
+        .components()
+        .iter()
+        .map(String::as_str)
+        .ne(raw.iter().copied())
+    {
+        return Err(invalid());
+    }
+    Ok(rel)
 }
 
 /// True if `a` and `b` are the same state, ignoring checking progress.

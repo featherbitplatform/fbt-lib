@@ -61,6 +61,18 @@ pub enum SessionError {
     /// needs could not be made; the message is the proxy error.
     #[error("proxy error: {0}")]
     Proxy(String),
+    /// A path given to
+    /// [`TorrentHandle::rename_file`](crate::TorrentHandle::rename_file) is
+    /// not a plain relative path (empty, with `.`/`..` or empty components,
+    /// or anything sanitising would change), or it collides with another
+    /// file of the torrent; the message is the path.
+    #[error("invalid path: {0}")]
+    InvalidPath(String),
+    /// The torrent's [`Storage`](crate::storage::Storage) does not support
+    /// the operation (a custom storage without `move_to` or
+    /// `rename_file`).
+    #[error("the storage does not support this operation")]
+    Unsupported,
 }
 
 /// Why a [`FileReader`](crate::FileReader) read failed. It comes inside the

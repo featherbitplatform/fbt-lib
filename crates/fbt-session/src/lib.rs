@@ -80,7 +80,7 @@ pub use settings::{
     DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, Settings,
 };
 pub use status::{TorrentState, TorrentStatus};
-pub use storage::{CacheStats, StorageError};
+pub use storage::{CacheStats, MoveMode, StorageError};
 pub use stream::{FileReader, ReadAhead};
 pub use torrent::TorrentHandle;
 

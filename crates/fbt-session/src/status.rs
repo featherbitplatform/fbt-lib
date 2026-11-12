@@ -1,5 +1,7 @@
 //! Plain-data torrent status snapshots.
 
+use std::path::PathBuf;
+
 use fbt_core::InfoHashes;
 
 /// What a torrent is doing.
@@ -67,6 +69,9 @@ pub struct TorrentStatus {
     pub num_seeds: u32,
     /// The storage or metadata error that stopped the torrent.
     pub error: Option<String>,
+    /// The directory the torrent's files are below, as added and changed
+    /// by [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage).
+    pub save_path: PathBuf,
 }
 
 impl TorrentStatus {
@@ -93,6 +98,7 @@ impl TorrentStatus {
             num_peers: 0,
             num_seeds: 0,
             error: None,
+            save_path: PathBuf::new(),
         }
     }
 }

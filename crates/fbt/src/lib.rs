@@ -272,7 +272,7 @@ pub use fbt_session::{
     AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtStats,
     DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, ExternalIpSource,
     FileReader, IpFilter, ListenError, MAX_METADATA_SIZE, MapMethod, MapProtocol, MixedMode,
-    PeerClassLimits, PeerSource, Priority, ProxyConfig, ProxyKind, RateLimit, ReadAhead,
+    MoveMode, PeerClassLimits, PeerSource, Priority, ProxyConfig, ProxyKind, RateLimit, ReadAhead,
     RemoveMode, SeedChokingAlgorithm, Session, SessionError, Settings, StorageError, StreamError,
     TorrentHandle, TorrentSource, TorrentState, TorrentStatus, Transport,
 };

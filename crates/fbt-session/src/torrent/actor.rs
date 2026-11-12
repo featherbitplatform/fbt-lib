@@ -3,16 +3,16 @@
 //! coming back as [`Job`]s, and commands to peers use `try_send` (a peer whose queue is full is
 //! closed as stalled).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use fbt_core::{InfoHashes, PieceLayout};
-use fbt_metainfo::Metainfo;
+use fbt_metainfo::{Metainfo, RelPath};
 use fbt_wire::PexFlags;
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, watch};
@@ -32,6 +32,7 @@ use super::readers::Readers;
 use super::retries::Retries;
 use super::serve::PieceReads;
 use super::smartban::SmartBan;
+use super::storage_ops::{MAX_DEFERRED_CMDS, StorageOp};
 use super::{Cmd, piece_priorities, same_state};
 use crate::bandwidth::BucketPair;
 use crate::choker::{Choker, ChokerConfig};
@@ -111,6 +112,8 @@ pub(super) struct Loaded {
     pub bufs: HashMap<u32, Vec<u8>>,
     /// Which files the storage is told are wanted; follows `file_prio`.
     pub wanted: Arc<WantedFiles>,
+    /// Files given a new path by `rename_file`, relative to the save path.
+    pub renamed: BTreeMap<usize, RelPath>,
 }
 
 /// The wanted flag of each file, for
@@ -165,6 +168,7 @@ impl Loaded {
             sequential,
             bufs: HashMap::new(),
             wanted,
+            renamed: BTreeMap::new(),
         }
     }
 }
@@ -258,6 +262,22 @@ pub(crate) struct Actor {
     pub(super) cache: PieceCache,
     /// Hash jobs running; pause waits for them, as for writes.
     pub(super) hashing: usize,
+    /// Storage reads running (`Job::Read`, `ReadPiece`, `ReadChunk`): a
+    /// storage operation waits for them.
+    pub(super) reads_in_flight: usize,
+    /// A storage operation holds the storage: no write is issued and reads
+    /// that miss the cache wait.
+    pub(super) storage_busy: bool,
+    /// The storage operation under way.
+    pub(super) storage_op: Option<StorageOp>,
+    /// Commands that wait for the storage operation, in arrival order; at
+    /// most `MAX_DEFERRED_CMDS`.
+    pub(super) deferred: VecDeque<Cmd>,
+    /// A `KeepExisting` move is done: its recheck runs, then this answers.
+    pub(super) recheck_after_move:
+        Option<tokio::sync::oneshot::Sender<Result<(), crate::error::SessionError>>>,
+    /// Where the files are (the save path given at add, changed by moves).
+    pub(super) save_path: PathBuf,
     /// The torrent finished: `TorrentFinished` follows once every piece is
     /// written and the storage flushed.
     pub(super) finish_pending: bool,
@@ -300,6 +320,7 @@ impl Actor {
     ) -> Self {
         let ih = params.source.info_hashes();
         let rate = BucketPair::new(params.rate_limit);
+        let save_path = params.save_path.clone();
         let (loaded, magnet, trackers) = match params.source {
             TorrentSource::Metainfo(m) => {
                 let trackers = m.trackers.clone();
@@ -410,6 +431,12 @@ impl Actor {
             next_pex_due: None,
             cache,
             hashing: 0,
+            reads_in_flight: 0,
+            storage_busy: false,
+            storage_op: None,
+            deferred: VecDeque::new(),
+            recheck_after_move: None,
+            save_path,
             finish_pending: false,
             finish_flush: false,
             piece_reads,
@@ -461,8 +488,20 @@ impl Actor {
         let mut rechoke = tokio::time::interval(self.shared.settings.rechoke_interval);
         rechoke.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
+            if !self.storage_busy {
+                if self.recheck_after_move.is_some() {
+                    self.finish_keep_existing().await;
+                    continue;
+                }
+                if let Some(cmd) = self.deferred.pop_front() {
+                    if let Flow::Exit = self.on_cmd(cmd).await {
+                        return;
+                    }
+                    continue;
+                }
+            }
             tokio::select! {
-                cmd = self.cmds.recv() => {
+                cmd = self.cmds.recv(), if self.deferred.len() < MAX_DEFERRED_CMDS => {
                     let Some(cmd) = cmd else {
                         // Every handle is gone, the session included.
                         let _ = self.stop(None).await;
@@ -657,6 +696,7 @@ impl Actor {
                 Phase::Error(e) => Some(e.clone()),
                 _ => None,
             },
+            save_path: self.save_path.clone(),
         }
     }
 

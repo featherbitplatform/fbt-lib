@@ -77,7 +77,22 @@ impl Actor {
             self.start_piece_read(block.piece, u64::from(size), vec![Waiter::Peer(key, block)]);
             return;
         }
+        if self.storage_busy {
+            // The files are moving: the request waits in a whole-piece
+            // read that starts once they are in place, or is rejected (the
+            // peer asks again).
+            if size <= WHOLE_PIECE_READ_MAX
+                && self.piece_reads.len() < MAX_PIECE_READS
+                && !self.piece_reads.contains_key(&block.piece)
+            {
+                self.start_piece_read(block.piece, 0, vec![Waiter::Peer(key, block)]);
+            } else {
+                self.send(key, PeerCommand::Reject(block));
+            }
+            return;
+        }
         let offset = l.layout.piece_offset(block.piece) + u64::from(block.offset);
+        self.reads_in_flight = self.reads_in_flight.saturating_add(1);
         self.shared.disk.spawn(&mut self.jobs, move || {
             let result = read_guarded(&*storage, offset, block.len as usize);
             Job::Read {
@@ -90,28 +105,42 @@ impl Actor {
     }
 
     /// Reads `piece` whole for `waiting`, under a clean reservation of
-    /// `reserved` bytes (its size, or 0: not kept).
+    /// `reserved` bytes (its size, or 0: not kept). While the storage is
+    /// busy the read is held, and starts once the operation is done.
     pub(super) fn start_piece_read(&mut self, piece: u32, reserved: u64, waiting: Vec<Waiter>) {
-        let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
+        if self.storage.is_none() || self.loaded.is_none() {
             // Unreachable (storage comes with the metadata). Serving the
             // readers again would come straight back here, and waiting
             // would hang them: they get an error.
             self.cache.release_clean(reserved);
             self.fail_reads(waiting, "the torrent has no storage");
             return;
+        }
+        let started = !self.storage_busy;
+        self.piece_reads.insert(
+            piece,
+            PieceRead {
+                generation: self.generation,
+                reserved,
+                waiting,
+                started,
+            },
+        );
+        if started {
+            self.spawn_piece_read(piece);
+        }
+    }
+
+    /// Starts the disk read of the whole-piece read entry of `piece`.
+    pub(super) fn spawn_piece_read(&mut self, piece: u32) {
+        let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
+            return;
         };
         let storage = Arc::clone(storage);
         let generation = self.generation;
         let size = l.layout.piece_size(piece);
         let offset = l.layout.piece_offset(piece);
-        self.piece_reads.insert(
-            piece,
-            PieceRead {
-                generation,
-                reserved,
-                waiting,
-            },
-        );
+        self.reads_in_flight = self.reads_in_flight.saturating_add(1);
         self.shared.disk.spawn(&mut self.jobs, move || {
             let result = read_guarded(&*storage, offset, size as usize);
             Job::ReadPiece {
@@ -314,7 +343,8 @@ impl Actor {
     }
 
     /// The pieces overlapping the torrent file that `path` names (the
-    /// longest matching entry), or just `piece` when it names none.
+    /// longest matching entry, renamed files at their new path), or just
+    /// `piece` when it names none.
     fn file_pieces(&self, path: Option<&Path>, piece: u32) -> std::ops::RangeInclusive<u32> {
         let Some(l) = self.loaded.as_ref() else {
             return piece..=piece;
@@ -322,8 +352,9 @@ impl Actor {
         let plen = u64::from(l.layout.piece_len());
         let mut off = 0u64;
         let mut best: Option<(usize, u64, u64)> = None;
-        for f in &l.meta.info.files {
-            let rel = f.path.to_path_buf();
+        for (i, f) in l.meta.info.files.iter().enumerate() {
+            // Where `rename_file` put it, if it did.
+            let rel = l.renamed.get(&i).unwrap_or(&f.path).to_path_buf();
             if !f.pad
                 && f.len > 0
                 && path.is_some_and(|p| p.ends_with(&rel))
@@ -373,6 +404,9 @@ pub(super) struct PieceRead {
     /// read without a reservation and not kept.
     pub reserved: u64,
     pub waiting: Vec<Waiter>,
+    /// Its disk read was started; a read asked for while the storage is
+    /// busy is held until the operation is done.
+    pub started: bool,
 }
 
 impl PieceRead {
@@ -425,6 +459,19 @@ impl PieceReads {
             read.waiting.extend(old.waiting);
         }
         self.reads.insert(piece, read);
+    }
+
+    /// The pieces whose reads are held, marked started: the caller starts
+    /// them.
+    pub(super) fn take_unstarted(&mut self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (&piece, r) in &mut self.reads {
+            if !r.started {
+                r.started = true;
+                out.push(piece);
+            }
+        }
+        out
     }
 
     /// Takes the entry out; its reservation is the caller's now.

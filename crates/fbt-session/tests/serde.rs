@@ -5,8 +5,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use fbt_session::{
-    ChokingAlgorithm, EncryptionPolicy, MixedMode, PeerClassLimits, Priority, RateLimit, ReadAhead,
-    RemoveMode, SeedChokingAlgorithm, Settings,
+    ChokingAlgorithm, EncryptionPolicy, MixedMode, MoveMode, PeerClassLimits, Priority, RateLimit,
+    ReadAhead, RemoveMode, SeedChokingAlgorithm, Settings,
 };
 
 fn changed() -> Settings {
@@ -130,6 +130,14 @@ fn read_ahead_and_priority_round_trip() {
     }
     for m in [RemoveMode::KeepData, RemoveMode::DeleteData] {
         let back: RemoveMode = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(m, back);
+    }
+    for m in [
+        MoveMode::FailIfExists,
+        MoveMode::ReplaceExisting,
+        MoveMode::KeepExisting,
+    ] {
+        let back: MoveMode = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(m, back);
     }
 }

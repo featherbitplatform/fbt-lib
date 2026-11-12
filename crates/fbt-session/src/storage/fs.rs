@@ -1,7 +1,7 @@
-use super::Storage;
 use super::part::PartFile;
+use super::{MoveMode, Storage};
 use fbt_core::{FileLayout, PieceLayout};
-use fbt_metainfo::Metainfo;
+use fbt_metainfo::{Metainfo, RelPath};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -100,9 +100,42 @@ fn at(path: &Path, e: io::Error) -> io::Error {
 
 #[derive(Debug)]
 struct Entry {
-    path: PathBuf,
     len: u64,
     pad: bool,
+}
+
+/// Where the files live. Changed only by `move_to` and `rename_file`,
+/// which hold the routing lock exclusively: never under a read or write.
+#[derive(Debug)]
+struct Paths {
+    save_path: PathBuf,
+    /// Per file, its path relative to `save_path`.
+    rel: Vec<RelPath>,
+    /// The part file's name inside `save_path`.
+    part_name: String,
+}
+
+impl Paths {
+    /// File `idx`'s path (the save path for an index out of range).
+    fn file(&self, idx: usize) -> PathBuf {
+        self.rel.get(idx).map_or_else(
+            || self.save_path.clone(),
+            |r| self.save_path.join(r.to_path_buf()),
+        )
+    }
+
+    fn part(&self) -> PathBuf {
+        self.save_path.join(&self.part_name)
+    }
+
+    /// The same files below `save_path`.
+    fn at(&self, save_path: &Path) -> Paths {
+        Paths {
+            save_path: save_path.to_path_buf(),
+            rel: self.rel.clone(),
+            part_name: self.part_name.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -132,9 +165,11 @@ struct State {
     synced: HashSet<usize>,
 }
 
-/// Which files live in the part file, and the part file itself.
-#[derive(Debug, Default)]
+/// Where the files are, which of them live in the part file, and the part
+/// file itself.
+#[derive(Debug)]
 struct Routing {
+    paths: Paths,
     /// Per file: its bytes go to the part file (a skipped file that did not
     /// exist on disk when the priorities were set). Empty until the first
     /// `set_file_priorities`.
@@ -178,59 +213,103 @@ impl std::fmt::Debug for ReadHook {
 /// again moves its bytes out of the part file into the file, which is
 /// created sparse where the platform supports it; the part file is deleted
 /// once it holds nothing, and by [`delete_files`](Storage::delete_files).
+///
+/// [`move_to`](Storage::move_to) and [`rename_file`](Storage::rename_file)
+/// wait for running reads and writes, close every cached handle, and move
+/// with `fs::rename`; across filesystems (and on Windows after any rename
+/// error) a file is copied, synced and only then deleted. The part file
+/// moves with the files. A move that fails moves back what it moved, so
+/// the data stays usable at the old path.
 #[derive(Debug)]
 pub struct FsStorage {
-    save_path: PathBuf,
     entries: Vec<Entry>,
     layout: FileLayout,
     pieces: PieceLayout,
-    part_path: PathBuf,
     /// Taken shared by every read and write for its whole I/O, and
-    /// exclusively by `set_file_priorities` and `delete_files`: a file
-    /// never changes place under a read. Always taken before `state`.
+    /// exclusively by `set_file_priorities`, `delete_files`, `move_to` and
+    /// `rename_file`: a file never changes place under a read. Always
+    /// taken before `state`.
     routing: RwLock<Routing>,
     state: Mutex<State>,
     #[cfg(test)]
     read_hook: std::sync::OnceLock<ReadHook>,
+    /// Tests: moves always copy, as across filesystems.
+    #[cfg(test)]
+    force_copy: std::sync::atomic::AtomicBool,
 }
 
 impl FsStorage {
     /// Storage for `metainfo`'s files below `save_path`.
     pub fn new(save_path: PathBuf, metainfo: &Metainfo) -> FsStorage {
-        let entries: Vec<Entry> = metainfo
-            .info
-            .files
+        Self::with_paths(save_path, metainfo, &[])
+    }
+
+    /// Storage for `metainfo`'s files below `save_path`, the files listed
+    /// in `renamed` at their given paths (relative to `save_path`, as
+    /// [`rename_file`](Storage::rename_file) set them). An index out of
+    /// range or naming a pad file is ignored.
+    pub fn with_paths(
+        save_path: PathBuf,
+        metainfo: &Metainfo,
+        renamed: &[(usize, RelPath)],
+    ) -> FsStorage {
+        let files = &metainfo.info.files;
+        let entries: Vec<Entry> = files
             .iter()
             .map(|f| Entry {
-                path: save_path.join(f.path.to_path_buf()),
                 len: f.len,
                 pad: f.pad,
             })
             .collect();
+        let mut rel: Vec<RelPath> = files.iter().map(|f| f.path.clone()).collect();
+        for (i, p) in renamed {
+            if let Some(r) = rel
+                .get_mut(*i)
+                .filter(|_| files.get(*i).is_some_and(|f| !f.pad))
+            {
+                *r = p.clone();
+            }
+        }
+        let paths = Paths {
+            save_path,
+            rel,
+            part_name: format!(".{}.parts", metainfo.info_hashes),
+        };
         FsStorage {
             layout: FileLayout::new(entries.iter().map(|e| e.len)),
             pieces: metainfo.piece_layout(),
-            part_path: save_path.join(format!(".{}.parts", metainfo.info_hashes)),
-            routing: RwLock::new(Routing::default()),
-            save_path,
+            routing: RwLock::new(Routing {
+                paths,
+                routed: Vec::new(),
+                part: None,
+            }),
             entries,
             state: Mutex::new(State::default()),
             #[cfg(test)]
             read_hook: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            force_copy: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// The part file: `<save_path>/.<info hash>.parts` (the v1 hash in hex
     /// for v1 and hybrid torrents). It exists only while it holds data.
     pub fn part_path(&self) -> PathBuf {
-        self.part_path.clone()
+        self.read_routing().paths.part()
+    }
+
+    /// The directory the files are below (changed by
+    /// [`move_to`](Storage::move_to)).
+    pub fn save_path(&self) -> PathBuf {
+        self.read_routing().paths.save_path.clone()
     }
 
     /// Creates every zero-length non-pad file that is not skipped (and its
     /// directories).
     pub fn create_empty_files(&self) -> io::Result<()> {
+        let routing = self.read_routing();
         let mut st = self.lock();
-        self.create_empty_locked(&mut st)
+        self.create_empty_locked(&routing.paths, &mut st)
     }
 
     #[cfg(test)]
@@ -248,6 +327,24 @@ impl FsStorage {
         let _ = self.read_hook.set(ReadHook(Box::new(hook)));
     }
 
+    #[cfg(test)]
+    fn set_force_copy(&self, on: bool) {
+        self.force_copy
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether moves skip `fs::rename` (tests of the copy fallback).
+    fn force_copy(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.force_copy.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -260,25 +357,25 @@ impl FsStorage {
         self.routing.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn create_empty_locked(&self, st: &mut State) -> io::Result<()> {
+    fn create_empty_locked(&self, paths: &Paths, st: &mut State) -> io::Result<()> {
         if st.empties_created {
             return Ok(());
         }
         let wanted = |i: usize| st.wanted.get(i).copied().unwrap_or(true);
-        for e in self
+        for (i, _) in self
             .entries
             .iter()
             .enumerate()
             .filter(|&(i, e)| e.len == 0 && !e.pad && wanted(i))
-            .map(|(_, e)| e)
         {
-            create_parent(&e.path).map_err(|err| at(&e.path, err))?;
+            let path = paths.file(i);
+            create_parent(&path).map_err(|err| at(&path, err))?;
             OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&e.path)
-                .map_err(|err| at(&e.path, err))?;
+                .open(&path)
+                .map_err(|err| at(&path, err))?;
         }
         st.empties_created = true;
         Ok(())
@@ -287,7 +384,7 @@ impl FsStorage {
     /// The (cached) handle of file `idx`, opened for writing if `write`.
     /// Only the lookup and the opening hold the lock; the caller does its
     /// I/O on the returned handle after it is released.
-    fn handle(&self, idx: usize, write: bool) -> io::Result<Arc<File>> {
+    fn handle(&self, paths: &Paths, idx: usize, write: bool) -> io::Result<Arc<File>> {
         let entry = self
             .entries
             .get(idx)
@@ -302,10 +399,11 @@ impl FsStorage {
             return Ok(Arc::clone(&h.file));
         }
         st.open.remove(&idx);
+        let path = paths.file(idx);
         let file = if write {
-            Self::open_writable(&mut st, idx, entry).map_err(|e| at(&entry.path, e))?
+            Self::open_writable(&mut st, idx, entry, &path).map_err(|e| at(&path, e))?
         } else {
-            File::open(&entry.path).map_err(|e| at(&entry.path, e))?
+            File::open(&path).map_err(|e| at(&path, e))?
         };
         if st.open.len() >= MAX_OPEN {
             let lru = st
@@ -333,14 +431,14 @@ impl FsStorage {
         Ok(file)
     }
 
-    fn open_writable(st: &mut State, idx: usize, entry: &Entry) -> io::Result<File> {
-        create_parent(&entry.path)?;
+    fn open_writable(st: &mut State, idx: usize, entry: &Entry, path: &Path) -> io::Result<File> {
+        create_parent(path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&entry.path)?;
+            .open(path)?;
         if !st.sized.contains(&idx) {
             if file.metadata()?.len() < entry.len {
                 file.set_len(entry.len)?;
@@ -361,12 +459,6 @@ impl FsStorage {
         self.entries.get(idx).is_some_and(|e| e.pad)
     }
 
-    fn path_of(&self, idx: usize) -> &Path {
-        self.entries
-            .get(idx)
-            .map_or(self.save_path.as_path(), |e| e.path.as_path())
-    }
-
     /// The piece holding torrent offset `at`, the offset in it, and how
     /// many of `len` bytes from `at` lie in that piece.
     fn piece_span(&self, at: u64, len: usize) -> io::Result<(u32, u32, usize)> {
@@ -385,13 +477,13 @@ impl FsStorage {
         let part = r
             .part
             .as_ref()
-            .ok_or_else(|| at_part(self, io::ErrorKind::NotFound.into()))?;
+            .ok_or_else(|| at_part(r, io::ErrorKind::NotFound.into()))?;
         let part = part.lock().unwrap_or_else(|e| e.into_inner());
         let mut rest = buf;
         while !rest.is_empty() {
             let (piece, off, n) = self.piece_span(at, rest.len())?;
             let (head, tail) = rest.split_at_mut(n);
-            part.read(piece, off, head).map_err(|e| at_part(self, e))?;
+            part.read(piece, off, head).map_err(|e| at_part(r, e))?;
             rest = tail;
             at += n as u64;
         }
@@ -403,13 +495,13 @@ impl FsStorage {
         let part = r
             .part
             .as_ref()
-            .ok_or_else(|| at_part(self, io::ErrorKind::NotFound.into()))?;
+            .ok_or_else(|| at_part(r, io::ErrorKind::NotFound.into()))?;
         let mut part = part.lock().unwrap_or_else(|e| e.into_inner());
         let mut rest = data;
         while !rest.is_empty() {
             let (piece, off, n) = self.piece_span(at, rest.len())?;
             let (head, tail) = rest.split_at(n);
-            part.write(piece, off, head).map_err(|e| at_part(self, e))?;
+            part.write(piece, off, head).map_err(|e| at_part(r, e))?;
             rest = tail;
             at += n as u64;
         }
@@ -417,7 +509,7 @@ impl FsStorage {
     }
 
     /// Copies the bytes of file `idx` that `part` holds into the file.
-    fn export(&self, idx: usize, part: &PartFile) -> io::Result<()> {
+    fn export(&self, paths: &Paths, idx: usize, part: &PartFile) -> io::Result<()> {
         let Some(range) = self.layout.file_range(idx).filter(|r| !r.is_empty()) else {
             return Ok(());
         };
@@ -442,13 +534,13 @@ impl FsStorage {
             }
             // Created (sparse where the platform supports it) and sized
             // by the first export, as by a first write.
-            let file = self.handle(idx, true)?;
-            write_all_at(&file, &buf, lo - range.start).map_err(|e| at(self.path_of(idx), e))?;
+            let file = self.handle(paths, idx, true)?;
+            write_all_at(&file, &buf, lo - range.start).map_err(|e| at(&paths.file(idx), e))?;
             exported = Some(file);
         }
         // On disk before the caller frees the slots it came from.
         if let Some(file) = exported {
-            file.sync_data().map_err(|e| at(self.path_of(idx), e))?;
+            file.sync_data().map_err(|e| at(&paths.file(idx), e))?;
         }
         Ok(())
     }
@@ -461,11 +553,40 @@ impl FsStorage {
             .files_overlapping(off, len)
             .any(|i| routed.get(i).copied().unwrap_or(false))
     }
+
+    /// The directories strictly below `paths.save_path` holding the
+    /// torrent's files, deepest first.
+    fn torrent_dirs(&self, paths: &Paths) -> Vec<PathBuf> {
+        let mut dirs: HashSet<PathBuf> = HashSet::new();
+        for (i, _) in self.entries.iter().enumerate().filter(|(_, e)| !e.pad) {
+            dirs.extend(dirs_below(&paths.file(i), &paths.save_path));
+        }
+        let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        dirs
+    }
+
+    /// Opens the part file at `paths`' location again after a move, or
+    /// leaves none (reopened by the next `set_file_priorities`) if that
+    /// fails.
+    fn reopen_part(&self, paths: &Paths) -> Option<Mutex<PartFile>> {
+        match PartFile::open(
+            paths.part(),
+            self.pieces.num_pieces(),
+            self.pieces.piece_len(),
+        ) {
+            Ok(p) => Some(Mutex::new(p)),
+            Err(e) => {
+                tracing::warn!(path = %paths.part().display(), error = %e, "cannot reopen the part file");
+                None
+            }
+        }
+    }
 }
 
 /// `e` naming the part file.
-fn at_part(s: &FsStorage, e: io::Error) -> io::Error {
-    at(&s.part_path, e)
+fn at_part(r: &Routing, e: io::Error) -> io::Error {
+    at(&r.paths.part(), e)
 }
 
 fn create_parent(path: &Path) -> io::Result<()> {
@@ -473,6 +594,79 @@ fn create_parent(path: &Path) -> io::Result<()> {
         Some(p) => std::fs::create_dir_all(p),
         None => Ok(()),
     }
+}
+
+/// The ancestors of `path` strictly below `root`, deepest first.
+fn dirs_below<'a>(path: &'a Path, root: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
+    path.ancestors()
+        .skip(1)
+        .take_while(move |a| *a != root && a.starts_with(root))
+        .map(Path::to_path_buf)
+}
+
+/// Removes each of `dirs` (deepest first) that is empty; best effort.
+fn remove_empty_dirs(dirs: impl IntoIterator<Item = PathBuf>) {
+    for d in dirs {
+        // Not empty, gone, or not ours to remove: left alone.
+        let _ = std::fs::remove_dir(&d);
+    }
+}
+
+/// Whether `a` and `b` name the same directory.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether something exists at `path`; an error that hides the answer is
+/// returned naming it.
+fn exists(path: &Path) -> io::Result<bool> {
+    path.try_exists().map_err(|e| at(path, e))
+}
+
+/// Moves file `from` to `to` (whose directory exists): `fs::rename`, else
+/// (across filesystems, and on Windows after any rename error, as a target
+/// on another volume reports several kinds there) a copy synced to disk
+/// before `from` is deleted. `copy` skips the rename. On failure `from` is
+/// intact; the error names the file it is about.
+fn move_file(from: &Path, to: &Path, copy: bool) -> io::Result<()> {
+    if !copy {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if cfg!(windows) || e.kind() == io::ErrorKind::CrossesDevices => {}
+            Err(e) => return Err(at(to, e)),
+        }
+    }
+    copy_then_delete(from, to)
+}
+
+fn copy_then_delete(from: &Path, to: &Path) -> io::Result<()> {
+    let mut src = File::open(from).map_err(|e| at(from, e))?;
+    let mut dst = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(to)
+        .map_err(|e| at(to, e))?;
+    let copied = io::copy(&mut src, &mut dst).and_then(|_| dst.sync_all());
+    drop(dst);
+    drop(src);
+    if let Err(e) = copied {
+        // Half a copy is no use to anyone; the source is intact.
+        let _ = std::fs::remove_file(to);
+        return Err(at(to, e));
+    }
+    if let Err(e) = std::fs::remove_file(from) {
+        // Both would exist: the move did not happen.
+        let _ = std::fs::remove_file(to);
+        return Err(at(from, e));
+    }
+    Ok(())
 }
 
 impl Storage for FsStorage {
@@ -495,7 +689,7 @@ impl Storage for FsStorage {
                 self.part_read(&routing, at_torrent, chunk)?;
                 continue;
             }
-            let file = self.handle(s.file, false)?;
+            let file = self.handle(&routing.paths, s.file, false)?;
             #[cfg(test)]
             if let Some(hook) = self.read_hook.get() {
                 (hook.0)();
@@ -506,7 +700,7 @@ impl Storage for FsStorage {
                 } else {
                     e
                 };
-                at(self.path_of(s.file), e)
+                at(&routing.paths.file(s.file), e)
             })?;
         }
         Ok(())
@@ -517,7 +711,7 @@ impl Storage for FsStorage {
         let routing = self.read_routing();
         {
             let mut st = self.lock();
-            self.create_empty_locked(&mut st)?;
+            self.create_empty_locked(&routing.paths, &mut st)?;
         }
         let slices = self.layout.map(offset, data.len() as u64);
         let mut pos = 0usize;
@@ -547,13 +741,16 @@ impl Storage for FsStorage {
                 self.part_write(&routing, here, chunk)?;
                 continue;
             }
-            let file = self.handle(s.file, true)?;
-            write_all_at(&file, chunk, s.file_offset).map_err(|e| at(self.path_of(s.file), e))?;
+            let file = self.handle(&routing.paths, s.file, true)?;
+            write_all_at(&file, chunk, s.file_offset)
+                .map_err(|e| at(&routing.paths.file(s.file), e))?;
         }
         Ok(())
     }
 
     fn flush(&self) -> io::Result<()> {
+        // Held throughout: no move changes the paths under the flush.
+        let routing = self.read_routing();
         let (open, reopen): (Vec<(usize, Arc<File>)>, Vec<usize>) = {
             let mut st = self.lock();
             let open: Vec<(usize, Arc<File>)> = st
@@ -580,16 +777,16 @@ impl Storage for FsStorage {
                     synced.push(k);
                 }
                 Err(e) => {
-                    first_err.get_or_insert_with(|| at(self.path_of(k), e));
+                    first_err.get_or_insert_with(|| at(&routing.paths.file(k), e));
                 }
             }
         }
         let mut retry = Vec::new();
         for k in reopen {
-            let path = self.path_of(k);
+            let path = routing.paths.file(k);
             let r = OpenOptions::new()
                 .write(true)
-                .open(path)
+                .open(&path)
                 .and_then(|f| f.sync_data());
             match r {
                 Ok(()) => {
@@ -605,14 +802,14 @@ impl Storage for FsStorage {
                 }
                 Err(e) => {
                     retry.push(k);
-                    first_err.get_or_insert_with(|| at(path, e));
+                    first_err.get_or_insert_with(|| at(&path, e));
                 }
             }
         }
-        if let Some(part) = self.read_routing().part.as_ref() {
+        if let Some(part) = routing.part.as_ref() {
             let part = part.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = part.sync() {
-                first_err.get_or_insert_with(|| at_part(self, e));
+                first_err.get_or_insert_with(|| at(part.path(), e));
             }
         }
         let mut st = self.lock();
@@ -623,18 +820,18 @@ impl Storage for FsStorage {
     }
 
     fn delete_files(&self) -> io::Result<()> {
-        let mut routing = self.write_routing();
-        match routing.part.as_mut() {
-            Some(part) => part
-                .get_mut()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove()
-                .map_err(|e| at_part(self, e))?,
+        let mut guard = self.write_routing();
+        let Routing { paths, part, .. } = &mut *guard;
+        match part.as_mut() {
+            Some(part) => {
+                let part = part.get_mut().unwrap_or_else(|e| e.into_inner());
+                part.remove().map_err(|e| at(part.path(), e))?;
+            }
             // Never opened by this instance: one may be left from before.
-            None => match std::fs::remove_file(&self.part_path) {
+            None => match std::fs::remove_file(paths.part()) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(at_part(self, e)),
+                Err(e) => return Err(at(&paths.part(), e)),
             },
         }
         let mut st = self.lock();
@@ -642,26 +839,16 @@ impl Storage for FsStorage {
         st.sized.clear();
         st.unsynced.clear();
         st.empties_created = false;
-        for e in self.entries.iter().filter(|e| !e.pad) {
-            match std::fs::remove_file(&e.path) {
+        for (i, _) in self.entries.iter().enumerate().filter(|(_, e)| !e.pad) {
+            let path = paths.file(i);
+            match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(at(&e.path, err)),
+                Err(err) => return Err(at(&path, err)),
             }
         }
         // Ancestor directories strictly below save_path, deepest first.
-        let mut dirs: HashSet<PathBuf> = HashSet::new();
-        for e in self.entries.iter().filter(|e| !e.pad) {
-            for a in e.path.ancestors().skip(1) {
-                if a == self.save_path || !a.starts_with(&self.save_path) {
-                    break;
-                }
-                dirs.insert(a.to_path_buf());
-            }
-        }
-        let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
-        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
-        for d in dirs {
+        for d in self.torrent_dirs(paths) {
             match std::fs::remove_dir(&d) {
                 Ok(()) => {}
                 Err(err)
@@ -678,29 +865,34 @@ impl Storage for FsStorage {
     fn set_file_priorities(&self, wanted: &[bool]) -> io::Result<()> {
         let want = |i: usize| wanted.get(i).copied().unwrap_or(true);
         let mut guard = self.write_routing();
-        let Routing { routed, part } = &mut *guard;
+        let Routing {
+            paths,
+            routed,
+            part,
+        } = &mut *guard;
         let first = part.is_none();
         let part = match part {
             Some(p) => p,
             None => {
                 let pf = PartFile::open(
-                    self.part_path.clone(),
+                    paths.part(),
                     self.pieces.num_pieces(),
                     self.pieces.piece_len(),
                 )
-                .map_err(|e| at_part(self, e))?;
+                .map_err(|e| at(&paths.part(), e))?;
                 part.insert(Mutex::new(pf))
             }
         };
         let part = part.get_mut().unwrap_or_else(|e| e.into_inner());
         routed.resize(self.entries.len(), false);
         if first {
-            // A part file left by an earlier instance may hold the bytes of
-            // any file missing from disk, whatever the priorities were then:
-            // every such file starts routed, so the loop below exports the
-            // wanted ones instead of freeing their slots.
-            for (e, r) in self.entries.iter().zip(routed.iter_mut()) {
-                *r = !e.pad && e.len > 0 && matches!(e.path.try_exists(), Ok(false));
+            // A part file left by an earlier instance (or one reopened by
+            // a move) may hold the bytes of any file missing from disk,
+            // whatever the priorities were then: every such file starts
+            // routed, so the loop below exports the wanted ones instead of
+            // freeing their slots.
+            for (i, (e, r)) in self.entries.iter().zip(routed.iter_mut()).enumerate() {
+                *r = !e.pad && e.len > 0 && matches!(paths.file(i).try_exists(), Ok(false));
             }
         }
         {
@@ -710,16 +902,16 @@ impl Storage for FsStorage {
             // others were already (by a write), else with them.
             let created = std::mem::take(&mut st.empties_created);
             if created {
-                self.create_empty_locked(&mut st)?;
+                self.create_empty_locked(paths, &mut st)?;
             }
         }
         for (i, (e, r)) in self.entries.iter().zip(routed.iter_mut()).enumerate() {
             if e.pad || e.len == 0 {
                 *r = false;
             } else if *r && want(i) {
-                self.export(i, part)?;
+                self.export(paths, i, part)?;
                 *r = false;
-            } else if !*r && !want(i) && matches!(e.path.try_exists(), Ok(false)) {
+            } else if !*r && !want(i) && matches!(paths.file(i).try_exists(), Ok(false)) {
                 *r = true;
                 let mut st = self.lock();
                 st.open.remove(&i);
@@ -729,11 +921,136 @@ impl Storage for FsStorage {
         // Slots of pieces whose files all left the part file.
         for piece in 0..self.pieces.num_pieces() {
             if part.has(piece) && !self.piece_routed(routed, piece) {
-                part.free(piece).map_err(|e| at_part(self, e))?;
+                part.free(piece).map_err(|e| at(part.path(), e))?;
             }
         }
         if part.is_empty() {
-            part.remove().map_err(|e| at_part(self, e))?;
+            part.remove().map_err(|e| at(part.path(), e))?;
+        }
+        Ok(())
+    }
+
+    fn move_to(&self, save_path: &Path, mode: MoveMode) -> io::Result<()> {
+        let mut guard = self.write_routing();
+        let Routing { paths, part, .. } = &mut *guard;
+        if same_dir(&paths.save_path, save_path) {
+            return Ok(());
+        }
+        let target = paths.at(save_path);
+        // Every non-pad file, then the part file: (here, there).
+        let mut plan: Vec<(PathBuf, PathBuf)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.pad)
+            .map(|(i, _)| (paths.file(i), target.file(i)))
+            .collect();
+        plan.push((paths.part(), target.part()));
+        if mode == MoveMode::FailIfExists {
+            for (_, to) in &plan {
+                if exists(to)? {
+                    return Err(at(to, io::ErrorKind::AlreadyExists.into()));
+                }
+            }
+        }
+        // No handle of the old place survives (Windows cannot delete an
+        // open file); the part file is opened again where it ends up.
+        self.lock().open.clear();
+        let had_part = part.take().is_some();
+        let copy = self.force_copy();
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        // Directories this move created, for a failure to take back.
+        let mut created: Vec<PathBuf> = Vec::new();
+        if !matches!(save_path.try_exists(), Ok(true)) {
+            created.push(save_path.to_path_buf());
+        }
+        let mut failed = None;
+        for (from, to) in plan {
+            let step = (|| {
+                if !exists(&from)? || (mode == MoveMode::KeepExisting && exists(&to)?) {
+                    return Ok(false);
+                }
+                created.extend(
+                    dirs_below(&to, save_path).filter(|d| matches!(d.try_exists(), Ok(false))),
+                );
+                create_parent(&to).map_err(|e| at(&to, e))?;
+                move_file(&from, &to, copy).map(|()| true)
+            })();
+            match step {
+                Ok(true) => moved.push((from, to)),
+                Ok(false) => {}
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = failed {
+            for (from, to) in moved.iter().rev() {
+                if let Err(back) = move_file(to, from, copy) {
+                    tracing::warn!(from = %to.display(), to = %from.display(), error = %back, "cannot move a file back");
+                }
+            }
+            // Directories the move created, deepest first.
+            created.sort_by(|a, b| {
+                b.components()
+                    .count()
+                    .cmp(&a.components().count())
+                    .then_with(|| a.cmp(b))
+            });
+            created.dedup();
+            remove_empty_dirs(created);
+            if had_part {
+                *part = self.reopen_part(paths);
+            }
+            return Err(e);
+        }
+        remove_empty_dirs(self.torrent_dirs(paths));
+        *paths = target;
+        if had_part {
+            *part = self.reopen_part(paths);
+        }
+        Ok(())
+    }
+
+    fn rename_file(&self, index: usize, path: &RelPath) -> io::Result<()> {
+        let mut guard = self.write_routing();
+        let routed = guard.is_routed(index);
+        let paths = &mut guard.paths;
+        if self.entries.get(index).is_none_or(|e| e.pad) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let Some(old) = paths.rel.get(index).cloned() else {
+            return Err(io::ErrorKind::InvalidInput.into());
+        };
+        if old == *path {
+            return Ok(());
+        }
+        let from = paths.file(index);
+        let to = paths.save_path.join(path.to_path_buf());
+        self.lock().open.remove(&index);
+        // A file in the part file, or not created yet, only changes name.
+        if !routed && exists(&from)? {
+            // The same file on a case-insensitive or normalising
+            // filesystem when only the key matches.
+            if old.key() != path.key() && exists(&to)? {
+                return Err(at(&to, io::ErrorKind::AlreadyExists.into()));
+            }
+            // Directories created for it, deepest first, taken back on failure.
+            let created: Vec<PathBuf> = dirs_below(&to, &paths.save_path)
+                .filter(|d| matches!(d.try_exists(), Ok(false)))
+                .collect();
+            if let Err(e) = create_parent(&to)
+                .map_err(|e| at(&to, e))
+                .and_then(|()| move_file(&from, &to, self.force_copy()))
+            {
+                remove_empty_dirs(created);
+                return Err(e);
+            }
+            remove_empty_dirs(dirs_below(&from, &paths.save_path));
+        }
+        if let Some(r) = paths.rel.get_mut(index) {
+            *r = path.clone();
         }
         Ok(())
     }
@@ -822,6 +1139,98 @@ mod tests {
             .collect();
         got.sort_unstable();
         assert_eq!(got, [1, 2, 3, 4]);
+    }
+
+    /// Across filesystems a move copies, syncs and deletes: the part
+    /// file goes with the files, and every byte reads back from the new
+    /// place.
+    #[test]
+    fn copy_fallback_moves_the_part_file() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let m = torrent("t", &[(&["d", "a"], 10, false), (&["b"], 10, false)], 8);
+        let s = FsStorage::new(old.path().to_path_buf(), &m);
+        // `a` is skipped and missing: its bytes live in the part file.
+        s.set_file_priorities(&[false, true]).unwrap();
+        let data: Vec<u8> = (1..=20).collect();
+        s.write(0, &data).unwrap();
+        let old_part = s.part_path();
+        assert!(old_part.exists());
+        assert!(!old.path().join("t/d/a").exists());
+        s.set_force_copy(true);
+        s.move_to(new.path(), MoveMode::FailIfExists).unwrap();
+        assert!(!old_part.exists(), "the part file stayed");
+        assert!(!old.path().join("t").exists(), "the old directory stayed");
+        assert_eq!(
+            s.part_path(),
+            new.path().join(old_part.file_name().unwrap())
+        );
+        assert!(s.part_path().exists(), "the part file did not move");
+        assert_eq!(std::fs::read(new.path().join("t/b")).unwrap(), &data[10..]);
+        assert!(
+            !new.path().join("t/d/a").exists(),
+            "a skipped file was created"
+        );
+        let mut out = [0u8; 20];
+        s.read(0, &mut out).unwrap();
+        assert_eq!(out.as_slice(), data.as_slice());
+        // Still writable at the new place, the part file included.
+        s.write(0, &[9; 20]).unwrap();
+        s.read(0, &mut out).unwrap();
+        assert_eq!(out, [9; 20]);
+        assert_eq!(s.save_path(), new.path());
+    }
+
+    /// A move that cannot finish puts back what it moved.
+    #[test]
+    fn failed_copy_moves_back() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let m = torrent("t", &[(&["a"], 4, false), (&["b"], 4, false)], 4);
+        let s = FsStorage::new(old.path().to_path_buf(), &m);
+        s.write(0, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        // `b`'s target is a directory: neither a rename nor a copy lands.
+        std::fs::create_dir_all(new.path().join("t/b/x")).unwrap();
+        s.set_force_copy(true);
+        let e = s
+            .move_to(new.path(), MoveMode::ReplaceExisting)
+            .unwrap_err();
+        assert!(error_path(&e).is_some(), "{e}");
+        assert_eq!(std::fs::read(old.path().join("t/a")).unwrap(), [1, 2, 3, 4]);
+        assert_eq!(std::fs::read(old.path().join("t/b")).unwrap(), [5, 6, 7, 8]);
+        assert!(!new.path().join("t/a").exists());
+        assert_eq!(s.save_path(), old.path());
+        let mut out = [0u8; 8];
+        s.read(0, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn rename_moves_the_file_and_keeps_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = torrent("t", &[(&["a"], 4, false), (&["b"], 4, false)], 4);
+        let s = FsStorage::new(dir.path().to_path_buf(), &m);
+        s.write(0, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let to = fbt_metainfo::sanitize_path([&b"x"[..], b"y", b"b.bin"]).unwrap();
+        s.rename_file(1, &to).unwrap();
+        assert!(!dir.path().join("t/b").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("x/y/b.bin")).unwrap(),
+            [5, 6, 7, 8]
+        );
+        let mut out = [0u8; 8];
+        s.read(0, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
+        // A foreign file at the target is never overwritten.
+        std::fs::write(dir.path().join("c"), b"theirs").unwrap();
+        let c = fbt_metainfo::sanitize_path([&b"c"[..]]).unwrap();
+        let e = s.rename_file(0, &c).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(dir.path().join("c")).unwrap(), b"theirs");
+        // The renamed path survives a new instance through `with_paths`.
+        let again = FsStorage::with_paths(dir.path().to_path_buf(), &m, &[(1, to)]);
+        again.read(0, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
