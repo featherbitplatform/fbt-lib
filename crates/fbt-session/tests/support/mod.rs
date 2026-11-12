@@ -2,6 +2,7 @@
 
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Range;
@@ -31,7 +32,9 @@ pub const T: Duration = Duration::from_secs(30);
 /// updates, and no DHT, LSD, UPnP or NAT-PMP (so no test ever contacts a public DHT node
 /// or a real router; the DHT
 /// tests bootstrap from a loopback node). Transports as by default: uTP
-/// first, TCP fallback.
+/// first, TCP fallback. Smart bans name one endpoint, not the whole IP:
+/// every test peer shares `127.0.0.1`, so banning a corrupt seeder's IP
+/// would ban the honest ones too.
 pub fn test_settings() -> Settings {
     let mut s = Settings::default();
     s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
@@ -41,6 +44,7 @@ pub fn test_settings() -> Settings {
     s.enable_lsd = false;
     s.enable_upnp = false;
     s.enable_natpmp = false;
+    s.ban_endpoints = true;
     s
 }
 
@@ -434,6 +438,57 @@ impl ScriptedPeer {
                 _ => {}
             }
         }
+    }
+}
+
+impl ScriptedPeer {
+    /// Answers every request with the matching bytes of `payload`, except
+    /// that each block in `bad_blocks` is corrupted (every byte flipped)
+    /// the first time it is served; logs every block served into `log`.
+    /// Runs until the connection closes.
+    pub async fn serve_corrupt(
+        &mut self,
+        payload: &[u8],
+        piece_len: u32,
+        mut bad_blocks: HashSet<BlockRef>,
+        log: Arc<Mutex<Vec<BlockRef>>>,
+    ) {
+        while let Some(Ok(m)) = self.framed.next().await {
+            if let Message::Request(b) = m
+                && !self
+                    .answer_corrupt(b, payload, piece_len, &mut bad_blocks, &log)
+                    .await
+            {
+                return;
+            }
+        }
+    }
+
+    /// Answers one request as [`serve_corrupt`](Self::serve_corrupt) does
+    /// (a block of `bad_blocks` is corrupted and removed from it), logging
+    /// it into `log`. False if the connection is gone.
+    pub async fn answer_corrupt(
+        &mut self,
+        b: BlockRef,
+        payload: &[u8],
+        piece_len: u32,
+        bad_blocks: &mut HashSet<BlockRef>,
+        log: &Mutex<Vec<BlockRef>>,
+    ) -> bool {
+        let start = b.piece as usize * piece_len as usize + b.offset as usize;
+        let mut data = payload[start..start + b.len as usize].to_vec();
+        if bad_blocks.remove(&b) {
+            for x in &mut data {
+                *x = !*x;
+            }
+        }
+        log.lock().unwrap().push(b);
+        let piece = Message::Piece {
+            piece: b.piece,
+            offset: b.offset,
+            data: Bytes::from(data),
+        };
+        self.framed.send(piece).await.is_ok()
     }
 }
 

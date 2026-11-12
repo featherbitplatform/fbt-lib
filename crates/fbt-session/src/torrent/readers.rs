@@ -612,6 +612,7 @@ impl Actor {
         }
         l.bufs.remove(&piece);
         self.cache.release_partial(piece);
+        self.smartban.forget(piece);
         for (key, block) in cancel {
             let Some(p) = self.peers.get_mut(&key) else {
                 continue;

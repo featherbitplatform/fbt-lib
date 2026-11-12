@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::PoisonError;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
 use fbt_metainfo::Metainfo;
@@ -18,7 +19,9 @@ use super::holepunch::{RelayAction, relay};
 use super::known::dialable;
 use super::metadata::{FetchStep, MAX_METADATA_REQUESTS_PER_PEER, serve_metadata};
 use super::pex::{PexPeer, connectable_addr};
+use super::smartban::BlockSource;
 use super::swarm::{BanTarget, ConnectOutcome};
+use crate::bans::{BanList, BlockReason};
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
@@ -744,6 +747,42 @@ impl Actor {
         self.close_peer(key);
     }
 
+    /// Who sent us peer `key`'s blocks, as smart ban keys it: the peer's
+    /// whole IP (port 0), or with `ban_endpoints` its address.
+    pub(super) fn block_source(&self, key: PeerKey) -> Option<BlockSource> {
+        let p = self.peers.get(&key)?;
+        Some(BlockSource::Peer(BanList::key(
+            p.addr,
+            self.shared.settings.ban_endpoints,
+        )))
+    }
+
+    /// Bans a source of bad blocks (smart ban). A peer key goes into the
+    /// session's ban list and every matching peer is closed with
+    /// `Blocked(Banned)` and reported ([`Event::PeerBlocked`]), or the key
+    /// is reported if none is connected. Unlike [`ban`](Self::ban) (bad
+    /// metadata, this torrent only), the ban is session-wide.
+    pub(super) fn smart_ban(&mut self, s: BlockSource) {
+        match s {
+            BlockSource::Peer(key) => {
+                let added = self
+                    .shared
+                    .bans
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .ban(key);
+                debug!(torrent = %self.name(), %key, added, "banned a peer that sent bad blocks");
+                if self.close_blocked() == 0 && added {
+                    self.emit_blocked(key, BlockReason::Banned);
+                }
+            }
+            BlockSource::WebSeed(key) => {
+                // Retiring the web seed comes with web seeds (Task 11).
+                debug!(torrent = %self.name(), ?key, "a web seed sent bad blocks");
+            }
+        }
+    }
+
     /// What to ban for peer `key`: the address we dialled; for an incoming
     /// peer its advertised listen address, else its IP.
     pub(super) fn ban_target(&self, key: PeerKey) -> Option<BanTarget> {
@@ -897,6 +936,7 @@ impl Actor {
             );
             for piece in evicted {
                 self.cache.release_partial(piece);
+                self.smartban.forget(piece);
             }
         }
         if !p.connected || p.tx.is_none() || p.generation != generation {

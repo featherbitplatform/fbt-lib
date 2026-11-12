@@ -43,7 +43,6 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
 impl BanList {
     /// The key banning `addr`: its whole IP (port 0), or with `endpoint`
     /// only `addr` itself.
-    #[allow(dead_code, reason = "smart ban is its first caller")]
     pub(crate) fn key(addr: SocketAddr, endpoint: bool) -> SocketAddr {
         if endpoint {
             addr
@@ -53,7 +52,6 @@ impl BanList {
     }
 
     /// Bans `key` (see [`BanList::key`]); false if it was banned already.
-    #[allow(dead_code, reason = "smart ban is its first caller")]
     pub(crate) fn ban(&mut self, key: SocketAddr) -> bool {
         let key = canonical(key);
         if !self.set.insert(key) {

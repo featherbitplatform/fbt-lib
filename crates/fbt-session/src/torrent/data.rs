@@ -7,7 +7,7 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use fbt_core::{Bitfield, BlockRef};
+use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef};
 use fbt_metainfo::{Metainfo, MetainfoError};
 use tokio::time::Instant;
 use tracing::debug;
@@ -42,6 +42,9 @@ pub(crate) enum Job {
         piece: u32,
         ok: bool,
         data: Vec<u8>,
+        /// The SHA-1 of each block, for smart ban: computed when the piece
+        /// fails, or passes while an earlier failure of it is on record.
+        block_hashes: Option<Vec<[u8; 20]>>,
     },
     /// A run of `count` verified pieces from `first` was written.
     WroteRun {
@@ -98,9 +101,10 @@ impl Actor {
                 piece,
                 ok,
                 data,
+                block_hashes,
             } => {
                 self.hashing = self.hashing.saturating_sub(1);
-                self.on_hashed(generation, piece, ok, data);
+                self.on_hashed(generation, piece, ok, data, block_hashes);
             }
             Job::WroteRun {
                 generation,
@@ -140,6 +144,7 @@ impl Actor {
     /// A block we requested arrived from `key`.
     pub(super) fn on_block(&mut self, key: PeerKey, block: BlockRef, data: Bytes) {
         let len = data.len() as u64;
+        let source = self.block_source(key);
         let generation = self.generation;
         let Some(p) = self.peers.get_mut(&key) else {
             self.counters.wasted = self.counters.wasted.saturating_add(len);
@@ -176,6 +181,10 @@ impl Actor {
             return;
         };
         dst.copy_from_slice(&data);
+        if let Some(source) = source {
+            self.smartban
+                .record_block(block.piece, block.offset / BLOCK_SIZE, source);
+        }
         self.counters.downloaded = self.counters.downloaded.saturating_add(len);
         self.counters.dl.record(len);
         if let Some(p) = self.peers.get_mut(&key) {
@@ -204,19 +213,33 @@ impl Actor {
         };
         let meta = Arc::clone(&l.meta);
         let generation = self.generation;
+        let wants_blocks = self.smartban.wants_block_hashes(piece);
         self.hashing = self.hashing.saturating_add(1);
         self.jobs.spawn_blocking(move || {
             let ok = meta.info.pieces.get(piece as usize) == Some(&sha1_piece(&data));
+            let block_hashes = (!ok || wants_blocks).then(|| {
+                data.chunks(BLOCK_SIZE as usize)
+                    .map(sha1_piece)
+                    .collect::<Vec<_>>()
+            });
             Job::Hashed {
                 generation,
                 piece,
                 ok,
                 data,
+                block_hashes,
             }
         });
     }
 
-    fn on_hashed(&mut self, generation: u64, piece: u32, ok: bool, data: Vec<u8>) {
+    fn on_hashed(
+        &mut self,
+        generation: u64,
+        piece: u32,
+        ok: bool,
+        data: Vec<u8>,
+        block_hashes: Option<Vec<[u8; 20]>>,
+    ) {
         if generation != self.generation || !matches!(self.phase, Phase::Ready) {
             return;
         }
@@ -235,6 +258,12 @@ impl Actor {
                 torrent: self.ih,
                 piece,
             });
+            let distrusted = self
+                .smartban
+                .piece_failed(piece, block_hashes.unwrap_or_default());
+            for s in distrusted {
+                self.smart_ban(s);
+            }
             self.top_up_all(None);
             return;
         }
@@ -259,6 +288,11 @@ impl Actor {
             torrent: self.ih,
             piece,
         });
+        // Whoever sent a block that differs from the good one when this
+        // piece failed earlier is banned.
+        for s in self.smartban.piece_passed(piece, block_hashes) {
+            self.smart_ban(s);
+        }
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
             let Some(p) = self.peers.get(&key) else {

@@ -540,12 +540,20 @@ impl Actor {
     /// The session's IP filter changed: closes every live peer it (or a
     /// ban) now blocks, and unqueues blocked addresses.
     pub(super) fn on_filter_changed(&mut self) {
+        self.close_blocked();
+    }
+
+    /// Closes every live peer the IP filter or a ban blocks, each reported
+    /// ([`Event::PeerBlocked`]), and unqueues blocked addresses. Returns
+    /// how many peers were closed.
+    pub(super) fn close_blocked(&mut self) -> usize {
         let blocked: Vec<(PeerKey, SocketAddr, BlockReason)> = self
             .peers
             .iter()
             .filter(|(_, p)| p.tx.is_some())
             .filter_map(|(k, p)| self.shared.blocked(p.addr).map(|r| (*k, p.addr, r)))
             .collect();
+        let closed = blocked.len();
         for (key, addr, reason) in blocked {
             if let Some(p) = self.peers.get_mut(&key) {
                 p.close_reason = Some(DisconnectReason::Blocked(reason));
@@ -555,6 +563,7 @@ impl Actor {
         }
         let shared = &self.shared;
         self.candidates.retain(|a| shared.blocked(*a).is_none());
+        closed
     }
 
     pub(super) fn close_all(&mut self) {

@@ -6,6 +6,8 @@
 //!   and fallbacks, and one connection's state.
 //! - `peers`: peer events, interest, choking and block requests.
 //! - `data`: block buffering, piece verification and writes.
+//! - `smartban`: who sent the blocks of a piece that failed its hash
+//!   check, and which senders to ban.
 //! - `serve`: answering block requests from peers.
 //! - `metadata`: fetching a magnet's metadata from peers and serving ours
 //!   (BEP 9).
@@ -32,6 +34,7 @@ mod pex;
 mod readers;
 mod retries;
 mod serve;
+mod smartban;
 mod swarm;
 mod tiers;
 

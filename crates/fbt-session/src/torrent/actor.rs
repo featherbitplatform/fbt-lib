@@ -31,6 +31,7 @@ use super::peer::Peer;
 use super::readers::Readers;
 use super::retries::Retries;
 use super::serve::PieceReads;
+use super::smartban::SmartBan;
 use super::{Cmd, piece_priorities, same_state};
 use crate::bandwidth::BucketPair;
 use crate::choker::{Choker, ChokerConfig};
@@ -237,6 +238,9 @@ pub(crate) struct Actor {
     pub(super) readers: Readers,
     /// The readers' windows: the missing pieces they wait for, and when.
     pub(super) deadlines: Deadlines,
+    /// Who sent the blocks of pieces in progress and of failed pieces,
+    /// and each sender's trust.
+    pub(super) smartban: SmartBan,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -373,6 +377,7 @@ impl Actor {
             rate,
             readers: Readers::default(),
             deadlines: Deadlines::default(),
+            smartban: SmartBan::default(),
             #[cfg(test)]
             pex_live_builds: 0,
             #[cfg(test)]
@@ -473,11 +478,13 @@ impl Actor {
         self.storage = Some(storage);
     }
 
-    /// Drops every partially downloaded piece and its budget reservation.
+    /// Drops every partially downloaded piece and its budget reservation,
+    /// and what smart ban recorded of pieces (trust stays).
     pub(super) fn clear_bufs(&mut self) {
         if let Some(l) = self.loaded.as_mut() {
             l.bufs.clear();
         }
+        self.smartban.forget_all();
         self.cache.release_partials();
         self.drop_piece_reads();
     }

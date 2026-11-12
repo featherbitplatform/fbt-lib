@@ -213,6 +213,7 @@ impl Actor {
                 picker.piece_failed(piece);
                 l.bufs.remove(&piece);
                 self.cache.release_partial(piece);
+                self.smartban.forget(piece);
             }
             if !picker.is_finished() {
                 self.finished_emitted = false;
