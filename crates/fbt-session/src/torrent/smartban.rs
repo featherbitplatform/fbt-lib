@@ -159,6 +159,13 @@ impl SmartBan {
     ) -> Vec<BlockSource> {
         let senders = self.senders.remove(&piece).unwrap_or_default();
         let contributors = distinct(senders.iter().copied().flatten());
+        // With several contributors, those already on parole are not
+        // charged (see the module docs). Known limitation: on a torrent
+        // driven by a reader, a liar on parole whose blocks only ever land
+        // in deadline pieces that other peers take over (the picker lets
+        // any peer not on parole take over a late piece) is never charged
+        // for those failures. It is still banned by its blocks once such a
+        // piece passes, and charged for any piece it downloads alone.
         let charged: Vec<BlockSource> = if contributors.len() > 1 {
             contributors
                 .iter()

@@ -910,4 +910,56 @@ mod tests {
             "every piece passes ({failures} failures)"
         );
     }
+
+    /// The honest seed, on parole, downloads the whole piece alone and
+    /// leaves while it is being hashed. The piece is not reopened (the
+    /// liar gets nothing of it), the hash result is applied as usual, and
+    /// no buffer or budget reservation is left behind.
+    #[tokio::test]
+    async fn owner_leaving_while_its_piece_is_hashed_does_not_reopen_it() {
+        let (mut actor, payload, mut rxs) = liar_and_honest(1, 4);
+        // A mixed attempt fails: both are on parole.
+        want_blocks(&mut actor, LIAR, 2);
+        want_blocks(&mut actor, HONEST, 2);
+        answer_all(&mut actor, &payload, &mut rxs).await;
+        let (_, failures) = bans_and_failures();
+        assert_eq!(failures, 1);
+        // B takes the whole piece and sends it; the hash job is in flight.
+        want_blocks(&mut actor, HONEST, 4);
+        let mut asked: Vec<BlockRef> = actor.peers[&HONEST].requested.iter().copied().collect();
+        asked.sort_unstable();
+        assert_eq!(asked.len(), 4, "B alone has the piece");
+        for blk in asked {
+            let start = blk.offset as usize;
+            let data = Bytes::copy_from_slice(&payload[start..start + blk.len as usize]);
+            actor.on_block(HONEST, blk, data);
+        }
+        assert_eq!(actor.hashing, 1);
+        actor.close_peer(HONEST);
+        let picker = |actor: &Actor| {
+            actor
+                .loaded
+                .as_ref()
+                .and_then(|l| l.picker.as_ref())
+                .map(|p| p.is_in_progress(0))
+        };
+        assert_eq!(picker(&actor), Some(true), "still pending its hash");
+        want_blocks(&mut actor, LIAR, 4);
+        assert!(
+            actor.peers[&LIAR].requested.is_empty(),
+            "the piece was reopened"
+        );
+        while let Some(r) = actor.jobs.join_next().await {
+            actor.on_job_result(r);
+        }
+        let log = EMITTED.take();
+        assert!(
+            log.iter()
+                .any(|(e, _)| matches!(e, Event::PieceFinished { piece: 0, .. })),
+            "the hash result is applied"
+        );
+        assert!(all_passed(&actor));
+        assert!(actor.loaded.as_ref().is_some_and(|l| l.bufs.is_empty()));
+        assert!(!actor.cache.has_partial(0), "a reservation leaked");
+    }
 }
