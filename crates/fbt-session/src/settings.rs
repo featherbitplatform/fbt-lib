@@ -354,12 +354,18 @@ pub struct Settings {
     /// - SOCKS5 with `proxy_peers` or `proxy_trackers` relays all UDP
     ///   (outgoing uTP, the DHT, UDP trackers) through one UDP ASSOCIATE.
     ///   The session then binds TCP listeners only, plus one relayed UDP
-    ///   socket on a free port; the DHT runs over IPv4 only. If the
+    ///   socket on a free port; the DHT runs over the relay's address
+    ///   family only (IPv4 in practice). If the
     ///   association cannot be made, [`Session::new`](crate::Session::new)
     ///   fails with [`SessionError::Proxy`](crate::SessionError::Proxy).
     /// - An HTTP proxy with `proxy_peers` dials peers over TCP only
     ///   (`enable_outgoing_utp` is treated as off); the DHT still runs
-    ///   directly unless `dht_enabled` is off.
+    ///   directly unless `dht_enabled` is off. With `enable_outgoing_tcp`
+    ///   off as well, the session cannot dial peers at all;
+    ///   [`Session::new`](crate::Session::new) logs a warning.
+    /// - UDP tracker and DHT bootstrap host names are resolved locally
+    ///   whatever `proxy_hostnames` says, and LSD, UPnP and NAT-PMP stay
+    ///   direct on the local network.
     ///
     /// Listening is unchanged: incoming connections never use the proxy.
     pub proxy: ProxyConfig,

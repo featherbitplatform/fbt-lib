@@ -283,3 +283,56 @@ async fn lost_relay_stops_the_socket() {
     );
     s.shutdown().await;
 }
+
+fn announce_request() -> fbt_tracker::AnnounceRequest {
+    fbt_tracker::AnnounceRequest {
+        info_hash: [7; 20],
+        peer_id: fbt_core::PeerId([b'p'; 20]),
+        port: 6881,
+        port_v4: None,
+        port_v6: None,
+        uploaded: 0,
+        downloaded: 0,
+        left: 1,
+        event: fbt_tracker::AnnounceEvent::Started,
+        num_want: Some(10),
+        key: 1,
+        tracker_id: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_tracker_behind_http_proxy_is_unsupported() {
+    let fake = FakeHttpProxy::start(fake_http_proxy::Script::Ok).await;
+    let tracker = FakeTracker::udp(Reply::Peers).await;
+    let client = fbt_tracker::TrackerClient::new_with(
+        fbt_tracker::TrackerConfig::default(),
+        Vec::new(),
+        Some(proxy(ProxyKind::Http, fake.addr())),
+    )
+    .unwrap();
+    let r = client.announce(&tracker.url, &announce_request()).await;
+    assert!(
+        matches!(r, Err(fbt_tracker::TrackerError::ProxyUnsupported)),
+        "{r:?}"
+    );
+    assert!(tracker.announces().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_tunnel_is_a_proxy_error() {
+    let fake = FakeSocks5::start(Script::Refuse(5)).await;
+    let tracker = FakeTracker::http(Reply::Peers).await;
+    let client = fbt_tracker::TrackerClient::new_with(
+        fbt_tracker::TrackerConfig::default(),
+        Vec::new(),
+        Some(proxy(ProxyKind::Socks5, fake.addr())),
+    )
+    .unwrap();
+    let r = client.announce(&tracker.url, &announce_request()).await;
+    match r {
+        Err(fbt_tracker::TrackerError::Proxy(msg)) => assert!(msg.contains("code 5"), "{msg}"),
+        other => panic!("expected TrackerError::Proxy, got {other:?}"),
+    }
+    assert!(tracker.announces().is_empty());
+}

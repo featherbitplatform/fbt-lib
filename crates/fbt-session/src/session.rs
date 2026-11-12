@@ -374,6 +374,12 @@ impl Session {
             proxy.kind == ProxyKind::Socks5 && (proxy.proxy_peers || proxy.proxy_trackers);
         // An HTTP proxy cannot carry uTP.
         if proxy.kind == ProxyKind::Http && proxy.proxy_peers {
+            if !settings.enable_outgoing_tcp {
+                warn!(
+                    "an HTTP proxy carries peer connections over TCP only, and \
+                     enable_outgoing_tcp is off: this session cannot dial peers"
+                );
+            }
             settings.enable_outgoing_utp = false;
         }
         let (endpoints, listen_errors) = bind_all(&settings, !relay_udp).await?;

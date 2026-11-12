@@ -107,5 +107,7 @@ fn surface_compiles() {
     ];
     let p: ProxyConfig = s.proxy;
     let _ = [ProxyKind::None, ProxyKind::Socks5, ProxyKind::Http];
+    let _: (ProxyKind, String, u16, Option<String>, Option<String>) =
+        (p.kind, p.host, p.port, p.username, p.password);
     let _: (bool, bool, bool) = (p.proxy_peers, p.proxy_trackers, p.proxy_hostnames);
 }

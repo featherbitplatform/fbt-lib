@@ -39,14 +39,19 @@ pub enum ProxyKind {
 /// - **SOCKS5 proxies all UDP or none.** With [`ProxyKind::Socks5`] and
 ///   `proxy_peers || proxy_trackers`, every UDP packet (outgoing uTP, DHT,
 ///   UDP trackers) goes through one UDP ASSOCIATE: one socket cannot be half
-///   proxied. The session then listens on TCP only, the DHT runs IPv4 only and
-///   incoming uTP arrives only as the relay forwards it.
+///   proxied. The session then listens on TCP only, the DHT runs over the
+///   relay's address family only (IPv4 in practice) and incoming uTP arrives
+///   only as the relay forwards it.
 /// - **HTTP proxies cannot carry UDP.** With [`ProxyKind::Http`], outgoing uTP
 ///   is off when `proxy_peers` is set, UDP trackers fail with
 ///   `ProxyUnsupported` when `proxy_trackers` is set, and the DHT runs direct
 ///   unless it is disabled.
 /// - **Many HTTP proxies refuse `CONNECT` to port 80** (Squid's default
 ///   `SSL_ports` rule, for one), so plain-HTTP trackers may fail through them.
+/// - **Not every lookup or packet uses the proxy.** `proxy_hostnames` covers
+///   TCP connections only: UDP tracker host names and DHT bootstrap host names
+///   are resolved locally. Local service discovery (LSD), UPnP and NAT-PMP
+///   stay direct on the local network and are never proxied.
 ///
 /// `Debug` prints the password as `"***"`.
 #[non_exhaustive]
