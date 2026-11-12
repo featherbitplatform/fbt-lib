@@ -14,7 +14,7 @@ use tokio::time::{Instant, sleep_until};
 use tokio_util::codec::Framed;
 
 use super::{Flow, PeerCtx, after, max_frame, wire_len, wire_reason};
-use crate::bandwidth::{PeerThrottles, Throttle};
+use crate::bandwidth::{PeerThrottles, Reservation, Throttle};
 use crate::peer::ext::{self, ExtConfig, RemoteIds};
 use crate::peer::messages::{DisconnectReason, PeerCommand, PeerEvent, PeerPiecesOwned};
 use crate::picker::PeerKey;
@@ -95,8 +95,8 @@ pub(super) struct Conn<S> {
     pub(super) last_send: Instant,
     /// What we read is charged here; reads wait while it is in debt.
     pub(super) down: Throttle,
-    /// What we write is charged here; queued blocks wait while it is in
-    /// debt (other messages never do).
+    /// What we write is charged here; queued blocks wait for their turn
+    /// (a reservation, see `upload_turn`), other messages never do.
     pub(super) up: Throttle,
     /// Blocks the torrent answered, waiting for the upload throttle. An
     /// entry whose block left `incoming` (cancelled, choked away) is
@@ -104,6 +104,8 @@ pub(super) struct Conn<S> {
     pub(super) uploads: VecDeque<(BlockRef, Bytes)>,
     /// The blocks in `uploads`, each queued at most once.
     pub(super) queued: HashSet<BlockRef>,
+    /// The bytes reserved for the next block written, and how many.
+    pub(super) upload_turn: Option<(Reservation, u64)>,
     /// The read hold reached `peer_idle_timeout`: reads are allowed (and
     /// the idle and request timers run) until one frame arrives.
     pub(super) floor_read: bool,
@@ -168,6 +170,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             up: throttles.up.clone(),
             uploads: VecDeque::new(),
             queued: HashSet::new(),
+            upload_turn: None,
             floor_read: false,
             held_since: None,
             block_rate: RateMeter::new(),
@@ -194,7 +197,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
             let now = Instant::now();
             let read_held = self.read_held(now);
-            let upload_held = !self.uploads.is_empty();
+            // Blocks left wait for their reservation (one is always held
+            // while blocks are queued); due since: written at once.
+            let upload_due = if self.uploads.is_empty() {
+                None
+            } else {
+                match self.upload_turn.as_ref().and_then(|t| t.0.due_at(now)) {
+                    Some(t) => Some(t),
+                    None => continue,
+                }
+            };
+            let upload_held = upload_due.is_some();
             let deadline = self.next_deadline();
             // Never blocks: a throttle only disables the read branch (the
             // transport's window closes and the sender slows) or delays
@@ -216,7 +229,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 },
                 () = sleep_until(deadline) => self.on_timer().await,
                 () = self.down.wait_ready(), if read_held => Ok(()),
-                () = self.up.wait_ready(), if upload_held => Ok(()),
+                () = sleep_until(upload_due.unwrap_or(now)), if upload_held => Ok(()),
             };
             if let Err(reason) = step {
                 return reason;

@@ -12,6 +12,15 @@
 //!   buckets, for a non-local peer, and for a local one only with
 //!   [`Settings::rate_limit_local_peers`].
 //!
+//! **Uploads queue fairly.** Blocks do not wait for the debt to be repaid
+//! and then race for the tokens: whichever connection a timer wakes first
+//! would win every time, and one busy connection could starve the others
+//! sharing a bucket (a seeder's upload slot that receives nothing). A
+//! connection instead reserves its next block's bytes ([`Throttle::reserve`]),
+//! charged at once, and writes it once the debt owed before the
+//! reservation is repaid ([`Reservation::due_at`]). Blocks so go out in
+//! the order they were reserved, and backlogged connections take turns.
+//!
 //! **Mixed mode.** While a global limit is set, a task re-evaluated every
 //! second sets the TCP and uTP share buckets to their part of it (see
 //! [`MixedMode`]), counting only the connected peers the global limit
@@ -132,6 +141,9 @@ pub(crate) struct TokenBucket {
     capacity: i64,
     /// The time `balance` was refilled up to.
     last: Instant,
+    /// Every token credited so far (refills and forgiven debt): a
+    /// [`Reservation`] is due once this reaches its mark.
+    credited: u128,
 }
 
 impl TokenBucket {
@@ -142,6 +154,7 @@ impl TokenBucket {
             balance: 0,
             capacity: to_i64(MIN_CAPACITY),
             last: now,
+            credited: 0,
         };
         b.set_rate(rate, now);
         b
@@ -180,8 +193,57 @@ impl TokenBucket {
             return;
         }
         let (add, upto) = self.gained(now);
+        let before = self.balance;
         self.balance = self.balance.saturating_add(add).min(self.capacity);
+        self.credit(before);
         self.last = upto;
+    }
+
+    /// Counts the tokens the balance gained since it was `before`.
+    fn credit(&mut self, before: i64) {
+        let gained = i128::from(self.balance) - i128::from(before);
+        if let Ok(gained) = u128::try_from(gained) {
+            self.credited = self.credited.saturating_add(gained);
+        }
+    }
+
+    /// The tokens credited by `now`, without changing the bucket.
+    fn credited_at(&self, now: Instant) -> u128 {
+        let gained = i128::from(self.balance_at(now)) - i128::from(self.balance);
+        self.credited
+            .saturating_add(u128::try_from(gained).unwrap_or(0))
+    }
+
+    /// Charges `n` bytes at `now` for a frame that waits its turn: returns
+    /// the credit mark at which the debt owed before it is repaid (see
+    /// [`Self::due_at`]), `None` for an unlimited bucket.
+    fn reserve(&mut self, n: u64, now: Instant) -> Option<u128> {
+        if self.rate == 0 {
+            return None;
+        }
+        self.refill(now);
+        let debt = u128::from(self.balance.min(0).unsigned_abs());
+        let mark = self.credited.saturating_add(debt);
+        self.consume(n, now);
+        Some(mark)
+    }
+
+    /// When the credit reaches `mark` at the current rate (at most
+    /// [`MAX_WAIT`] away, so a changed rate is seen); `None` once it has,
+    /// or with an unlimited rate.
+    fn due_at(&self, mark: u128, now: Instant) -> Option<Instant> {
+        if self.rate == 0 {
+            return None;
+        }
+        let owed = mark.checked_sub(self.credited_at(now)).filter(|&o| o > 0)?;
+        let rate = u128::from(self.rate);
+        let nanos = owed.saturating_mul(NANOS_PER_SEC).div_ceil(rate);
+        let max = MAX_WAIT.as_nanos();
+        if nanos >= max {
+            return Some(later(now, MAX_WAIT));
+        }
+        let nanos = u64::try_from(nanos).unwrap_or(u64::MAX);
+        Some(later(now, Duration::from_nanos(nanos)))
     }
 
     /// The balance at `now`, without changing the bucket.
@@ -200,6 +262,10 @@ impl TokenBucket {
         self.rate = rate;
         self.capacity = to_i64(rate.max(MIN_CAPACITY));
         if rate == 0 {
+            // Forgiven debt counts as credit: every reservation is due.
+            let before = self.balance;
+            self.balance = self.balance.max(0);
+            self.credit(before);
             self.balance = 0;
             self.last = now;
         } else {
@@ -304,6 +370,37 @@ impl Throttle {
         while let Some(t) = self.ready_at(Instant::now()) {
             sleep_until(t).await;
         }
+    }
+
+    /// Charges `n` bytes to every bucket of the chain now, for a frame
+    /// written once the reservation is due: after every frame reserved
+    /// before it, so connections sharing a bucket take turns.
+    pub(crate) fn reserve(&self, n: u64) -> Reservation {
+        let now = Instant::now();
+        let marks = self
+            .chain
+            .iter()
+            .filter_map(|b| lock(b).reserve(n, now).map(|m| (Arc::clone(b), m)))
+            .collect();
+        Reservation { marks }
+    }
+}
+
+/// Bytes charged to a [`Throttle`] ahead of the frame they pay for.
+#[derive(Debug)]
+pub(crate) struct Reservation {
+    /// Each limited bucket, and the credit at which it is the frame's turn.
+    marks: Vec<(Bucket, u128)>,
+}
+
+impl Reservation {
+    /// When to check again, `None` once the frame may be written: every
+    /// bucket repaid the debt owed before it was reserved.
+    pub(crate) fn due_at(&self, now: Instant) -> Option<Instant> {
+        self.marks
+            .iter()
+            .filter_map(|(b, m)| lock(b).due_at(*m, now))
+            .max()
     }
 }
 
@@ -576,6 +673,49 @@ mod tests {
         assert_eq!(b.repaid_at(t0 + Duration::from_secs(3)), None);
     }
 
+    /// Reservations are served in the order they were made: a connection
+    /// that keeps asking cannot jump ahead of one that waits.
+    #[test]
+    fn reservations_take_turns() {
+        let t0 = Instant::now();
+        let s = Duration::from_millis(500);
+        let mut b = TokenBucket::new(1000, t0);
+        // A's first frame goes at once; B's waits for it, A's second for B's.
+        let a1 = b.reserve(500, t0).expect("limited");
+        let b1 = b.reserve(500, t0).expect("limited");
+        let a2 = b.reserve(500, t0).expect("limited");
+        assert_eq!(b.due_at(a1, t0), None);
+        assert!(close(b.due_at(b1, t0), t0 + s));
+        assert!(close(b.due_at(a2, t0), t0 + 2 * s));
+        assert_eq!(b.due_at(b1, t0 + s), None);
+        assert!(b.due_at(a2, t0 + s).is_some());
+        assert_eq!(b.due_at(a2, t0 + 2 * s), None);
+        // A wait is checked again within a second, and a raised rate
+        // shortens it.
+        let far = b.reserve(10_000, t0 + 2 * s).expect("limited");
+        let c = b.reserve(1, t0 + 2 * s).expect("limited");
+        let t1 = t0 + 2 * s;
+        assert!(close(b.due_at(c, t1), t1 + Duration::from_secs(1)));
+        b.set_rate(20_000, t1);
+        assert!(close(b.due_at(c, t1), t1 + Duration::from_millis(525)));
+        // Lifting the limit makes every reservation due.
+        b.set_rate(0, t1);
+        assert_eq!(b.due_at(far, t1), None);
+        b.set_rate(1000, t1);
+        assert_eq!(b.due_at(c, t1), None);
+        assert_eq!(b.reserve(1, t1).map(|m| b.due_at(m, t1)), Some(None));
+        // Through a throttle: unlimited buckets hold nothing back.
+        let th = Throttle {
+            chain: vec![bucket(0), bucket(1000)],
+        };
+        let first = th.reserve(2000);
+        let second = th.reserve(1);
+        let now = Instant::now();
+        assert_eq!(first.due_at(now), None);
+        assert!(second.due_at(now).is_some());
+        assert_eq!(Throttle::default().reserve(u64::MAX).due_at(now), None);
+    }
+
     #[test]
     fn zero_rate_is_unlimited() {
         let t0 = Instant::now();
@@ -619,6 +759,15 @@ mod tests {
                 let _ = b.repaid_at(far);
                 if let Some(r) = b.ready_at(t0) {
                     assert!(r <= t0 + Duration::from_secs(1));
+                }
+                for _ in 0..3 {
+                    if let Some(m) = b.reserve(u64::MAX, t0) {
+                        for &now in &[t0, far] {
+                            if let Some(r) = b.due_at(m, now) {
+                                assert!(r <= now + Duration::from_secs(1));
+                            }
+                        }
+                    }
                 }
                 b.set_rate(rate, far);
                 b.consume(u64::MAX, far);
