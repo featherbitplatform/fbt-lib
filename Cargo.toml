@@ -22,6 +22,8 @@ all = "warn"
 # crates never pin their own versions.
 [workspace.dependencies]
 thiserror = "2"
+# NFC normalisation for collision keys (macOS and others normalise file names).
+unicode-normalization = "0.1"
 bytes = "1.12"
 tokio = { version = "1", default-features = false }
 # IPv6-only sockets (IPV6_V6ONLY), so IPv4 and IPv6 share a port: the DHT's

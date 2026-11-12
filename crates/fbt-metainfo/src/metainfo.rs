@@ -5,10 +5,16 @@ use std::collections::HashSet;
 use fbt_bencode::{DecodeError, Dict, Limits, Value, decode, decode_with};
 use fbt_core::{FileLayout, InfoHashV1, InfoHashV2, InfoHashes, PieceLayout};
 
+use crate::collide::resolve_collisions;
 use crate::magnet::Magnet;
 use crate::path::{RelPath, sanitize_component, sanitize_path};
 
 /// Deepest accepted file path, in components (including the root name).
+/// Most web seed URLs kept (`url-list` here, `ws` in a magnet); later ones are
+/// ignored.
+pub const MAX_WEB_SEEDS: usize = 16;
+/// Longest web seed URL kept, in bytes.
+pub(crate) const MAX_URL_LEN: usize = 2048;
 const MAX_PATH_DEPTH: usize = 256;
 const MAX_PIECE_LEN: i64 = 268_435_456;
 /// Most tracker URLs kept across all tiers; later ones are ignored.
@@ -37,6 +43,8 @@ pub enum MetainfoError {
         reason: &'static str,
     },
     /// Two files share a path, or a file path is a directory prefix of another.
+    ///
+    /// No longer produced: colliding paths are renamed at parse time.
     #[error("duplicate path `{0}`")]
     DuplicatePath(String),
     /// A v2-only torrent (no v1 `pieces`); supported from milestone 6.
@@ -90,6 +98,9 @@ pub struct Metainfo {
     /// Announce tiers (de-duplicated, no empty tiers, at most 64 URLs in
     /// all: the first ones in tier order).
     pub trackers: Vec<Vec<String>>,
+    /// BEP 19 `url-list` web seeds: `http` and `https` URLs only,
+    /// de-duplicated, at most [`MAX_WEB_SEEDS`], each at most 2048 bytes.
+    pub web_seeds: Vec<String>,
     /// Free-form comment.
     pub comment: Option<String>,
     /// Creating program.
@@ -116,6 +127,7 @@ impl Metainfo {
             info_hashes: parsed.info_hashes,
             info: parsed.info,
             trackers: parse_trackers(root),
+            web_seeds: parse_web_seeds(root),
             comment: lossy(root, b"comment"),
             created_by: lossy(root, b"created by"),
             creation_date: root.get(b"creation date").and_then(Value::as_int),
@@ -158,6 +170,7 @@ impl Metainfo {
             info_hashes: parsed.info_hashes,
             info: parsed.info,
             trackers: clean_trackers(trackers.iter().map(|t| t.iter().map(String::as_str))),
+            web_seeds: Vec::new(),
             comment: None,
             created_by: None,
             creation_date: None,
@@ -166,8 +179,8 @@ impl Metainfo {
         })
     }
 
-    /// A magnet link for this torrent: info hashes, name and the first
-    /// tracker of each tier.
+    /// A magnet link for this torrent: info hashes, name, the first
+    /// tracker of each tier and the web seeds.
     pub fn magnet(&self) -> Magnet {
         let mut m = Magnet::from_info_hashes(self.info_hashes);
         m.display_name = Some(self.info.name.clone());
@@ -176,6 +189,7 @@ impl Metainfo {
             .iter()
             .filter_map(|t| t.first().cloned())
             .collect();
+        m.web_seeds = self.web_seeds.clone();
         m
     }
 
@@ -255,7 +269,7 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
     let name = sanitize_component(name_bytes).unwrap_or_else(|| v1.to_string());
 
     let private = matches!(info_dict.get(b"private").and_then(Value::as_int), Some(1));
-    let (files, single_file) = parse_files(info_dict, &name)?;
+    let (mut files, single_file) = parse_files(info_dict, &name)?;
 
     let mut total: u64 = 0;
     for f in &files {
@@ -268,7 +282,7 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
     if usize::try_from(layout.num_pieces()).ok() != Some(pieces_raw.len() / 20) {
         return Err(invalid("pieces", "count does not match total length"));
     }
-    check_duplicates(&files)?;
+    resolve_collisions(&mut files);
 
     let pieces: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
 
@@ -358,35 +372,43 @@ fn parse_files(info: &Dict<'_>, name: &str) -> Result<(Vec<FileEntry>, bool), Me
     Ok((out, false))
 }
 
-/// Rejects equal paths and a file that is a directory prefix of another,
-/// comparing components ASCII-case-insensitively (APFS/NTFS collide on case).
-/// Padding files are exempt: writers legitimately repeat `.pad/<len>`.
-///
-/// Sorted lexicographically, every extension of a path sits right after it, so
-/// comparing adjacent pairs finds all equal-or-prefix collisions.
-fn check_duplicates(files: &[FileEntry]) -> Result<(), MetainfoError> {
-    let mut keys: Vec<(Vec<String>, &FileEntry)> = files
-        .iter()
-        .filter(|f| !f.pad)
-        .map(|f| {
-            let k = f
-                .path
-                .components()
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-            (k, f)
-        })
-        .collect();
-    keys.sort_by(|a, b| a.0.cmp(&b.0));
-    for pair in keys.windows(2) {
-        if let [(a, fa), (b, _)] = pair
-            && b.starts_with(a)
-        {
-            return Err(MetainfoError::DuplicatePath(fa.path.to_string()));
+/// Keeps the `http` and `https` URLs of `urls`: at most [`MAX_URL_LEN`] bytes
+/// each, de-duplicated, at most [`MAX_WEB_SEEDS`] in all (the first ones).
+pub(crate) fn clean_web_seeds<'a>(urls: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for url in urls {
+        if out.len() >= MAX_WEB_SEEDS {
+            break;
+        }
+        if is_web_url(url) && !out.iter().any(|u| u == url) {
+            out.push(url.to_string());
         }
     }
-    Ok(())
+    out
+}
+
+/// An `http://` or `https://` URL (scheme in any case) with something after
+/// the scheme, within [`MAX_URL_LEN`].
+fn is_web_url(url: &str) -> bool {
+    if url.len() > MAX_URL_LEN {
+        return false;
+    }
+    ["http://", "https://"].iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(scheme))
+            && url.len() > scheme.len()
+    })
+}
+
+/// `url-list` (BEP 19): one URL string or a list of them.
+fn parse_web_seeds(root: &Dict<'_>) -> Vec<String> {
+    let Some(v) = root.get(b"url-list") else {
+        return Vec::new();
+    };
+    match v.as_list() {
+        Some(items) => clean_web_seeds(items.iter().filter_map(Value::as_str)),
+        None => clean_web_seeds(v.as_str()),
+    }
 }
 
 fn lossy(root: &Dict<'_>, key: &[u8]) -> Option<String> {

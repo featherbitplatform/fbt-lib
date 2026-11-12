@@ -7,9 +7,15 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// Longest component, in bytes, that is kept as is.
-const MAX_COMPONENT_BYTES: usize = 255;
+pub(crate) const MAX_COMPONENT_BYTES: usize = 255;
 /// Longest extension (including the dot) preserved when truncating.
 const MAX_EXT_BYTES: usize = 16;
+
+/// Appends the key of one component: NFC-normalised, then lower-cased.
+pub(crate) fn push_component_key(out: &mut String, component: &str) {
+    use unicode_normalization::UnicodeNormalization as _;
+    out.extend(component.nfc().flat_map(char::to_lowercase));
+}
 
 /// A sanitized relative path: one or more safe components.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -30,6 +36,25 @@ impl RelPath {
     pub(crate) fn with_root(mut self, root: String) -> Self {
         self.0.insert(0, root);
         self
+    }
+
+    /// A path from already-sanitized components (non-empty).
+    pub(crate) fn from_components(parts: Vec<String>) -> Self {
+        Self(parts)
+    }
+
+    /// The collision key: each component NFC-normalised and lower-cased,
+    /// joined with `/`. Two paths with equal keys name the same file on a
+    /// case-insensitive or normalising filesystem.
+    pub fn key(&self) -> String {
+        let mut out = String::new();
+        for (i, c) in self.0.iter().enumerate() {
+            if i > 0 {
+                out.push('/');
+            }
+            push_component_key(&mut out, c);
+        }
+        out
     }
 
     /// The path as a platform `PathBuf` (relative).
@@ -82,7 +107,7 @@ fn is_reserved_stem(stem: &str) -> bool {
 
 /// Renames a reserved device name by appending `_` to its stem (the part
 /// before the first dot), keeping the result within the length limit.
-fn guard_reserved(s: String) -> String {
+pub(crate) fn guard_reserved(s: String) -> String {
     let stem_end = s.find('.').unwrap_or(s.len());
     let (Some(stem), Some(rest)) = (s.get(..stem_end), s.get(stem_end..)) else {
         return s;
@@ -99,7 +124,7 @@ fn guard_reserved(s: String) -> String {
         .to_owned()
 }
 
-fn truncate_at_boundary(s: &str, max: usize) -> &str {
+pub(crate) fn truncate_at_boundary(s: &str, max: usize) -> &str {
     let mut end = max.min(s.len());
     while !s.is_char_boundary(end) {
         end -= 1;

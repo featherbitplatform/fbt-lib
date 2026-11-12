@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 use fbt_core::{InfoHashV1, InfoHashV2, InfoHashes};
 
+use crate::metainfo::{MAX_WEB_SEEDS, clean_web_seeds};
 use crate::path::sanitize_component;
 
 /// Longest accepted magnet URI, in bytes.
@@ -64,6 +65,9 @@ pub struct Magnet {
     pub display_name: Option<String>,
     /// `tr` trackers, de-duplicated, in order.
     pub trackers: Vec<String>,
+    /// `ws` web seeds: `http` and `https` URLs, de-duplicated, at most
+    /// [`MAX_WEB_SEEDS`](crate::MAX_WEB_SEEDS).
+    pub web_seeds: Vec<String>,
     /// `x.pe` peers that are IP literals with a non-zero port.
     pub peers: Vec<SocketAddr>,
     /// BEP 53 `so` file selection; `None` selects every file.
@@ -77,6 +81,7 @@ impl Magnet {
             info_hashes: ih,
             display_name: None,
             trackers: Vec::new(),
+            web_seeds: Vec::new(),
             peers: Vec::new(),
             select_only: None,
         }
@@ -98,6 +103,7 @@ impl Magnet {
         let mut v2: Option<InfoHashV2> = None;
         let mut display_name = None;
         let mut trackers: Vec<String> = Vec::new();
+        let mut web_seeds: Vec<String> = Vec::new();
         let mut peers: Vec<SocketAddr> = Vec::new();
         let mut select: Option<Vec<RangeInclusive<usize>>> = None;
 
@@ -121,6 +127,16 @@ impl Magnet {
                         && !trackers.contains(&url)
                     {
                         trackers.push(url);
+                    }
+                }
+                k if is_indexed(k, "ws") => {
+                    let url = utf8(percent_decode(value, false)?)?;
+                    if web_seeds.len() < MAX_WEB_SEEDS {
+                        for u in clean_web_seeds([url.as_str()]) {
+                            if !web_seeds.contains(&u) {
+                                web_seeds.push(u);
+                            }
+                        }
                     }
                 }
                 k if is_indexed(k, "x.pe") => {
@@ -148,6 +164,7 @@ impl Magnet {
             info_hashes: InfoHashes { v1, v2 },
             display_name,
             trackers,
+            web_seeds,
             peers,
             select_only: select,
         })
@@ -181,6 +198,9 @@ impl Magnet {
         }
         for t in &self.trackers {
             param(&mut out, "tr", &percent_encode(t));
+        }
+        for w in &self.web_seeds {
+            param(&mut out, "ws", &percent_encode(w));
         }
         for p in &self.peers {
             param(&mut out, "x.pe", &percent_encode(&p.to_string()));

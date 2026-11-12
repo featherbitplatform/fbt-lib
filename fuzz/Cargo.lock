@@ -150,14 +150,14 @@ dependencies = [
 
 [[package]]
 name = "fbt-bencode"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fbt-core"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "rand",
  "sha1",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-dht"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -199,16 +199,17 @@ dependencies = [
 
 [[package]]
 name = "fbt-metainfo"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
  "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "fbt-net"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -221,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-tracker"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "fbt-bencode",
@@ -236,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-utp"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -248,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-wire"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bitflags",
  "bytes",
@@ -606,6 +607,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -687,6 +694,15 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "want"
