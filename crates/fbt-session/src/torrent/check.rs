@@ -52,8 +52,9 @@ impl Actor {
             self.compare_stamps();
             return;
         }
-        // A magnet's resume data saved before its metadata has no pieces.
-        self.drop_resume();
+        // A magnet's resume data saved before its metadata has no pieces:
+        // nothing was trusted or doubted, so `resume_trusted` stays `None`.
+        self.resume = None;
         let seq = self.check_seq;
         let checks = self.shared.disk.check_permit();
         // A free slot goes to the queue's head first: this only succeeds

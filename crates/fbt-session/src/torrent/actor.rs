@@ -857,6 +857,8 @@ impl Actor {
         }
         debug!(torrent = %self.name(), ratio_hit, time_hit, "seed limit reached");
         self.auto_managed = false;
+        // Paused and out of the queue's control: both are in resume data.
+        self.need_save_resume = true;
         if let Some(session) = self.session.upgrade() {
             session.set_auto_managed(&self.ih, false);
         }

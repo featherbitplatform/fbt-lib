@@ -103,7 +103,8 @@ pub struct TorrentStatus {
     /// ([`AddTorrent::from_resume`](crate::AddTorrent::from_resume)):
     /// `Some(true)` once its pieces were trusted without a check, `Some(false)`
     /// once a full check ran instead (a file changed since the save). `None`
-    /// without resume data, and while the stamps are being compared.
+    /// without resume data, while the stamps are being compared, and for a
+    /// magnet saved before its metadata arrived (it has no pieces to trust).
     pub resume_trusted: Option<bool>,
 }
 

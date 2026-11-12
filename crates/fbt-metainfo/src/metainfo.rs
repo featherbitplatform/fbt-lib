@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use fbt_bencode::{DecodeError, Dict, Limits, Value, decode, decode_with};
+use fbt_bencode::{DecodeError, Dict, Limits, Value, decode_with};
 use fbt_core::{FileLayout, InfoHashV1, InfoHashV2, InfoHashes, PieceLayout};
 
 use crate::collide::resolve_collisions;
@@ -20,6 +20,12 @@ const MAX_PIECE_LEN: i64 = 268_435_456;
 /// Most tracker URLs kept across all tiers; later ones are ignored. The
 /// session applies the same cap to trackers set by hand.
 pub const MAX_TRACKERS: usize = 64;
+/// Deepest nesting [`Metainfo::from_bytes`] accepts in a `.torrent`, the
+/// root dictionary counting as one (the `fbt-bencode` default).
+pub const MAX_TORRENT_DEPTH: usize = 64;
+/// Most bencode values [`Metainfo::from_bytes`] accepts in a `.torrent`
+/// (the `fbt-bencode` default).
+pub const MAX_TORRENT_ITEMS: usize = 4_194_304;
 /// Item cap when decoding an info dictionary received from a peer.
 const MAX_INFO_ITEMS: usize = 4_194_304;
 /// Nesting cap when decoding an info dictionary received from a peer.
@@ -115,7 +121,7 @@ pub struct Metainfo {
 impl Metainfo {
     /// Parses and validates `.torrent` bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Metainfo, MetainfoError> {
-        let root = decode(bytes)?;
+        let root = decode_with(bytes, Limits::new(MAX_TORRENT_DEPTH, MAX_TORRENT_ITEMS))?;
         let root = root
             .as_dict()
             .ok_or_else(|| invalid("torrent", "not a dictionary"))?;

@@ -16,7 +16,7 @@ use crate::error::SessionError;
 use crate::event::{Event, PeerSource};
 use crate::peer::messages::PeerEvent;
 use crate::picker::PeerKey;
-use crate::resume::{self, ResumeRecord, ResumeState};
+use crate::resume::{self, ResumeError, ResumeRecord, ResumeState};
 use crate::session::{Priority, RemoveMode, release};
 use crate::storage::FileStamp;
 use crate::storage::cache::FlushReason;
@@ -162,14 +162,17 @@ impl Actor {
             }
             Cmd::ShutdownSave(tx) => {
                 let _ = self.stop(None).await;
-                let _ = tx.send(self.resume_data().await);
+                let data = self.resume_data().await.map_err(SessionError::Resume);
+                let _ = tx.send(data);
                 return Flow::Exit;
             }
             Cmd::SaveResume(tx) => {
                 let data = self.resume_data().await;
-                self.need_save_resume = false;
-                self.publish();
-                let _ = tx.send(Ok(data));
+                if data.is_ok() {
+                    self.need_save_resume = false;
+                    self.publish();
+                }
+                let _ = tx.send(data.map_err(SessionError::Resume));
             }
             Cmd::OpenReader { file, link, tx } => self.on_open_reader(file, link, tx),
             Cmd::ReaderMoved(id) => self.on_reader_moved(id),
@@ -416,7 +419,13 @@ impl Actor {
     /// saved, so the next add checks in full; while the saved stamps are
     /// still being compared, the resume data it was added from is saved
     /// again.
-    pub(super) async fn resume_data(&mut self) -> Vec<u8> {
+    ///
+    /// The result is decoded again (off the actor) before it is returned:
+    /// data that [`AddTorrent::from_resume`](crate::AddTorrent::from_resume)
+    /// would refuse (an `info` over
+    /// [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES), say) is an error here
+    /// instead.
+    pub(super) async fn resume_data(&mut self) -> Result<Vec<u8>, ResumeError> {
         self.flush_and_wait().await;
         self.account_time();
         let num_pieces = self.loaded.as_ref().map_or(0, |l| l.layout.num_pieces());
@@ -479,7 +488,7 @@ impl Actor {
             (None, None) => &no_trackers,
         };
         let file_priorities = self.loaded.as_ref().map_or(&[][..], |l| &l.file_prio[..]);
-        resume::encode(&ResumeRecord {
+        let bytes = resume::encode(&ResumeRecord {
             info_hash: self.ih.wire_hash(),
             save_path: &save_path,
             info: self.loaded.as_ref().map(|l| l.meta.raw_info()),
@@ -491,7 +500,23 @@ impl Actor {
             sequential,
             rate_limit: self.rate_limit,
             state: &state,
-        })
+        });
+        let checked =
+            tokio::task::spawn_blocking(move || resume::decode_resume(&bytes).map(|_| bytes)).await;
+        match checked {
+            Ok(r) => {
+                if let Err(e) = &r {
+                    warn!(torrent = %self.name(), error = %e, "resume data would not load back");
+                }
+                r
+            }
+            // The check panicked, which decoding never does; nothing to
+            // return.
+            Err(e) => {
+                warn!(torrent = %self.name(), error = %e, "resume data check failed");
+                Err(ResumeError::Invalid("resume"))
+            }
+        }
     }
 
     /// The storage flushed, then its stamps; none if either fails (the

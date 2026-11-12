@@ -99,7 +99,7 @@ pub(crate) enum Cmd {
     },
     Shutdown(oneshot::Sender<()>),
     /// Stops as `Shutdown` does, then answers with the resume data.
-    ShutdownSave(oneshot::Sender<Vec<u8>>),
+    ShutdownSave(oneshot::Sender<Result<Vec<u8>, SessionError>>),
     /// Every verified piece written, then the resume data.
     SaveResume(oneshot::Sender<Result<Vec<u8>, SessionError>>),
     /// A [`FileReader`] opens on file `file`, sharing `link`.
@@ -291,6 +291,13 @@ impl TorrentHandle {
     /// check (or its resume data's, or none) without stamps, so the next
     /// add checks again. Waits for a storage move, as
     /// [`move_storage`](Self::move_storage) describes.
+    ///
+    /// The data is decoded again before it is returned, so whatever this
+    /// returns [`AddTorrent::from_resume`](crate::AddTorrent::from_resume)
+    /// accepts; data it would refuse (an `info` dictionary over
+    /// [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES), or more values than
+    /// [`MAX_RESUME_ITEMS`](crate::MAX_RESUME_ITEMS)) fails here with
+    /// [`SessionError::Resume`] instead.
     pub async fn save_resume_data(&self) -> Result<Vec<u8>, SessionError> {
         self.call(Cmd::SaveResume).await?
     }
@@ -686,7 +693,9 @@ impl TorrentHandle {
     }
 
     /// Asks the actor to stop and save; the receiver gets its resume data.
-    pub(crate) async fn send_shutdown_save(&self) -> Option<oneshot::Receiver<Vec<u8>>> {
+    pub(crate) async fn send_shutdown_save(
+        &self,
+    ) -> Option<oneshot::Receiver<Result<Vec<u8>, SessionError>>> {
         let (tx, rx) = oneshot::channel();
         self.inner.cmds.send(Cmd::ShutdownSave(tx)).await.ok()?;
         Some(rx)

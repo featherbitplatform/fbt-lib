@@ -1138,9 +1138,13 @@ impl Session {
     /// [`shutdown`](Self::shutdown), returning the session's state for
     /// [`restore`](Self::restore): each torrent's resume data taken after
     /// its final flush (so nothing is written after it and its pieces are
-    /// trusted on restart), in queue order, and the DHT's state. Empty if
-    /// the session was already shut down.
-    pub async fn shutdown_and_save(&self) -> SessionState {
+    /// trusted on restart), in queue order, and the DHT's state. A torrent
+    /// whose resume data could not be taken (its task already gone, or data
+    /// that would not load back, see
+    /// [`TorrentHandle::save_resume_data`]) is left out of the state, logged,
+    /// and returned with its error. Empty if the session was already shut
+    /// down.
+    pub async fn shutdown_and_save(&self) -> (SessionState, Vec<(InfoHashes, SessionError)>) {
         self.shutdown_inner(true).await.unwrap_or_default()
     }
 
@@ -1150,33 +1154,45 @@ impl Session {
     /// what they write afterwards makes their resume data untrusted on
     /// restart (a full check), unless they were paused first; see
     /// [`shutdown_and_save`](Self::shutdown_and_save). A torrent removed
-    /// meanwhile is left out.
+    /// meanwhile is left out silently; one whose save fails (for instance
+    /// [`SessionError::Busy`] during a storage move) is left out, logged,
+    /// and returned with its error, the others still saved.
     ///
     /// Fails with [`SessionError::Shutdown`] once the session has shut
     /// down.
-    pub async fn save_state(&self) -> Result<SessionState, SessionError> {
+    pub async fn save_state(
+        &self,
+    ) -> Result<(SessionState, Vec<(InfoHashes, SessionError)>), SessionError> {
         if self.inner.shared.is_shutdown() {
             return Err(SessionError::Shutdown);
         }
         let mut torrents = Vec::new();
+        let mut failed = Vec::new();
         for h in self.torrents() {
             match h.save_resume_data().await {
                 Ok(b) => torrents.push(b),
                 Err(SessionError::TorrentNotFound) => {}
-                Err(e) => return Err(e),
+                Err(SessionError::Shutdown) => return Err(SessionError::Shutdown),
+                Err(e) => {
+                    warn!(torrent = %h.info_hashes(), error = %e, "left out of the saved state");
+                    failed.push((h.info_hashes(), e));
+                }
             }
         }
-        Ok(SessionState {
+        let state = SessionState {
             dht: self.dht_state().await?,
             torrents,
-        })
+        };
+        Ok((state, failed))
     }
 
     /// Starts a session from `state` ([`save_state`](Self::save_state) or
     /// [`shutdown_and_save`](Self::shutdown_and_save)): its DHT state
     /// replaces [`Settings::dht_state`] (when it has one), and each torrent
     /// is added from its resume data ([`AddTorrent::from_resume`]) in the
-    /// saved order, which is the queue's. A torrent that cannot be added
+    /// saved order, which is the queue's (each torrent's own saved position
+    /// is ignored here: the order of `state.torrents` decides). A torrent
+    /// that cannot be added
     /// does not stop the others: it is returned with its index in
     /// `state.torrents` and the error ([`SessionError::Resume`] for resume
     /// data that does not decode).
@@ -1193,7 +1209,13 @@ impl Session {
         let mut failed = Vec::new();
         for (i, bytes) in state.torrents.iter().enumerate() {
             let r = match AddTorrent::from_resume(bytes) {
-                Ok(p) => session.add_torrent(p).await.map(|_| ()),
+                Ok(mut p) => {
+                    // At the bottom, so the queue follows the state's order.
+                    if let Some(r) = p.resume.as_mut() {
+                        r.queue_position = None;
+                    }
+                    session.add_torrent(p).await.map(|_| ())
+                }
                 Err(e) => Err(SessionError::Resume(e)),
             };
             if let Err(e) = r {
@@ -1206,7 +1228,10 @@ impl Session {
     /// The shutdown; with `save`, each torrent's resume data after its
     /// final flush and the DHT state before the DHT stops. `None` if the
     /// session was already shut down.
-    async fn shutdown_inner(&self, save: bool) -> Option<SessionState> {
+    async fn shutdown_inner(
+        &self,
+        save: bool,
+    ) -> Option<(SessionState, Vec<(InfoHashes, SessionError)>)> {
         if self.inner.shared.shutdown.swap(true, Ordering::AcqRel) {
             return None;
         }
@@ -1226,16 +1251,24 @@ impl Session {
             handles
         };
         let mut state = SessionState::default();
+        let mut failed = Vec::new();
         if save {
             let mut waits = Vec::new();
             for h in &handles {
-                if let Some(rx) = h.send_shutdown_save().await {
-                    waits.push(rx);
-                }
+                waits.push((h.info_hashes(), h.send_shutdown_save().await));
             }
-            for rx in waits {
-                if let Ok(bytes) = rx.await {
-                    state.torrents.push(bytes);
+            for (ih, rx) in waits {
+                // A task already gone (it stopped on its own) cannot save.
+                let r = match rx {
+                    Some(rx) => rx.await.unwrap_or(Err(SessionError::TorrentNotFound)),
+                    None => Err(SessionError::TorrentNotFound),
+                };
+                match r {
+                    Ok(bytes) => state.torrents.push(bytes),
+                    Err(e) => {
+                        warn!(torrent = %ih, error = %e, "left out of the saved state");
+                        failed.push((ih, e));
+                    }
                 }
             }
         } else {
@@ -1267,7 +1300,7 @@ impl Session {
         }
         // Last: the `stopped` announces and the DHT used these sockets.
         self.inner.close_udp();
-        Some(state)
+        Some((state, failed))
     }
 }
 

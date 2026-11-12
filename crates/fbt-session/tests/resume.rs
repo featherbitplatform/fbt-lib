@@ -702,7 +702,8 @@ async fn session_state_round_trip() {
         .unwrap();
     order.rotate_right(1);
     assert!(wait_until(|| s.dht_stats().unwrap().nodes_v4 >= 1, T).await);
-    let state = s.shutdown_and_save().await;
+    let (state, failed) = s.shutdown_and_save().await;
+    assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(state.torrents.len(), 3);
     assert!(state.dht.is_some());
     let state = SessionState::from_bytes(&state.to_bytes()).unwrap();
@@ -750,7 +751,8 @@ async fn dirty_pieces_at_shutdown_are_in_the_state() {
     h.add_peer(seed).await.unwrap();
     wait_have(&h, &[0, 1, 2]).await;
     assert!(s.cache_stats().dirty > 0, "nothing left dirty to test");
-    let state = s.shutdown_and_save().await;
+    let (state, failed) = s.shutdown_and_save().await;
+    assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(state.torrents.len(), 1);
 
     let (s, failed) = Session::restore(dial_tcp(settings()), &state)
@@ -763,5 +765,161 @@ async fn dirty_pieces_at_shutdown_are_in_the_state() {
     assert_eq!(have(&h).await, vec![0, 1, 2]);
     let a = std::fs::read(file(dir.path(), "a")).unwrap();
     assert!(a == payload[..A]);
+    s.shutdown().await;
+}
+
+/// A seeding torrent with every file five directories deep, its `info`
+/// for a hybrid (v1 and v2) torrent: the `file tree` nests one level per
+/// directory. Returns the metainfo and the payload.
+fn deep_hybrid_torrent() -> (Metainfo, Vec<u8>) {
+    use fbt_bencode::DictBuilder;
+    let dirs = ["d1", "d2", "d3", "d4", "d5"];
+    let len = 50_000usize;
+    let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let pieces: Vec<u8> = payload
+        .chunks(16_384)
+        .flat_map(fbt_session::storage::sha1_piece)
+        .collect();
+    let mut file = DictBuilder::new();
+    file.insert(b"length", len as i64);
+    let path = dirs.iter().chain(["f"].iter());
+    file.insert(
+        b"path",
+        OwnedValue::List(path.map(|c| OwnedValue::from(*c)).collect()),
+    );
+    // file tree: d1 -> ... -> d5 -> f -> "" -> {length, pieces root}.
+    let mut leaf = DictBuilder::new();
+    leaf.insert(b"length", len as i64);
+    leaf.insert(b"pieces root", vec![0u8; 32]);
+    let mut node = DictBuilder::new();
+    node.insert(b"", leaf.build());
+    let mut tree = DictBuilder::new();
+    tree.insert(b"f", node.build());
+    for d in dirs.iter().rev() {
+        let mut up = DictBuilder::new();
+        up.insert(d.as_bytes(), tree.build());
+        tree = up;
+    }
+    let mut info = DictBuilder::new();
+    info.insert(b"file tree", tree.build());
+    info.insert(b"files", OwnedValue::List(vec![file.build()]));
+    info.insert(b"meta version", 2i64);
+    info.insert(b"name", "torrent");
+    info.insert(b"piece length", 16_384i64);
+    info.insert(b"pieces", pieces);
+    let mut root = DictBuilder::new();
+    root.insert(b"info", info.build());
+    let m = Metainfo::from_bytes(&encode(&root.build())).expect("valid hybrid torrent");
+    (m, payload)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deep_hybrid_torrent_resumes() {
+    let (m, payload) = deep_hybrid_torrent();
+    assert!(m.info_hashes.v2.is_some(), "hybrid");
+    let s = Session::new(settings()).await.unwrap();
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(Arc::new(MemStorage::from_bytes(payload.clone())));
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    h.pause().await.unwrap();
+    let data = h.save_resume_data().await.unwrap();
+    s.shutdown().await;
+
+    let mut p = AddTorrent::from_resume(&data).unwrap();
+    let TorrentSource::Metainfo(got) = &p.source else {
+        panic!("metainfo expected");
+    };
+    assert_eq!(got.info_hashes, m.info_hashes, "the v2 hash survives");
+    p.storage = Some(Arc::new(MemStorage::from_bytes(payload)));
+    let s = Session::new(settings()).await.unwrap();
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(trusted(&h).await);
+    assert_eq!(have(&h).await, vec![0, 1, 2, 3]);
+    s.shutdown().await;
+}
+
+/// A magnet saved before its metadata comes back as a magnet, fetches its
+/// metadata, and reports no trust verdict: there were no pieces to trust.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_without_metadata_resumes_as_a_magnet() {
+    let (m, payload) = make_torrent(&FILES, PL);
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::new(settings()).await.unwrap();
+    let h = s
+        .add_torrent(AddTorrent::magnet(
+            Magnet::from_info_hashes(m.info_hashes),
+            dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::DownloadingMetadata, T).await);
+    let data = h.save_resume_data().await.unwrap();
+    s.shutdown().await;
+
+    let p = AddTorrent::from_resume(&data).unwrap();
+    assert!(matches!(p.source, TorrentSource::Magnet(_)));
+    let full = seeder(&m, &payload).await;
+    let s = Session::new(settings()).await.unwrap();
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(!h.status().has_metadata);
+    h.add_peer(full.local_addr()).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    assert_eq!(h.status().resume_trusted, None);
+    s.shutdown().await;
+    full.shutdown().await;
+}
+
+/// `restore` follows the state's order, whatever positions the torrents
+/// saved (here all of them saved position 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_follows_the_states_order() {
+    let mut state = SessionState::default();
+    let mut order = Vec::new();
+    for _ in 0..3 {
+        let (m, payload) = make_torrent(&[("x", 20_000)], 16_384);
+        let s = Session::new(settings()).await.unwrap();
+        let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+        p.storage = Some(Arc::new(MemStorage::from_bytes(payload)));
+        let h = s.add_torrent(p).await.unwrap();
+        assert_eq!(h.status().queue_position, 0);
+        state.torrents.push(h.save_resume_data().await.unwrap());
+        order.push(m.info_hashes);
+        s.shutdown().await;
+    }
+    let (s, failed) = Session::restore(settings(), &state).await.unwrap();
+    assert!(failed.is_empty(), "{failed:?}");
+    let got: Vec<InfoHashes> = s
+        .torrents()
+        .iter()
+        .map(TorrentHandle::info_hashes)
+        .collect();
+    assert_eq!(got, order);
+    s.shutdown().await;
+}
+
+/// A seed limit pauses the torrent and takes it out of the queue's
+/// control: both are in resume data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seed_limit_pause_needs_a_save() {
+    let (m, payload) = make_torrent(&[("x", 20_000)], 16_384);
+    let mut st = settings();
+    st.seed_ratio_limit = Some(0.0);
+    let s = Session::new(st).await.unwrap();
+    let mut ev = s.subscribe(EventMask::ALL);
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(Arc::new(MemStorage::from_bytes(payload)));
+    p.paused = true;
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Paused, T).await);
+    h.save_resume_data().await.unwrap();
+    assert!(!h.status().need_save_resume);
+    h.resume().await.unwrap();
+    h.save_resume_data().await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::SeedLimitReached { .. }), T)
+        .await
+        .expect("SeedLimitReached");
+    assert!(wait_until(|| h.status().need_save_resume, T).await);
+    assert!(!h.status().auto_managed);
     s.shutdown().await;
 }

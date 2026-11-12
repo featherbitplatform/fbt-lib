@@ -38,9 +38,10 @@ use std::time::Duration;
 
 use fbt_bencode::{DecodeError, Dict, Limits, OwnedValue, Value, decode_with, encode_into};
 use fbt_core::compact::{decode_v4_list, decode_v6_list};
-use fbt_core::{Bitfield, InfoHashV1, InfoHashes, compact};
+use fbt_core::{Bitfield, InfoHashV1, compact};
 use fbt_metainfo::{
-    FileEntry, MAX_WEB_SEEDS, Magnet, MagnetError, Metainfo, MetainfoError, RelPath, sanitize_path,
+    FileEntry, MAX_TORRENT_DEPTH, MAX_TORRENT_ITEMS, MAX_WEB_SEEDS, Magnet, MagnetError, Metainfo,
+    MetainfoError, RelPath, sanitize_path,
 };
 
 use crate::bandwidth::RateLimit;
@@ -48,12 +49,30 @@ use crate::session::{Priority, TorrentSource};
 use crate::storage::FileStamp;
 
 /// Largest resume data accepted; longer input is refused before decoding.
+/// The `.torrent` parser has no byte cap, so this one can be reached by a
+/// valid torrent (an `info` over 64 MiB: more than about 3.3 million
+/// piece hashes); [`TorrentHandle::save_resume_data`](crate::TorrentHandle::save_resume_data)
+/// then fails with [`ResumeError::TooLarge`] rather than return data that
+/// would not load.
 pub const MAX_RESUME_BYTES: usize = 64 * 1024 * 1024;
-/// Most bencode values (the raw `info` dictionary's included) in resume
-/// data.
-pub const MAX_RESUME_ITEMS: usize = 4_194_304;
-/// Deepest nesting of resume data.
-const MAX_RESUME_DEPTH: usize = 8;
+/// Most bencode values in resume data: twice what
+/// [`Metainfo::from_bytes`] accepts in a whole `.torrent`
+/// ([`MAX_TORRENT_ITEMS`]). The raw `info` takes at most one share; every
+/// file costs at least six values there and adds four here (its priority
+/// and its stamp), so the per-file fields take at most two thirds of the
+/// other share, and the rest (about 1.4 million values) is left for the
+/// renamed paths and the fixed fields. Resume data a torrent saves never
+/// exceeds it unless its renamed paths hold more components than that;
+/// [`TorrentHandle::save_resume_data`](crate::TorrentHandle::save_resume_data)
+/// checks its own output and fails rather than return data that would not
+/// load.
+pub const MAX_RESUME_ITEMS: usize = 2 * MAX_TORRENT_ITEMS;
+/// Deepest nesting of resume data: that of a `.torrent`
+/// ([`MAX_TORRENT_DEPTH`]). The raw `info` sits at the same depth as in a
+/// `.torrent` (below the root dictionary), so any `info` the parser
+/// accepted fits (a hybrid torrent's `file tree` nests one level per
+/// directory); the other fields nest at most four deep.
+const MAX_RESUME_DEPTH: usize = MAX_TORRENT_DEPTH;
 /// Most peers kept per address family (`peers`, `peers6`); later ones are
 /// dropped, on save and on load.
 pub const MAX_RESUME_PEERS: usize = 200;
@@ -183,8 +202,7 @@ pub fn decode_resume(bytes: &[u8]) -> Result<DecodedResume, ResumeError> {
             if InfoHashV1::of(raw).0 != ih {
                 return Err(ResumeError::InfoHashMismatch);
             }
-            let m = Metainfo::from_info_bytes(raw, InfoHashes::from_v1(InfoHashV1(ih)), trackers)
-                .map_err(ResumeError::Metainfo)?;
+            let m = parse_info(raw, &trackers)?;
             let source = TorrentSource::Metainfo(Box::new(m.clone()));
             (source, Some(m))
         }
@@ -244,6 +262,28 @@ pub fn decode_resume(bytes: &[u8]) -> Result<DecodedResume, ResumeError> {
         ),
         state,
     })
+}
+
+/// The torrent of a raw `info` dictionary (already checked against the
+/// info hash) and its tracker tiers, parsed as a `.torrent` holding just
+/// them: the same parser and limits as the torrent was added with (a
+/// hybrid torrent's v2 hash included), so whatever was added can be
+/// resumed.
+fn parse_info(raw: &[u8], trackers: &[Vec<String>]) -> Result<Metainfo, ResumeError> {
+    let mut torrent = Vec::with_capacity(raw.len().saturating_add(64));
+    torrent.push(b'd');
+    if !trackers.is_empty() {
+        encode_into(&OwnedValue::from("announce-list"), &mut torrent);
+        let tiers = trackers
+            .iter()
+            .map(|t| OwnedValue::List(t.iter().map(|u| OwnedValue::from(u.as_str())).collect()))
+            .collect();
+        encode_into(&OwnedValue::List(tiers), &mut torrent);
+    }
+    encode_into(&OwnedValue::from("info"), &mut torrent);
+    torrent.extend_from_slice(raw);
+    torrent.push(b'e');
+    Metainfo::from_bytes(&torrent).map_err(ResumeError::Metainfo)
 }
 
 /// An integer field; `Invalid` if it is not one.
