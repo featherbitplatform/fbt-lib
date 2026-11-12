@@ -293,10 +293,11 @@ impl Actor {
     /// Follows the seeding state: peers learn when we become (or stop
     /// being) upload-only, and upload-only peers are dropped once we are.
     /// "Finished" means seeding, with the data on disk, not merely every
-    /// piece verified, and no reader's deadline piece missing (a reader on
-    /// a skipped file needs the seeds).
+    /// piece verified, and no open reader's file missing a piece (a reader
+    /// on a skipped file needs the seeds for as long as it reads; see
+    /// [`reader_needs_pieces`](Self::reader_needs_pieces)).
     pub(super) fn sync_upload_only(&mut self) {
-        let on = matches!(self.last_state, TorrentState::Seeding) && !self.deadline_missing();
+        let on = matches!(self.last_state, TorrentState::Seeding) && !self.reader_needs_pieces();
         if on == self.upload_only_sent {
             return;
         }
@@ -857,7 +858,7 @@ impl Actor {
                     .as_ref()
                     .and_then(|l| l.picker.as_ref())
                     .is_some_and(|pk| !pk.is_finished())
-                    || self.deadline_missing()
+                    || self.reader_needs_pieces()
             } else {
                 p.bits.iter_ones().any(|i| self.wants_piece(i))
             };
@@ -916,28 +917,30 @@ impl Actor {
         let (Some(picker), Some(p)) = (l.picker.as_mut(), self.peers.get(&key)) else {
             return;
         };
+        // Choking us, only its allowed-fast pieces (`can_request_fast`
+        // above means it has some); no fallback to its other pieces.
         let has = if p.choked_us {
-            p.fast_has
-                .as_ref()
-                .map_or(PeerPieces::Some(&p.bits), PeerPieces::Some)
+            p.fast_has.as_ref().map(PeerPieces::Some)
         } else {
-            p.pieces()
+            Some(p.pieces())
         };
-        // Deadline pieces go only through `fill_deadlines`, which knows
-        // whether this peer is in time for them.
-        let without_deadlines = (!self.deadlines.is_empty()).then(|| {
-            let mut mask = match has {
-                PeerPieces::Some(bf) => bf.clone(),
-                _ => Bitfield::full(picker.have().len()),
-            };
-            for &(piece, _) in self.deadlines.ordered() {
-                mask.clear(piece);
-            }
-            mask
-        });
-        let has = without_deadlines.as_ref().map_or(has, PeerPieces::Some);
         let mut blocks = deadline_blocks;
-        if room > 0 {
+        if let Some(has) = has
+            && room > 0
+        {
+            // Deadline pieces go only through `fill_deadlines`, which knows
+            // whether this peer is in time for them.
+            let without_deadlines = (!self.deadlines.is_empty()).then(|| {
+                let mut mask = match has {
+                    PeerPieces::Some(bf) => bf.clone(),
+                    _ => Bitfield::full(picker.have().len()),
+                };
+                for &(piece, _) in self.deadlines.ordered() {
+                    mask.clear(piece);
+                }
+                mask
+            });
+            let has = without_deadlines.as_ref().map_or(has, PeerPieces::Some);
             blocks.extend(pick_capped(picker, key, has, room, cap, &mut self.rng));
         }
         // Every piece started here reserves its buffer from the cache

@@ -976,6 +976,8 @@ async fn finished_torrent_keeps_seeds_for_a_skipped_file_reader() {
     let mut hs = fbt_wire::ExtHandshake::default();
     hs.m.insert(fbt_wire::UPLOAD_ONLY.to_owned(), 7);
     observer.send_ext_handshake(&hs).await;
+    // How the torrent sees the observer's connection.
+    let observer_addr = observer.framed.get_ref().local_addr().unwrap();
     let upload_only = |m: &Message| matches!(m, Message::Extended { id: 7, .. });
     match observer.next_matching(upload_only).await {
         Some(Message::Extended { payload, .. }) => {
@@ -1002,19 +1004,23 @@ async fn finished_torrent_keeps_seeds_for_a_skipped_file_reader() {
         other => panic!("no UploadOnly(false): {other:?}"),
     }
     let observe = tokio::spawn(async move { observer.wait_closed(T).await });
-    let got = tokio::time::timeout(T, read_at(&mut r, 0, 64 * 1024))
+    // 1 MiB into C: a piece only C covers (C's first piece is also B's,
+    // and B is done), so only the seed has it.
+    let at = MIB as u64;
+    let got = tokio::time::timeout(T, read_at(&mut r, at, 64 * 1024))
         .await
         .expect("read in time")
         .unwrap();
-    assert!(got == payload[STRADDLE_C..STRADDLE_C + 64 * 1024]);
+    let start = STRADDLE_C + MIB;
+    assert!(got == payload[start..start + 64 * 1024]);
     let events = seen.lock().unwrap().clone();
     // Our redial, or the seed's own dial if it wins the race: the only
-    // peer with C's bytes is connected again (the observer connected
-    // before these events).
+    // peer with C's bytes is connected again (the stream may still hold
+    // the observer's own `PeerConnected`).
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, Event::PeerConnected { .. })),
+            .any(|e| matches!(e, Event::PeerConnected { addr, .. } if *addr != observer_addr)),
         "the seed is connected again: {events:?}"
     );
     // The default window covers all of C: still missing, so nobody is
@@ -1075,7 +1081,7 @@ async fn seek_away_from_skipped_file_drops_its_partial_pieces() {
     let _ = pending.await;
     let waiting = tokio::spawn(async move { read_at(&mut rw, 0, 4096).await });
     assert!(
-        wait_until(|| l.cache_stats().partial == 0, Duration::from_secs(5)).await,
+        wait_until(|| l.cache_stats().partial == 0, T).await,
         "partial pieces dropped: {:?}",
         l.cache_stats()
     );
@@ -1085,7 +1091,7 @@ async fn seek_away_from_skipped_file_drops_its_partial_pieces() {
         asked == cancelled
     };
     assert!(
-        wait_until(all_cancelled, Duration::from_secs(5)).await,
+        wait_until(all_cancelled, T).await,
         "every held block cancelled: {} requests, {} cancels",
         logged(&requests).len(),
         logged(&cancels).len()
@@ -1207,15 +1213,27 @@ async fn only_peer_chokes_then_unchokes() {
     assert!(!read.is_finished(), "the read waits, with no error");
     let at = choked_at.lock().unwrap().expect("choked");
     // Requests already on the wire when the choke went out may still
-    // arrive; none is sent once it is a second old.
-    let late: Vec<BlockRef> = log
+    // arrive, each block once and at most a pipeline's worth; a busy loop
+    // would ask for the released blocks again and again.
+    let after: Vec<BlockRef> = log
         .lock()
         .unwrap()
         .iter()
-        .filter(|(t, _)| *t > at + Duration::from_secs(1))
+        .filter(|(t, _)| *t >= at)
         .map(|(_, b)| *b)
         .collect();
-    assert!(late.is_empty(), "requests while choked: {late:?}");
+    let distinct: std::collections::HashSet<BlockRef> = after.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        after.len(),
+        "a block asked twice while choked: {after:?}"
+    );
+    let pipeline = Settings::default().max_outstanding_requests;
+    assert!(
+        after.len() <= pipeline,
+        "{} requests while choked",
+        after.len()
+    );
     let _ = go.send(());
     let got = tokio::time::timeout(T, read)
         .await
@@ -1225,4 +1243,131 @@ async fn only_peer_chokes_then_unchokes() {
     assert!(got == payload[..4096]);
     task.abort();
     l.shutdown().await;
+}
+
+/// A reader on a skipped file many windows long, on a finished torrent,
+/// reads slower than the download: each window completes before the reader
+/// moves on. The seeds stay connected and we stay non-upload-only until the
+/// reader closes, instead of closing and redialling them at every window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_a_large_skipped_file_keeps_the_seeds() {
+    // W (pieces 0 to 3) wanted, S (pieces 4 to 27) skipped.
+    let (m, payload) = make_torrent(&[("w", MIB), ("s", 6 * MIB)], PL as u32);
+    let s_start = MIB;
+    let (seed, _sh) = seeder(&m, &payload).await;
+    let seed_addr = seed.local_addr();
+    let (l, lh) = leech_with(
+        settings(),
+        &m,
+        vec![Priority::Normal, Priority::Skip],
+        TorrentState::Downloading,
+    )
+    .await;
+    let mut ev = l.subscribe(EventMask::PEER);
+    lh.add_peer(seed_addr).await.unwrap();
+    assert!(wait_state(&lh, |s| *s == TorrentState::Seeding, T).await);
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == seed_addr),
+        T,
+    )
+    .await
+    .expect("the seed is closed once W is done");
+    // A peer that hears every upload-only change.
+    let mut reserved = fbt_wire::Reserved::default();
+    reserved.set_extended();
+    let mut observer =
+        ScriptedPeer::connect_with(l.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    let mut hs = fbt_wire::ExtHandshake::default();
+    hs.m.insert(fbt_wire::UPLOAD_ONLY.to_owned(), 7);
+    observer.send_ext_handshake(&hs).await;
+    let heard: Arc<std::sync::Mutex<Vec<bool>>> = Arc::default();
+    let listen = {
+        let heard = Arc::clone(&heard);
+        tokio::spawn(async move {
+            while let Some(Ok(m)) = observer.framed.next().await {
+                if let Message::Extended { id: 7, payload } = m {
+                    heard
+                        .lock()
+                        .unwrap()
+                        .push(fbt_wire::decode_upload_only(&payload).unwrap());
+                }
+            }
+        })
+    };
+    assert!(
+        wait_until(|| *heard.lock().unwrap() == [true], T).await,
+        "upload-only while seeding: {:?}",
+        heard.lock().unwrap()
+    );
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collect = {
+        let seen = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(e) = ev.recv().await {
+                seen.lock().unwrap().push(e);
+            }
+        })
+    };
+    // A 1 MiB window: S is six of them.
+    let mut r = lh
+        .open_file_with(1, ReadAhead::new(MIB as u64, Duration::from_secs(1), None))
+        .await
+        .unwrap();
+    assert!(
+        wait_until(|| *heard.lock().unwrap() == [true, false], T).await,
+        "a reader on S: no longer upload-only: {:?}",
+        heard.lock().unwrap()
+    );
+    let mut buf = vec![0u8; MIB];
+    for step in 0..4 {
+        let at = s_start + step * MIB;
+        tokio::time::timeout(T, r.read_exact(&mut buf))
+            .await
+            .expect("read in time")
+            .unwrap();
+        assert!(buf == payload[at..at + MIB], "step {step}");
+        // The next window completes and is written before the reader moves
+        // on: the moment a window-only rule would turn upload-only on.
+        let end = tokio::time::Instant::now() + T;
+        loop {
+            if lh.status().state == TorrentState::Seeding && lh.debug_deadlines().await.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < end,
+                "window {step} done in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // One status tick for any upload-only change to go out.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        *heard.lock().unwrap(),
+        [true, false],
+        "no upload-only between windows"
+    );
+    let events = seen.lock().unwrap().clone();
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::PeerDisconnected {
+                reason: DisconnectReason::UploadOnly,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    // The reader goes: finished again, upload-only again.
+    drop(r);
+    assert!(
+        wait_until(|| *heard.lock().unwrap() == [true, false, true], T).await,
+        "upload-only once the reader closed: {:?}",
+        heard.lock().unwrap()
+    );
+    collect.abort();
+    listen.abort();
+    l.shutdown().await;
+    seed.shutdown().await;
 }

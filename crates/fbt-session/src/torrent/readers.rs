@@ -132,6 +132,8 @@ impl Actor {
             },
         );
         self.sync_reader(id, Instant::now(), true);
+        // Its file may be incomplete although its window is not.
+        self.sync_upload_only();
         Ok(id)
     }
 
@@ -432,6 +434,18 @@ impl Actor {
         let orphans = self.deadlines.remove(id);
         self.remove_reader_waiters(id);
         self.deadlines_changed(&[], &orphans);
+        // Its file no longer keeps the seeds (as interesting, and from an
+        // upload-only close), whatever its window held.
+        let interested: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.live() && p.am_interested)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in interested {
+            self.update_interest(key);
+        }
+        self.sync_upload_only();
     }
 
     /// Reads the reader's link and sets its window (missing pieces only)
@@ -547,22 +561,30 @@ impl Actor {
     /// `orphans` left every window. An orphan of priority 0 has no other
     /// reason to finish: its outstanding blocks are cancelled and its
     /// buffer freed (one pending its hash check keeps going). Peers that
-    /// have an added piece may become interesting, and a seeding torrent
-    /// is upload-only only while no deadline piece is missing.
+    /// have an added piece may become interesting; interested peers may
+    /// stop being so once pieces left the windows.
     pub(super) fn deadlines_changed(&mut self, added: &[u32], orphans: &[u32]) {
+        if added.is_empty() && orphans.is_empty() {
+            return;
+        }
         for &piece in orphans {
             self.abandon_skipped(piece);
         }
-        if !added.is_empty() {
-            let keys: Vec<PeerKey> = self
-                .peers
-                .iter()
-                .filter(|(_, p)| p.live() && !p.am_interested && added.iter().any(|&i| p.has(i)))
-                .map(|(k, _)| *k)
-                .collect();
-            for key in keys {
-                self.update_interest(key);
-            }
+        let keys: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| {
+                p.live()
+                    && if p.am_interested {
+                        !orphans.is_empty()
+                    } else {
+                        added.iter().any(|&i| p.has(i))
+                    }
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for key in keys {
+            self.update_interest(key);
         }
         self.sync_upload_only();
         if !added.is_empty() {
@@ -598,6 +620,35 @@ impl Actor {
                 self.send(key, PeerCommand::Cancel(block));
             }
         }
+    }
+
+    /// Some open reader's file still has a missing piece. A finished
+    /// torrent is not upload-only (BEP 21) and keeps its interest in seeds
+    /// while this holds: a reader slower than the download completes its
+    /// window again and again, and turning upload-only on at each of those
+    /// moments would close and redial the seeds once per window.
+    pub(super) fn reader_needs_pieces(&self) -> bool {
+        let Some(l) = self.loaded.as_ref() else {
+            return false;
+        };
+        let Some(pk) = l.picker.as_ref() else {
+            return false;
+        };
+        let pl = u64::from(l.layout.piece_len());
+        self.readers.open.values().any(|r| {
+            let Some(last) = r.file.end.checked_sub(1) else {
+                return false;
+            };
+            if r.file.start > last {
+                return false;
+            }
+            let (Ok(first), Ok(last)) =
+                (u32::try_from(r.file.start / pl), u32::try_from(last / pl))
+            else {
+                return false;
+            };
+            (first..=last).any(|i| !pk.have().get(i))
+        })
     }
 
     /// Some piece with a deadline is missing.
@@ -698,24 +749,32 @@ impl Actor {
             if !has {
                 continue;
             }
-            let left = deadline.saturating_duration_since(now);
-            let mine = arrival_after(base.saturating_add(out.len()), rate);
-            // Free blocks: as many as arrive in time, or all for the best.
-            let best = !choked
-                && !ahead
-                    .iter()
-                    .any(|k| self.peers.get(k).is_some_and(|o| o.has(piece)));
-            let free = if best {
-                left_room
-            } else {
-                blocks_within(left, rate)
-                    .saturating_sub(base.saturating_add(out.len()))
-                    .min(left_room)
-            };
             let Some(progress) = picker.progress(piece) else {
                 continue;
             };
-            let take_free = free > 0 && progress.free > 0;
+            let left = deadline.saturating_duration_since(now);
+            let mine = arrival_after(base.saturating_add(out.len()), rate);
+            // Free blocks: as many as arrive in time, or all for the best
+            // (worked out only when the piece has free blocks).
+            let free = if progress.free == 0 {
+                0
+            } else {
+                let in_time = blocks_within(left, rate)
+                    .saturating_sub(base.saturating_add(out.len()))
+                    .min(left_room);
+                let best = || {
+                    !choked
+                        && !ahead
+                            .iter()
+                            .any(|k| self.peers.get(k).is_some_and(|o| o.has(piece)))
+                };
+                if in_time < left_room && best() {
+                    left_room
+                } else {
+                    in_time
+                }
+            };
+            let take_free = free > 0;
             let late: Vec<PeerKey> = if progress.owners.contains(&key) {
                 Vec::new()
             } else {
@@ -1093,6 +1152,52 @@ mod tests {
         assert!(of_piece(&a, slower, 10).is_empty());
         want(&mut a, faster, 4);
         assert_eq!(of_piece(&a, faster, 10), vec![0, 16_384, 32_768, 49_152]);
+    }
+
+    /// An owner that chokes us (fast extension: its requests stay
+    /// outstanding) is late whatever its rate says; unchoking, the same
+    /// owner is on time and keeps its blocks to itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_choking_holder_on_time_by_rate_is_still_late() {
+        for choking in [true, false] {
+            let mut a = late_setup();
+            // 1 MiB/s holding two blocks: 47 ms away, piece 10 is due in 390 ms.
+            let (owner, _r1) = add_peer(&mut a, 1, MIB, None);
+            let (other, _r2) = add_peer(&mut a, 2, MIB, None);
+            let (_id, _link) = open(&mut a, 0, 0);
+            hold(&mut a, owner, 10, 2);
+            hold(&mut a, other, 10, 2);
+            a.peers.get_mut(&owner).expect("owner").choked_us = choking;
+            let (c, _r3) = add_peer(&mut a, 3, MIB, None);
+            want(&mut a, c, 2);
+            if choking {
+                assert_eq!(of_piece(&a, c, 10), vec![0, 16_384], "the choking owner's");
+            } else {
+                assert!(of_piece(&a, c, 10).is_empty());
+            }
+        }
+    }
+
+    /// Interest that only a reader's window gave goes with the reader.
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_reader_drops_interest_it_gave() {
+        let plen = u64::from(P4);
+        let mut a = actor_with(&[8 * plen, 8 * plen], P4, 64 * MIB);
+        a.set_priorities(vec![Priority::Normal, Priority::Skip]);
+        let mut only_12 = Bitfield::new(16);
+        only_12.set(12);
+        let (p, mut rp) = add_peer(&mut a, 1, MIB, Some(only_12));
+        let (id, _link) = open(&mut a, 1, 12 * plen);
+        assert!(a.peers[&p].am_interested);
+        a.on_close_reader(id);
+        assert!(!a.peers[&p].am_interested);
+        let mut said = Vec::new();
+        while let Ok(cmd) = rp.try_recv() {
+            if let PeerCommand::Interested(on) = cmd {
+                said.push(on);
+            }
+        }
+        assert_eq!(said, vec![true, false]);
     }
 
     #[tokio::test(start_paused = true)]
