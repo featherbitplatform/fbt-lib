@@ -267,15 +267,15 @@ pub use fbt_core::{
     LayoutError, ParseInfoHashError, PeerId, PieceLayout,
 };
 pub use fbt_metainfo::{FileEntry, Info, Magnet, MagnetError, Metainfo, MetainfoError, RelPath};
-pub use fbt_session::storage::{FsStorage, MemStorage, Storage};
+pub use fbt_session::storage::{FileStamp, FsStorage, MemStorage, Storage};
 pub use fbt_session::{
     AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtStats,
     DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, ExternalIpSource,
     FileReader, IpFilter, ListenError, MAX_METADATA_SIZE, MapMethod, MapProtocol, MixedMode,
     MoveMode, PeerClassLimits, PeerSource, Priority, ProxyConfig, ProxyKind, QueueSettings,
-    RateLimit, ReadAhead, RemoveMode, SeedChokingAlgorithm, Session, SessionError, Settings,
-    StorageError, StreamError, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
-    Transport,
+    RateLimit, ReadAhead, RemoveMode, ResumeError, SeedChokingAlgorithm, Session, SessionError,
+    SessionState, Settings, StorageError, StreamError, TorrentHandle, TorrentSource, TorrentState,
+    TorrentStatus, Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

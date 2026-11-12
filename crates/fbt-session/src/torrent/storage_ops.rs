@@ -59,6 +59,8 @@ impl Cmd {
                 | Cmd::Recheck(_)
                 | Cmd::SetPriorities(..)
                 | Cmd::Shutdown(_)
+                | Cmd::ShutdownSave(_)
+                | Cmd::SaveResume(_)
                 | Cmd::MoveStorage { .. }
                 | Cmd::RenameFile { .. }
         )
@@ -77,6 +79,9 @@ impl Cmd {
             Cmd::Remove(_, tx) | Cmd::MoveStorage { tx, .. } | Cmd::RenameFile { tx, .. } => {
                 let _ = tx.send(busy());
             }
+            Cmd::SaveResume(tx) => {
+                let _ = tx.send(Err(SessionError::Busy));
+            }
             // Never rejected (see `defer`); dropping answers it as gone.
             _ => {}
         }
@@ -88,7 +93,9 @@ impl Actor {
     /// `MAX_DEFERRED_CMDS` it fails with [`SessionError::Busy`] instead,
     /// except the session's `Shutdown`.
     pub(super) fn defer(&mut self, cmd: Cmd) {
-        if self.deferred.len() >= MAX_DEFERRED_CMDS && !matches!(cmd, Cmd::Shutdown(_)) {
+        if self.deferred.len() >= MAX_DEFERRED_CMDS
+            && !matches!(cmd, Cmd::Shutdown(_) | Cmd::ShutdownSave(_))
+        {
             cmd.reject_busy();
         } else {
             self.deferred.push_back(cmd);
@@ -174,7 +181,7 @@ impl Actor {
     pub(super) fn try_start_storage_job(&mut self) {
         let checking = matches!(
             self.phase,
-            Phase::Checking { .. } | Phase::QueuedForCheck { .. }
+            Phase::Checking { .. } | Phase::QueuedForCheck { .. } | Phase::Resuming
         );
         let idle = self.reads_in_flight == 0
             && !self.cache.writes_in_flight()
@@ -214,6 +221,7 @@ impl Actor {
                     // checked (after the pieces verified meanwhile are
                     // written) before the answer.
                     self.save_path.clone_from(&path);
+                    self.need_save_resume = true;
                     self.emit(Event::StorageMoved {
                         torrent: self.ih,
                         path,
@@ -232,6 +240,8 @@ impl Actor {
                 if let Some(l) = self.loaded.as_mut() {
                     l.renamed.insert(index, path);
                 }
+                self.need_save_resume = true;
+                self.publish();
                 self.emit(Event::FileRenamed {
                     torrent: self.ih,
                     index,
@@ -278,6 +288,7 @@ impl Actor {
     /// The move succeeded (or had nothing to do): the save path is `path`.
     fn moved(&mut self, path: PathBuf, tx: Reply) {
         self.save_path.clone_from(&path);
+        self.need_save_resume = true;
         self.publish();
         self.emit(Event::StorageMoved {
             torrent: self.ih,

@@ -6,6 +6,7 @@ mod check;
 mod fs;
 mod mem;
 mod part;
+mod stamp;
 
 use std::io;
 use std::path::Path;
@@ -16,6 +17,7 @@ pub use cache::CacheStats;
 pub use check::{check_pieces, sha1_piece};
 pub use fs::{FsStorage, StorageError, error_path};
 pub use mem::MemStorage;
+pub use stamp::FileStamp;
 
 /// What [`Storage::move_to`] does with files that already exist at the
 /// target.
@@ -89,6 +91,21 @@ pub trait Storage: Send + Sync + std::fmt::Debug + 'static {
     fn rename_file(&self, index: usize, path: &RelPath) -> io::Result<()> {
         let _ = (index, path);
         Err(io::ErrorKind::Unsupported.into())
+    }
+    /// The stamp (length and modification time) of each file, pad files
+    /// included, `None` for one that does not exist; then one more entry
+    /// for the storage's own side file, if it has one (`None` otherwise).
+    /// Resume data records them when it is saved, and the next add trusts
+    /// its pieces without a check only if every file holding a saved piece
+    /// has the same stamp again. The session calls it on the disk pool with
+    /// every verified piece written and flushed.
+    ///
+    /// `Ok(None)` (the default) means the storage cannot tell: resume data
+    /// is then trusted as saved. [`FsStorage`] closes its cached handles
+    /// first (on Windows a file's modification time is final only then)
+    /// and stamps its part file last.
+    fn stamps(&self) -> io::Result<Option<Vec<Option<FileStamp>>>> {
+        Ok(None)
     }
 }
 

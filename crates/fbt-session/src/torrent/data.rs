@@ -38,6 +38,11 @@ pub(crate) enum Job {
         generation: u64,
         result: io::Result<Bitfield>,
     },
+    /// Resume data's stamps were compared: its pieces when trusted.
+    ResumeChecked {
+        generation: u64,
+        trusted: Option<Bitfield>,
+    },
     /// A downloaded piece was hashed; `data` comes back for the write.
     Hashed {
         generation: u64,
@@ -109,7 +114,17 @@ impl Actor {
     pub(super) fn on_job(&mut self, job: Job) {
         match job {
             Job::CheckSlot { seq, permit } => self.on_check_slot(seq, permit),
-            Job::Checked { generation, result } => self.on_checked(generation, result),
+            Job::Checked { generation, result } => {
+                if generation == self.generation {
+                    // What the check found may differ from any saved data.
+                    self.need_save_resume = true;
+                }
+                self.on_checked(generation, result);
+            }
+            Job::ResumeChecked {
+                generation,
+                trusted,
+            } => self.on_resume_checked(generation, trusted),
             Job::Hashed {
                 generation,
                 piece,
@@ -427,6 +442,7 @@ impl Actor {
             return;
         }
         self.cache.written(first, count);
+        self.need_save_resume = true;
         self.maybe_finish();
         self.refresh_state();
         // A landed write may make room for new pieces.
@@ -484,6 +500,8 @@ impl Actor {
         if !finished {
             return;
         }
+        self.completed_time
+            .get_or_insert_with(super::actor::unix_now);
         // Whoever reacts to the event reads the final counters and state.
         self.publish();
         self.emit(Event::TorrentFinished { torrent: self.ih });

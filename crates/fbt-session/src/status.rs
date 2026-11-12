@@ -93,6 +93,18 @@ pub struct TorrentStatus {
     pub active_time: Duration,
     /// Time spent running as a seed since it was added.
     pub seeding_time: Duration,
+    /// Something resume data records changed since the last
+    /// [`save_resume_data`](crate::TorrentHandle::save_resume_data): a
+    /// piece written, a file priority, a rename, a move, a pause or resume,
+    /// a rate limit or the queue. True for a torrent added without resume
+    /// data until its first save.
+    pub need_save_resume: bool,
+    /// For a torrent added from resume data
+    /// ([`AddTorrent::from_resume`](crate::AddTorrent::from_resume)):
+    /// `Some(true)` once its pieces were trusted without a check, `Some(false)`
+    /// once a full check ran instead (a file changed since the save). `None`
+    /// without resume data, and while the stamps are being compared.
+    pub resume_trusted: Option<bool>,
 }
 
 impl TorrentStatus {
@@ -125,6 +137,8 @@ impl TorrentStatus {
             auto_managed: false,
             active_time: Duration::ZERO,
             seeding_time: Duration::ZERO,
+            need_save_resume: false,
+            resume_trusted: None,
         }
     }
 }

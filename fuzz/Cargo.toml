@@ -20,6 +20,7 @@ fbt-dht = { path = "../crates/fbt-dht" }
 fbt-core = { path = "../crates/fbt-core" }
 fbt-utp = { path = "../crates/fbt-utp" }
 fbt-net = { path = "../crates/fbt-net" }
+fbt-session = { path = "../crates/fbt-session" }
 tokio = { version = "1", default-features = false, features = ["rt", "io-util"] }
 
 [workspace]
@@ -172,6 +173,13 @@ bench = false
 [[bin]]
 name = "web_seed_head"
 path = "fuzz_targets/web_seed_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resume"
+path = "fuzz_targets/resume.rs"
 test = false
 doc = false
 bench = false

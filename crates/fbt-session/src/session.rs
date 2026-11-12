@@ -32,6 +32,7 @@ use crate::net::{
     start_port_mapping, utp_for, utp_sockets,
 };
 use crate::queue::{QueueEntry, QueueSettings, is_slow, plan, running_since};
+use crate::resume::{ResumeError, ResumeState, SessionState, decode_resume};
 use crate::settings::Settings;
 use crate::status::TorrentStatus;
 use crate::storage::cache::{CacheBudget, CacheStats};
@@ -125,6 +126,9 @@ pub struct AddTorrent {
     /// stopped as slots free and fill. Changed with
     /// [`TorrentHandle::set_auto_managed`].
     pub auto_managed: bool,
+    /// What [`from_resume`](Self::from_resume) read beyond the public
+    /// fields.
+    pub(crate) resume: Option<Box<ResumeState>>,
 }
 
 impl AddTorrent {
@@ -150,7 +154,49 @@ impl AddTorrent {
             storage: None,
             rate_limit: RateLimit::default(),
             auto_managed: true,
+            resume: None,
         }
+    }
+
+    /// Adds a torrent from its resume data
+    /// ([`TorrentHandle::save_resume_data`]): the torrent (its `info`
+    /// dictionary, or the magnet while the metadata was missing), save
+    /// path, flags, file priorities, rate limit and `auto_managed` fill the
+    /// public fields; the verified pieces, renamed files, web seeds, queue
+    /// position, counters, times and peers come along. `storage` may still
+    /// be set; otherwise the files are found below the save path at their
+    /// renamed paths.
+    ///
+    /// At the add the saved pieces are trusted without a check when every
+    /// file holding one (and the part file, for pieces of skipped files
+    /// kept there) has the length and modification time it had at the save
+    /// ([`Storage::stamps`]); otherwise, or without stamps from an
+    /// [`FsStorage`], the data is checked in full.
+    /// [`TorrentStatus::resume_trusted`] tells which happened. The torrent
+    /// takes its saved queue position when the queue has that many
+    /// torrents, else the bottom.
+    ///
+    /// Resume data is hostile input: anything longer than
+    /// [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES), malformed, of another
+    /// format version, whose `info` does not hash to its info hash, with a
+    /// field of the wrong type or length (`pieces` for another piece count,
+    /// say), or with a renamed path that is unsafe or collides, fails with
+    /// a [`ResumeError`] naming what was wrong. At most
+    /// [`MAX_RESUME_PEERS`](crate::MAX_RESUME_PEERS) peers per address
+    /// family are kept.
+    pub fn from_resume(bytes: &[u8]) -> Result<AddTorrent, ResumeError> {
+        let d = decode_resume(bytes)?;
+        Ok(AddTorrent {
+            source: d.source,
+            save_path: d.save_path,
+            paused: d.paused,
+            sequential: d.sequential,
+            file_priorities: d.file_priorities,
+            storage: None,
+            rate_limit: d.rate_limit,
+            auto_managed: d.auto_managed,
+            resume: Some(Box::new(d.state)),
+        })
     }
 }
 
@@ -968,29 +1014,39 @@ impl Session {
         // auto-managed torrent beyond the limits starts queued: no
         // `started`/`stopped` pair. Its data is unknown yet: it counts as a
         // download until its check says otherwise (the check's end wakes
-        // the scheduler).
-        let position = reg.order.len();
+        // the scheduler). Resume data's position is taken when it fits.
+        let position = params
+            .resume
+            .as_ref()
+            .and_then(|r| r.queue_position)
+            .filter(|&p| p <= reg.order.len())
+            .unwrap_or(reg.order.len());
         let queued = params.auto_managed && !params.paused && {
             let cfg = shared.queue_settings();
             !cfg.unlimited() && {
                 let mut entries: Vec<QueueEntry> = reg
                     .order
                     .iter()
+                    .filter_map(|o| reg.torrents.get(o))
                     .enumerate()
-                    .filter_map(|(i, o)| reg.torrents.get(o).map(|e| queue_entry(e, i).0))
+                    .map(|(i, e)| queue_entry(e, if i < position { i } else { i + 1 }).0)
                     .collect();
-                entries.push(QueueEntry {
-                    position,
-                    seeding: false,
-                    running_since: None,
-                    down_rate: 0,
-                    up_rate: 0,
-                    user_paused: false,
-                    auto_managed: true,
-                    slow: false,
-                });
+                let at = position.min(entries.len());
+                entries.insert(
+                    at,
+                    QueueEntry {
+                        position,
+                        seeding: false,
+                        running_since: None,
+                        down_rate: 0,
+                        up_rate: 0,
+                        user_paused: false,
+                        auto_managed: true,
+                        slow: false,
+                    },
+                );
                 !plan(&entries, &cfg, std::time::Instant::now())
-                    .last()
+                    .get(at)
                     .copied()
                     .unwrap_or(true)
             }
@@ -1002,7 +1058,12 @@ impl Session {
             (TorrentSource::Magnet(_), _) => None,
             (TorrentSource::Metainfo(_), Some(s)) => Some(s),
             (TorrentSource::Metainfo(m), None) => {
-                Some(Arc::new(FsStorage::new(params.save_path.clone(), m)))
+                let renamed = params.resume.as_ref().map_or(&[][..], |r| &r.renamed[..]);
+                Some(Arc::new(FsStorage::with_paths(
+                    params.save_path.clone(),
+                    m,
+                    renamed,
+                )))
             }
         };
         shared.emit(Event::TorrentAdded { torrent: ih });
@@ -1015,7 +1076,7 @@ impl Session {
         );
         reg.by_wire.insert(wire_hash, ih);
         reg.by_req2.insert(req2_hash(&wire_hash), wire_hash);
-        reg.order.push(ih);
+        reg.order.insert(position, ih);
         reg.torrents.insert(
             ih,
             TorrentEntry {
@@ -1071,25 +1132,122 @@ impl Session {
     /// Idempotent; afterwards every command returns
     /// [`SessionError::Shutdown`].
     pub async fn shutdown(&self) {
+        self.shutdown_inner(false).await;
+    }
+
+    /// [`shutdown`](Self::shutdown), returning the session's state for
+    /// [`restore`](Self::restore): each torrent's resume data taken after
+    /// its final flush (so nothing is written after it and its pieces are
+    /// trusted on restart), in queue order, and the DHT's state. Empty if
+    /// the session was already shut down.
+    pub async fn shutdown_and_save(&self) -> SessionState {
+        self.shutdown_inner(true).await.unwrap_or_default()
+    }
+
+    /// Every torrent's resume data
+    /// ([`TorrentHandle::save_resume_data`]) in queue order, and the DHT's
+    /// state ([`dht_state`](Self::dht_state)). The torrents keep running:
+    /// what they write afterwards makes their resume data untrusted on
+    /// restart (a full check), unless they were paused first; see
+    /// [`shutdown_and_save`](Self::shutdown_and_save). A torrent removed
+    /// meanwhile is left out.
+    ///
+    /// Fails with [`SessionError::Shutdown`] once the session has shut
+    /// down.
+    pub async fn save_state(&self) -> Result<SessionState, SessionError> {
+        if self.inner.shared.is_shutdown() {
+            return Err(SessionError::Shutdown);
+        }
+        let mut torrents = Vec::new();
+        for h in self.torrents() {
+            match h.save_resume_data().await {
+                Ok(b) => torrents.push(b),
+                Err(SessionError::TorrentNotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(SessionState {
+            dht: self.dht_state().await?,
+            torrents,
+        })
+    }
+
+    /// Starts a session from `state` ([`save_state`](Self::save_state) or
+    /// [`shutdown_and_save`](Self::shutdown_and_save)): its DHT state
+    /// replaces [`Settings::dht_state`] (when it has one), and each torrent
+    /// is added from its resume data ([`AddTorrent::from_resume`]) in the
+    /// saved order, which is the queue's. A torrent that cannot be added
+    /// does not stop the others: it is returned with its index in
+    /// `state.torrents` and the error ([`SessionError::Resume`] for resume
+    /// data that does not decode).
+    ///
+    /// Fails as [`Session::new`] does.
+    pub async fn restore(
+        mut settings: Settings,
+        state: &SessionState,
+    ) -> Result<(Session, Vec<(usize, SessionError)>), SessionError> {
+        if let Some(dht) = &state.dht {
+            settings.dht_state = Some(dht.clone());
+        }
+        let session = Session::new(settings).await?;
+        let mut failed = Vec::new();
+        for (i, bytes) in state.torrents.iter().enumerate() {
+            let r = match AddTorrent::from_resume(bytes) {
+                Ok(p) => session.add_torrent(p).await.map(|_| ()),
+                Err(e) => Err(SessionError::Resume(e)),
+            };
+            if let Err(e) = r {
+                failed.push((i, e));
+            }
+        }
+        Ok((session, failed))
+    }
+
+    /// The shutdown; with `save`, each torrent's resume data after its
+    /// final flush and the DHT state before the DHT stops. `None` if the
+    /// session was already shut down.
+    async fn shutdown_inner(&self, save: bool) -> Option<SessionState> {
         if self.inner.shared.shutdown.swap(true, Ordering::AcqRel) {
-            return;
+            return None;
         }
         self.inner.stop_listeners();
         let handles: Vec<TorrentHandle> = {
             let mut reg = self.inner.registry();
+            let reg = &mut *reg;
             reg.by_wire.clear();
             reg.by_req2.clear();
-            reg.order.clear();
-            reg.torrents.drain().map(|(_, e)| e.handle).collect()
+            let order = std::mem::take(&mut reg.order);
+            let handles = order
+                .iter()
+                .filter_map(|ih| reg.torrents.remove(ih))
+                .map(|e| e.handle)
+                .collect();
+            reg.torrents.clear();
+            handles
         };
-        let mut waits: Vec<oneshot::Receiver<()>> = Vec::new();
-        for h in &handles {
-            if let Some(rx) = h.send_shutdown().await {
-                waits.push(rx);
+        let mut state = SessionState::default();
+        if save {
+            let mut waits = Vec::new();
+            for h in &handles {
+                if let Some(rx) = h.send_shutdown_save().await {
+                    waits.push(rx);
+                }
             }
-        }
-        for rx in waits {
-            let _ = rx.await;
+            for rx in waits {
+                if let Ok(bytes) = rx.await {
+                    state.torrents.push(bytes);
+                }
+            }
+        } else {
+            let mut waits: Vec<oneshot::Receiver<()>> = Vec::new();
+            for h in &handles {
+                if let Some(rx) = h.send_shutdown().await {
+                    waits.push(rx);
+                }
+            }
+            for rx in waits {
+                let _ = rx.await;
+            }
         }
         self.inner.shared.lsd.shutdown().await;
         // Bounded (2 s in all): an unreachable router never holds us up.
@@ -1097,6 +1255,9 @@ impl Session {
             pm.shutdown().await;
         }
         if let Some(dht) = &self.inner.shared.dht {
+            if save {
+                state.dht = dht.state().await.ok().map(|s| s.to_bytes());
+            }
             dht.shutdown().await;
         }
         // The peers are gone; the uTP sockets stop before the UDP sockets
@@ -1106,6 +1267,7 @@ impl Session {
         }
         // Last: the `stopped` announces and the DHT used these sockets.
         self.inner.close_udp();
+        Some(state)
     }
 }
 

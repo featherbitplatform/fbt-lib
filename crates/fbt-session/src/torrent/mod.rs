@@ -98,6 +98,10 @@ pub(crate) enum Cmd {
         addr: SocketAddr,
     },
     Shutdown(oneshot::Sender<()>),
+    /// Stops as `Shutdown` does, then answers with the resume data.
+    ShutdownSave(oneshot::Sender<Vec<u8>>),
+    /// Every verified piece written, then the resume data.
+    SaveResume(oneshot::Sender<Result<Vec<u8>, SessionError>>),
     /// A [`FileReader`] opens on file `file`, sharing `link`.
     OpenReader {
         file: usize,
@@ -201,6 +205,8 @@ pub(crate) fn spawn(
     initial.save_path = params.save_path.clone();
     initial.queue_position = queue.position;
     initial.auto_managed = params.auto_managed;
+    // Nothing saved yet; resume data is up to date until something changes.
+    initial.need_save_resume = params.resume.is_none();
     let (status_tx, status_rx) = watch::channel(initial);
     let metainfo = Arc::new(OnceLock::new());
     let handle = TorrentHandle {
@@ -264,6 +270,29 @@ impl TorrentHandle {
     /// The latest status snapshot. Still readable after removal or shutdown.
     pub fn status(&self) -> TorrentStatus {
         self.inner.status.borrow().clone()
+    }
+
+    /// The torrent's resume data, for
+    /// [`AddTorrent::from_resume`](crate::AddTorrent::from_resume) in a
+    /// later session: every verified piece is written and the storage
+    /// flushed first, then the files' stamps
+    /// ([`Storage::stamps`](crate::storage::Storage::stamps)) are taken
+    /// with the rest of its state. Clears
+    /// [`TorrentStatus::need_save_resume`]. The library never writes it
+    /// anywhere.
+    ///
+    /// The saved pieces are trusted on restart (no check) only if nothing
+    /// is written to the files after this: save after
+    /// [`pause`](Self::pause), or use
+    /// [`Session::shutdown_and_save`](crate::Session::shutdown_and_save).
+    /// Data saved from a running torrent is still valid, but a file written
+    /// after the save makes the next add check the torrent in full. While
+    /// the torrent is checking, the pieces saved are those before the
+    /// check (or its resume data's, or none) without stamps, so the next
+    /// add checks again. Waits for a storage move, as
+    /// [`move_storage`](Self::move_storage) describes.
+    pub async fn save_resume_data(&self) -> Result<Vec<u8>, SessionError> {
+        self.call(Cmd::SaveResume).await?
     }
 
     /// Disconnects every peer and stops announcing.
@@ -653,6 +682,13 @@ impl TorrentHandle {
     pub(crate) async fn send_shutdown(&self) -> Option<oneshot::Receiver<()>> {
         let (tx, rx) = oneshot::channel();
         self.inner.cmds.send(Cmd::Shutdown(tx)).await.ok()?;
+        Some(rx)
+    }
+
+    /// Asks the actor to stop and save; the receiver gets its resume data.
+    pub(crate) async fn send_shutdown_save(&self) -> Option<oneshot::Receiver<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.cmds.send(Cmd::ShutdownSave(tx)).await.ok()?;
         Some(rx)
     }
 }

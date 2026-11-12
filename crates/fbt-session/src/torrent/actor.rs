@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use fbt_core::{InfoHashes, PieceLayout};
+use fbt_core::{Bitfield, InfoHashes, PieceLayout};
 use fbt_metainfo::{Metainfo, RelPath};
 use fbt_wire::PexFlags;
 use rand::rngs::StdRng;
@@ -42,6 +42,7 @@ use crate::event::{Event, PeerSource};
 use crate::peer::messages::PeerEvent;
 use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
+use crate::resume::ResumeState;
 use crate::session::{AddTorrent, Priority, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::cache::{FlushReason, PieceCache};
@@ -75,6 +76,10 @@ pub(super) enum Phase {
         done: Arc<AtomicU32>,
         cancel: Arc<AtomicBool>,
     },
+    /// Resume data's stamps are compared with the files' on the disk pool
+    /// (`Job::ResumeChecked`): its pieces are trusted, or a full check
+    /// follows. Shown as `QueuedForChecking`.
+    Resuming,
     /// Checked; downloading or seeding (unless paused).
     Ready,
     /// Stopped by a storage error or invalid metadata.
@@ -320,6 +325,22 @@ pub(crate) struct Actor {
     pub(super) smartban: SmartBan,
     /// The torrent's web seeds (BEP 19).
     pub(super) web_seeds: WebSeeds,
+    /// Resume data not yet applied: its pieces wait for the stamp
+    /// comparison (taken by the first check).
+    pub(super) resume: Option<Box<ResumeState>>,
+    /// The pieces verified before the running check started, for resume
+    /// data saved meanwhile.
+    pub(super) last_have: Option<Bitfield>,
+    /// See [`TorrentStatus::need_save_resume`].
+    pub(super) need_save_resume: bool,
+    /// See [`TorrentStatus::resume_trusted`].
+    pub(super) resume_trusted: Option<bool>,
+    /// The torrent's own rate limit, as last set.
+    pub(super) rate_limit: crate::bandwidth::RateLimit,
+    /// When the torrent was first added, seconds since the Unix epoch.
+    pub(super) added_time: i64,
+    /// When it first finished, likewise.
+    pub(super) completed_time: Option<i64>,
     /// What web seed downloads are charged to: the torrent's and the
     /// session's download limits.
     pub(super) web_seed_throttle: Throttle,
@@ -342,6 +363,8 @@ impl Actor {
     ) -> Self {
         let ih = params.source.info_hashes();
         let rate = BucketPair::new(params.rate_limit);
+        let rate_limit = params.rate_limit;
+        let resume = params.resume;
         let save_path = params.save_path.clone();
         let web_seed_throttle = shared.bandwidth.web_seed(&rate);
         let (loaded, magnet, trackers, web_seed_urls) = match params.source {
@@ -350,7 +373,10 @@ impl Actor {
                 let urls = m.web_seeds.clone();
                 let meta = Arc::new(*m);
                 let _ = metainfo_cell.set(Arc::clone(&meta));
-                let loaded = Loaded::new(meta, params.file_priorities, params.sequential);
+                let mut loaded = Loaded::new(meta, params.file_priorities, params.sequential);
+                if let Some(r) = &resume {
+                    loaded.renamed = r.renamed.iter().cloned().collect();
+                }
                 (Some(loaded), None, trackers, urls)
             }
             TorrentSource::Magnet(magnet) => {
@@ -479,12 +505,28 @@ impl Actor {
             smartban: SmartBan::default(),
             web_seeds: WebSeeds::default(),
             web_seed_throttle,
+            need_save_resume: resume.is_none(),
+            resume_trusted: None,
+            last_have: None,
+            rate_limit,
+            added_time: resume.as_ref().map_or_else(unix_now, |r| r.added),
+            completed_time: resume.as_ref().and_then(|r| r.completed),
+            resume: None,
             #[cfg(test)]
             pex_live_builds: 0,
             #[cfg(test)]
             pex_scans: 0,
         };
         actor.init_web_seeds(web_seed_urls);
+        if let Some(r) = resume {
+            actor.counters.uploaded = r.uploaded;
+            actor.counters.downloaded = r.downloaded;
+            actor.active_time = r.active_time;
+            actor.seeding_time = r.seeding_time;
+            // The current set: seeds added by hand included.
+            actor.init_web_seeds(r.web_seeds.clone());
+            actor.resume = Some(r);
+        }
         if actor.magnet.is_some() {
             actor.last_state = actor.state();
         }
@@ -492,6 +534,18 @@ impl Actor {
     }
 
     pub(super) async fn run(mut self) {
+        // Resume data's peers are known addresses, dialled once the torrent
+        // runs.
+        let saved = self
+            .resume
+            .as_ref()
+            .map(|r| r.peers.clone())
+            .unwrap_or_default();
+        for addr in saved {
+            if dialable(&addr) && self.shared.blocked(addr).is_none() {
+                self.remember(addr);
+            }
+        }
         self.start_check();
         // Checking, queued for it, or fetching the metadata.
         self.last_state = self.state();
@@ -655,7 +709,7 @@ impl Actor {
             || (self.metadata_check
                 && matches!(
                     self.phase,
-                    Phase::Checking { .. } | Phase::QueuedForCheck { .. }
+                    Phase::Checking { .. } | Phase::QueuedForCheck { .. } | Phase::Resuming
                 )
                 && !self.stopped())
     }
@@ -666,7 +720,7 @@ impl Actor {
             Phase::Metadata | Phase::Ready if self.paused => TorrentState::Paused,
             Phase::Metadata | Phase::Ready if self.queued => TorrentState::Queued,
             Phase::Metadata => TorrentState::DownloadingMetadata,
-            Phase::QueuedForCheck { .. } => TorrentState::QueuedForChecking,
+            Phase::QueuedForCheck { .. } | Phase::Resuming => TorrentState::QueuedForChecking,
             Phase::Checking { done, .. } => {
                 let n = self.loaded.as_ref().map_or(0, |l| l.layout.num_pieces());
                 let progress = if n == 0 {
@@ -751,6 +805,8 @@ impl Actor {
             auto_managed: self.auto_managed,
             active_time: self.active_time,
             seeding_time: self.seeding_time,
+            need_save_resume: self.need_save_resume,
+            resume_trusted: self.resume_trusted,
         }
     }
 
@@ -930,6 +986,8 @@ impl Actor {
             return;
         }
         warn!(torrent = %self.name(), error = %e, "storage error while {during}");
+        // What the files hold is unknown now: no check is skipped.
+        self.resume = None;
         let message = format!("{during}: {e}");
         let reader_error = StreamError::TorrentError(message.clone());
         self.cancel_check();
@@ -982,6 +1040,13 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Now, in seconds since the Unix epoch.
+pub(super) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Bytes of the pieces with a non-zero priority.

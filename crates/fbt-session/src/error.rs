@@ -87,6 +87,10 @@ pub enum SessionError {
     /// [`MAX_WEB_SEEDS`](fbt_metainfo::MAX_WEB_SEEDS) web seeds.
     #[error("too many web seeds")]
     TooManyWebSeeds,
+    /// Resume data given to [`Session::restore`](crate::Session::restore)
+    /// was refused.
+    #[error("invalid resume data: {0}")]
+    Resume(#[source] crate::resume::ResumeError),
 }
 
 /// Why a [`FileReader`](crate::FileReader) read failed. It comes inside the

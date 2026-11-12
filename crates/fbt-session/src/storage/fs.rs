@@ -1,5 +1,5 @@
 use super::part::PartFile;
-use super::{MoveMode, Storage};
+use super::{FileStamp, MoveMode, Storage};
 use fbt_core::{FileLayout, PieceLayout};
 use fbt_metainfo::{Metainfo, RelPath};
 use std::collections::{HashMap, HashSet};
@@ -955,6 +955,31 @@ impl Storage for FsStorage {
             part.remove().map_err(|e| at(part.path(), e))?;
         }
         Ok(())
+    }
+
+    fn stamps(&self) -> io::Result<Option<Vec<Option<FileStamp>>>> {
+        // Exclusive: no read or write runs, so dropping the cached handles
+        // closes every file (on Windows the modification time is final only
+        // once the handle is closed). The part file is closed and opened
+        // again for the same reason.
+        let mut guard = self.write_routing();
+        let Routing { paths, part, .. } = &mut *guard;
+        self.lock().open.clear();
+        if part.take().is_some() {
+            *part = self.reopen_part(paths);
+        }
+        let mut out = Vec::with_capacity(self.entries.len().saturating_add(1));
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.pad {
+                out.push(None);
+                continue;
+            }
+            let path = paths.file(i);
+            out.push(FileStamp::of(&path).map_err(|e| at(&path, e))?);
+        }
+        let part_path = paths.part();
+        out.push(FileStamp::of(&part_path).map_err(|e| at(&part_path, e))?);
+        Ok(Some(out))
     }
 
     fn move_to(&self, save_path: &Path, mode: MoveMode) -> io::Result<()> {

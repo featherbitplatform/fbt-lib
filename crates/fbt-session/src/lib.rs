@@ -42,6 +42,22 @@
 //! list ([`Session::banned_peers`]) and each torrent accepts at most
 //! [`Settings::max_peers_per_ip`] connections from one IP. Every refusal is
 //! reported as [`Event::PeerBlocked`] with its [`BlockReason`].
+//!
+//! # Resume data and session state
+//!
+//! [`TorrentHandle::save_resume_data`] returns a torrent's state as bytes
+//! (the library writes no file of its own) and [`AddTorrent::from_resume`]
+//! adds it back: the pieces it had are trusted without a check when every
+//! file holding one is unchanged (same length and modification time, see
+//! [`FileStamp`]), and checked in full otherwise
+//! ([`TorrentStatus::resume_trusted`] tells which). Resume data saved while
+//! a torrent writes is trusted only if nothing was written after the save:
+//! save after [`TorrentHandle::pause`], or with
+//! [`Session::shutdown_and_save`]. [`Session::save_state`] and
+//! [`Session::shutdown_and_save`] bundle the DHT state and every torrent's
+//! resume data into a [`SessionState`]; [`Session::restore`] starts a
+//! session from it. Resume data is hostile input: a bad field fails with a
+//! [`ResumeError`] naming it.
 
 #![forbid(unsafe_code)]
 
@@ -57,6 +73,7 @@ mod peer;
 pub mod picker;
 mod queue;
 pub mod rate;
+mod resume;
 mod session;
 pub mod settings;
 mod status;
@@ -77,12 +94,18 @@ pub use net::ListenError;
 pub use peer::{DisconnectReason, Transport};
 pub use queue::QueueSettings;
 pub use rate::RateMeter;
+#[doc(hidden)]
+pub use resume::{DecodedResume, decode_resume};
+pub use resume::{
+    MAX_RESUME_BYTES, MAX_RESUME_ITEMS, MAX_RESUME_PEERS, MAX_SESSION_TORRENTS, ResumeError,
+    SessionState,
+};
 pub use session::{AddTorrent, Priority, RemoveMode, Session, TorrentSource};
 pub use settings::{
     DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, Settings,
 };
 pub use status::{TorrentState, TorrentStatus};
-pub use storage::{CacheStats, MoveMode, StorageError};
+pub use storage::{CacheStats, FileStamp, MoveMode, StorageError};
 pub use stream::{FileReader, ReadAhead};
 pub use torrent::TorrentHandle;
 

@@ -258,3 +258,31 @@ async fn web_seed_methods(h: &TorrentHandle, e: &Event, m: &Metainfo, mg: &Magne
         let _: (&InfoHashes, &String, &String, &bool) = (torrent, url, message, retired);
     }
 }
+
+/// Resume data and session state.
+async fn resume_methods(s: &Session, h: &TorrentHandle, st: &dyn Storage) {
+    use fbt::{FileStamp, ResumeError, SessionState};
+    let _: Result<Vec<u8>, SessionError> = h.save_resume_data().await;
+    let _: Result<AddTorrent, ResumeError> = AddTorrent::from_resume(b"");
+    let _: (bool, Option<bool>) = (h.status().need_save_resume, h.status().resume_trusted);
+    let _: Result<SessionState, SessionError> = s.save_state().await;
+    let state: SessionState = s.shutdown_and_save().await;
+    let _: (&Option<Vec<u8>>, &Vec<Vec<u8>>) = (&state.dht, &state.torrents);
+    let _: Vec<u8> = state.to_bytes();
+    let _: Result<SessionState, ResumeError> = SessionState::from_bytes(b"");
+    let _: Result<(Session, Vec<(usize, SessionError)>), SessionError> =
+        Session::restore(Settings::default(), &state).await;
+    let _: std::io::Result<Option<Vec<Option<FileStamp>>>> = st.stamps();
+    let stamp = FileStamp::new(1, 2);
+    let _: (u64, i64) = (stamp.len, stamp.mtime);
+    let _ = [
+        ResumeError::TooLarge,
+        ResumeError::Version(2),
+        ResumeError::Missing("info-hash"),
+        ResumeError::Invalid("pieces"),
+        ResumeError::InfoHashMismatch,
+    ];
+    if let SessionError::Resume(e) = SessionError::Resume(ResumeError::TooLarge) {
+        let _: ResumeError = e;
+    }
+}

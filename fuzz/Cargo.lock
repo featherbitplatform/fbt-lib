@@ -189,6 +189,7 @@ dependencies = [
  "fbt-dht",
  "fbt-metainfo",
  "fbt-net",
+ "fbt-session",
  "fbt-tracker",
  "fbt-utp",
  "fbt-wire",
@@ -217,6 +218,31 @@ dependencies = [
  "socket2",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "fbt-session"
+version = "0.4.0"
+dependencies = [
+ "bitflags",
+ "bytes",
+ "fbt-bencode",
+ "fbt-core",
+ "fbt-dht",
+ "fbt-metainfo",
+ "fbt-net",
+ "fbt-tracker",
+ "fbt-utp",
+ "fbt-wire",
+ "futures-core",
+ "futures-util",
+ "rand",
+ "sha1",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -306,6 +332,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
+ "futures-sink",
  "futures-task",
  "pin-project-lite",
 ]
