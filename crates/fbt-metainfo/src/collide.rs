@@ -36,15 +36,34 @@ const IS_DIR: u8 = 2;
 /// `stem.n.ext` for `component`, within [`MAX_COMPONENT_BYTES`] (the stem
 /// gives way), never a reserved Windows device name.
 fn numbered(component: &str, n: usize) -> String {
-    let dot = component.rfind('.').filter(|&i| i > 0);
-    let (stem, ext) = match dot.and_then(|i| Some((i, component.get(i..)?))) {
-        Some((i, e)) if e.len() <= MAX_EXT_BYTES => (component.get(..i).unwrap_or(""), e),
-        _ => (component, ""),
-    };
+    let (stem, ext) = split_ext(component);
     let suffix = format!(".{n}{ext}");
     let room = MAX_COMPONENT_BYTES.saturating_sub(suffix.len());
     let stem = truncate_at_boundary(stem, room);
     guard_reserved(format!("{stem}{suffix}"))
+}
+
+/// A component as `(stem, extension with its dot)`.
+fn split_ext(component: &str) -> (&str, &str) {
+    let dot = component.rfind('.').filter(|&i| i > 0);
+    match dot.and_then(|i| Some((i, component.get(i..)?))) {
+        Some((i, e)) if e.len() <= MAX_EXT_BYTES => (component.get(..i).unwrap_or(""), e),
+        _ => (component, ""),
+    }
+}
+
+/// What the `digits`-digit numbered names of `component` have in common: the
+/// stem cut to the room those names leave, and the extension, as keys. Equal
+/// families give the same candidate for every such number, so they can share
+/// one search position.
+fn family(component: &str, digits: u32) -> String {
+    let (stem, ext) = split_ext(component);
+    let suffix = ext.len() + 1 + usize::try_from(digits).unwrap_or(0);
+    let room = MAX_COMPONENT_BYTES.saturating_sub(suffix);
+    let mut out = component_key(truncate_at_boundary(stem, room));
+    out.push('\0');
+    push_component_key(&mut out, ext);
+    out
 }
 
 fn component_key(component: &str) -> String {
@@ -116,14 +135,27 @@ pub(crate) fn resolve_collisions(files: &mut [FileEntry]) {
     resolve(files);
 }
 
-/// [`resolve_collisions`], returning how many trie nodes it needed.
-fn resolve(files: &mut [FileEntry]) -> usize {
+/// What one renaming pass cost; only the tests read it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, Default)]
+struct Stats {
+    /// Trie nodes held, the root included.
+    nodes: usize,
+    /// Candidate names tried in all.
+    probes: usize,
+}
+
+/// [`resolve_collisions`], returning its cost.
+fn resolve(files: &mut [FileEntry]) -> Stats {
+    let mut probes = 0usize;
     let mut trie = Trie::new();
     // Original prefix node -> the prefix it became.
     let mut renamed_dirs: HashMap<u32, Renamed> = HashMap::new();
-    // Where the search for a free number resumes, per colliding key: the
-    // flags only grow, so every smaller number stays taken.
-    let mut resume: HashMap<u32, usize> = HashMap::new();
+    // Where the search for a free number resumes, per parent, digit count and
+    // family of candidate names (see `family`): the flags only grow, so every
+    // smaller number of the group stays taken. A candidate name belongs to
+    // exactly one group, so each taken name is skipped once in all.
+    let mut resume: HashMap<(u32, u32, String), usize> = HashMap::new();
     let max_n = files.len().saturating_add(1);
 
     for file in files.iter_mut().filter(|f| !f.pad) {
@@ -162,22 +194,32 @@ fn resolve(files: &mut [FileEntry]) -> usize {
         });
         if let Some(i) = clash
             && let Some(component) = parts.get(i).cloned()
-            && let Some(&taken) = nodes.get(i)
         {
             let parent = i
                 .checked_sub(1)
                 .and_then(|p| nodes.get(p))
                 .copied()
                 .unwrap_or(ROOT);
-            let mut n = resume.get(&taken).copied().unwrap_or(0);
-            while n < max_n {
-                n += 1;
-                let name = numbered(&component, n);
-                let candidate = trie.intern(parent, &component_key(&name));
-                if trie.flags_of(candidate) != 0 {
-                    continue;
+            let mut found = None;
+            'digits: for digits in 1..=max_n.ilog10() + 1 {
+                let low = 10usize.saturating_pow(digits - 1);
+                let high = 10usize.saturating_pow(digits).saturating_sub(1).min(max_n);
+                let group = (parent, digits, family(&component, digits));
+                let mut n = resume.get(&group).copied().unwrap_or(low);
+                while n <= high {
+                    probes += 1;
+                    let name = numbered(&component, n);
+                    let candidate = trie.intern(parent, &component_key(&name));
+                    n += 1;
+                    if trie.flags_of(candidate) == 0 {
+                        resume.insert(group, n);
+                        found = Some((candidate, name));
+                        break 'digits;
+                    }
                 }
-                resume.insert(taken, n);
+                resume.insert(group, n);
+            }
+            if let Some((candidate, name)) = found {
                 nodes.truncate(i);
                 nodes.push(candidate);
                 parts.truncate(i);
@@ -199,7 +241,6 @@ fn resolve(files: &mut [FileEntry]) -> usize {
                         parts.push(comp.clone());
                     }
                 }
-                break;
             }
         }
 
@@ -208,7 +249,10 @@ fn resolve(files: &mut [FileEntry]) -> usize {
         }
         file.path = RelPath::from_components(parts);
     }
-    trie.len()
+    Stats {
+        nodes: trie.len(),
+        probes,
+    }
 }
 
 /// Whether `candidate` as the path of `files[index]` would collide with
@@ -258,10 +302,86 @@ mod tests {
                 entry(p)
             })
             .collect();
-        let start = std::time::Instant::now();
-        let nodes = resolve(&mut files);
+        let stats = resolve(&mut files);
         // The root of the trie, "root", then each file's own components.
-        assert_eq!(nodes, 1 + 1 + files_n * (depth + 1));
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(stats.nodes, 1 + 1 + files_n * (depth + 1));
+        assert_eq!(stats.probes, 0);
+    }
+
+    /// Pairs of a long name and its upper-case twin, different pairs sharing
+    /// the truncated stem of their renames: one probe per rename, in all.
+    #[test]
+    fn truncated_candidates_share_one_hint() {
+        let pairs = 4000usize;
+        let mut files = Vec::new();
+        for i in 0..pairs {
+            let base = format!("{}{i:08}", "a".repeat(247));
+            files.push(entry(vec!["root".to_owned(), base.to_uppercase()]));
+            files.push(entry(vec!["root".to_owned(), base]));
+        }
+        let n = files.len();
+        let stats = resolve(&mut files);
+        assert!(
+            stats.probes <= 2 * n,
+            "{} probes for {n} files",
+            stats.probes
+        );
+        let mut keys: Vec<String> = files.iter().map(|f| f.path.key()).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), n);
+        assert!(files.iter().all(|f| {
+            f.path
+                .components()
+                .iter()
+                .all(|c| c.len() <= MAX_COMPONENT_BYTES)
+        }));
+    }
+
+    /// Every case variant of one name: one key, one hint.
+    #[test]
+    fn case_variant_flood_takes_one_probe_per_rename() {
+        let n = 20_000usize;
+        let mut files: Vec<FileEntry> = (0..n)
+            .map(|i| {
+                let name: String = (0..20)
+                    .map(|b| {
+                        let c = char::from(b'a' + u8::try_from(b).unwrap_or(0));
+                        if (i >> b) & 1 == 1 {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                entry(vec!["root".to_owned(), name])
+            })
+            .collect();
+        let stats = resolve(&mut files);
+        assert!(
+            stats.probes <= 2 * n,
+            "{} probes for {n} files",
+            stats.probes
+        );
+    }
+
+    /// Literal `a.N` names already hold numbers 1..=3000; later `A`s skip them
+    /// once, not once each.
+    #[test]
+    fn pre_taken_numbers_are_probed_once() {
+        let mut files = vec![entry(vec!["root".to_owned(), "a".to_owned()])];
+        files.extend((1..=3000).map(|i| entry(vec!["root".to_owned(), format!("a.{i}")])));
+        files.extend((0..3000).map(|_| entry(vec!["root".to_owned(), "A".to_owned()])));
+        let n = files.len();
+        let stats = resolve(&mut files);
+        assert!(
+            stats.probes <= 2 * n,
+            "{} probes for {n} files",
+            stats.probes
+        );
+        assert_eq!(
+            files.last().map(|f| f.path.to_string()).as_deref(),
+            Some("root/A.6000")
+        );
     }
 }
