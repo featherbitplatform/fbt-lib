@@ -633,6 +633,7 @@ dependencies = [
  "bytes",
  "fbt-bencode",
  "fbt-core",
+ "fbt-net",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -643,6 +644,7 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+ "tower-service",
  "webpki-roots",
 ]
 

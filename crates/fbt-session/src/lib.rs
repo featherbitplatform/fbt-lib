@@ -59,6 +59,7 @@ pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::{SessionError, StreamError};
 pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
 pub use fbt_dht::DhtStats;
+pub use fbt_net::proxy::{ProxyConfig, ProxyKind};
 pub use fbt_net::{MapMethod, MapProtocol};
 pub use net::ListenError;
 pub use peer::{DisconnectReason, Transport};

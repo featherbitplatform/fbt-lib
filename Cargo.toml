@@ -42,6 +42,8 @@ rand = "0.10"
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
+# The connector trait hyper's client takes (the trackers' proxy connector).
+tower-service = "0.3"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.1.0-pre.0"

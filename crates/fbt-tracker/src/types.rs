@@ -139,6 +139,13 @@ pub enum TrackerError {
     /// An I/O or transport error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The proxy could not be reached or refused the tunnel.
+    #[error("proxy error: {0}")]
+    Proxy(String),
+    /// A UDP tracker while trackers go through an HTTP proxy, which cannot
+    /// carry UDP.
+    #[error("UDP trackers cannot go through an HTTP proxy")]
+    ProxyUnsupported,
 }
 
 /// Tracker client configuration.

@@ -13,7 +13,8 @@ use fbt::{
 };
 use fbt::{
     CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
-    PeerClassLimits, RateLimit, ReadAhead, SeedChokingAlgorithm, StorageError, StreamError,
+    PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
+    StorageError, StreamError,
 };
 
 fn names(
@@ -74,6 +75,8 @@ fn names(
     _: Option<FileReader>,
     _: Option<ReadAhead>,
     _: Option<StreamError>,
+    _: Option<ProxyConfig>,
+    _: Option<ProxyKind>,
 ) {
 }
 
@@ -102,4 +105,7 @@ fn surface_compiles() {
         s.enable_outgoing_utp,
         s.enable_incoming_utp,
     ];
+    let p: ProxyConfig = s.proxy;
+    let _ = [ProxyKind::None, ProxyKind::Socks5, ProxyKind::Http];
+    let _: (bool, bool, bool) = (p.proxy_peers, p.proxy_trackers, p.proxy_hostnames);
 }

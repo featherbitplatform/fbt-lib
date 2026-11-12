@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
+use fbt_net::proxy::{ProxyConfig, ProxyKind};
 use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
@@ -259,6 +260,32 @@ pub(crate) struct UdpClient {
     shared_v6: Option<Arc<dyn DatagramSender>>,
     shared_pending: Pending,
     conns: Mutex<ConnCache>,
+    route: Route,
+}
+
+/// How announces leave, as the proxy settings decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Shared sockets per family, else the client's own.
+    Direct,
+    /// Every announce, of either family, through the one shared (relayed)
+    /// socket; the client never binds its own.
+    Relayed,
+    /// Trackers go through an HTTP proxy, which cannot carry UDP.
+    Unsupported,
+}
+
+impl Route {
+    fn of(proxy: Option<&ProxyConfig>) -> Route {
+        match proxy {
+            // One socket cannot be half proxied: SOCKS5 relays all UDP.
+            Some(p) if p.kind == ProxyKind::Socks5 && (p.proxy_peers || p.proxy_trackers) => {
+                Route::Relayed
+            }
+            Some(p) if p.kind == ProxyKind::Http && p.proxy_trackers => Route::Unsupported,
+            _ => Route::Direct,
+        }
+    }
 }
 
 impl std::fmt::Debug for UdpClient {
@@ -355,14 +382,18 @@ fn parse_connect(buf: &[u8], tid: u32) -> Result<u64, TrackerError> {
 
 impl UdpClient {
     pub(crate) fn new(cfg: &TrackerConfig) -> UdpClient {
-        UdpClient::with_sockets(cfg, Vec::new())
+        UdpClient::with_sockets(cfg, Vec::new(), None)
     }
 
     /// Sends through the shared socket of each family; a family without one
-    /// binds its own socket lazily.
+    /// binds its own socket lazily. Through a SOCKS5 `proxy` every announce
+    /// takes the first shared socket (the relayed one) and none is bound;
+    /// through an HTTP proxy with `proxy_trackers` announces fail with
+    /// [`TrackerError::ProxyUnsupported`].
     pub(crate) fn with_sockets(
         cfg: &TrackerConfig,
         sockets: Vec<Arc<dyn DatagramSender>>,
+        proxy: Option<&ProxyConfig>,
     ) -> UdpClient {
         let mut shared_v4 = None;
         let mut shared_v6 = None;
@@ -384,6 +415,7 @@ impl UdpClient {
             v4: OnceCell::new(),
             v6: OnceCell::new(),
             conns: Mutex::new(ConnCache::new()),
+            route: Route::of(proxy),
         }
     }
 
@@ -398,6 +430,9 @@ impl UdpClient {
         url: &str,
         req: &AnnounceRequest,
     ) -> Result<AnnounceResponse, TrackerError> {
+        if self.route == Route::Unsupported {
+            return Err(TrackerError::ProxyUnsupported);
+        }
         let (host, port) = parse_udp_url(url)?;
         // The host comes from a hostile torrent: bound the lookup.
         let addrs: Vec<SocketAddr> = match tokio::time::timeout(
@@ -430,10 +465,17 @@ impl UdpClient {
         req: &AnnounceRequest,
     ) -> Result<AnnounceResponse, TrackerError> {
         let ipv6 = addr.is_ipv6();
-        let shared = if ipv6 {
-            &self.shared_v6
+        let shared = if self.route == Route::Relayed {
+            // The relay carries either family; never a direct socket.
+            let relayed = self.shared_v4.as_ref().or(self.shared_v6.as_ref());
+            if relayed.is_none() {
+                return Err(TrackerError::Proxy("no relayed UDP socket".to_owned()));
+            }
+            relayed
+        } else if ipv6 {
+            self.shared_v6.as_ref()
         } else {
-            &self.shared_v4
+            self.shared_v4.as_ref()
         };
         let sock = match shared {
             Some(s) => Endpoint::Shared(s, &self.shared_pending),
@@ -827,12 +869,13 @@ mod tests {
     }
 
     fn shared_client(socks: Vec<Arc<dyn DatagramSender>>) -> TrackerClient {
-        TrackerClient::with_udp_sockets(
+        TrackerClient::new_with(
             TrackerConfig {
                 udp_base_timeout: Duration::from_millis(100),
                 ..TrackerConfig::default()
             },
             socks,
+            None,
         )
         .unwrap()
     }

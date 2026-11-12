@@ -31,6 +31,7 @@ tls-rustcrypto = [
 [dependencies]
 fbt-bencode = { path = "../fbt-bencode" }
 fbt-core = { path = "../fbt-core" }
+fbt-net = { path = "../fbt-net" }
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 bytes.workspace = true
@@ -39,6 +40,7 @@ rand.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+tower-service.workspace = true
 hyper-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-rustcrypto = { workspace = true, optional = true }

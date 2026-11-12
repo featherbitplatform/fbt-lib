@@ -4,11 +4,11 @@
 #[cfg(any(feature = "tls-ring", feature = "tls-rustcrypto"))]
 mod enabled {
     use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-    use hyper_util::client::legacy::connect::HttpConnector;
 
     use crate::TrackerError;
+    use crate::connector::ProxyConnector;
 
-    pub(crate) type Connector = HttpsConnector<HttpConnector>;
+    pub(crate) type Connector = HttpsConnector<ProxyConnector>;
     pub(crate) const HTTPS_AVAILABLE: bool = true;
 
     #[cfg(feature = "tls-rustcrypto")]
@@ -21,13 +21,14 @@ mod enabled {
         rustls::crypto::ring::default_provider()
     }
 
-    pub(crate) fn build_connector() -> Result<Connector, TrackerError> {
+    /// TLS (for `https`) over `c`.
+    pub(crate) fn build_connector(c: ProxyConnector) -> Result<Connector, TrackerError> {
         Ok(HttpsConnectorBuilder::new()
             .with_provider_and_webpki_roots(provider())
             .map_err(std::io::Error::other)?
             .https_or_http()
             .enable_http1()
-            .build())
+            .wrap_connector(c))
     }
 }
 
@@ -36,15 +37,15 @@ pub(crate) use enabled::*;
 
 #[cfg(not(any(feature = "tls-ring", feature = "tls-rustcrypto")))]
 mod disabled {
-    use hyper_util::client::legacy::connect::HttpConnector;
-
     use crate::TrackerError;
+    use crate::connector::ProxyConnector;
 
-    pub(crate) type Connector = HttpConnector;
+    pub(crate) type Connector = ProxyConnector;
     pub(crate) const HTTPS_AVAILABLE: bool = false;
 
-    pub(crate) fn build_connector() -> Result<Connector, TrackerError> {
-        Ok(HttpConnector::new())
+    /// `c` itself: plain HTTP only.
+    pub(crate) fn build_connector(c: ProxyConnector) -> Result<Connector, TrackerError> {
+        Ok(c)
     }
 }
 

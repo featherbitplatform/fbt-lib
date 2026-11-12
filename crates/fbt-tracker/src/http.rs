@@ -11,6 +11,9 @@ use hyper::{Request, Uri, header};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
+use fbt_net::proxy::{ProxyConfig, ProxyError, ProxyKind};
+
+use crate::connector::ProxyConnector;
 use crate::tls::{self, Connector};
 use crate::types::{MAX_TRACKER_ID_BYTES, MIN_INTERVAL, bounded_text};
 use crate::urlencode::url_encode_bytes;
@@ -20,7 +23,11 @@ const MAX_REDIRECTS: usize = 3;
 const MIN_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct HttpClient {
-    client: Client<Connector, Empty<Bytes>>,
+    /// For announces: through the proxy with `proxy_trackers`.
+    trackers: Client<Connector, Empty<Bytes>>,
+    /// For web seeds: through the proxy with `proxy_peers`.
+    #[expect(dead_code, reason = "the web seed fetcher is its first user")]
+    web_seeds: Client<Connector, Empty<Bytes>>,
     user_agent: String,
     timeout: Duration,
     max_bytes: usize,
@@ -33,10 +40,21 @@ impl std::fmt::Debug for HttpClient {
 }
 
 impl HttpClient {
-    pub(crate) fn new(cfg: &TrackerConfig) -> Result<HttpClient, TrackerError> {
-        let client = Client::builder(TokioExecutor::new()).build(tls::build_connector()?);
+    /// Two clients over the same TLS setup: announces go through `proxy`
+    /// when it sets `proxy_trackers`, web seeds when it sets `proxy_peers`.
+    /// Proxy round trips are bounded by `cfg.http_timeout`.
+    pub(crate) fn new(
+        cfg: &TrackerConfig,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<HttpClient, TrackerError> {
+        let active = proxy.filter(|p| p.kind != ProxyKind::None);
+        let client = |use_proxy: bool| -> Result<_, TrackerError> {
+            let c = ProxyConnector::new(active.filter(|_| use_proxy), cfg.http_timeout);
+            Ok(Client::builder(TokioExecutor::new()).build(tls::build_connector(c)?))
+        };
         Ok(HttpClient {
-            client,
+            trackers: client(active.is_some_and(|p| p.proxy_trackers))?,
+            web_seeds: client(active.is_some_and(|p| p.proxy_peers))?,
             user_agent: cfg.user_agent.clone(),
             timeout: cfg.http_timeout,
             max_bytes: cfg.max_response_bytes,
@@ -64,10 +82,10 @@ impl HttpClient {
                 .body(Empty::<Bytes>::new())
                 .map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
             let resp = self
-                .client
+                .trackers
                 .request(request)
                 .await
-                .map_err(|e| TrackerError::Io(std::io::Error::other(e)))?;
+                .map_err(request_error)?;
             let status = resp.status();
             if status.is_redirection() {
                 redirects += 1;
@@ -106,6 +124,19 @@ impl HttpClient {
         }
         Ok(out)
     }
+}
+
+/// A failed request: [`TrackerError::Proxy`] when the proxy failed (a
+/// [`ProxyError`] in the source chain), else [`TrackerError::Io`].
+fn request_error(e: hyper_util::client::legacy::Error) -> TrackerError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    while let Some(s) = source {
+        if let Some(p) = s.downcast_ref::<ProxyError>() {
+            return TrackerError::Proxy(p.to_string());
+        }
+        source = s.source();
+    }
+    TrackerError::Io(std::io::Error::other(e))
 }
 
 /// Parses and scheme-checks `url`.

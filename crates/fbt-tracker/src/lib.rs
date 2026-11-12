@@ -11,6 +11,7 @@
     )
 )]
 
+mod connector;
 mod http;
 mod tls;
 mod types;
@@ -20,6 +21,7 @@ mod urlencode;
 use std::sync::Arc;
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
+use fbt_net::proxy::ProxyConfig;
 
 #[doc(hidden)]
 pub use http::parse_http_announce;
@@ -45,24 +47,37 @@ impl TrackerClient {
     pub fn new(cfg: TrackerConfig) -> Result<TrackerClient, TrackerError> {
         Ok(TrackerClient {
             inner: Arc::new(Inner {
-                http: http::HttpClient::new(&cfg)?,
+                http: http::HttpClient::new(&cfg, None)?,
                 udp: udp::UdpClient::new(&cfg),
             }),
         })
     }
 
     /// Like [`TrackerClient::new`], but UDP announces go out through the
-    /// session's shared sockets (one per address family), so trackers see the
-    /// listen port. Feed their replies to [`TrackerClient::udp_handler`]. A
-    /// family without a shared socket binds its own.
-    pub fn with_udp_sockets(
+    /// session's shared sockets `udp` (one per address family), so trackers
+    /// see the listen port. Feed their replies to
+    /// [`TrackerClient::udp_handler`]. A family without a shared socket binds
+    /// its own.
+    ///
+    /// With a `proxy` (other than [`ProxyKind::None`](fbt_net::proxy::ProxyKind::None)):
+    ///
+    /// - HTTP(S) announces tunnel through it when `proxy_trackers` is set,
+    ///   and fail with [`TrackerError::Proxy`] when the proxy does.
+    /// - SOCKS5 (with `proxy_peers` or `proxy_trackers`): `udp` holds the one
+    ///   relayed socket, and every UDP announce, of either family, goes
+    ///   through it; no other socket is bound. Tracker host names are
+    ///   resolved locally.
+    /// - HTTP with `proxy_trackers`: UDP announces fail with
+    ///   [`TrackerError::ProxyUnsupported`].
+    pub fn new_with(
         cfg: TrackerConfig,
-        sockets: Vec<Arc<dyn DatagramSender>>,
+        udp: Vec<Arc<dyn DatagramSender>>,
+        proxy: Option<ProxyConfig>,
     ) -> Result<TrackerClient, TrackerError> {
         Ok(TrackerClient {
             inner: Arc::new(Inner {
-                http: http::HttpClient::new(&cfg)?,
-                udp: udp::UdpClient::with_sockets(&cfg, sockets),
+                http: http::HttpClient::new(&cfg, proxy.as_ref())?,
+                udp: udp::UdpClient::with_sockets(&cfg, udp, proxy.as_ref()),
             }),
         })
     }

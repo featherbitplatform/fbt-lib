@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use fbt_net::lsd::{LSD_V4, LSD_V6};
 use fbt_net::natpmp::NATPMP_PORT;
+use fbt_net::proxy::ProxyConfig;
 use fbt_net::upnp::SSDP_V4;
 use fbt_tracker::TrackerConfig;
 
@@ -347,6 +348,21 @@ pub struct Settings {
     /// at the stream's bitrate when that is more). Its `time` and a known
     /// `bitrate` must be non-zero.
     pub read_ahead: ReadAhead,
+    /// The proxy peer connections, web seeds and trackers go through (none
+    /// by default). See [`ProxyConfig`] for what each kind can carry:
+    ///
+    /// - SOCKS5 with `proxy_peers` or `proxy_trackers` relays all UDP
+    ///   (outgoing uTP, the DHT, UDP trackers) through one UDP ASSOCIATE.
+    ///   The session then binds TCP listeners only, plus one relayed UDP
+    ///   socket on a free port; the DHT runs over IPv4 only. If the
+    ///   association cannot be made, [`Session::new`](crate::Session::new)
+    ///   fails with [`SessionError::Proxy`](crate::SessionError::Proxy).
+    /// - An HTTP proxy with `proxy_peers` dials peers over TCP only
+    ///   (`enable_outgoing_utp` is treated as off); the DHT still runs
+    ///   directly unless `dht_enabled` is off.
+    ///
+    /// Listening is unchanged: incoming connections never use the proxy.
+    pub proxy: ProxyConfig,
 }
 
 impl Settings {
@@ -436,6 +452,7 @@ impl Settings {
                 "dht_bootstrap_nodes entries must be host:port, got {bad:?}"
             ));
         }
+        self.proxy.validate().map_err(|e| format!("proxy: {e}"))?;
         self.read_ahead.validate()
     }
 }
@@ -529,6 +546,7 @@ impl Default for Settings {
             rate_limit_local_peers: false,
             mixed_mode: MixedMode::default(),
             read_ahead: ReadAhead::default(),
+            proxy: ProxyConfig::default(),
         }
     }
 }

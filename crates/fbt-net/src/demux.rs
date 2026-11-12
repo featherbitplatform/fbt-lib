@@ -3,6 +3,10 @@
 //! Incoming datagrams are routed to a handler by packet shape (see
 //! [`classify`]); the three shapes are disjoint. Datagrams of an unknown
 //! shape, or of a kind with no handler, are dropped and counted.
+//!
+//! A socket bound with [`SharedUdpSocket::bind_relayed`] sends and receives
+//! through a SOCKS5 UDP relay instead: every datagram is framed for the
+//! relay, and only framed datagrams from the relay are dispatched.
 
 use std::io;
 use std::net::SocketAddr;
@@ -13,6 +17,8 @@ use std::time::Duration;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
+
+use crate::proxy::{Socks5Udp, decode_udp, encode_udp};
 
 /// The receive buffer: the largest possible UDP payload.
 pub const MAX_DATAGRAM: usize = 65_536;
@@ -59,8 +65,12 @@ pub struct DemuxStats {
     pub dht: u64,
     /// Datagrams dispatched to the tracker handler.
     pub tracker: u64,
-    /// Datagrams of unknown shape or with no handler for their kind.
+    /// Datagrams of unknown shape or with no handler for their kind; on a
+    /// relayed socket also those not from the relay or not decodable.
     pub dropped: u64,
+    /// A relayed socket lost its SOCKS5 association (the proxy closed the
+    /// control connection) and stopped. Always false on a direct socket.
+    pub relay_lost: bool,
 }
 
 #[derive(Debug, Default)]
@@ -85,13 +95,34 @@ type SendHalf = Arc<Mutex<Option<std::net::UdpSocket>>>;
 struct Inner {
     send: SendHalf,
     local: SocketAddr,
+    /// The SOCKS5 UDP relay every datagram goes through; `None` for a
+    /// direct socket.
+    relay: Option<SocketAddr>,
     handlers: Mutex<Handlers>,
     counters: Counters,
     closed: AtomicBool,
+    relay_lost: AtomicBool,
     stop: Arc<Notify>,
+    /// Wakes the relay's control task at close (a second waiter, so it
+    /// cannot take the receive task's permit).
+    control_stop: Arc<Notify>,
 }
 
 impl Inner {
+    fn new(send: std::net::UdpSocket, local: SocketAddr, relay: Option<SocketAddr>) -> Inner {
+        Inner {
+            send: Arc::new(Mutex::new(Some(send))),
+            local,
+            relay,
+            handlers: Mutex::new(Handlers::default()),
+            counters: Counters::default(),
+            closed: AtomicBool::new(false),
+            relay_lost: AtomicBool::new(false),
+            stop: Arc::new(Notify::new()),
+            control_stop: Arc::new(Notify::new()),
+        }
+    }
+
     fn stop(&self) {
         self.closed.store(true, Ordering::SeqCst);
         // drop the send clone so the port is released once the receive task
@@ -102,6 +133,25 @@ impl Inner {
             .take();
         // notify_one stores a permit, so a task not yet waiting still sees it
         self.stop.notify_one();
+        self.control_stop.notify_one();
+    }
+
+    /// A datagram arrived from `from`: on a relayed socket only a framed
+    /// datagram from the relay counts, dispatched with the source it names.
+    fn receive(&self, from: SocketAddr, data: &[u8]) {
+        let Some(relay) = self.relay else {
+            return self.dispatch(from, data);
+        };
+        if canonical(from) != canonical(relay) {
+            self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        match decode_udp(data) {
+            Some((src, payload)) => self.dispatch(src, payload),
+            None => {
+                self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     fn dispatch(&self, from: SocketAddr, data: &[u8]) {
@@ -150,6 +200,7 @@ pub struct SharedUdpSocket {
 struct Sender {
     socket: SendHalf,
     local: SocketAddr,
+    relay: Option<SocketAddr>,
 }
 
 impl DatagramSender for Sender {
@@ -159,11 +210,41 @@ impl DatagramSender for Sender {
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
         let guard = self.socket.lock().unwrap_or_else(PoisonError::into_inner);
-        match guard.as_ref() {
-            Some(s) => s.send_to(data, to),
-            None => Err(io::ErrorKind::NotConnected.into()),
+        let Some(s) = guard.as_ref() else {
+            return Err(io::ErrorKind::NotConnected.into());
+        };
+        match self.relay {
+            None => s.send_to(data, to),
+            Some(relay) => {
+                let mut framed = Vec::with_capacity(data.len().saturating_add(22));
+                encode_udp(to, data, &mut framed);
+                s.send_to(&framed, relay)?;
+                Ok(data.len())
+            }
         }
     }
+}
+
+/// `::ffff:a.b.c.d` and `a.b.c.d` are one address.
+fn canonical(a: SocketAddr) -> SocketAddr {
+    SocketAddr::new(a.ip().to_canonical(), a.port())
+}
+
+/// Binds a non-blocking UDP socket on `addr` (IPv6-only for IPv6).
+fn bind_std(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        s.set_only_v6(true)?;
+    }
+    s.set_nonblocking(true)?;
+    s.bind(&addr.into())?;
+    Ok(s.into())
 }
 
 impl SharedUdpSocket {
@@ -171,33 +252,36 @@ impl SharedUdpSocket {
     /// runtime. An IPv6 address binds IPv6-only, so an IPv4 socket can share
     /// its port.
     pub fn bind(addr: SocketAddr) -> io::Result<SharedUdpSocket> {
-        use socket2::{Domain, Protocol, Socket, Type};
-        let domain = if addr.is_ipv6() {
-            Domain::IPV6
-        } else {
-            Domain::IPV4
-        };
-        let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6() {
-            s.set_only_v6(true)?;
-        }
-        s.set_nonblocking(true)?;
-        s.bind(&addr.into())?;
-        let std_sock: std::net::UdpSocket = s.into();
+        Self::start(addr, None)
+    }
+
+    /// Binds `local` and sends and receives through the SOCKS5 association
+    /// `assoc`: each datagram goes to the relay framed with
+    /// [`encode_udp`], and only datagrams from the relay that
+    /// [`decode_udp`] accepts are dispatched, with the source they name;
+    /// the rest count as [`DemuxStats::dropped`]. When the proxy closes the
+    /// control connection the socket stops, with a warning, and
+    /// [`DemuxStats::relay_lost`] turns true. Must run inside a tokio
+    /// runtime.
+    pub fn bind_relayed(local: SocketAddr, assoc: Socks5Udp) -> io::Result<SharedUdpSocket> {
+        let socket = Self::start(local, Some(assoc.relay()))?;
+        tokio::spawn(watch_relay(
+            assoc,
+            Arc::downgrade(&socket.inner),
+            Arc::clone(&socket.inner.control_stop),
+        ));
+        Ok(socket)
+    }
+
+    fn start(addr: SocketAddr, relay: Option<SocketAddr>) -> io::Result<SharedUdpSocket> {
+        let std_sock = bind_std(addr)?;
         // sends go straight to a non-blocking clone: tokio's try_send_to
         // fails until the first readiness event, which a fresh socket lacks
         let send = std_sock.try_clone()?;
         send.set_nonblocking(true)?;
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local = socket.local_addr()?;
-        let inner = Arc::new(Inner {
-            send: Arc::new(Mutex::new(Some(send))),
-            local,
-            handlers: Mutex::new(Handlers::default()),
-            counters: Counters::default(),
-            closed: AtomicBool::new(false),
-            stop: Arc::new(Notify::new()),
-        });
+        let inner = Arc::new(Inner::new(send, local, relay));
         tokio::spawn(receive_loop(
             socket,
             Arc::downgrade(&inner),
@@ -216,6 +300,7 @@ impl SharedUdpSocket {
         Arc::new(Sender {
             socket: Arc::clone(&self.inner.send),
             local: self.inner.local,
+            relay: self.inner.relay,
         })
     }
 
@@ -241,6 +326,7 @@ impl SharedUdpSocket {
             dht: c.dht.load(Ordering::Relaxed),
             tracker: c.tracker.load(Ordering::Relaxed),
             dropped: c.dropped.load(Ordering::Relaxed),
+            relay_lost: self.inner.relay_lost.load(Ordering::SeqCst),
         }
     }
 
@@ -268,7 +354,7 @@ async fn receive_loop(socket: Arc<UdpSocket>, inner: Weak<Inner>, stop: Arc<Noti
                     break;
                 }
                 if let Some(data) = buf.get(..n) {
-                    inner.dispatch(from, data);
+                    inner.receive(from, data);
                 }
             }
             Err(e) => {
@@ -284,6 +370,25 @@ async fn receive_loop(socket: Arc<UdpSocket>, inner: Weak<Inner>, stop: Arc<Noti
                 if errors >= ERROR_BURST {
                     tokio::time::sleep(ERROR_PAUSE).await;
                 }
+            }
+        }
+    }
+}
+
+/// Holds the SOCKS5 association (its control connection) for as long as the
+/// socket lives; when the proxy closes it, stops the socket and marks the
+/// relay lost.
+async fn watch_relay(mut assoc: Socks5Udp, inner: Weak<Inner>, stop: Arc<Notify>) {
+    tokio::select! {
+        () = stop.notified() => {}
+        () = assoc.closed() => {
+            if let Some(inner) = inner.upgrade() {
+                tracing::warn!(
+                    relay = %assoc.relay(),
+                    "the SOCKS5 proxy closed the UDP association; the relayed socket stopped"
+                );
+                inner.relay_lost.store(true, Ordering::SeqCst);
+                inner.stop();
             }
         }
     }

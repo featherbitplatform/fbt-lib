@@ -1,7 +1,7 @@
 //! The session: torrent registry, peer listener, events and limits.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -12,6 +12,7 @@ use fbt_dht::{Dht, DhtConfig, DhtState, DhtStats};
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::PortMapper;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
+use fbt_net::proxy::{ProxyKind, udp_associate};
 use fbt_tracker::TrackerClient;
 use fbt_utp::UtpSocket;
 use fbt_wire::req2_hash;
@@ -359,19 +360,40 @@ impl Session {
     /// [`listen_errors`](Self::listen_errors).
     ///
     /// Fails with [`SessionError::InvalidSettings`] for settings it cannot
-    /// work with (see [`Settings`]) and with [`SessionError::Bind`] (the
-    /// first error) when no address binds.
-    pub async fn new(settings: Settings) -> Result<Session, SessionError> {
+    /// work with (see [`Settings`]), with [`SessionError::Bind`] (the
+    /// first error) when no address binds, and with [`SessionError::Proxy`]
+    /// when a SOCKS5 [`Settings::proxy`] cannot open its UDP association
+    /// (the session then binds TCP listeners only and one relayed UDP
+    /// socket; see [`Settings::proxy`]).
+    pub async fn new(mut settings: Settings) -> Result<Session, SessionError> {
         settings.validate().map_err(SessionError::InvalidSettings)?;
-        let (endpoints, listen_errors) = bind_all(&settings).await?;
+        let proxy = &settings.proxy;
+        // SOCKS5 relays all UDP through one association: one socket cannot
+        // be half proxied.
+        let relay_udp =
+            proxy.kind == ProxyKind::Socks5 && (proxy.proxy_peers || proxy.proxy_trackers);
+        // An HTTP proxy cannot carry uTP.
+        if proxy.kind == ProxyKind::Http && proxy.proxy_peers {
+            settings.enable_outgoing_utp = false;
+        }
+        let (endpoints, listen_errors) = bind_all(&settings, !relay_udp).await?;
         let local_addrs: Vec<SocketAddr> = endpoints.iter().map(|e| e.addr).collect();
-        let mut udp: Vec<SharedUdpSocket> =
-            endpoints.iter().filter_map(|e| e.udp.clone()).collect();
-        udp.extend(fallback_udp(&endpoints));
+        let udp: Vec<SharedUdpSocket> = if relay_udp {
+            vec![bind_relay(&settings, &local_addrs).await?]
+        } else {
+            let mut udp: Vec<SharedUdpSocket> =
+                endpoints.iter().filter_map(|e| e.udp.clone()).collect();
+            udp.extend(fallback_udp(&endpoints));
+            udp
+        };
         let utp = utp_sockets(&settings, &udp);
         let senders: Vec<Arc<dyn DatagramSender>> =
             udp.iter().map(SharedUdpSocket::sender).collect();
-        let tracker = match TrackerClient::with_udp_sockets(settings.tracker.clone(), senders) {
+        let tracker = match TrackerClient::new_with(
+            settings.tracker.clone(),
+            senders,
+            Some(settings.proxy.clone()),
+        ) {
             Ok(t) => t,
             Err(e) => {
                 for u in &utp {
@@ -714,6 +736,30 @@ impl Session {
         // Last: the `stopped` announces and the DHT used these sockets.
         self.inner.close_udp();
     }
+}
+
+/// The one UDP socket of a session behind a SOCKS5 proxy: a UDP association
+/// (bounded by `connect_timeout`) and a socket relayed through it, on a free
+/// port of the first listen IP of the relay's family (IPv4 in practice),
+/// else the unspecified address. Fails with [`SessionError::Proxy`].
+async fn bind_relay(
+    settings: &Settings,
+    local_addrs: &[SocketAddr],
+) -> Result<SharedUdpSocket, SessionError> {
+    let assoc = udp_associate(&settings.proxy, settings.connect_timeout)
+        .await
+        .map_err(|e| SessionError::Proxy(e.to_string()))?;
+    let v4 = assoc.relay().is_ipv4();
+    let ip = local_addrs.iter().find(|a| a.is_ipv4() == v4).map_or(
+        if v4 {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        },
+        SocketAddr::ip,
+    );
+    SharedUdpSocket::bind_relayed(SocketAddr::new(ip, 0), assoc)
+        .map_err(|e| SessionError::Proxy(format!("cannot bind the relayed UDP socket: {e}")))
 }
 
 /// A UDP socket on a free port for each address family that has a

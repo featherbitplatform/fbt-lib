@@ -57,6 +57,10 @@ pub enum SessionError {
     /// it allows (16).
     #[error("too many open file readers")]
     TooManyReaders,
+    /// The SOCKS5 UDP association [`Settings::proxy`](crate::Settings::proxy)
+    /// needs could not be made; the message is the proxy error.
+    #[error("proxy error: {0}")]
+    Proxy(String),
 }
 
 /// Why a [`FileReader`](crate::FileReader) read failed. It comes inside the

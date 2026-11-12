@@ -13,7 +13,7 @@ workspace = true
 
 [features]
 default = []
-serde = ["dep:serde", "fbt-tracker/serde"]
+serde = ["dep:serde", "fbt-tracker/serde", "fbt-net/serde"]
 tls-ring = ["fbt-tracker/tls-ring"]
 tls-rustcrypto = ["fbt-tracker/tls-rustcrypto"]
 
