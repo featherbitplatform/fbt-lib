@@ -882,9 +882,9 @@ mod tests {
         root.insert(b"info", info.build());
         let m = Metainfo::from_bytes(&encode(&root.build())).unwrap();
         let names = RawNames::of(&m);
-        for i in 0..3 {
+        for (i, file) in m.info.files.iter().enumerate().take(3) {
             let url = url_for("http://h/", &names, i);
-            let sanitised: Vec<String> = m.info.files[i].path.components()[1..]
+            let sanitised: Vec<String> = file.path.components()[1..]
                 .iter()
                 .map(|c| url_encode_bytes(c.as_bytes()))
                 .collect();
