@@ -379,7 +379,8 @@ async fn requests_flow_when_unchoked() {
     unchoke_and_request(&mut wire, &mut r, &blocks).await;
 
     // A delivered block is forwarded, and the freed request (at least a
-    // quarter of the depth) is asked for again.
+    // quarter of the depth) is asked for again: the block just read warms
+    // the rate meter to 3 blocks of depth, 2 of them free.
     send(
         &mut wire,
         Message::Piece {
@@ -396,7 +397,7 @@ async fn requests_flow_when_unchoked() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 1 });
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
 
     // Closing reports what is still outstanding.
     r.cmd(PeerCommand::Close).await;
@@ -566,7 +567,7 @@ async fn unrequested_or_wrong_length_piece_is_dropped() {
         },
     )
     .await;
-    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 3 });
     assert_eq!(
         r.next().await,
         PeerEvent::Wasted {
@@ -1637,7 +1638,7 @@ async fn snub_after_timeout_and_clear_on_block() {
         }
     );
     assert!(matches!(r.next().await, PeerEvent::Block { .. }));
-    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 1 });
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
     // Not snubbed again before another full timeout without a block.
     let t1 = Instant::now();
     assert_eq!(
@@ -1649,14 +1650,14 @@ async fn snub_after_timeout_and_clear_on_block() {
     );
     assert!(t1.elapsed() >= Duration::from_millis(300));
     // The last block clears it again, and the emptied pipeline asks for
-    // the minimum.
+    // the depth the two blocks read so far warm the rate meter to.
     send(&mut wire, piece(16_384)).await;
     assert!(matches!(
         r.next().await,
         PeerEvent::Snubbed { snubbed: false, .. }
     ));
     assert!(matches!(r.next().await, PeerEvent::Block { .. }));
-    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 2 });
+    assert_eq!(r.next().await, PeerEvent::WantBlocks { key: KEY, count: 6 });
 }
 
 /// A read hold pauses the snub timer as it does the request timeouts.

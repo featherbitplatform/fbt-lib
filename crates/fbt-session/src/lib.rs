@@ -51,11 +51,12 @@ mod session;
 pub mod settings;
 mod status;
 pub mod storage;
+pub mod stream;
 mod torrent;
 
 pub use bandwidth::{MixedMode, PeerClassLimits, RateLimit};
 pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
-pub use error::SessionError;
+pub use error::{SessionError, StreamError};
 pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
 pub use fbt_dht::DhtStats;
 pub use fbt_net::{MapMethod, MapProtocol};
@@ -68,6 +69,7 @@ pub use settings::{
 };
 pub use status::{TorrentState, TorrentStatus};
 pub use storage::{CacheStats, StorageError};
+pub use stream::{FileReader, ReadAhead};
 pub use torrent::TorrentHandle;
 
 #[cfg(test)]

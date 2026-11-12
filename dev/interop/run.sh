@@ -4,18 +4,30 @@
 # repeats both with encryption forced everywhere, downloads a trackerless
 # magnet through the private DHT (bootstrapped from the `dht-node` service
 # only) with BEP 9 metadata exchange, finds a peer through PEX alone, moves
-# a torrent each way with qBittorrent over uTP only, and finds a second
-# fbt-example (the `fbt-lsd` service) through LSD alone.
+# a torrent each way with qBittorrent over uTP only, streams a file from
+# qBittorrent with seeks, and finds a second fbt-example (the `fbt-lsd`
+# service) through LSD alone.
 # Needs Docker with Compose v2. Everything lands in target/interop/.
 #
 #   bash dev/interop/run.sh
 #
 # INTEROP_ONLY=utp (a comma-separated list of download, seed, encryption,
-# magnet, pex, utp, lsd) runs only those scenarios, after the shared setup;
-# uTP always runs. FBT_RUST_LOG sets RUST_LOG for the uTP download (its
+# magnet, pex, utp, lsd, stream) runs only those scenarios, after the shared
+# setup; uTP always runs, and an unknown name fails before anything starts. FBT_RUST_LOG sets RUST_LOG for the uTP download (its
 # tracing lands in fbt-download-utp.log), e.g. FBT_RUST_LOG=fbt_utp=debug.
 set -euo pipefail
 
+known_scenarios=(download seed encryption magnet pex utp lsd stream)
+# An unknown name fails at once, before the setup, rather than selecting nothing.
+if [ -n "${INTEROP_ONLY:-}" ]; then
+    IFS=, read -ra only_names <<<"$INTEROP_ONLY"
+    for name in "${only_names[@]}"; do
+        [[ " ${known_scenarios[*]} " == *" $name "* ]] || {
+            echo "interop: unknown scenario '$name' (known: $(IFS=,; echo "${known_scenarios[*]}" | sed 's/,/, /g'))" >&2
+            exit 1
+        }
+    done
+fi
 # want <scenario>: INTEROP_ONLY is unset or names it.
 want() { [ -z "${INTEROP_ONLY:-}" ] || [[ ",$INTEROP_ONLY," == *",$1,"* ]]; }
 utp_env=()
@@ -558,6 +570,62 @@ stop_seed
 set_bt_protocol 0
 echo "interop: uTP seed OK (qbittorrent)"
 
+if want stream; then
+# ------------------------------------------------------ streaming, with seeks --
+# qBittorrent is the only source: Transmission's copy of fixture 1 stops.
+echo "interop: fbt-example stream from qBittorrent, with seeks"
+trc transmission-remote -t "$hash1" -S >/dev/null
+stream_started=$SECONDS
+# beta.bin's index in the torrent (files print in torrent order; no pad files).
+beta_index=$(fbt fbt-example info /interop/fixture.torrent |
+    awk '/^files:/ {n = 0; on = 1; next} /^trackers:/ {on = 0} on { if ($1 ~ /(^|\/)beta\.bin$/) { print n; exit } n++ }')
+[ -n "$beta_index" ] || fail "could not find beta.bin in fixture.torrent"
+qbt_up_before=$(qbt_field "$hash1" .uploaded)
+beta=/interop/payload/fixture/beta.bin
+
+# stream_step <step> <offset> <length|-> <out file>: one fbt-example stream run.
+stream_step() {
+    local log="$logs/fbt-stream-$1.log" len=()
+    [ "$3" = - ] || len=(--length "$3")
+    set +e
+    fbt timeout 300 fbt-example stream /interop/fixture.torrent --file "$beta_index" \
+        --out /interop/fbt-stream --port 6899 --no-dht --seek "$2" ${len[@]+"${len[@]}"} \
+        --to "$4" >"$log" 2>&1
+    status=$?
+    set -e
+    check_download "$log" "$status" "fbt-example stream ($1)"
+}
+# stream_matches <offset> <length|-> <out file>: the output equals that range of beta.bin.
+stream_matches() {
+    local want_sum got_sum
+    if [ "$2" = - ]; then
+        want_sum=$(fbt sh -c "tail -c +$(($1 + 1)) '$beta' | sha1sum")
+    else
+        want_sum=$(fbt sh -c "tail -c +$(($1 + 1)) '$beta' | head -c $2 | sha1sum")
+    fi
+    got_sum=$(fbt sh -c "sha1sum <'$3'")
+    [ "$want_sum" = "$got_sum" ]
+}
+
+stream_step mid 12000000 3000000 /interop/stream-mid.bin
+stream_matches 12000000 3000000 /interop/stream-mid.bin ||
+    fail "the mid-file stream differs from beta.bin (see $logs/fbt-stream-mid.log)"
+stream_step all 0 - /interop/stream-all.bin
+stream_matches 0 - /interop/stream-all.bin ||
+    fail "the whole-file stream differs from beta.bin (see $logs/fbt-stream-all.log)"
+stream_step tail 24999000 - /interop/stream-tail.bin
+stream_matches 24999000 - /interop/stream-tail.bin ||
+    fail "the tail stream differs from beta.bin (see $logs/fbt-stream-tail.log)"
+for step in mid all; do
+    grep -Eq "^peer connected $qbt_ip:6882( |$)" "$logs/fbt-stream-$step.log" ||
+        fail "the $step stream never connected to qBittorrent ($qbt_ip:6882) (see $logs/fbt-stream-$step.log)"
+done
+wait_for "qBittorrent's uploaded to grow while streaming" 30 qbt_uploaded_more_than "$hash1" "$qbt_up_before"
+echo "interop: stream: qBittorrent uploaded $qbt_up_before -> $(qbt_field "$hash1" .uploaded) bytes"
+trc transmission-remote -t "$hash1" -s >/dev/null
+echo "interop: stream with seeks OK (qbittorrent) in $((SECONDS - stream_started))s"
+fi
+
 if want lsd; then
 # --------------------------------------------------------------------- LSD --
 echo "interop: creating payload and trackerless fixture5.torrent"
@@ -604,4 +672,8 @@ stop_seed
 seed_service=fbt
 echo "interop: LSD OK"
 fi
-echo "interop: all scenarios passed in $((SECONDS - setup_secs))s (setup ${setup_secs}s, total ${SECONDS}s)"
+if [ -n "${INTEROP_ONLY:-}" ]; then
+    echo "interop: selected scenarios passed ($INTEROP_ONLY) in $((SECONDS - setup_secs))s (setup ${setup_secs}s, total ${SECONDS}s)"
+else
+    echo "interop: all scenarios passed in $((SECONDS - setup_secs))s (setup ${setup_secs}s, total ${SECONDS}s)"
+fi

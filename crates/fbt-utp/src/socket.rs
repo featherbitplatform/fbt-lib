@@ -28,7 +28,7 @@ use tokio::sync::Notify;
 
 use crate::UtpError;
 use crate::conn::{ConnState, Connection, HOLE_RESERVE, UtpConfig};
-use crate::packet::{Packet, PacketType};
+use crate::packet::{Packet, PacketError, PacketType};
 use crate::stream::UtpStream;
 
 /// The receive buffer of an owned socket: the largest UDP payload.
@@ -272,6 +272,9 @@ pub(crate) struct Shared {
     closed: AtomicBool,
     /// Start of the current reset window and resets sent in it.
     resets: Mutex<(Instant, u32)>,
+    /// When the last undecodable datagram was logged, and how many were
+    /// not logged since (at most one event per second).
+    decode_log: Mutex<(Option<Instant>, u64)>,
     /// Stops the receive task of an owned socket.
     recv_stop: Option<Arc<Notify>>,
 }
@@ -502,10 +505,14 @@ impl Shared {
         if self.is_closed() {
             return;
         }
-        let Ok(p) = Packet::decode(&Bytes::copy_from_slice(data)) else {
-            return;
-        };
         let now = Instant::now();
+        let p = match Packet::decode(&Bytes::copy_from_slice(data)) {
+            Ok(p) => p,
+            Err(e) => {
+                self.decode_failed(from, data.len(), e, now);
+                return;
+            }
+        };
         // A SYN carries the initiator's receive id; ours is one more.
         let id = if p.ty == PacketType::Syn {
             p.conn_id.wrapping_add(1)
@@ -519,6 +526,24 @@ impl Shared {
             (None, PacketType::Reset) => self.reset_by_send_id(from, &p, now),
             (None, _) => self.unknown(from, &p, now),
         }
+    }
+
+    /// Logs an undecodable datagram, at most once per second; the events
+    /// skipped meanwhile are counted in the next one's `suppressed`.
+    fn decode_failed(&self, from: SocketAddr, len: usize, e: PacketError, now: Instant) {
+        let suppressed = {
+            let mut log = lock(&self.decode_log);
+            if log
+                .0
+                .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1))
+            {
+                log.1 = log.1.saturating_add(1);
+                return;
+            }
+            log.0 = Some(now);
+            std::mem::take(&mut log.1)
+        };
+        tracing::trace!(%from, len, error = %e, suppressed, "uTP datagram failed to decode");
     }
 
     /// A reset carrying a connection's send id (libutp answers with the id
@@ -570,12 +595,6 @@ impl Shared {
             && syn_neighbours_free(table, key, syn)
     }
 
-    /// [`Shared::admissible`] with a free half-open place.
-    fn has_room(&self, table: &Table, pending: usize, key: Key, syn: &Packet) -> bool {
-        table.half_open.len() < self.cfg.max_pending_accept
-            && self.admissible(table, pending, key, syn)
-    }
-
     /// A SYN for no known connection. It gets a half-open slot (and our
     /// STATE), but reaches `accept` only once the dialler confirms it (see
     /// `deliver`). At most `max_pending_accept` slots are half-open; a newer
@@ -583,38 +602,53 @@ impl Shared {
     /// nor keep an honest dialler out for longer than its round trip.
     fn incoming_syn(&self, key: Key, syn: &Packet, now: Instant) {
         // Checked before any allocation, so a flood costs a lookup each.
-        let victim = {
+        {
             let table = lock(&self.table);
             let pending = lock(&self.pending).len();
             if !self.admissible(&table, pending, key, syn) {
                 return;
             }
-            if table.half_open.len() >= self.cfg.max_pending_accept {
-                table.oldest_half_open()
-            } else {
-                None
-            }
-        };
+        }
         let filter = lock(&self.filter).clone();
         if filter.is_some_and(|f| !f(key.0)) {
             return;
-        }
-        if let Some((vkey, vslot)) = victim {
-            self.evict(vkey, &vslot);
         }
         let isn: u16 = rand::rng().random();
         let conn = Connection::accept(&self.cfg, key.0, syn, isn, now);
         let mut slot = ConnSlot::new(conn, key, true);
         slot.unconfirmed_until = now.checked_add(self.cfg.connect_timeout);
         let slot = Arc::new(Mutex::new(slot));
-        {
+        // The final check, and the victim, are decided under the table
+        // lock; the victim is evicted only after it is released (`evict`
+        // takes the victim's slot lock, never held inside the table lock),
+        // so a SYN that fails here evicts nobody.
+        let victim = {
             let mut table = lock(&self.table);
             let pending = lock(&self.pending).len();
-            if table.slots.contains_key(&key) || !self.has_room(&table, pending, key, syn) {
+            if table.slots.contains_key(&key) || !self.admissible(&table, pending, key, syn) {
                 return;
+            }
+            let victim = if table.half_open.len() < self.cfg.max_pending_accept {
+                None
+            } else {
+                match table.oldest_half_open() {
+                    Some(v) => Some(v),
+                    None => return,
+                }
+            };
+            // `handle` is not serialised (a shared socket's handler may be
+            // called from any thread), so the victim leaves the half-open
+            // set now: a concurrent SYN then picks another victim, and the
+            // set never grows past `max_pending_accept`.
+            if let Some((vkey, _)) = &victim {
+                table.drop_half_open(*vkey);
             }
             table.slots.insert(key, Arc::clone(&slot));
             table.add_half_open(key);
+            victim
+        };
+        if let Some((vkey, vslot)) = victim {
+            self.evict(vkey, &vslot);
         }
         let st = self.settle(&mut lock(&slot), now, None);
         self.finish(key, &slot, key.0, st);
@@ -827,6 +861,7 @@ impl UtpSocket {
             timer_visits: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             resets: Mutex::new((Instant::now(), 0)),
+            decode_log: Mutex::new((None, 0)),
             recv_stop,
         });
         tokio::spawn(timer_loop(Arc::downgrade(&inner), timer));

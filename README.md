@@ -2,7 +2,7 @@
 
 A from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent, and an idiomatic async Rust API. It is the engine for featherbittorrent, a future client with a terminal UI, a web UI and media streaming while downloading. It has no UI of its own and runs on macOS, Linux and Windows.
 
-Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 added the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange (v0.2.0). Milestone 3 adds uTP, local and NAT reach, rate limits and a write-back cache, and is heading for v0.3.0. Nothing is published to crates.io and the API will change.
+Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 added the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange (v0.2.0). Milestone 3 added uTP, local and NAT reach, rate limits and a write-back cache (v0.3.0). Milestone 4 adds streaming while downloading, a seekable reader over a torrent that is still downloading, and is heading for v0.4.0. Nothing is published to crates.io and the API will change.
 
 ## Features
 
@@ -15,6 +15,7 @@ Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 
 - Local service discovery (BEP 14), UPnP and NAT-PMP/PCP port mapping, and BEP 55 holepunch over uTP
 - Global, per-torrent and per-peer-class rate limits; rate-based and seeding choker variants; BEP 21 upload-only and BEP 54 `lt_donthave`
 - Bounded write-back cache that coalesces writes, and a queue for file checks
+- Streaming while downloading: a seekable `FileReader` (tokio `AsyncRead` and `AsyncSeek`) whose position sets deadlines on a read-ahead window, fetched first from the fastest peers; seeks replace the window, and several readers can share a torrent
 - Pure Rust, no `unsafe`; hostile peer, tracker and `.torrent` input is bounded
 
 ## Usage
@@ -77,6 +78,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Streaming while downloading
+
+```rust
+use std::io::SeekFrom;
+use fbt::{AddTorrent, Metainfo, Session, Settings};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let metainfo = Metainfo::from_bytes(&std::fs::read("example.torrent")?)?;
+    let session = Session::new(Settings::default()).await?;
+    let torrent = session
+        .add_torrent(AddTorrent::new(metainfo, "downloads".into()))
+        .await?;
+
+    // A reader on file 0 of the torrent, which is still downloading.
+    let mut file = torrent.open_file(0).await?;
+    file.seek(SeekFrom::Start(1 << 20)).await?;
+    tokio::io::copy(&mut file.take(1 << 20), &mut tokio::io::sink()).await?;
+    session.shutdown().await;
+    Ok(())
+}
+```
+
+`TorrentHandle::open_file` returns a `FileReader`. A read of a piece that is not there yet waits, and returns only bytes that passed their piece's hash check. The reader's position sets deadlines on the pieces of its read-ahead window (`ReadAhead`: at least 16 MiB, or 10 s at the stream's bitrate when that is more; `Settings::read_ahead`, `TorrentHandle::open_file_with` and `FileReader::set_read_ahead` change it), and those pieces are fetched first from the fastest peers, whatever the file's priority. Seeking replaces the deadlines. A read fails only with a `StreamError` (torrent removed, session shut down, or torrent in error); there is no read timeout, so wrap reads in `tokio::time::timeout`.
+
 ### Rate limits and the cache
 
 ```rust
@@ -115,7 +142,7 @@ All three are on by default; set them to `false` to stay off the LAN. Private to
 
 `Settings::encryption` defaults to `EncryptionPolicy::Preferred`: outgoing connections open with an MSE handshake and may fall back to plain text. `Forced` refuses plain text, `Disabled` never encrypts.
 
-`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`, plus `--transport tcp|utp|both`, `--listen ADDR`, `--download-limit` and `--upload-limit`, `--cache-mb`, and `--lsd` and `--nat` (both off in the CLI); `fbt-example dht-node` runs a bare DHT node.
+`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`, plus `--transport tcp|utp|both`, `--listen ADDR`, `--download-limit` and `--upload-limit`, `--cache-mb`, and `--lsd` and `--nat` (both off in the CLI); `fbt-example stream <torrent> --file N --out DIR` streams file `N` to stdout or a file while it downloads, fetching only what is read plus the read-ahead window, with `--seek`, `--length`, `--bitrate` and `--peer`; `fbt-example dht-node` runs a bare DHT node.
 
 ## Feature flags
 
@@ -144,12 +171,13 @@ cargo deny --all-features check
 
 ## Known limitations
 
-- uTP throughput and CPU, and the CPU of 1,000 idle torrents, miss their targets on the recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)). The uTP misses are known implementation costs (in-flight window scans per send, byte-wise `VecDeque` payload, zero-fill per read) scheduled for milestone 4; the idle CPU is to be revisited.
+- uTP throughput and CPU, and the CPU of 1,000 idle torrents, miss their targets on the recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)). Milestone 4 removed the in-flight window scans, the byte-wise payload queue and the zero-fill per read from the uTP hot path, but the measured numbers did not move: about 579 Mbit/s at 42.7 % of a core per 100 Mbit/s, against targets of 1000 Mbit/s and 15 %, with TCP at about 5100 Mbit/s. About 90 % of the on-CPU time is system calls (one `sendto` and one `recvfrom` per 1.4 KiB datagram, plus the reactor wakeups), and batching them (`sendmmsg`, `recvmmsg`, GSO) needs platform FFI, which the no-unsafe rule rules out. The idle CPU is to be revisited.
+- Reading a skipped file of a finished torrent switches its state between `Seeding` and `Downloading` once per piece until the window is written. It is parked for a later fix.
 - LSD joins the multicast group on the default interface only, and on a host with no default route it fails to start: the session then runs without LSD.
 
 ## Interop and fuzzing
 
-Live interop against qBittorrent-nox and Transmission through opentracker, plus magnet via DHT, forced encryption, PEX, uTP with qBittorrent and LSD between two fbt containers on isolated networks with their own DHT node (no public node and no router is contacted), needs Docker (details in [dev/interop/README.md](dev/interop/README.md)):
+Live interop against qBittorrent-nox and Transmission through opentracker, plus magnet via DHT, forced encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent and LSD between two fbt containers on isolated networks with their own DHT node (no public node and no router is contacted), needs Docker (details in [dev/interop/README.md](dev/interop/README.md)):
 
 ```
 bash dev/interop/run.sh

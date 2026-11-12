@@ -47,7 +47,9 @@ impl RateMeter {
         }
     }
 
-    /// Average bytes per second over the five seconds ending at `now`.
+    /// Average bytes per second over the five seconds ending at `now`; a
+    /// meter younger than that divides by the seconds it has been running
+    /// (counting the current one), so it does not under-report its start.
     pub fn rate(&self, now: Instant) -> u64 {
         let sec = self.second(now);
         let sum: u64 = self
@@ -56,7 +58,7 @@ impl RateMeter {
             .filter(|(s, _)| *s <= sec && sec - *s < WINDOW_SECS)
             .map(|(_, b)| *b)
             .fold(0, u64::saturating_add);
-        sum / WINDOW_SECS
+        sum / sec.saturating_add(1).min(WINDOW_SECS)
     }
 
     /// All bytes ever recorded.
@@ -77,7 +79,7 @@ mod tests {
         m.record(1000);
         tokio::time::advance(Duration::from_secs(1)).await;
         m.record(4000);
-        assert_eq!(m.rate(Instant::now()), 1000);
+        assert_eq!(m.rate(Instant::now()), 2500);
         assert_eq!(m.total(), 5000);
         // The first second leaves the window after five seconds.
         tokio::time::advance(Duration::from_secs(4)).await;
@@ -88,5 +90,16 @@ mod tests {
         m.record(500);
         assert_eq!(m.rate(Instant::now()), 100);
         assert_eq!(m.total(), 5500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_meter_is_not_diluted() {
+        let mut m = RateMeter::new();
+        let t0 = Instant::now();
+        m.record(10_000);
+        assert_eq!(m.rate(t0 + Duration::from_millis(500)), 10_000);
+        assert_eq!(m.rate(t0 + Duration::from_millis(1500)), 5_000);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(m.rate(Instant::now()), 0);
     }
 }

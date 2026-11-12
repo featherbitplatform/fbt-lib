@@ -12,6 +12,7 @@
 #   BENCH_TORRENTS     idle seeding torrents (default 1000)
 #   BENCH_IDLE_SECS    how long they idle (default 60)
 #   BENCH_BASELINE     torrents in the RSS baseline run (default 10)
+#   BENCH_STREAM_MIB   payload of the streaming run (default 256)
 #   BENCH_NO_RECORD=1  print the row instead of appending it
 #
 # The row holds only the date, the workspace version, `uname -sm` and the
@@ -24,6 +25,7 @@ SIZE=${BENCH_SIZE_MIB:-1024}
 TORRENTS=${BENCH_TORRENTS:-1000}
 IDLE_SECS=${BENCH_IDLE_SECS:-60}
 BASELINE=${BENCH_BASELINE:-10}
+STREAM=${BENCH_STREAM_MIB:-256}
 DOC=docs/benchmarks.md
 BIN="${CARGO_TARGET_DIR:-target}/release/fbt-example"
 
@@ -32,7 +34,7 @@ if [ -f "$HOME/.cargo/env" ] && ! command -v cargo >/dev/null 2>&1; then
     . "$HOME/.cargo/env"
 fi
 
-for v in "$SIZE" "$TORRENTS" "$IDLE_SECS" "$BASELINE"; do
+for v in "$SIZE" "$TORRENTS" "$IDLE_SECS" "$BASELINE" "$STREAM"; do
     case $v in '' | *[!0-9]*) echo "bench: overrides must be whole numbers" >&2; exit 2 ;; esac
 done
 
@@ -146,6 +148,12 @@ TCP_MBIT=$MBIT TCP_CPU=$CPUPCT100
 transfer utp
 UTP_MBIT=$MBIT UTP_CPU=$CPUPCT100
 
+echo "bench: stream, $STREAM MiB" >&2
+run_bench stream '^bench: start' '^bench: stream seek' --stream --size "$STREAM"
+grep '^bench: stream' "$OUT" >&2
+STREAM_MBIT=$(grep '^bench: stream [0-9]* MiB in' "$OUT" | awk '{print $9}')
+SEEK_P50=$(grep '^bench: stream seek' "$OUT" | awk '{print $5}')
+
 echo "bench: $TORRENTS idle torrents for $IDLE_SECS s" >&2
 run_bench idle '^bench: idle start' '^bench: idle [0-9]* torrents' \
     --torrents "$TORRENTS" --idle-secs "$IDLE_SECS"
@@ -168,10 +176,11 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 HOST=$(uname -sm)
 NOTE="seed and leech in one process"
 [ "$SIZE" -ne 1024 ] && NOTE="$NOTE; override: $SIZE MiB instead of 1024"
+[ "$STREAM" -ne 256 ] && NOTE="$NOTE; override: $STREAM MiB streamed instead of 256"
 [ "$TORRENTS" -ne 1000 ] && NOTE="$NOTE; override: $TORRENTS idle torrents instead of 1000"
 [ "$IDLE_SECS" -ne 60 ] && NOTE="$NOTE; override: $IDLE_SECS s idle instead of 60"
 
-ROW="| $DATE | $VERSION | $HOST | $TCP_MBIT | $TCP_CPU | $UTP_MBIT | $UTP_CPU | $TORRENTS | $IDLE_CPU | $RSS_PER | $NOTE |"
+ROW="| $DATE | $VERSION | $HOST | $TCP_MBIT | $TCP_CPU | $UTP_MBIT | $UTP_CPU | $STREAM_MBIT | $SEEK_P50 | $TORRENTS | $IDLE_CPU | $RSS_PER | $NOTE |"
 echo "$ROW"
 if [ -z "${BENCH_NO_RECORD:-}" ]; then
     printf '%s\n' "$ROW" >>"$DOC"

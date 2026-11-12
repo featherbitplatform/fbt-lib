@@ -17,7 +17,8 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use super::actor::Actor;
-use super::swarm::{Peer, dialable};
+use super::known::dialable;
+use super::peer::Peer;
 use crate::event::PeerSource;
 use crate::peer::messages::PeerCommand;
 use crate::peer::transport::Transport;
