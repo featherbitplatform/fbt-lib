@@ -522,3 +522,119 @@ fn content_range_parsing() {
         None
     );
 }
+
+fn partial(content_range: &str, body: &[u8]) -> Vec<u8> {
+    let mut v = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: {content_range}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    v.extend_from_slice(body);
+    v
+}
+
+/// Counts what a paced fetch charges.
+struct Counting(Mutex<(u64, u32)>);
+
+impl RangePace for Counting {
+    fn ready(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        self.0.lock().unwrap().1 += 1;
+        Box::pin(std::future::ready(()))
+    }
+
+    fn charge(&self, n: u64) {
+        self.0.lock().unwrap().0 += n;
+    }
+}
+
+#[tokio::test]
+async fn fetch_range_accepts_a_matching_206() {
+    let (addr, _) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let pace = Counting(Mutex::new((0, 0)));
+    let got = client()
+        .fetch_range_paced(&format!("http://{addr}/f"), 2..6, &pace)
+        .await
+        .unwrap();
+    assert_eq!(&got[..], b"cdef");
+    let (charged, waits) = *pace.0.lock().unwrap();
+    assert_eq!(charged, 4, "every body byte is charged");
+    assert!(waits >= 1, "every read waits for the pace first");
+}
+
+#[tokio::test]
+async fn fetch_range_takes_a_200_only_for_the_whole_file_from_0() {
+    let (addr, _) = serve(vec![http_ok(b"0123456789"), http_ok(b"0123456789")]).await;
+    let url = format!("http://{addr}/f");
+    assert_eq!(
+        &client().fetch_range(&url, 0..10).await.unwrap()[..],
+        b"0123456789"
+    );
+    // Asked for part of it: the server ignored the range.
+    assert!(matches!(
+        client().fetch_range(&url, 0..5).await,
+        Err(TrackerError::InvalidResponse(_))
+    ));
+}
+
+#[tokio::test]
+async fn fetch_range_refuses_a_wrong_content_range() {
+    let (addr, _) = serve(vec![
+        partial("bytes 3-6/10", b"defg"),
+        partial("bytes 2-5", b"cdef"),
+    ])
+    .await;
+    let url = format!("http://{addr}/f");
+    for _ in 0..2 {
+        assert!(matches!(
+            client().fetch_range(&url, 2..6).await,
+            Err(TrackerError::InvalidResponse(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn fetch_range_refuses_a_body_too_long_or_short() {
+    // The right Content-Range, but more bytes than it says.
+    let long = partial("bytes 2-5/10", b"cdefXXXX");
+    // Close-delimited and longer.
+    let mut endless =
+        b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-5/10\r\nConnection: close\r\n\r\n"
+            .to_vec();
+    endless.extend_from_slice(&[b'x'; 64 * 1024]);
+    let short = partial("bytes 2-5/10", b"cd");
+    let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (addr, _) = serve(vec![long, endless, short, not_found.to_vec()]).await;
+    let url = format!("http://{addr}/f");
+    let c = client();
+    assert!(matches!(
+        c.fetch_range(&url, 2..6).await,
+        Err(TrackerError::ResponseTooLarge)
+    ));
+    assert!(matches!(
+        c.fetch_range(&url, 2..6).await,
+        Err(TrackerError::ResponseTooLarge)
+    ));
+    assert!(matches!(
+        c.fetch_range(&url, 2..6).await,
+        Err(TrackerError::InvalidResponse(_))
+    ));
+    assert!(matches!(
+        c.fetch_range(&url, 2..6).await,
+        Err(TrackerError::HttpStatus(404))
+    ));
+    // An empty range asks nothing.
+    assert!(c.fetch_range(&url, 6..6).await.unwrap().is_empty());
+}
+
+#[test]
+fn minimum_rate_after_the_grace() {
+    use crate::http::too_slow;
+    let grace = RANGE_RATE_GRACE;
+    // Within the grace nothing is too slow.
+    assert!(!too_slow(0, grace));
+    let later = grace + Duration::from_secs(10);
+    let at_min = MIN_RANGE_RATE * later.as_secs();
+    assert!(!too_slow(at_min, later));
+    assert!(too_slow(at_min - 1, later));
+    assert!(too_slow(1, later));
+}

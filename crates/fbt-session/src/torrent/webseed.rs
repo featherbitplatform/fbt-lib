@@ -27,13 +27,17 @@
 //! picker never puts a web seed on parole; smart ban still charges and
 //! bans it as any sender.
 
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use fbt_bencode::{Limits, decode_with};
 use fbt_core::{BlockRef, FileLayout, PieceLayout};
 use fbt_metainfo::Metainfo;
-use fbt_tracker::{TrackerClient, TrackerError, url_encode_bytes};
+use fbt_tracker::{RangePace, TrackerClient, TrackerError, url_encode_bytes};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::debug;
@@ -41,6 +45,7 @@ use tracing::debug;
 use super::actor::{Actor, Phase};
 use super::data::Job;
 use super::smartban::BlockSource;
+use crate::bandwidth::Throttle;
 use crate::error::SessionError;
 use crate::event::Event;
 use crate::picker::{PeerKey, PeerPieces};
@@ -52,6 +57,9 @@ pub(super) const WEB_SEED_REQUEST_MAX: u64 = 4 << 20;
 const BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// The longest backoff.
 const BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+/// With a download limit, a request covers about this many seconds of it
+/// (at least one piece, at most [`WEB_SEED_REQUEST_MAX`]).
+const LIMITED_REQUEST_SECS: u64 = 4;
 /// Longest URL accepted (as `fbt_metainfo` keeps from a torrent).
 const MAX_URL_LEN: usize = 2048;
 
@@ -79,12 +87,18 @@ pub(super) struct WebSeed {
     pub failures: u32,
     /// Where its next run starts looking (just past its last one).
     pub cursor: u32,
+    /// The id of its latest request: a job carrying another one was
+    /// superseded (the seed was retired and revived meanwhile) and is
+    /// ignored.
+    pub request: u64,
 }
 
 /// A torrent's web seeds, at most [`fbt_metainfo::MAX_WEB_SEEDS`].
 #[derive(Debug, Default)]
 pub(super) struct WebSeeds {
     seeds: Vec<WebSeed>,
+    /// The torrent's names for URLs, read once the metadata is known.
+    names: Option<Arc<RawNames>>,
 }
 
 impl WebSeeds {
@@ -170,32 +184,103 @@ pub(super) fn backoff(failures: u32) -> Duration {
         .min(BACKOFF_MAX)
 }
 
-/// The URL of file `file_index` of `meta` on the web seed `base` (BEP 19):
-/// a single-file torrent is `base` itself, or `base` + its name when
-/// `base` ends in `/`; a multi-file torrent's file is below `base` as a
-/// directory, by the torrent's name and the file's path, each component
-/// percent-encoded.
-pub(super) fn url_for(base: &str, meta: &Metainfo, file_index: usize) -> String {
-    let encode = |c: &str| url_encode_bytes(c.as_bytes());
-    if meta.info.single_file {
+/// The torrent's names as its info dictionary spells them, byte for
+/// byte: a BEP 19 server holds the files under those, not under the
+/// sanitised, collision-renamed paths of [`Metainfo`]'s files.
+#[derive(Debug)]
+pub(super) struct RawNames {
+    /// The `name` entry.
+    name: Vec<u8>,
+    /// Each file's `path` components, in torrent order; `None` for a
+    /// single-file torrent.
+    files: Option<Vec<Vec<Vec<u8>>>>,
+}
+
+impl RawNames {
+    /// Read from `meta`'s raw info dictionary; should it not match the
+    /// parsed files (it always does for a parsed torrent), from the parsed
+    /// names instead.
+    pub(super) fn of(meta: &Metainfo) -> RawNames {
+        Self::parse(meta).unwrap_or_else(|| Self::parsed(meta))
+    }
+
+    fn parse(meta: &Metainfo) -> Option<RawNames> {
+        let root =
+            decode_with(meta.raw_info(), Limits::new(RAW_INFO_DEPTH, RAW_INFO_ITEMS)).ok()?;
+        let info = root.as_dict()?;
+        let name = info.get(b"name")?.as_bytes()?.to_vec();
+        let files = match info.get(b"files") {
+            None => None,
+            Some(list) => {
+                let list = list.as_list()?;
+                let mut out = Vec::with_capacity(list.len());
+                for item in list {
+                    let comps = item.as_dict()?.get(b"path")?.as_list()?;
+                    let path = comps
+                        .iter()
+                        .map(|c| c.as_bytes().map(<[u8]>::to_vec))
+                        .collect::<Option<Vec<_>>>()?;
+                    out.push(path);
+                }
+                Some(out)
+            }
+        };
+        let count = files.as_ref().map_or(1, Vec::len);
+        (count == meta.info.files.len() && files.is_none() == meta.info.single_file)
+            .then_some(RawNames { name, files })
+    }
+
+    fn parsed(meta: &Metainfo) -> RawNames {
+        let files = (!meta.info.single_file).then(|| {
+            meta.info
+                .files
+                .iter()
+                .map(|f| {
+                    // The first component is the torrent's name.
+                    f.path
+                        .components()
+                        .iter()
+                        .skip(1)
+                        .map(|c| c.as_bytes().to_vec())
+                        .collect()
+                })
+                .collect()
+        });
+        RawNames {
+            name: meta.info.name.as_bytes().to_vec(),
+            files,
+        }
+    }
+}
+
+/// Nesting cap when decoding the raw info dictionary (as `fbt_metainfo`).
+const RAW_INFO_DEPTH: usize = 32;
+/// Item cap when decoding the raw info dictionary (as `fbt_metainfo`).
+const RAW_INFO_ITEMS: usize = 4_194_304;
+
+/// The URL of file `file_index` on the web seed `base` (BEP 19), from the
+/// torrent's own names (`names`): a single-file torrent is `base` itself,
+/// or `base` + its name when `base` ends in `/`; a multi-file torrent's
+/// file is below `base` as a directory, by the torrent's name and the
+/// file's path. Each component is percent-encoded byte by byte, so names
+/// that are not UTF-8 work too.
+pub(super) fn url_for(base: &str, names: &RawNames, file_index: usize) -> String {
+    let Some(files) = &names.files else {
         return if base.ends_with('/') {
-            format!("{base}{}", encode(&meta.info.name))
+            format!("{base}{}", url_encode_bytes(&names.name))
         } else {
             base.to_owned()
         };
-    }
+    };
     let mut out = base.to_owned();
     if !out.ends_with('/') {
         out.push('/');
     }
-    let components = meta
-        .info
-        .files
-        .get(file_index)
-        .map(|f| f.path.components().to_vec())
-        .unwrap_or_default();
-    let path: Vec<String> = components.iter().map(|c| encode(c)).collect();
-    out.push_str(&path.join("/"));
+    out.push_str(&url_encode_bytes(&names.name));
+    for c in files.get(file_index).map(Vec::as_slice).unwrap_or_default() {
+        out.push('/');
+        out.push_str(&url_encode_bytes(c));
+    }
     out
 }
 
@@ -228,8 +313,11 @@ fn span_of(pieces: &PieceLayout, blocks: &[BlockRef]) -> Option<Range<u64>> {
 
 /// Fetches `parts` one after the other into one buffer of `total` bytes
 /// and cuts it at `cuts` (offset and length of each block).
+/// The body of each range is read at `pace`'s rate (the torrent's and the
+/// session's download limits), so the limits hold while it arrives.
 async fn fetch(
     tracker: TrackerClient,
+    pace: Throttle,
     parts: Vec<Part>,
     total: usize,
     cuts: Vec<(usize, usize)>,
@@ -239,7 +327,7 @@ async fn fetch(
         match part {
             Part::Http { url, range } => {
                 let got = tracker
-                    .fetch_range(&url, range)
+                    .fetch_range_paced(&url, range, &pace)
                     .await
                     .map_err(|e| FetchError::from_tracker(&e))?;
                 buf.extend_from_slice(&got);
@@ -263,6 +351,16 @@ async fn fetch(
                 })
         })
         .collect()
+}
+
+impl RangePace for Throttle {
+    fn ready(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.wait_ready())
+    }
+
+    fn charge(&self, n: u64) {
+        Throttle::charge(self, n);
+    }
 }
 
 /// An `http://` or `https://` URL (scheme in any case) with something
@@ -311,6 +409,7 @@ impl Actor {
             state: SeedState::Idle,
             failures: 0,
             cursor: 0,
+            request: 0,
         });
         self.count_web_seed(key);
         self.web_seed_tick();
@@ -429,9 +528,16 @@ impl Actor {
     fn start_web_seed(&mut self, key: PeerKey) -> bool {
         let generation = self.generation;
         let tracker = self.shared.tracker.clone();
+        let pace = self.web_seed_throttle.clone();
+        let limit = pace.min_rate();
         let Some(l) = self.loaded.as_mut() else {
             return false;
         };
+        let names = Arc::clone(
+            self.web_seeds
+                .names
+                .get_or_insert_with(|| Arc::new(RawNames::of(&l.meta))),
+        );
         let Some(picker) = l.picker.as_mut() else {
             return false;
         };
@@ -446,7 +552,16 @@ impl Actor {
         if room == 0 {
             return false;
         }
-        let max = WEB_SEED_REQUEST_MAX.min(room.saturating_mul(piece_len));
+        let mut max = WEB_SEED_REQUEST_MAX.min(room.saturating_mul(piece_len));
+        if let Some(rate) = limit {
+            // About four seconds at the lowest download limit: the run's
+            // pieces are its alone while it trickles in.
+            let by_rate = rate
+                .saturating_mul(LIMITED_REQUEST_SECS)
+                .max(piece_len)
+                .min(WEB_SEED_REQUEST_MAX);
+            max = max.min(by_rate);
+        }
         let mut blocks = picker.pick_run(key, seed.cursor, max);
         if blocks.is_empty() && seed.cursor > 0 {
             blocks = picker.pick_run(key, 0, max);
@@ -487,7 +602,7 @@ impl Actor {
                     Part::Zeros(range.end - range.start)
                 } else {
                     Part::Http {
-                        url: url_for(&seed.url, &l.meta, file),
+                        url: url_for(&seed.url, &names, file),
                         range,
                     }
                 }
@@ -505,14 +620,17 @@ impl Actor {
         seed.state = SeedState::Busy {
             cancel: Some(cancel_tx),
         };
+        seed.request = seed.request.wrapping_add(1);
+        let request = seed.request;
         debug!(url = %seed.url, first = blocks.first().map(|b| b.piece), bytes = total, "web seed request");
         self.jobs.spawn(async move {
             let result = tokio::select! {
-                r = fetch(tracker, parts, total, cuts) => r,
+                r = fetch(tracker, pace, parts, total, cuts) => r,
                 _ = cancel_rx => Err(FetchError::cancelled()),
             };
             Job::WebSeed {
                 key,
+                request,
                 generation,
                 blocks,
                 result,
@@ -523,10 +641,14 @@ impl Actor {
 
     /// A web seed request returned: its blocks are accepted, or released
     /// with a backoff or retirement; a request cancelled, stale or for a
-    /// torrent no longer active only releases them.
+    /// torrent no longer active only releases them. A request superseded
+    /// by a newer one of the same seed (retired, then revived, meanwhile)
+    /// is ignored: its blocks went back with the retirement, and the newer
+    /// request may hold them again.
     pub(super) fn on_web_seed_job(
         &mut self,
         key: PeerKey,
+        request: u64,
         generation: u64,
         blocks: Vec<BlockRef>,
         result: Result<Vec<Bytes>, FetchError>,
@@ -534,6 +656,13 @@ impl Actor {
         let current = generation == self.generation && matches!(self.phase, Phase::Ready);
         let active = self.active();
         let mut live = false;
+        if self
+            .web_seeds
+            .get_mut(key)
+            .is_some_and(|seed| seed.request != request)
+        {
+            return;
+        }
         if let Some(seed) = self.web_seeds.get_mut(key)
             && let SeedState::Busy { cancel } = &seed.state
         {
@@ -553,8 +682,6 @@ impl Actor {
                 if let Some(seed) = self.web_seeds.get_mut(key) {
                     seed.failures = 0;
                 }
-                let bytes: u64 = data.iter().map(|d| d.len() as u64).sum();
-                self.web_seed_throttle.charge(bytes);
                 for (block, d) in blocks.into_iter().zip(data) {
                     self.accept_block(key, block, d, BlockSource::WebSeed(key), generation);
                 }
@@ -646,14 +773,65 @@ mod tests {
 
     #[test]
     fn urls_follow_bep_19() {
-        let s = single("a b.iso");
+        let s = RawNames::of(&single("a b.iso"));
         assert_eq!(url_for("http://h/x/", &s, 0), "http://h/x/a%20b.iso");
         assert_eq!(url_for("http://h/file.iso", &s, 0), "http://h/file.iso");
-        let m = multi(&[("d/a#b", 5), ("c", 5)], 16_384);
+        let m = RawNames::of(&multi(&[("d/a#b", 5), ("c", 5)], 16_384));
         assert_eq!(url_for("http://h/", &m, 0), "http://h/my%20torrent/d/a%23b");
         assert_eq!(
             url_for("http://h/root", &m, 1),
             "http://h/root/my%20torrent/c"
+        );
+    }
+
+    /// Names the parser sanitises or renames are asked for as the torrent
+    /// spells them.
+    #[test]
+    fn urls_use_the_torrents_own_names() {
+        let s = single("What?: live.iso");
+        assert_eq!(s.info.name, "What__ live.iso", "sanitised by the parser");
+        assert_eq!(
+            url_for("http://h/", &RawNames::of(&s), 0),
+            "http://h/What%3F%3A%20live.iso"
+        );
+        let files: Vec<(Vec<u8>, i64)> = vec![
+            (b"A.txt".to_vec(), 5),
+            (b"a.txt".to_vec(), 5),
+            (b"\xff.bin".to_vec(), 5),
+            (b"con".to_vec(), 5),
+        ];
+        let list = files
+            .iter()
+            .map(|(name, len)| {
+                let mut f = DictBuilder::new();
+                f.insert(b"length", *len);
+                f.insert(
+                    b"path",
+                    OwnedValue::List(vec![OwnedValue::from(name.clone())]),
+                );
+                f.build()
+            })
+            .collect();
+        let mut info = DictBuilder::new();
+        info.insert(b"files", OwnedValue::List(list));
+        info.insert(b"name", "t:1");
+        info.insert(b"piece length", 16_384i64);
+        info.insert(b"pieces", vec![0u8; 20]);
+        let mut root = DictBuilder::new();
+        root.insert(b"info", info.build());
+        let m = Metainfo::from_bytes(&encode(&root.build())).unwrap();
+        // The parser renamed the second file and sanitised the rest.
+        assert_ne!(m.info.files[1].path.components()[1], "a.txt");
+        let names = RawNames::of(&m);
+        let urls: Vec<String> = (0..4).map(|i| url_for("http://h/", &names, i)).collect();
+        assert_eq!(
+            urls,
+            [
+                "http://h/t%3A1/A.txt",
+                "http://h/t%3A1/a.txt",
+                "http://h/t%3A1/%FF.bin",
+                "http://h/t%3A1/con",
+            ]
         );
     }
 
@@ -702,5 +880,217 @@ mod tests {
         assert!(is_web_url("http://a/") && is_web_url("HTTPS://a"));
         assert!(!is_web_url("ftp://a/") && !is_web_url("http://"));
         assert!(!is_web_url(&format!("http://{}", "a".repeat(MAX_URL_LEN))));
+    }
+
+    /// A loopback server answering every `Range` request with the bytes of
+    /// `payload`, or, while `hold` is set, never answering.
+    struct RangeServer {
+        addr: std::net::SocketAddr,
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for RangeServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl RangeServer {
+        async fn start(payload: Vec<u8>) -> RangeServer {
+            use std::sync::atomic::Ordering::SeqCst;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let payload = Arc::new(payload);
+            let (h, r) = (Arc::clone(&hold), Arc::clone(&requests));
+            let task = tokio::spawn(async move {
+                let mut conns = tokio::task::JoinSet::new();
+                while let Ok((mut s, _)) = listener.accept().await {
+                    let (hold, requests, payload) =
+                        (Arc::clone(&h), Arc::clone(&r), Arc::clone(&payload));
+                    conns.spawn(async move {
+                        let mut buf = Vec::new();
+                        loop {
+                            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                let mut chunk = [0u8; 4096];
+                                match s.read(&mut chunk).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                }
+                            }
+                            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                            buf.drain(..end + 4);
+                            requests.fetch_add(1, SeqCst);
+                            if hold.load(SeqCst) {
+                                std::future::pending::<()>().await;
+                            }
+                            let spec = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("range")
+                                        .then(|| v.trim().strip_prefix("bytes="))
+                                        .flatten()
+                                })
+                                .unwrap();
+                            let (a, b) = spec.split_once('-').unwrap();
+                            let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                            let reply = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{}\r\nContent-Length: {}\r\n\r\n",
+                                payload.len(),
+                                b - a + 1
+                            );
+                            if s.write_all(reply.as_bytes()).await.is_err()
+                                || s.write_all(&payload[a..=b]).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            RangeServer {
+                addr,
+                hold,
+                requests,
+                task,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/", self.addr)
+        }
+    }
+
+    /// A single-file torrent `f.bin` over `len` bytes of `piece_len`
+    /// pieces, and its payload.
+    fn torrent(len: usize, piece_len: usize) -> (Metainfo, Vec<u8>) {
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut pieces = Vec::new();
+        for chunk in payload.chunks(piece_len) {
+            pieces.extend_from_slice(&crate::storage::sha1_piece(chunk));
+        }
+        let mut info = DictBuilder::new();
+        info.insert(b"length", len as i64);
+        info.insert(b"name", "f.bin");
+        info.insert(b"piece length", piece_len as i64);
+        info.insert(b"pieces", pieces);
+        let mut root = DictBuilder::new();
+        root.insert(b"info", info.build());
+        (
+            Metainfo::from_bytes(&encode(&root.build())).unwrap(),
+            payload,
+        )
+    }
+
+    /// A seed retired with a request in flight and revived at once: the
+    /// first request, cancelled by the retirement, comes back after the
+    /// second started and is ignored; the second completes the torrent.
+    /// (Before request ids, the stale result cancelled the new request,
+    /// whose own result cancelled the next, without end.)
+    #[tokio::test]
+    async fn revived_seed_ignores_its_superseded_request() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (meta, payload) = torrent(64 * 1024, 16 * 1024);
+        let srv = RangeServer::start(payload.clone()).await;
+        srv.hold.store(true, SeqCst);
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::MemStorage::new(payload.len() as u64));
+        let mut actor = crate::torrent::data::tests::test_actor(meta, storage, 64 << 20);
+        actor.add_web_seed(srv.url()).unwrap();
+        let key = actor.web_seeds.seeds[0].key;
+        assert!(matches!(
+            actor.web_seeds.seeds[0].state,
+            SeedState::Busy { .. }
+        ));
+        // The held request reaches the server before the seed is retired.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while srv.requests.load(SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "no request");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        actor.retire_web_seed(key, "test".to_owned());
+        srv.hold.store(false, SeqCst);
+        actor.add_web_seed(srv.url()).unwrap();
+        assert_eq!(actor.web_seeds.seeds[0].request, 2);
+        let finished = |a: &Actor| {
+            a.loaded
+                .as_ref()
+                .and_then(|l| l.picker.as_ref())
+                .is_some_and(|p| p.is_finished())
+        };
+        let run = async {
+            while !finished(&actor) {
+                let Some(r) = actor.jobs.join_next().await else {
+                    break;
+                };
+                actor.on_job_result(r);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the revived seed never completed");
+        assert!(finished(&actor));
+        assert_eq!(actor.web_seeds.seeds[0].request, 2, "no further request");
+        assert_eq!(srv.requests.load(SeqCst), 2);
+        crate::torrent::actor::EMITTED.take();
+    }
+
+    /// A paced fetch reads the body at the download limit, charging each
+    /// frame as it goes: the bucket is never more than about one frame in
+    /// debt (charging after the fetch would put the whole body there).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paced_fetch_holds_the_limit() {
+        use crate::bandwidth::{Bandwidth, BucketPair, RateLimit};
+        const RATE: u64 = 256 * 1024;
+        let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let srv = RangeServer::start(payload.clone()).await;
+        let pair = BucketPair::new(RateLimit::new(RATE, 0));
+        let throttle = Bandwidth::new(&crate::settings::Settings::default()).web_seed(&pair);
+        assert_eq!(throttle.min_rate(), Some(RATE));
+        let down = Arc::clone(&pair.down);
+        let worst = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+        let seen = Arc::clone(&worst);
+        let watch = tokio::spawn(async move {
+            loop {
+                let now = tokio::time::Instant::now();
+                let debt = down
+                    .lock()
+                    .unwrap()
+                    .repaid_at(now)
+                    .map_or(Duration::ZERO, |t| t - now);
+                {
+                    let mut w = seen.lock().unwrap();
+                    *w = (*w).max(debt);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let tracker = TrackerClient::new(fbt_tracker::TrackerConfig::default()).unwrap();
+        let start = tokio::time::Instant::now();
+        let got = tracker
+            .fetch_range_paced(
+                &format!("{}f", srv.url()),
+                0..payload.len() as u64,
+                &throttle,
+            )
+            .await
+            .unwrap();
+        let took = start.elapsed();
+        watch.abort();
+        assert!(got == payload);
+        // 1 MiB at 256 KiB/s from an empty bucket: about 4 s less the
+        // last frame. Generous bounds either way.
+        assert!(took >= Duration::from_secs(2), "too fast: {took:?}");
+        assert!(took < Duration::from_secs(30), "too slow: {took:?}");
+        // At most one read buffer (hyper's is at most about 400 KiB)
+        // ahead; the whole body charged at once would be 4 s.
+        let worst = *worst.lock().unwrap();
+        assert!(worst < Duration::from_millis(2_500), "debt {worst:?}");
     }
 }

@@ -27,6 +27,7 @@ use bytes::Bytes;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_net::proxy::ProxyConfig;
 
+pub use http::{MIN_RANGE_RATE, RANGE_RATE_GRACE, RangePace};
 #[doc(hidden)]
 pub use http::{parse_content_range, parse_http_announce};
 #[doc(hidden)]
@@ -123,15 +124,31 @@ impl TrackerClient {
     /// range, or `200` only when the range starts at 0 and the
     /// `Content-Length` is its length (the whole file); a range the server
     /// ignored is [`TrackerError::InvalidResponse`], a non-success status
-    /// [`TrackerError::HttpStatus`]. At most `range.end - range.start + 1`
-    /// bytes of the body are read, whatever `max_response_bytes` says: a
-    /// longer body is [`TrackerError::ResponseTooLarge`], a shorter one
-    /// [`TrackerError::InvalidResponse`]. `http_timeout` bounds each wait
-    /// (for the response head, then for each piece of the body), not the
-    /// whole transfer, so a slow but live server is never cut. An empty
+    /// [`TrackerError::HttpStatus`]. At most `range.end - range.start`
+    /// bytes of the body are kept, whatever `max_response_bytes` says: the
+    /// first byte past them fails the request with
+    /// [`TrackerError::ResponseTooLarge`] (the transport may have read a
+    /// buffer's worth more off the socket, which is dropped), and a
+    /// shorter body is [`TrackerError::InvalidResponse`]. `http_timeout`
+    /// bounds each wait (for the response head, then for each piece of the
+    /// body), not the whole transfer, so a slow but live server is not
+    /// cut; past [`RANGE_RATE_GRACE`] a body averaging less than
+    /// [`MIN_RANGE_RATE`] fails with [`TrackerError::TooSlow`]. An empty
     /// range returns no bytes without a request.
     pub async fn fetch_range(&self, url: &str, range: Range<u64>) -> Result<Bytes, TrackerError> {
-        self.inner.http.fetch_range(url, range).await
+        self.inner.http.fetch_range(url, range, None).await
+    }
+
+    /// [`fetch_range`](Self::fetch_range) with the body paced by `pace`
+    /// (a download rate limit): each read waits for it and is charged to
+    /// it, and that waiting does not count against the minimum rate.
+    pub async fn fetch_range_paced(
+        &self,
+        url: &str,
+        range: Range<u64>,
+        pace: &dyn RangePace,
+    ) -> Result<Bytes, TrackerError> {
+        self.inner.http.fetch_range(url, range, Some(pace)).await
     }
 
     /// Scrapes `url` for `hashes` (BEP 48 over HTTP, BEP 15 action 2 over

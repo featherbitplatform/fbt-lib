@@ -1,8 +1,10 @@
 //! HTTP(S) announce: request building, redirect handling, capped body read
 //! and untrusted-response parsing; byte-range fetches for web seeds.
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
+use std::pin::Pin;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -27,6 +29,44 @@ const MIN_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// Most bytes reserved up front for a range body; it grows past this only
 /// as bytes arrive.
 const MAX_RANGE_PREALLOC: usize = 1 << 20;
+
+/// The slowest a range body may arrive, on average, once
+/// [`RANGE_RATE_GRACE`] has passed (time spent waiting on the caller's
+/// [`RangePace`] excluded): a server trickling bytes would otherwise hold
+/// the request for ever, each byte arriving within the per-frame timeout.
+pub const MIN_RANGE_RATE: u64 = 4 * 1024;
+/// How long a range request runs before [`MIN_RANGE_RATE`] applies.
+pub const RANGE_RATE_GRACE: Duration = Duration::from_secs(30);
+
+/// Paces the body of a range fetch, as a download rate limit does for a
+/// peer connection: before each read the fetch waits for
+/// [`ready`](Self::ready), and after it reports the bytes read to
+/// [`charge`](Self::charge). TCP backpressure then holds the server to
+/// the limit.
+pub trait RangePace: Send + Sync {
+    /// Completes once the next bytes may be read.
+    fn ready(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// `n` bytes of the body were read.
+    fn charge(&self, n: u64);
+}
+
+/// No pacing.
+struct Unpaced;
+
+impl RangePace for Unpaced {
+    fn ready(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn charge(&self, _: u64) {}
+}
+
+/// Whether `bytes` read in `active` time is below [`MIN_RANGE_RATE`], once
+/// past [`RANGE_RATE_GRACE`].
+pub(crate) fn too_slow(bytes: u64, active: Duration) -> bool {
+    active > RANGE_RATE_GRACE
+        && u128::from(bytes) * 1000 < u128::from(MIN_RANGE_RATE) * active.as_millis()
+}
 
 /// An HTTP client with its pooled connections.
 type HttpPool = Client<Connector, Empty<Bytes>>;
@@ -155,7 +195,10 @@ impl HttpClient {
         &self,
         url: &str,
         range: Range<u64>,
+        pace: Option<&dyn RangePace>,
     ) -> Result<Bytes, TrackerError> {
+        let pace = pace.unwrap_or(&Unpaced);
+        let started = tokio::time::Instant::now();
         let len = range.end.saturating_sub(range.start);
         if len == 0 {
             return Ok(Bytes::new());
@@ -202,21 +245,29 @@ impl HttpClient {
                 ));
             }
         }
-        self.read_exact(resp.into_body(), len).await
+        self.read_exact(resp.into_body(), len, pace, started).await
     }
 
-    /// Reads a body that must be exactly `len` bytes: a byte more is an
-    /// error at once, so at most `len + 1` bytes are ever taken in, and
-    /// no wait for the next frame may exceed the configured timeout (a
-    /// slow but live server is not cut).
+    /// Reads a body that must be exactly `len` bytes: at most `len` bytes
+    /// are kept, and the first byte past them fails the request (the
+    /// frame that carries it is dropped). No wait for the next frame may
+    /// exceed the configured timeout, so a slow but live server is not
+    /// cut, but past [`RANGE_RATE_GRACE`] since `started` the average rate,
+    /// waits on `pace` excluded, must stay at [`MIN_RANGE_RATE`] or more.
     async fn read_exact(
         &self,
         mut body: hyper::body::Incoming,
         len: u64,
+        pace: &dyn RangePace,
+        started: tokio::time::Instant,
     ) -> Result<Bytes, TrackerError> {
         let cap = usize::try_from(len).map_err(|_| TrackerError::ResponseTooLarge)?;
         let mut out = BytesMut::with_capacity(cap.min(MAX_RANGE_PREALLOC));
+        let mut paced = Duration::ZERO;
         loop {
+            let before = tokio::time::Instant::now();
+            pace.ready().await;
+            paced = paced.saturating_add(before.elapsed());
             let frame = match tokio::time::timeout(self.timeout, body.frame()).await {
                 Err(_) => return Err(TrackerError::Timeout),
                 Ok(None) => break,
@@ -227,6 +278,11 @@ impl HttpClient {
                     return Err(TrackerError::ResponseTooLarge);
                 }
                 out.extend_from_slice(data);
+                pace.charge(data.len() as u64);
+            }
+            let active = started.elapsed().saturating_sub(paced);
+            if out.len() < cap && too_slow(out.len() as u64, active) {
+                return Err(TrackerError::TooSlow);
             }
         }
         if out.len() != cap {

@@ -160,7 +160,6 @@ impl TokenBucket {
         b
     }
 
-    #[cfg(test)]
     pub(crate) fn rate(&self) -> u64 {
         self.rate
     }
@@ -355,6 +354,16 @@ impl Throttle {
         for b in &self.chain {
             lock(b).consume(n, now);
         }
+    }
+
+    /// The lowest limit of the chain in bytes per second; `None` when
+    /// every bucket is unlimited.
+    pub(crate) fn min_rate(&self) -> Option<u64> {
+        self.chain
+            .iter()
+            .map(|b| lock(b).rate())
+            .filter(|&r| r > 0)
+            .min()
     }
 
     /// When to check again, `None` once every bucket is out of debt.

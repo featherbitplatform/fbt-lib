@@ -97,6 +97,8 @@ pub(crate) enum Job {
     /// returned their data (one buffer per block) or failed.
     WebSeed {
         key: PeerKey,
+        /// The seed's request id, to tell a superseded request.
+        request: u64,
         generation: u64,
         blocks: Vec<BlockRef>,
         result: Result<Vec<Bytes>, FetchError>,
@@ -162,10 +164,11 @@ impl Actor {
             Job::Metadata { key, ban, result } => self.on_metadata_job(key, ban, result),
             Job::WebSeed {
                 key,
+                request,
                 generation,
                 blocks,
                 result,
-            } => self.on_web_seed_job(key, generation, blocks, result),
+            } => self.on_web_seed_job(key, request, generation, blocks, result),
         }
         // Whatever returned may have been the last thing a storage
         // operation waited for.
@@ -507,7 +510,7 @@ impl Actor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -528,7 +531,11 @@ mod tests {
     /// An actor for `meta` over `storage`, checked with nothing on disk,
     /// with a session cache of `cache_size` bytes whose dirty pieces expire
     /// after ten minutes.
-    fn test_actor(meta: Metainfo, storage: Arc<dyn Storage>, cache_size: u64) -> Actor {
+    pub(in crate::torrent) fn test_actor(
+        meta: Metainfo,
+        storage: Arc<dyn Storage>,
+        cache_size: u64,
+    ) -> Actor {
         let pieces = meta.info.pieces.len();
         let settings = Settings {
             dht_enabled: false,

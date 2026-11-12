@@ -154,6 +154,10 @@ pub enum TrackerError {
     /// info hashes; nothing was sent.
     #[error("too many info hashes in one scrape")]
     TooManyHashes,
+    /// A range fetch (a web seed) averaged less than
+    /// [`MIN_RANGE_RATE`](crate::MIN_RANGE_RATE) past its grace period.
+    #[error("the server sends slower than the minimum rate")]
+    TooSlow,
 }
 
 /// Most info hashes in one scrape: what fits a UDP scrape request in a

@@ -20,8 +20,8 @@ use fbt_bencode::{DictBuilder, encode};
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage, sha1_piece};
 use fbt_session::{
-    AddTorrent, Event, EventMask, EventStream, ProxyKind, RateLimit, Session, Settings,
-    TorrentHandle, TorrentState,
+    AddTorrent, Event, EventMask, EventStream, ProxyKind, RateLimit, Session, SessionError,
+    Settings, TorrentHandle, TorrentState,
 };
 use rand::RngExt;
 use support::*;
@@ -208,14 +208,12 @@ async fn web_seed_and_peer_together() {
     let l = leecher(dial_tcp(test_settings()), &m, payload.len()).await;
     l.handle.add_peer(seed.local_addr()).await.unwrap();
     l.finish(&payload, SLOW).await;
+    let piece = 256 * 1024;
     let uploaded = seed_h.status().total_uploaded;
-    let downloaded = l.handle.status().total_downloaded;
-    assert!(uploaded > 0, "the peer delivered nothing");
-    // Every accepted byte the peer did not send came from the web seed.
-    assert!(
-        downloaded > uploaded,
-        "the web seed delivered nothing: downloaded {downloaded}, peer sent {uploaded}"
-    );
+    assert!(uploaded >= piece, "the peer sent {uploaded} bytes");
+    // What the server sent, counted at the server.
+    let served = srv.sent();
+    assert!(served >= piece, "the web seed served {served} bytes");
     l.session.shutdown().await;
     seed.shutdown().await;
 }
@@ -327,7 +325,11 @@ async fn missing_file_retires_the_seed() {
 async fn corrupt_web_seed_is_retired() {
     let piece = 16_384usize;
     let (mut m, payload) = make_single("f.bin", 8 * piece, piece as u32);
-    // Piece 2 is wrong every time the seed serves it.
+    // Piece 2 is wrong every time the seed serves it. Smart ban retires
+    // the seed by whichever of its rules fires first: repeated failures
+    // spending its trust, or its block differing once the piece passes
+    // from the peer (`corrupt_block_is_found_once_the_piece_passes` shows
+    // that rule alone).
     let (_dir, srv) = server(&m, &payload, Behaviour::Corrupt(2 * piece as u64 + 7)).await;
     m.web_seeds = vec![srv.url()];
     let mut l = leecher(dial_tcp(test_settings()), &m, payload.len()).await;
@@ -338,7 +340,7 @@ async fn corrupt_web_seed_is_retired() {
     )
     .await;
     assert!(failed.is_some(), "piece 2 never failed");
-    // A peer has the good piece: once it passes, the seed's block differs.
+    // A peer has the good piece and finishes the torrent.
     let (seed, _) = seeder(&m, &payload, 0).await;
     l.handle.add_peer(seed.local_addr()).await.unwrap();
     let (_, message, retired) = l.web_seed_error().await;
@@ -406,5 +408,160 @@ async fn paused_torrent_fetches_nothing() {
     l.handle.remove_web_seed(&srv.url()).await.unwrap();
     assert!(l.handle.web_seeds().await.unwrap().is_empty());
     assert_eq!(l.handle.status().num_web_seeds, 0);
+    l.session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_block_is_found_once_the_piece_passes() {
+    let piece = 16_384usize;
+    let (mut m, payload) = make_single("f.bin", 8 * piece, piece as u32);
+    // Piece 2 is wrong the first time only. One failure costs the seed 2
+    // trust points, far from a ban: what retires it is the comparison of
+    // its recorded block with the good one once the piece passes.
+    let (_dir, srv) = server(&m, &payload, Behaviour::CorruptOnce(2 * piece as u64 + 7)).await;
+    m.web_seeds = vec![srv.url()];
+    let mut l = leecher(test_settings(), &m, payload.len()).await;
+    let failed = next_matching(
+        &mut l.events,
+        |e| matches!(e, Event::HashFailed { piece: 2, .. }),
+        T,
+    )
+    .await;
+    assert!(failed.is_some(), "piece 2 never failed");
+    let (_, message, retired) = l.web_seed_error().await;
+    assert!(retired, "{message}");
+    assert!(message.contains("hash"), "{message}");
+    // The seed fetched piece 2 again (good this time) before it was
+    // retired: the torrent is complete.
+    l.finish(&payload, T).await;
+    l.session.shutdown().await;
+}
+
+/// Names the parser sanitises or renames are fetched under the torrent's
+/// own spelling, which the server has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sanitised_names_are_fetched_as_the_torrent_spells_them() {
+    let files = [
+        ("Live?: one.bin", 30_000),
+        ("A.txt", 20_000),
+        ("a.txt", 20_000),
+    ];
+    let (mut m, payload) = make_torrent(&files, 16_384);
+    let on_disk: Vec<String> = m
+        .info
+        .files
+        .iter()
+        .map(|f| f.path.components().join("/"))
+        .collect();
+    assert_ne!(on_disk[0], "torrent/Live?: one.bin", "sanitised");
+    assert_ne!(on_disk[2], "torrent/a.txt", "renamed after its collision");
+    let (dir, srv) = server(&m, &payload, Behaviour::Normal).await;
+    // The server holds the original names; files with these names cannot
+    // exist on every filesystem, so they are served from the files
+    // written under the sanitised names.
+    srv.alias(
+        "/torrent/Live%3F%3A%20one.bin",
+        dir.path().join(m.info.files[0].path.to_path_buf()),
+    );
+    srv.alias(
+        "/torrent/A.txt",
+        dir.path().join(m.info.files[1].path.to_path_buf()),
+    );
+    srv.alias(
+        "/torrent/a.txt",
+        dir.path().join(m.info.files[2].path.to_path_buf()),
+    );
+    m.web_seeds = vec![srv.url()];
+    let l = leecher(test_settings(), &m, payload.len()).await;
+    l.finish(&payload, T).await;
+    let mut paths: Vec<String> = srv.requests().into_iter().map(|(p, _)| p).collect();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(
+        paths,
+        [
+            "/torrent/A.txt",
+            "/torrent/Live%3F%3A%20one.bin",
+            "/torrent/a.txt"
+        ]
+    );
+    l.session.shutdown().await;
+}
+
+/// With a 64 KiB/s download limit the seed's body is read at that rate,
+/// not burst and charged afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn download_limit_paces_the_web_seed() {
+    const LIMIT: u64 = 64 * 1024;
+    let (mut m, payload) = make_single("f.bin", 512 * 1024, 16_384);
+    let (_dir, srv) = server(&m, &payload, Behaviour::Normal).await;
+    m.web_seeds = vec![srv.url()];
+    let session = Session::new(test_settings()).await.unwrap();
+    let storage = Arc::new(MemStorage::new(payload.len() as u64));
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(storage.clone());
+    p.rate_limit = RateLimit::new(LIMIT, 0);
+    let start = tokio::time::Instant::now();
+    let h = session.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, SLOW).await);
+    let took = start.elapsed();
+    // 512 KiB at 64 KiB/s from an empty bucket is about 8 s; at least
+    // half of that, whatever the scheduling.
+    assert!(took >= Duration::from_secs(4), "took {took:?}");
+    // Requests were sized to the limit: about 4 s of it each.
+    let ranges: Vec<(u64, u64)> = srv
+        .requests()
+        .into_iter()
+        .map(|(_, r)| range_of(&r.expect("a Range")))
+        .collect();
+    assert!(ranges.len() >= 2, "{ranges:?}");
+    assert!(ranges.iter().all(|(a, b)| b - a <= 4 * LIMIT), "{ranges:?}");
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_most_sixteen_web_seeds() {
+    let (m, payload) = make_single("f.bin", 16_384, 16_384);
+    let l = leecher_with(test_settings(), &m, vec![0; payload.len()], true).await;
+    for i in 0..fbt_metainfo::MAX_WEB_SEEDS {
+        l.handle
+            .add_web_seed(format!("http://127.0.0.1:9/{i}/"))
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        l.handle.add_web_seed("http://127.0.0.1:9/x/".into()).await,
+        Err(SessionError::TooManyWebSeeds)
+    ));
+    // One already there is not an error.
+    l.handle
+        .add_web_seed("http://127.0.0.1:9/0/".into())
+        .await
+        .unwrap();
+    assert_eq!(l.handle.web_seeds().await.unwrap().len(), 16);
+    l.session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_during_a_request() {
+    let (mut m, payload) = make_single("f.bin", 256 * 1024, 16_384);
+    let (_dir, srv) = server(&m, &payload, Behaviour::Normal).await;
+    // Slow enough that the request is still running when removed.
+    srv.set_rate(16 * 1024);
+    m.web_seeds = vec![srv.url()];
+    let l = leecher(test_settings(), &m, payload.len()).await;
+    assert!(wait_until(|| !srv.requests().is_empty(), T).await);
+    l.handle.remove_web_seed(&srv.url()).await.unwrap();
+    assert!(l.handle.web_seeds().await.unwrap().is_empty());
+    assert_eq!(l.handle.status().num_web_seeds, 0);
+    // The cancelled request delivers nothing and no new one starts.
+    let n = srv.requests().len();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(srv.requests().len(), n);
+    assert_eq!(l.handle.status().total_downloaded, 0);
+    // Its pieces went back: added again at full speed, the seed finishes.
+    srv.set_rate(0);
+    l.handle.add_web_seed(srv.url()).await.unwrap();
+    l.finish(&payload, T).await;
     l.session.shutdown().await;
 }

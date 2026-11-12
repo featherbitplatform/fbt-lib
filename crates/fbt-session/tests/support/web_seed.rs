@@ -33,6 +33,9 @@ pub enum Behaviour {
     /// As [`Normal`](Self::Normal), with the byte at this offset of every
     /// file flipped.
     Corrupt(u64),
+    /// As [`Corrupt`](Self::Corrupt), but only in the first response that
+    /// covers the offset; [`Normal`](Self::Normal) after it.
+    CorruptOnce(u64),
 }
 
 /// Most bytes of a request head the server reads.
@@ -48,6 +51,10 @@ struct State {
     rate: AtomicU64,
     /// Body bytes written.
     sent: AtomicU64,
+    /// Request paths served from another file ([`WebSeedServer::alias`]).
+    aliases: Mutex<std::collections::HashMap<String, PathBuf>>,
+    /// `CorruptOnce` already corrupted a response.
+    corrupted: std::sync::atomic::AtomicBool,
 }
 
 pub struct WebSeedServer {
@@ -73,6 +80,8 @@ impl WebSeedServer {
             requests: Mutex::new(Vec::new()),
             rate: AtomicU64::new(0),
             sent: AtomicU64::new(0),
+            aliases: Mutex::new(std::collections::HashMap::new()),
+            corrupted: std::sync::atomic::AtomicBool::new(false),
         });
         let shared = state.clone();
         let task = tokio::spawn(async move {
@@ -106,6 +115,17 @@ impl WebSeedServer {
     /// unlimited).
     pub fn set_rate(&self, bytes_per_sec: u64) {
         self.state.rate.store(bytes_per_sec, Ordering::SeqCst);
+    }
+
+    /// Serves requests for `path` (as requested, percent-encoded) from
+    /// `file`: a name the local filesystem cannot hold, or that the
+    /// torrent parser renamed on disk.
+    pub fn alias(&self, path: &str, file: PathBuf) {
+        self.state
+            .aliases
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), file);
     }
 
     /// Body bytes sent so far.
@@ -182,7 +202,8 @@ async fn answer(
         stream.write_all(head.as_bytes()).await?;
         return Ok(true);
     }
-    let Some(file) = file_for(&state.root, path) else {
+    let alias = state.aliases.lock().unwrap().get(path).cloned();
+    let Some(file) = alias.or_else(|| file_for(&state.root, path)) else {
         not_found(stream).await?;
         return Ok(true);
     };
@@ -197,6 +218,13 @@ async fn answer(
     }
     let total = data.len() as u64;
     let wanted = range.and_then(|r| parse_range(r, total));
+    if let Behaviour::CorruptOnce(off) = state.behaviour
+        && wanted.is_none_or(|(a, b)| (a..=b).contains(&off))
+        && let Some(b) = data.get_mut(off as usize)
+        && !state.corrupted.swap(true, Ordering::SeqCst)
+    {
+        *b = !*b;
+    }
     match (&state.behaviour, wanted) {
         (Behaviour::IgnoreRange, _) | (_, None) => {
             let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");

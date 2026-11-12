@@ -25,6 +25,7 @@ fbt-wire = { path = "../fbt-wire" }
 fbt-dht = { path = "../fbt-dht" }
 fbt-net = { path = "../fbt-net" }
 fbt-utp = { path = "../fbt-utp" }
+fbt-bencode = { path = "../fbt-bencode" }
 socket2.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "io-util"] }
@@ -39,7 +40,6 @@ thiserror.workspace = true
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-fbt-bencode = { path = "../fbt-bencode" }
 proptest.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
