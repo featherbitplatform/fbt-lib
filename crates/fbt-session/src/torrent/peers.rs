@@ -31,6 +31,15 @@ use crate::picker::{PeerKey, PeerPieces, PiecePicker};
 use crate::session::HolepunchCounters;
 use crate::status::TorrentState;
 
+/// A piece reserved for a peer on parole is forfeited after this many
+/// request timeouts without a block of it arriving. One timeout is a
+/// single unanswered request (or a choke that dropped them); the second
+/// lets the owner answer the requests it gets again after an unchoke, so
+/// a seed that rotates its unchokes keeps the piece, while one that holds
+/// it and sends nothing loses it within two timeouts (2 minutes with the
+/// default 60 s).
+pub(super) const PAROLE_GRACE_TIMEOUTS: u32 = 2;
+
 impl Actor {
     // ----- peer events --------------------------------------------------------
 
@@ -487,6 +496,7 @@ impl Actor {
             }
             picker.release_peer(key);
             picker.remove_peer_pieces(p.pieces());
+            self.drop_forfeited();
         }
         // `PeerDisconnected` stays paired with `PeerConnected`. A
         // connection that got through reports its end only if it is the one
@@ -747,6 +757,42 @@ impl Actor {
         self.close_peer(key);
     }
 
+    /// Frees the pieces the picker forfeited (parole downloads whose owner
+    /// left or stalled): their partial data, budget reservation and the
+    /// blocks smart ban recorded of the attempt. Called right after every
+    /// picker call that can forfeit.
+    pub(super) fn drop_forfeited(&mut self) {
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        let Some(picker) = l.picker.as_mut() else {
+            return;
+        };
+        for piece in picker.take_forfeited() {
+            l.bufs.remove(&piece);
+            self.cache.release_partial(piece);
+            self.smartban.drop_attempt(piece);
+        }
+    }
+
+    /// Forfeits the parole pieces whose owner has delivered none of their
+    /// blocks for [`PAROLE_GRACE_TIMEOUTS`] request timeouts, so other
+    /// peers may download them. A request of the owner's still pending
+    /// for such a piece is no longer the picker's: its answer counts as
+    /// wasted, or it times out.
+    pub(super) fn expire_parole_pieces(&mut self) {
+        let grace = self
+            .shared
+            .settings
+            .request_timeout
+            .saturating_mul(PAROLE_GRACE_TIMEOUTS);
+        let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) else {
+            return;
+        };
+        picker.expire_exclusive(Instant::now().into_std(), grace);
+        self.drop_forfeited();
+    }
+
     /// Who sent us peer `key`'s blocks, as smart ban keys it: the peer's
     /// whole IP (port 0), or with `ban_endpoints` its address.
     pub(super) fn block_source(&self, key: PeerKey) -> Option<BlockSource> {
@@ -953,12 +999,6 @@ impl Actor {
             return;
         };
         picker.set_parole(key, parole);
-        // Parole downloads given up half done: their partial data goes.
-        for piece in picker.take_forfeited() {
-            l.bufs.remove(&piece);
-            self.cache.release_partial(piece);
-            self.smartban.drop_attempt(piece);
-        }
         let cap = partial_cap(
             picker.num_in_progress(),
             self.cache.partial_room(u64::from(l.layout.piece_len())),

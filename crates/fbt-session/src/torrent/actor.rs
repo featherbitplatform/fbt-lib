@@ -524,6 +524,7 @@ impl Actor {
                 _ = tick.tick() => {
                     self.flush(FlushReason::Expired);
                     self.release_stale_partials();
+                    self.expire_parole_pieces();
                     self.readers_tick();
                     self.top_up_all(None);
                     self.metadata_tick();

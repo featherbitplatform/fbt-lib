@@ -712,35 +712,40 @@ mod tests {
         assert_eq!(actor.state(), TorrentState::Seeding);
     }
 
-    /// A liar (A, every block corrupt) and an honest seed (B) share a
-    /// piece: each round both ask for two of its four blocks, A first,
-    /// and every requested block is answered at once. The first attempt
-    /// mixes their blocks and fails, which puts both on parole; from then
-    /// on each attempt is one peer's alone, so only A loses trust for its
-    /// failures. The piece passes from B, A is banned and B never is.
-    /// Without parole every attempt mixes their blocks, and B's trust
-    /// falls with A's until both are banned together.
-    #[tokio::test]
-    async fn honest_co_contributor_of_a_failed_piece_is_not_banned() {
-        const PIECE: usize = 4 * BLOCK_SIZE as usize;
-        let payload: Vec<u8> = (0..PIECE).map(|i| (i % 251) as u8).collect();
-        let mut bytes =
-            format!("d4:infod6:lengthi{PIECE}e4:name1:a12:piece lengthi{PIECE}e6:pieces20:")
-                .into_bytes();
-        bytes.extend_from_slice(&sha1_piece(&payload));
+    /// The liar of the parole tests.
+    const LIAR: PeerKey = PeerKey(1);
+    /// The honest seed of the parole tests.
+    const HONEST: PeerKey = PeerKey(2);
+    const LIAR_ADDR: ([u8; 4], u16) = ([10, 0, 0, 1], 6881);
+    const HONEST_ADDR: ([u8; 4], u16) = ([10, 0, 0, 2], 6881);
+
+    /// Two unchoking seeds of a single-file torrent of `pieces` pieces of
+    /// `blocks` blocks: [`LIAR`] and [`HONEST`]. Returns the actor, the
+    /// payload and the seeds' command receivers.
+    fn liar_and_honest(
+        pieces: usize,
+        blocks: usize,
+    ) -> (Actor, Vec<u8>, Vec<mpsc::Receiver<PeerCommand>>) {
+        let piece_len = blocks * BLOCK_SIZE as usize;
+        let len = pieces * piece_len;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut bytes = format!(
+            "d4:infod6:lengthi{len}e4:name1:a12:piece lengthi{piece_len}e6:pieces{}:",
+            20 * pieces
+        )
+        .into_bytes();
+        for chunk in payload.chunks(piece_len) {
+            bytes.extend_from_slice(&sha1_piece(chunk));
+        }
         bytes.extend_from_slice(b"ee");
         let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
-        let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(PIECE as u64));
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(len as u64));
         let mut actor = test_actor(meta, storage, 64 << 20);
-        EMITTED.take();
-
-        let (a, b) = (PeerKey(1), PeerKey(2));
-        let a_addr = SocketAddr::from(([10, 0, 0, 1], 6881));
-        let b_addr = SocketAddr::from(([10, 0, 0, 2], 6881));
+        let n = u32::try_from(pieces).expect("piece count");
         let mut rxs = Vec::new();
-        for (key, addr) in [(a, a_addr), (b, b_addr)] {
-            let (mut peer, rx) = seed_peer(&actor, 1);
-            peer.addr = addr;
+        for (key, addr) in [(LIAR, LIAR_ADDR), (HONEST, HONEST_ADDR)] {
+            let (mut peer, rx) = seed_peer(&actor, n);
+            peer.addr = SocketAddr::from(addr);
             peer.choked_us = false;
             rxs.push(rx);
             actor
@@ -751,49 +756,83 @@ mod tests {
                 .add_peer_pieces(peer.pieces());
             actor.peers.insert(key, peer);
         }
-        let finished = |actor: &Actor| {
-            actor
-                .loaded
-                .as_ref()
-                .and_then(|l| l.picker.as_ref())
-                .is_some_and(crate::picker::PiecePicker::is_finished)
-        };
-        for _ in 0..32 {
-            if finished(&actor) {
-                break;
-            }
-            for key in [a, b] {
-                if let Some(p) = actor.peers.get_mut(&key) {
-                    p.demand = 2;
+        EMITTED.take();
+        (actor, payload, rxs)
+    }
+
+    /// Gives `key` (if still connected) a demand of `n` blocks.
+    fn want_blocks(actor: &mut Actor, key: PeerKey, n: usize) {
+        if let Some(p) = actor.peers.get_mut(&key) {
+            p.demand = n;
+        }
+        actor.fill(key);
+    }
+
+    /// Both seeds answer every block requested from them, the liar with
+    /// every byte flipped; then every hash job lands.
+    async fn answer_all(
+        actor: &mut Actor,
+        payload: &[u8],
+        rxs: &mut [mpsc::Receiver<PeerCommand>],
+    ) {
+        let piece_len = actor
+            .loaded
+            .as_ref()
+            .map_or(0, |l| l.layout.piece_len() as usize);
+        for key in [LIAR, HONEST] {
+            let Some(p) = actor.peers.get(&key) else {
+                continue;
+            };
+            let mut asked: Vec<BlockRef> = p.requested.iter().copied().collect();
+            asked.sort_unstable();
+            for blk in asked {
+                let start = blk.piece as usize * piece_len + blk.offset as usize;
+                let mut data = payload[start..start + blk.len as usize].to_vec();
+                if key == LIAR {
+                    data.iter_mut().for_each(|x| *x ^= 0xff);
                 }
-                actor.fill(key);
-            }
-            for key in [a, b] {
-                let Some(p) = actor.peers.get(&key) else {
-                    continue;
-                };
-                let mut asked: Vec<BlockRef> = p.requested.iter().copied().collect();
-                asked.sort_unstable();
-                for blk in asked {
-                    let start = blk.offset as usize;
-                    let end = start + blk.len as usize;
-                    let mut data = payload[start..end].to_vec();
-                    if key == a {
-                        data.iter_mut().for_each(|x| *x ^= 0xff);
-                    }
-                    actor.on_block(key, blk, Bytes::from(data));
-                }
-            }
-            while let Some(r) = actor.jobs.join_next().await {
-                actor.on_job_result(r);
-            }
-            for rx in &mut rxs {
-                while rx.try_recv().is_ok() {}
+                actor.on_block(key, blk, Bytes::from(data));
             }
         }
+        while let Some(r) = actor.jobs.join_next().await {
+            actor.on_job_result(r);
+        }
+        for rx in rxs {
+            while rx.try_recv().is_ok() {}
+        }
+    }
 
+    fn all_passed(actor: &Actor) -> bool {
+        actor
+            .loaded
+            .as_ref()
+            .and_then(|l| l.picker.as_ref())
+            .is_some_and(crate::picker::PiecePicker::is_finished)
+    }
+
+    /// Rounds of: the liar, then the honest seed, ask for `n` blocks each,
+    /// and both answer; until every piece passed (at most 64 rounds).
+    async fn rounds_until_done(
+        actor: &mut Actor,
+        payload: &[u8],
+        rxs: &mut [mpsc::Receiver<PeerCommand>],
+        n: usize,
+    ) {
+        for _ in 0..64 {
+            if all_passed(actor) {
+                return;
+            }
+            want_blocks(actor, LIAR, n);
+            want_blocks(actor, HONEST, n);
+            answer_all(actor, payload, rxs).await;
+        }
+    }
+
+    /// The emitted events so far: the addresses banned and the number of
+    /// hash failures.
+    fn bans_and_failures() -> (Vec<SocketAddr>, usize) {
         let log = EMITTED.take();
-        let banned: Vec<SocketAddr> = log
+        let banned = log
             .iter()
             .filter_map(|(e, _)| match e {
                 Event::PeerBlocked { addr, .. } => Some(*addr),
@@ -804,14 +843,71 @@ mod tests {
             .iter()
             .filter(|(e, _)| matches!(e, Event::HashFailed { .. }))
             .count();
-        assert!(!banned.contains(&b_addr), "B was banned: {banned:?}");
-        assert_eq!(banned, vec![a_addr], "A is banned");
-        assert!(finished(&actor), "the piece passes ({failures} failures)");
+        (banned, failures)
+    }
+
+    /// A liar (every block corrupt) and an honest seed share a piece:
+    /// each round both ask for two of its four blocks, the liar first,
+    /// and every requested block is answered at once. The first attempt
+    /// mixes their blocks and fails, which puts both on parole; from then
+    /// on each attempt is one peer's alone, so only the liar loses trust
+    /// for its failures. The piece passes from the honest seed, the liar
+    /// is banned and the honest seed never is. Without parole every
+    /// attempt mixes their blocks, and the honest seed's trust falls with
+    /// the liar's until both are banned together.
+    #[tokio::test]
+    async fn honest_co_contributor_of_a_failed_piece_is_not_banned() {
+        let (mut actor, payload, mut rxs) = liar_and_honest(1, 4);
+        rounds_until_done(&mut actor, &payload, &mut rxs, 2).await;
+        let (banned, failures) = bans_and_failures();
+        let honest = SocketAddr::from(HONEST_ADDR);
+        assert!(!banned.contains(&honest), "B was banned: {banned:?}");
+        assert_eq!(banned, vec![SocketAddr::from(LIAR_ADDR)], "A is banned");
+        assert!(all_passed(&actor), "the piece passes ({failures} failures)");
         // B lost 2 for the mixed failure, got them back when the piece
         // passed, and 1 for the pass.
-        let b_trust = actor.smartban.trust_of(actor.peer_block_source(b_addr));
+        let b_trust = actor.smartban.trust_of(actor.peer_block_source(honest));
         assert_eq!(b_trust, 1);
         // The first, mixed attempt and at least one of A's alone.
         assert!(failures >= 2, "{failures} failures");
+    }
+
+    /// Four pieces are in flight, each shared by the liar and the honest
+    /// seed, when the first of them fails: the other three fail mixed too,
+    /// after both are on parole. Only the first charges them, so the
+    /// honest seed is never banned, the liar is, and every piece passes.
+    /// Charging every mixed failure would take both to -8 together.
+    #[tokio::test]
+    async fn mixed_pieces_in_flight_do_not_ban_the_honest_seed() {
+        let (mut actor, payload, mut rxs) = liar_and_honest(6, 2);
+        // One block each, in turn: each new piece is shared.
+        for _ in 0..4 {
+            want_blocks(&mut actor, LIAR, 1);
+            want_blocks(&mut actor, HONEST, 1);
+        }
+        let shared: std::collections::HashSet<u32> = [LIAR, HONEST]
+            .iter()
+            .flat_map(|k| actor.peers[k].requested.iter().map(|b| b.piece))
+            .collect();
+        assert_eq!(shared.len(), 4, "four pieces in flight: {shared:?}");
+        answer_all(&mut actor, &payload, &mut rxs).await;
+        let honest = SocketAddr::from(HONEST_ADDR);
+        let b_trust = actor.smartban.trust_of(actor.peer_block_source(honest));
+        assert_eq!(b_trust, -2, "only the first mixed failure charges B");
+        let failed = EMITTED.with(|log| {
+            log.borrow()
+                .iter()
+                .filter(|(e, _)| matches!(e, Event::HashFailed { .. }))
+                .count()
+        });
+        assert_eq!(failed, 4);
+        rounds_until_done(&mut actor, &payload, &mut rxs, 2).await;
+        let (banned, failures) = bans_and_failures();
+        assert!(!banned.contains(&honest), "B was banned: {banned:?}");
+        assert_eq!(banned, vec![SocketAddr::from(LIAR_ADDR)], "A is banned");
+        assert!(
+            all_passed(&actor),
+            "every piece passes ({failures} failures)"
+        );
     }
 }

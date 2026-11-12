@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PieceLayout};
 use rand::RngExt;
@@ -81,6 +82,9 @@ struct Downloading {
     received: usize,
     /// Started by a peer on parole: only that peer downloads it.
     exclusive: Option<PeerKey>,
+    /// For an exclusive piece: `received` when last looked at by
+    /// [`PiecePicker::expire_exclusive`], and since when it has been that.
+    progress_seen: Option<(usize, Instant)>,
 }
 
 /// Ordering key of a queued piece: priority descending, then availability.
@@ -97,14 +101,20 @@ type BucketKey = (Reverse<u8>, u32);
 /// Parole (as libtorrent's): a peer on parole ([`set_parole`]) downloads
 /// only whole pieces, each its alone, so a piece that fails afterwards
 /// has a single contributor. It never joins another peer's piece or takes
-/// end-game duplicates, and no other peer joins the pieces it starts. If
-/// it gives back its last outstanding block of such a piece before the
-/// piece completes (reject, timeout, disconnect), the piece is forfeited:
-/// its progress is dropped and it is listed by [`take_forfeited`], so its
-/// blocks are never completed by someone else.
+/// end-game duplicates, and no other peer joins the pieces it starts. Such
+/// a piece stays reserved for its owner while the owner's requests come
+/// and go (choke, reject, timeout): its received blocks are kept and the
+/// owner continues it. It is forfeited (its progress dropped and listed by
+/// [`take_forfeited`], so its blocks are never completed by someone else)
+/// when the owner leaves ([`release_peer`]) or has received none of its
+/// blocks for a grace period ([`expire_exclusive`]). The reservation ends
+/// when the owner leaves parole. Pieces picked by
+/// [`pick_piece`](Self::pick_piece) (reader deadlines) are never reserved.
 ///
 /// [`set_parole`]: Self::set_parole
 /// [`take_forfeited`]: Self::take_forfeited
+/// [`release_peer`]: Self::release_peer
+/// [`expire_exclusive`]: Self::expire_exclusive
 #[derive(Debug)]
 pub struct PiecePicker {
     layout: PieceLayout,
@@ -215,21 +225,51 @@ impl PiecePicker {
     }
 
     /// Puts `peer` on parole or takes it off. On parole it gets only whole
-    /// pieces of its own (see the type's docs). Pieces it already started
-    /// alone stay its own when parole ends; nothing else changes until its
-    /// next pick.
+    /// pieces of its own (see the type's docs). Off parole, the pieces it
+    /// kept to itself are open to every peer again.
     pub fn set_parole(&mut self, peer: PeerKey, on: bool) {
         if on {
             self.parole.insert(peer);
-        } else {
-            self.parole.remove(&peer);
+        } else if self.parole.remove(&peer) {
+            let mine: Vec<u32> = self.exclusive_to(peer).collect();
+            for piece in mine {
+                if let Some(d) = self.downloading.get_mut(&piece) {
+                    d.exclusive = None;
+                    d.progress_seen = None;
+                }
+            }
         }
     }
 
-    /// The pieces forfeited since the last call: a peer on parole gave
-    /// back its last outstanding block before the piece completed. Their
-    /// progress is already dropped (they are wanted again); the caller
-    /// frees their buffers.
+    /// Forfeits every piece reserved for a peer on parole that has
+    /// received none of its blocks for `grace` (a reserved piece's
+    /// progress is first seen at the first call after it changes, so
+    /// calls should come at least every few seconds). A piece with no
+    /// block received is opened to every peer instead: nothing of it is
+    /// lost.
+    pub fn expire_exclusive(&mut self, now: Instant, grace: Duration) {
+        let mut stale = Vec::new();
+        for (&piece, d) in &mut self.downloading {
+            if d.exclusive.is_none() {
+                continue;
+            }
+            match d.progress_seen {
+                Some((received, since)) if received == d.received => {
+                    if now.saturating_duration_since(since) >= grace {
+                        stale.push(piece);
+                    }
+                }
+                _ => d.progress_seen = Some((d.received, now)),
+            }
+        }
+        for piece in stale {
+            self.forfeit(piece);
+        }
+    }
+
+    /// The pieces forfeited since the last call (see the type's docs).
+    /// Their progress is already dropped (they are wanted again); the
+    /// caller frees their buffers.
     pub fn take_forfeited(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.forfeited)
     }
@@ -345,12 +385,16 @@ impl PiecePicker {
             return out;
         }
         match self.state_of(piece) {
-            PieceState::Unrequested => {
-                self.start_piece(piece);
-                self.claim(peer, piece);
+            // A reader's deadline piece is never reserved: whoever is in
+            // time takes it, parole or not.
+            PieceState::Unrequested => self.start_piece(piece),
+            PieceState::Partial => {
+                if let Some(d) = self.downloading.get_mut(&piece) {
+                    d.exclusive = None;
+                    d.progress_seen = None;
+                }
             }
-            PieceState::Partial if self.may_join(peer, piece) => {}
-            PieceState::Partial | PieceState::PendingHash | PieceState::Have => return out,
+            PieceState::PendingHash | PieceState::Have => return out,
         }
         self.take_free(peer, piece, max_blocks, &mut out);
         if out.len() >= max_blocks || late.is_empty() {
@@ -482,17 +526,21 @@ impl PiecePicker {
         }
     }
 
-    /// Returns every block outstanding from `peer` (disconnect) and takes
-    /// it off parole.
+    /// Returns every block outstanding from `peer` (disconnect), takes it
+    /// off parole and forfeits every piece reserved for it, whether or not
+    /// it still had a block of it outstanding.
     pub fn release_peer(&mut self, peer: PeerKey) {
         self.parole.remove(&peer);
-        let Some(blocks) = self.outstanding.remove(&peer) else {
-            return;
-        };
-        let mut blocks: Vec<(u32, u32)> = blocks.into_iter().collect();
-        blocks.sort_unstable();
-        for (piece, bi) in blocks {
-            self.release_inner(peer, piece, bi);
+        if let Some(blocks) = self.outstanding.remove(&peer) {
+            let mut blocks: Vec<(u32, u32)> = blocks.into_iter().collect();
+            blocks.sort_unstable();
+            for (piece, bi) in blocks {
+                self.release_inner(peer, piece, bi);
+            }
+        }
+        let mine: Vec<u32> = self.exclusive_to(peer).collect();
+        for piece in mine {
+            self.forfeit(piece);
         }
     }
 
@@ -748,9 +796,36 @@ impl PiecePicker {
                 free: n,
                 received: 0,
                 exclusive: None,
+                progress_seen: None,
             },
         );
         self.set_state(piece, PieceState::Partial);
+    }
+
+    /// The pieces reserved for `peer`.
+    fn exclusive_to(&self, peer: PeerKey) -> impl Iterator<Item = u32> + '_ {
+        self.downloading
+            .iter()
+            .filter(move |(_, d)| d.exclusive == Some(peer))
+            .map(|(&i, _)| i)
+    }
+
+    /// Gives up the reserved `piece`: with blocks received, its progress
+    /// is dropped and it is listed for [`take_forfeited`](Self::take_forfeited);
+    /// with none, it is just opened to every peer.
+    fn forfeit(&mut self, piece: u32) {
+        let Some(d) = self.downloading.get_mut(&piece) else {
+            return;
+        };
+        if d.received == 0 {
+            d.exclusive = None;
+            d.progress_seen = None;
+            return;
+        }
+        self.piece_failed(piece);
+        if !self.forfeited.contains(&piece) {
+            self.forfeited.push(piece);
+        }
     }
 
     /// `peer`, just starting `piece`, keeps it to itself if on parole.
@@ -871,17 +946,9 @@ impl PiecePicker {
         if slot.owners.is_empty() && !slot.received {
             d.free += 1;
         }
-        let forfeit = d.exclusive == Some(peer)
-            && d.received > 0
-            && !d.blocks.iter().any(|b| b.owners.contains(&peer));
-        if forfeit {
-            // Its parole download, given up half done: nobody else may
-            // complete it with these blocks, so it starts over.
-            self.piece_failed(piece);
-            if !self.forfeited.contains(&piece) {
-                self.forfeited.push(piece);
-            }
-        } else if d.received == 0 && d.free == d.blocks.len() {
+        // A reserved piece stays its owner's (received blocks included)
+        // while its requests come and go: see the type's docs.
+        if d.received == 0 && d.free == d.blocks.len() {
             // Nothing left of this piece: back to the new-piece candidates.
             self.downloading.remove(&piece);
             self.partial_remove(piece);
@@ -1724,15 +1791,79 @@ mod tests {
         assert!(p.pick(b, PeerPieces::All, 8, &mut rng()).is_empty());
         let rest = p.pick(a, PeerPieces::All, 8, &mut rng());
         assert_eq!(rest, vec![blk(mine, 2), blk(mine, 3)]);
-        assert!(p.pick_piece(b, mine, 4, &[a]).is_empty());
-        // A parole peer never joins someone else's piece.
-        let other = 1 - mine;
-        assert!(p.pick_piece(a, other, 4, &[b]).is_empty());
         assert!(p.take_forfeited().is_empty());
     }
 
     #[test]
-    fn parole_piece_given_up_half_done_is_forfeited() {
+    fn deadline_pieces_are_never_reserved() {
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        let mut p = picker(2, 4);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_parole(a, true);
+        // A deadline piece A starts is not A's alone: B joins it.
+        assert_eq!(p.pick_piece(a, 0, 2, &[]), vec![blk(0, 0), blk(0, 1)]);
+        let got_b = p.pick(b, PeerPieces::All, 2, &mut rng());
+        assert_eq!(got_b, vec![blk(0, 2), blk(0, 3)]);
+        // A piece reserved by a normal pick loses its reservation once a
+        // reader's deadline reaches it.
+        assert_eq!(p.pick(a, PeerPieces::All, 2, &mut rng()).len(), 2);
+        assert!(p.pick(b, PeerPieces::All, 2, &mut rng()).is_empty());
+        assert_eq!(p.pick_piece(b, 1, 2, &[]), vec![blk(1, 2), blk(1, 3)]);
+    }
+
+    #[test]
+    fn leaving_parole_opens_reserved_pieces() {
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        let mut p = picker(1, 4);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_parole(a, true);
+        assert_eq!(p.pick(a, PeerPieces::All, 2, &mut rng()).len(), 2);
+        assert!(p.pick(b, PeerPieces::All, 2, &mut rng()).is_empty());
+        p.set_parole(a, false);
+        let got_b = p.pick(b, PeerPieces::All, 2, &mut rng());
+        assert_eq!(got_b, vec![blk(0, 2), blk(0, 3)]);
+    }
+
+    /// The owner of a reserved piece got blocks 0 and 1, asks for nothing
+    /// more (no demand, nothing outstanding) and leaves: the piece is
+    /// forfeited and another peer downloads all of it.
+    #[test]
+    fn departed_owner_forfeits_its_piece_with_nothing_outstanding() {
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        let mut p = picker(1, 4);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_parole(a, true);
+        let got = p.pick(a, PeerPieces::All, 2, &mut rng());
+        assert_eq!(got, vec![blk(0, 0), blk(0, 1)]);
+        for x in got {
+            assert!(p.on_block(a, x).accepted);
+        }
+        assert!(p.pick(b, PeerPieces::All, 4, &mut rng()).is_empty());
+        p.release_peer(a);
+        assert_eq!(p.take_forfeited(), vec![0]);
+        let got_b = p.pick(b, PeerPieces::All, 4, &mut rng());
+        assert_eq!(got_b.len(), 4);
+        let done: Vec<bool> = got_b
+            .into_iter()
+            .map(|x| p.on_block(b, x).piece_complete)
+            .collect();
+        assert_eq!(done, vec![false, false, false, true]);
+        // An owner leaving a reserved piece with nothing received loses
+        // nothing: the piece is just open again.
+        let mut p = picker(1, 4);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_parole(a, true);
+        assert_eq!(p.pick(a, PeerPieces::All, 2, &mut rng()).len(), 2);
+        p.release_peer(a);
+        assert!(p.take_forfeited().is_empty());
+        assert_eq!(p.pick(b, PeerPieces::All, 8, &mut rng()).len(), 4);
+    }
+
+    /// A choke drops the owner's requests: the piece stays reserved with
+    /// its received blocks, and after the unchoke the owner completes it
+    /// without starting over.
+    #[test]
+    fn choke_keeps_the_reserved_piece_for_its_owner() {
         let (a, b) = (PeerKey(1), PeerKey(2));
         let mut p = picker(1, 4);
         p.add_peer_pieces(PeerPieces::All);
@@ -1740,31 +1871,50 @@ mod tests {
         let got = p.pick(a, PeerPieces::All, 4, &mut rng());
         assert_eq!(got.len(), 4);
         assert!(p.on_block(a, got[0]).accepted);
-        // Released one by one (rejects, timeouts): the piece stays A's
-        // until its last outstanding block goes, then starts over.
-        p.release(a, got[1]);
+        assert!(p.on_block(a, got[1]).accepted);
+        // Choked: the rest are rejected.
         p.release(a, got[2]);
-        assert!(p.pick(b, PeerPieces::All, 4, &mut rng()).is_empty());
-        assert!(p.take_forfeited().is_empty());
         p.release(a, got[3]);
-        assert_eq!(p.take_forfeited(), vec![0]);
-        assert!(!p.is_in_progress(0));
-        // A's block is gone with it: B downloads the whole piece.
-        let got_b = p.pick(b, PeerPieces::All, 8, &mut rng());
-        assert_eq!(got_b.len(), 4);
-        // Leaving takes a peer off parole; a piece started with nothing
-        // received is just returned, not forfeited.
+        assert!(p.take_forfeited().is_empty());
+        assert!(p.pick(b, PeerPieces::All, 4, &mut rng()).is_empty());
+        // Unchoked: A asks again for exactly what is missing.
+        let again = p.pick(a, PeerPieces::All, 4, &mut rng());
+        assert_eq!(again, vec![blk(0, 2), blk(0, 3)]);
+        assert!(!p.on_block(a, again[0]).piece_complete);
+        assert!(p.on_block(a, again[1]).piece_complete);
+        assert!(p.take_forfeited().is_empty());
+    }
+
+    #[test]
+    fn stalled_owner_forfeits_after_the_grace_period() {
+        let (a, b) = (PeerKey(1), PeerKey(2));
+        let grace = Duration::from_secs(120);
+        let t0 = Instant::now();
         let mut p = picker(1, 4);
         p.add_peer_pieces(PeerPieces::All);
         p.set_parole(a, true);
-        assert_eq!(p.pick(a, PeerPieces::All, 4, &mut rng()).len(), 4);
-        p.release_peer(a);
+        let got = p.pick(a, PeerPieces::All, 4, &mut rng());
+        assert!(p.on_block(a, got[0]).accepted);
+        p.expire_exclusive(t0, grace);
+        p.expire_exclusive(t0 + grace - Duration::from_millis(1), grace);
         assert!(p.take_forfeited().is_empty());
-        let again = p.pick(a, PeerPieces::All, 2, &mut rng());
-        assert_eq!(again.len(), 2);
-        // Shared again: B takes the other two blocks.
-        let shared = p.pick(b, PeerPieces::All, 2, &mut rng());
-        assert_eq!(shared, vec![blk(0, 2), blk(0, 3)]);
+        // A block arrives: the grace period starts over.
+        assert!(p.on_block(a, got[1]).accepted);
+        p.expire_exclusive(t0 + grace, grace);
+        p.expire_exclusive(t0 + 2 * grace - Duration::from_millis(1), grace);
+        assert!(p.take_forfeited().is_empty());
+        p.expire_exclusive(t0 + 2 * grace, grace);
+        assert_eq!(p.take_forfeited(), vec![0]);
+        assert_eq!(p.pick(b, PeerPieces::All, 8, &mut rng()).len(), 4);
+        // Nothing received in the grace period: opened, not forfeited.
+        let mut p = picker(1, 4);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_parole(a, true);
+        assert_eq!(p.pick(a, PeerPieces::All, 2, &mut rng()).len(), 2);
+        p.expire_exclusive(t0, grace);
+        p.expire_exclusive(t0 + grace, grace);
+        assert!(p.take_forfeited().is_empty());
+        assert_eq!(p.pick(b, PeerPieces::All, 2, &mut rng()).len(), 2);
     }
 
     #[test]

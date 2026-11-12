@@ -489,6 +489,7 @@ impl Actor {
             && let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut())
         {
             picker.release_peer(key);
+            self.drop_forfeited();
         }
     }
 

@@ -17,7 +17,12 @@
 //! honest peer that keeps sharing pieces with a liar loses trust at the
 //! liar's pace and is banned with it before any of those pieces passes;
 //! with it, each failure after the first has a single contributor, so the
-//! points land on the peer that sent the bad data.
+//! points land on the peer that sent the bad data. Pieces still shared
+//! (in flight when parole began, or a reader's deadline pieces, which are
+//! never reserved) can fail mixed later: such a failure charges only the
+//! contributors not yet on parole, since those on it already paid for the
+//! failure that put them there and cannot be told apart from the liar.
+//! A failure with a single contributor always charges it.
 //!
 //! This is separate from the per-torrent ban of peers that sent bad
 //! metadata (`BanTarget`).
@@ -143,8 +148,10 @@ impl SmartBan {
 
     /// `piece` failed its hash check with these block hashes. Records each
     /// block's sender and hash (merged into an earlier record of the
-    /// piece, which becomes the newest), takes trust from every contributor
-    /// and returns those whose trust fell to [`BAN_TRUST`] or below.
+    /// piece, which becomes the newest), takes trust from the contributors
+    /// (with several, only those not on parole: see the module docs), puts
+    /// every contributor on parole and returns those whose trust fell to
+    /// [`BAN_TRUST`] or below.
     pub(super) fn piece_failed(
         &mut self,
         piece: u32,
@@ -152,6 +159,15 @@ impl SmartBan {
     ) -> Vec<BlockSource> {
         let senders = self.senders.remove(&piece).unwrap_or_default();
         let contributors = distinct(senders.iter().copied().flatten());
+        let charged: Vec<BlockSource> = if contributors.len() > 1 {
+            contributors
+                .iter()
+                .copied()
+                .filter(|s| !self.parole.contains(s))
+                .collect()
+        } else {
+            contributors.clone()
+        };
         let blocks = block_hashes
             .into_iter()
             .enumerate()
@@ -159,7 +175,7 @@ impl SmartBan {
         self.failed
             .entry(piece)
             .or_default()
-            .merge(blocks, &contributors);
+            .merge(blocks, &charged);
         self.failed_order.retain(|&p| p != piece);
         self.failed_order.push_back(piece);
         while self.failed_order.len() > MAX_SMART_BAN_PIECES {
@@ -169,7 +185,8 @@ impl SmartBan {
         }
         let mut banned = Vec::new();
         for s in contributors {
-            if self.adjust(s, FAIL_POINTS) <= BAN_TRUST {
+            let points = if charged.contains(&s) { FAIL_POINTS } else { 0 };
+            if self.adjust(s, points) <= BAN_TRUST {
                 self.forget_sender(s);
                 banned.push(s);
             } else {
@@ -452,6 +469,35 @@ mod tests {
     }
 
     #[test]
+    fn mixed_failures_charge_only_contributors_not_on_parole() {
+        let mut sb = SmartBan::default();
+        let (a, b) = (peer(1), peer(2));
+        // Four pieces in flight, each shared by the liar A and honest B.
+        for piece in 0..4 {
+            sb.record_block(piece, 0, a);
+            sb.record_block(piece, 1, b);
+        }
+        for piece in 0..4 {
+            assert!(sb.piece_failed(piece, vec![h(9), h(2)]).is_empty());
+        }
+        // Only the first charged them; both are on parole.
+        assert_eq!((sb.trust_of(a), sb.trust_of(b)), (-2, -2));
+        assert!(sb.on_parole(a) && sb.on_parole(b));
+        // A failure of A's alone still charges it.
+        assert!(fail_alone(&mut sb, 10, a).is_empty());
+        assert_eq!(sb.trust_of(a), -4);
+        // B's retries pass: A is caught by its blocks, B is refunded.
+        let mut liars = Vec::new();
+        for piece in 0..4 {
+            liars.extend(pass_alone(&mut sb, piece, b));
+        }
+        liars.dedup();
+        assert_eq!(liars, vec![a]);
+        assert_eq!(sb.trust_of(b), 4, "-2, +2 back, +1 per pass");
+        assert!(!sb.on_parole(b));
+    }
+
+    #[test]
     fn a_second_failure_is_merged() {
         let mut sb = SmartBan::default();
         let (a, b, c, d) = (peer(1), peer(2), peer(3), peer(4));
@@ -463,9 +509,11 @@ mod tests {
         sb.record_block(5, 0, c);
         sb.record_block(5, 1, b);
         assert!(sb.piece_failed(5, vec![h(8), h(2)]).is_empty());
-        assert_eq!(sb.trust_of(b), -4);
+        // A mixed failure charges only those not yet on parole: C, not B.
+        assert_eq!(sb.trust_of(b), -2);
+        assert_eq!(sb.trust_of(c), -2);
         // D sends the good piece: both liars are caught, and B gets back
-        // both failures' points.
+        // the points it paid.
         sb.record_block(5, 0, d);
         sb.record_block(5, 1, d);
         let mut liars = sb.piece_passed(5, Some(vec![h(1), h(2)]));
