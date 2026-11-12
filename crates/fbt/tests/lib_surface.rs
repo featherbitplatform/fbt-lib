@@ -287,3 +287,19 @@ async fn resume_methods(s: &Session, h: &TorrentHandle, st: &dyn Storage) {
         let _: ResumeError = e;
     }
 }
+
+/// DHT scrape (BEP 33) and `sample_infohashes` (BEP 51).
+async fn dht_methods(s: &Session, addr: std::net::SocketAddr) {
+    use fbt::{DhtSamples, DhtScrape};
+    let r: Result<DhtScrape, SessionError> = s.dht_scrape([0; 20]).await;
+    if let Ok(d) = r {
+        let _: (u32, u32) = (d.seeds, d.peers);
+    }
+    let r: Result<DhtSamples, SessionError> = s.dht_sample_infohashes(addr, [0; 20]).await;
+    if let Ok(d) = r {
+        let _: (std::time::Duration, u32, &Vec<[u8; 20]>) = (d.interval, d.num, &d.samples);
+        let _: Vec<(std::net::SocketAddr, [u8; 20])> =
+            d.nodes.iter().map(|n| (n.addr, n.id.0)).collect();
+    }
+    let _ = [SessionError::DhtDisabled, SessionError::Dht(String::new())];
+}

@@ -91,6 +91,14 @@ pub enum SessionError {
     /// was refused.
     #[error("invalid resume data: {0}")]
     Resume(#[source] crate::resume::ResumeError),
+    /// A DHT method was called with [`Settings::dht_enabled`](crate::Settings::dht_enabled)
+    /// off.
+    #[error("the DHT is disabled")]
+    DhtDisabled,
+    /// A DHT operation failed (the queried node did not answer, answered
+    /// with an error, or the DHT shut down); the message is the DHT error.
+    #[error("DHT error: {0}")]
+    Dht(String),
 }
 
 /// Why a [`FileReader`](crate::FileReader) read failed. It comes inside the

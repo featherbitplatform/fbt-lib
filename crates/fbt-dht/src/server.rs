@@ -1,5 +1,6 @@
 //! Answers to incoming queries: `ping`, `find_node`, `get_peers`,
-//! `announce_peer` (BEP 5), with `want` (BEP 32) and `ip` (BEP 42).
+//! `announce_peer` (BEP 5), with `want` (BEP 32), `ip` (BEP 42), the
+//! scrape and seed flags (BEP 33) and `sample_infohashes` (BEP 51).
 //!
 //! Pure: the node runtime passes in its tables, tokens, peer store and the
 //! time. Every answer it builds fits in [`MAX_DATAGRAM`].
@@ -10,8 +11,8 @@ use std::time::Instant;
 use rand::Rng;
 
 use crate::krpc::{
-    Body, ERR_METHOD_UNKNOWN, ERR_PROTOCOL, MAX_DATAGRAM, MAX_VALUES, Message, NodeInfo, Query,
-    QueryMsg, Response,
+    Body, ERR_METHOD_UNKNOWN, ERR_PROTOCOL, MAX_DATAGRAM, MAX_SAMPLES, MAX_VALUES, Message,
+    NodeInfo, Query, QueryMsg, Response,
 };
 use crate::store::PeerStore;
 use crate::table::{Family, K, RoutingTable};
@@ -23,6 +24,9 @@ pub(crate) const MAX_VALUES_V4: usize = 100;
 /// datagram stays within [`MAX_DATAGRAM`] next to a full `nodes6`).
 pub(crate) const MAX_VALUES_V6: usize = 50;
 const _: () = assert!(MAX_VALUES_V4 <= MAX_VALUES && MAX_VALUES_V6 <= MAX_VALUES);
+/// BEP 51 `interval` we announce: our samples are fresh for 6 hours at
+/// most (BEP 51's upper bound).
+pub(crate) const SAMPLE_INTERVAL_SECS: u32 = 6 * 60 * 60;
 
 /// Our client version: `FB` plus the crate's major and minor version.
 pub(crate) fn version() -> Vec<u8> {
@@ -67,11 +71,9 @@ impl Server<'_> {
             }
         };
         Response {
-            id: crate::NodeId([0; 20]),
             nodes: pick(Family::V4, v4),
             nodes6: pick(Family::V6, v6),
-            values: Vec::new(),
-            token: None,
+            ..Response::default()
         }
     }
 
@@ -97,29 +99,51 @@ impl Server<'_> {
                 id: own,
                 ..self.nodes(family, q, target)
             }),
-            Query::GetPeers { info_hash } => {
+            Query::GetPeers { info_hash, scrape } => {
                 let max = match family {
                     Family::V4 => MAX_VALUES_V4,
                     Family::V6 => MAX_VALUES_V6,
                 };
-                Body::Response(Response {
+                let mut r = Response {
                     id: own,
-                    values: self.store.peers(info_hash, family, max, rng),
                     token: Some(self.tokens.issue(from.ip())),
                     ..self.nodes(family, q, &crate::NodeId(*info_hash))
-                })
+                };
+                // BEP 33: a scrape gets the two filters instead of values
+                // (none for an unknown info hash), as libtorrent answers
+                match (scrape, self.store.scrape(info_hash)) {
+                    (true, Some((seeds, peers))) => {
+                        r.bf_seeds = Some(Box::new(*seeds.bytes()));
+                        r.bf_peers = Some(Box::new(*peers.bytes()));
+                    }
+                    (true, None) => {}
+                    (false, _) => r.values = self.store.peers(info_hash, family, max, rng),
+                }
+                Body::Response(r)
             }
+            Query::SampleInfohashes { target } => Body::Response(Response {
+                id: own,
+                samples: self.store.sample(rng, MAX_SAMPLES),
+                num: Some(u32::try_from(self.store.len()).unwrap_or(u32::MAX)),
+                interval: Some(SAMPLE_INTERVAL_SECS),
+                ..self.nodes(family, q, target)
+            }),
             Query::AnnouncePeer {
                 info_hash,
                 port,
                 implied_port,
                 token,
+                seed,
             } => {
                 if self.tokens.verify(from.ip(), token) {
                     let port = if *implied_port { from.port() } else { *port };
                     if port != 0 {
-                        self.store
-                            .announce(*info_hash, SocketAddr::new(from.ip(), port), now);
+                        self.store.announce(
+                            *info_hash,
+                            SocketAddr::new(from.ip(), port),
+                            *seed,
+                            now,
+                        );
                     }
                     Body::Response(empty(own))
                 } else {
@@ -146,15 +170,13 @@ impl Server<'_> {
 fn empty(id: crate::NodeId) -> Response {
     Response {
         id,
-        nodes: Vec::new(),
-        nodes6: Vec::new(),
-        values: Vec::new(),
-        token: None,
+        ..Response::default()
     }
 }
 
 /// Encodes `m`, dropping values, then `nodes6`, then `nodes` entries until
-/// the datagram fits in [`MAX_DATAGRAM`].
+/// the datagram fits in [`MAX_DATAGRAM`]. (Two filters, 20 samples and
+/// full node lists of both families fit: about 1,150 bytes.)
 pub(crate) fn bounded(mut m: Message) -> Vec<u8> {
     loop {
         let out = m.encode();
@@ -220,10 +242,11 @@ mod tests {
             store.announce(
                 ih,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0300_0000 + k)), 1),
+                k % 2 == 0,
                 now,
             );
             let v6 = IpAddr::V6(Ipv6Addr::from(0x2a00_u128 << 112 | u128::from(k)));
-            store.announce(ih, SocketAddr::new(v6, 1), now);
+            store.announce(ih, SocketAddr::new(v6, 1), false, now);
         }
         let mut s = Server {
             table_v4: Some(&t4),
@@ -245,8 +268,20 @@ mod tests {
                 Query::FindNode {
                     target: NodeId([7; 20]),
                 },
-                Query::GetPeers { info_hash: ih },
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: true,
+                },
+                Query::SampleInfohashes {
+                    target: NodeId([7; 20]),
+                },
             ] {
+                let scrape = matches!(query, Query::GetPeers { scrape: true, .. });
+                let sample = matches!(query, Query::SampleInfohashes { .. });
                 let out = s
                     .answer(from, &tid, &q(query, want), now, &mut rng)
                     .unwrap();
@@ -264,7 +299,21 @@ mod tests {
                 assert_eq!(!r.nodes.is_empty(), v4);
                 assert_eq!(!r.nodes6.is_empty(), v6);
                 assert!(r.values.iter().all(|v| v.is_ipv4() == from.is_ipv4()));
-                if want == Want::default() && r.token.is_some() {
+                assert_eq!(r.bf_seeds.is_some(), scrape);
+                assert_eq!(!r.samples.is_empty(), sample);
+                if let Some(seeds) = &r.bf_seeds {
+                    // scrape: filters, no values; 100 IPv4 seeds, the rest peers
+                    assert!(r.values.is_empty());
+                    let seeds = crate::bloom::BloomFilter::from_bytes(**seeds);
+                    assert!(seeds.estimate().abs_diff(100) <= 10);
+                    assert!(r.bf_peers.is_some());
+                }
+                if !r.samples.is_empty() {
+                    assert_eq!(r.samples, vec![ih]);
+                    assert_eq!(r.num, Some(1));
+                    assert_eq!(r.interval, Some(SAMPLE_INTERVAL_SECS));
+                }
+                if want == Want::default() && r.token.is_some() && r.bf_seeds.is_none() {
                     let max = if from.is_ipv4() {
                         MAX_VALUES_V4
                     } else {
@@ -295,6 +344,7 @@ mod tests {
             port: 0,
             implied_port: true,
             token,
+            seed: false,
         };
         let out = s
             .answer(from, b"t", &q(a, Want::default()), Instant::now(), &mut rng)
@@ -303,6 +353,6 @@ mod tests {
             Message::decode(&out).unwrap().body,
             Body::Response(_)
         ));
-        assert_eq!(store.torrents(), 0);
+        assert_eq!(store.len(), 0);
     }
 }

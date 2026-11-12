@@ -1,5 +1,6 @@
-//! KRPC messages (BEP 5) with the BEP 32 (`nodes6`, `want`), BEP 42 (`ip`)
-//! and BEP 43 (`ro`) fields.
+//! KRPC messages (BEP 5) with the BEP 32 (`nodes6`, `want`), BEP 33
+//! (`scrape`, `seed`, `BFsd`, `BFpe`), BEP 42 (`ip`), BEP 43 (`ro`) and
+//! BEP 51 (`sample_infohashes`) fields.
 //!
 //! [`Message::decode`] parses hostile UDP datagrams: it never panics, decodes
 //! with [`KRPC_LIMITS`], and cuts every list to a named cap before allocating.
@@ -32,6 +33,12 @@ pub const MAX_METHOD_LEN: usize = 32;
 pub const MAX_ERROR_MESSAGE: usize = 256;
 /// Largest datagram accepted.
 pub const MAX_DATAGRAM: usize = 1500;
+/// BEP 51 info hash samples kept from one `samples` string; extra ones (and
+/// a trailing partial one) are cut.
+pub const MAX_SAMPLES: usize = 20;
+/// Bytes in a BEP 33 bloom filter (`BFsd`, `BFpe`); filters of any other
+/// length are ignored.
+pub const BLOOM_FILTER_LEN: usize = crate::bloom::BLOOM_BYTES;
 
 /// KRPC error code: generic error.
 pub const ERR_GENERIC: i64 = 201;
@@ -79,6 +86,9 @@ pub enum Query {
     GetPeers {
         /// The torrent's info hash.
         info_hash: [u8; 20],
+        /// BEP 33 `scrape`: answer with the `BFsd`/`BFpe` bloom filters
+        /// instead of `values`.
+        scrape: bool,
     },
     /// `announce_peer`.
     AnnouncePeer {
@@ -90,6 +100,13 @@ pub enum Query {
         implied_port: bool,
         /// The token from an earlier `get_peers` response.
         token: Vec<u8>,
+        /// BEP 33 `seed`: the announcing peer is a seed.
+        seed: bool,
+    },
+    /// BEP 51 `sample_infohashes`.
+    SampleInfohashes {
+        /// Where in the id space the answer's `nodes` should be close to.
+        target: NodeId,
     },
     /// Any other method, by name (cut to [`MAX_METHOD_LEN`] bytes), so the
     /// server can answer [`ERR_METHOD_UNKNOWN`].
@@ -122,6 +139,36 @@ pub struct Response {
     pub values: Vec<SocketAddr>,
     /// Announce token.
     pub token: Option<Vec<u8>>,
+    /// BEP 33 `BFsd`: bloom filter of seeds (only one of exactly
+    /// [`BLOOM_FILTER_LEN`] bytes is kept).
+    pub bf_seeds: Option<Box<[u8; 256]>>,
+    /// BEP 33 `BFpe`: bloom filter of downloaders (only one of exactly
+    /// [`BLOOM_FILTER_LEN`] bytes is kept).
+    pub bf_peers: Option<Box<[u8; 256]>>,
+    /// BEP 51 `samples`: info hashes, at most [`MAX_SAMPLES`].
+    pub samples: Vec<[u8; 20]>,
+    /// BEP 51 `num`: info hashes the responder stores.
+    pub num: Option<u32>,
+    /// BEP 51 `interval`: seconds before the responder's samples change.
+    pub interval: Option<u32>,
+}
+
+impl Default for Response {
+    /// An empty response with an all-zero id.
+    fn default() -> Self {
+        Response {
+            id: NodeId([0; NODE_ID_LEN]),
+            nodes: Vec::new(),
+            nodes6: Vec::new(),
+            values: Vec::new(),
+            token: None,
+            bf_seeds: None,
+            bf_peers: None,
+            samples: Vec::new(),
+            num: None,
+            interval: None,
+        }
+    }
 }
 
 /// The message kind and payload.
@@ -237,6 +284,10 @@ fn decode_query(top: &Dict<'_>) -> Result<QueryMsg, KrpcError> {
         },
         b"get_peers" => Query::GetPeers {
             info_hash: hash20(a, "info_hash")?,
+            scrape: int(a, "scrape").is_some_and(|v| v != 0),
+        },
+        b"sample_infohashes" => Query::SampleInfohashes {
+            target: NodeId(hash20(a, "target")?),
         },
         b"announce_peer" => {
             let info_hash = hash20(a, "info_hash")?;
@@ -258,6 +309,7 @@ fn decode_query(top: &Dict<'_>) -> Result<QueryMsg, KrpcError> {
                 port,
                 implied_port,
                 token: token.to_vec(),
+                seed: int(a, "seed").is_some_and(|v| v != 0),
             }
         }
         other => Query::Unknown(text(other, MAX_METHOD_LEN)),
@@ -318,12 +370,34 @@ fn decode_response(top: &Dict<'_>) -> Result<Response, KrpcError> {
             Some(t.to_vec())
         }
     };
+    let bloom = |key: &[u8]| -> Option<Box<[u8; 256]>> {
+        let b = r.get(key).and_then(Value::as_bytes)?;
+        <[u8; BLOOM_FILTER_LEN]>::try_from(b).ok().map(Box::new)
+    };
+    let samples = r
+        .get(b"samples")
+        .and_then(Value::as_bytes)
+        .map(|b| {
+            b.as_chunks::<20>()
+                .0
+                .iter()
+                .take(MAX_SAMPLES)
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default();
+    let u32_of = |key: &str| int(r, key).and_then(|v| u32::try_from(v).ok());
     Ok(Response {
         id,
         nodes,
         nodes6,
         values,
         token,
+        bf_seeds: bloom(b"BFsd"),
+        bf_peers: bloom(b"BFpe"),
+        samples,
+        num: u32_of("num"),
+        interval: u32_of("interval"),
     })
 }
 
@@ -413,16 +487,27 @@ impl Message {
                         a.insert(b"target".to_vec(), OwnedValue::Bytes(target.0.to_vec()));
                         b"find_node"
                     }
-                    Query::GetPeers { info_hash } => {
+                    Query::GetPeers { info_hash, scrape } => {
                         a.insert(b"info_hash".to_vec(), OwnedValue::Bytes(info_hash.to_vec()));
+                        if *scrape {
+                            a.insert(b"scrape".to_vec(), OwnedValue::Int(1));
+                        }
                         b"get_peers"
+                    }
+                    Query::SampleInfohashes { target } => {
+                        a.insert(b"target".to_vec(), OwnedValue::Bytes(target.0.to_vec()));
+                        b"sample_infohashes"
                     }
                     Query::AnnouncePeer {
                         info_hash,
                         port,
                         implied_port,
                         token,
+                        seed,
                     } => {
+                        if *seed {
+                            a.insert(b"seed".to_vec(), OwnedValue::Int(1));
+                        }
                         a.insert(b"info_hash".to_vec(), OwnedValue::Bytes(info_hash.to_vec()));
                         a.insert(b"port".to_vec(), OwnedValue::Int(i64::from(*port)));
                         if *implied_port {
@@ -465,6 +550,21 @@ impl Message {
                 }
                 if let Some(t) = &r.token {
                     d.insert(b"token".to_vec(), OwnedValue::Bytes(t.clone()));
+                }
+                if let Some(b) = &r.bf_seeds {
+                    d.insert(b"BFsd".to_vec(), OwnedValue::Bytes(b.to_vec()));
+                }
+                if let Some(b) = &r.bf_peers {
+                    d.insert(b"BFpe".to_vec(), OwnedValue::Bytes(b.to_vec()));
+                }
+                if !r.samples.is_empty() {
+                    d.insert(b"samples".to_vec(), OwnedValue::Bytes(r.samples.concat()));
+                }
+                if let Some(n) = r.num {
+                    d.insert(b"num".to_vec(), OwnedValue::Int(i64::from(n)));
+                }
+                if let Some(i) = r.interval {
+                    d.insert(b"interval".to_vec(), OwnedValue::Int(i64::from(i)));
                 }
                 top.insert(b"r".to_vec(), OwnedValue::Dict(d));
                 b"r"
@@ -547,6 +647,7 @@ mod tests {
                 }],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         assert_eq!(Message::decode(&resp.encode()).unwrap(), resp);
@@ -599,18 +700,23 @@ mod tests {
             Query::FindNode {
                 target: NodeId([3; 20]),
             },
-            Query::GetPeers { info_hash: [4; 20] },
+            Query::GetPeers {
+                info_hash: [4; 20],
+                scrape: false,
+            },
             Query::AnnouncePeer {
                 info_hash: [5; 20],
                 port: 0,
                 implied_port: true,
                 token: b"tok".to_vec(),
+                seed: false,
             },
             Query::AnnouncePeer {
                 info_hash: [5; 20],
                 port: 51413,
                 implied_port: false,
                 token: vec![],
+                seed: false,
             },
             Query::Unknown("vote".into()),
         ] {
@@ -663,6 +769,7 @@ mod tests {
                     "[2001:db8::3]:10".parse().unwrap(),
                 ],
                 token: Some(vec![0xab; MAX_TOKEN_LEN]),
+                ..Response::default()
             }),
         };
         assert_eq!(Message::decode(&m.encode()).unwrap(), m);
@@ -773,6 +880,160 @@ mod tests {
             Message::decode(&vec![b'x'; MAX_DATAGRAM])
                 .is_err_and(|e| !matches!(e, KrpcError::TooLarge))
         );
+    }
+
+    #[test]
+    fn new_fields_round_trip() {
+        for query in [
+            Query::GetPeers {
+                info_hash: [4; 20],
+                scrape: true,
+            },
+            Query::AnnouncePeer {
+                info_hash: [5; 20],
+                port: 6881,
+                implied_port: false,
+                token: b"tok".to_vec(),
+                seed: true,
+            },
+            Query::SampleInfohashes {
+                target: NodeId([6; 20]),
+            },
+        ] {
+            let m = Message {
+                tid: b"aa".to_vec(),
+                ip: None,
+                version: None,
+                body: Body::Query(QueryMsg {
+                    id: NodeId([9; 20]),
+                    query,
+                    want: Want::default(),
+                    read_only: false,
+                }),
+            };
+            assert_eq!(Message::decode(&m.encode()).unwrap(), m);
+        }
+        let mut seeds = Box::new([0u8; 256]);
+        seeds[0] = 0x81;
+        let mut peers = Box::new([0u8; 256]);
+        peers[255] = 0x18;
+        let m = Message {
+            tid: b"aa".to_vec(),
+            ip: None,
+            version: None,
+            body: Body::Response(Response {
+                id: NodeId([1; 20]),
+                nodes: vec![NodeInfo {
+                    id: NodeId([2; 20]),
+                    addr: "1.2.3.4:5".parse().unwrap(),
+                }],
+                bf_seeds: Some(seeds),
+                bf_peers: Some(peers),
+                samples: vec![[7; 20], [8; 20]],
+                num: Some(1234),
+                interval: Some(21600),
+                ..Response::default()
+            }),
+        };
+        let bytes = m.encode();
+        assert!(bytes.windows(9).any(|w| w == b"4:BFsd256"));
+        assert!(bytes.windows(9).any(|w| w == b"4:BFpe256"));
+        assert_eq!(Message::decode(&bytes).unwrap(), m);
+        // BEP 33 and BEP 51 key names on the wire
+        let q = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234566:scrapei1ee1:q9:get_peers1:t2:aa1:y1:qe";
+        assert!(matches!(
+            Message::decode(q).unwrap().body,
+            Body::Query(QueryMsg {
+                query: Query::GetPeers { scrape: true, .. },
+                ..
+            })
+        ));
+        assert_eq!(Message::decode(q).unwrap().encode(), q);
+        let q = b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz123456e1:q17:sample_infohashes1:t2:aa1:y1:qe";
+        assert!(matches!(
+            Message::decode(q).unwrap().body,
+            Body::Query(QueryMsg {
+                query: Query::SampleInfohashes { .. },
+                ..
+            })
+        ));
+        assert_eq!(Message::decode(q).unwrap().encode(), q);
+        let q = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234564:porti6881e4:seedi1e5:token1:xe1:q13:announce_peer1:t2:aa1:y1:qe";
+        assert!(matches!(
+            Message::decode(q).unwrap().body,
+            Body::Query(QueryMsg {
+                query: Query::AnnouncePeer { seed: true, .. },
+                ..
+            })
+        ));
+        assert_eq!(Message::decode(q).unwrap().encode(), q);
+        // a sample_infohashes query without a target is malformed
+        assert!(matches!(
+            Message::decode(
+                b"d1:ad2:id20:abcdefghij0123456789e1:q17:sample_infohashes1:t2:aa1:y1:qe"
+            ),
+            Err(KrpcError::Malformed("target"))
+        ));
+    }
+
+    #[test]
+    fn oversized_samples_are_cut() {
+        // 25 whole samples plus 7 stray bytes: 20 kept, the tail dropped
+        let mut raw = Vec::new();
+        for k in 0..25u8 {
+            raw.extend_from_slice(&[k; 20]);
+        }
+        raw.extend_from_slice(&[0xee; 7]);
+        let mut v = format!("{}:", raw.len()).into_bytes();
+        v.extend_from_slice(&raw);
+        let Body::Response(r) = Message::decode(&response_with(b"7:samples", &v))
+            .unwrap()
+            .body
+        else {
+            panic!()
+        };
+        assert_eq!(r.samples.len(), MAX_SAMPLES);
+        assert!(
+            r.samples
+                .iter()
+                .enumerate()
+                .all(|(k, s)| *s == [k as u8; 20])
+        );
+        // fewer than 20 bytes: no sample at all; num and interval out of range are ignored
+        let Body::Response(r) = Message::decode(&response_with(
+            b"8:intervali-1e3:numi99999999999e7:samples",
+            b"19:aaaaaaaaaaaaaaaaaaa",
+        ))
+        .unwrap()
+        .body
+        else {
+            panic!()
+        };
+        assert!(r.samples.is_empty());
+        assert_eq!((r.num, r.interval), (None, None));
+    }
+
+    #[test]
+    fn short_bloom_filter_is_ignored() {
+        for len in [0usize, 1, 255, 257] {
+            let mut v = format!("{len}:").into_bytes();
+            v.extend(std::iter::repeat_n(0xffu8, len));
+            for key in [&b"4:BFpe"[..], b"4:BFsd"] {
+                let Body::Response(r) = Message::decode(&response_with(key, &v)).unwrap().body
+                else {
+                    panic!()
+                };
+                assert_eq!((r.bf_seeds, r.bf_peers), (None, None), "{len}");
+            }
+        }
+        // the right length but not a string: ignored too
+        let Body::Response(r) = Message::decode(&response_with(b"4:BFsd", b"i1e"))
+            .unwrap()
+            .body
+        else {
+            panic!()
+        };
+        assert!(r.bf_seeds.is_none());
     }
 
     proptest! {

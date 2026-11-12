@@ -15,7 +15,11 @@
 //! up and announces itself every [`Settings::dht_announce_interval`];
 //! peers' `Port` messages add their nodes. [`Session::dht_state`] returns the
 //! node's state to pass back as [`Settings::dht_state`] next time; the
-//! library never writes files. Private torrents never touch the DHT.
+//! library never writes files. Private torrents never touch the DHT. A
+//! seeding torrent announces itself as a seed (BEP 33);
+//! [`Session::dht_scrape`] estimates a torrent's seeds and peers (BEP 33)
+//! and [`Session::dht_sample_infohashes`] asks one node for samples of the
+//! info hashes it stores (BEP 51).
 //!
 //! # Magnet links
 //!
@@ -86,7 +90,7 @@ pub use bans::BlockReason;
 pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::{SessionError, StreamError};
 pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
-pub use fbt_dht::DhtStats;
+pub use fbt_dht::{DhtSamples, DhtScrape, DhtStats};
 pub use fbt_net::ipfilter::IpFilter;
 pub use fbt_net::proxy::{ProxyConfig, ProxyKind};
 pub use fbt_net::{MapMethod, MapProtocol};

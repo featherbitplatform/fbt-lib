@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_core::{InfoHashes, PeerId};
-use fbt_dht::{Dht, DhtConfig, DhtState, DhtStats};
+use fbt_dht::{Dht, DhtConfig, DhtSamples, DhtScrape, DhtState, DhtStats, NodeId};
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::PortMapper;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
@@ -857,6 +857,46 @@ impl Session {
         };
         let state = dht.state().await.map_err(|_| SessionError::Shutdown)?;
         Ok(Some(state.to_bytes()))
+    }
+
+    /// BEP 33 scrape through the DHT: the estimated number of seeds and of
+    /// other peers announced for `info_hash` to the nodes closest to it
+    /// (bloom filters: estimates count distinct IPs, not ports).
+    ///
+    /// Fails with [`SessionError::DhtDisabled`] with the DHT off and
+    /// [`SessionError::Dht`] once the DHT has shut down.
+    pub async fn dht_scrape(&self, info_hash: [u8; 20]) -> Result<DhtScrape, SessionError> {
+        let dht = self.dht()?;
+        dht.scrape(info_hash)
+            .await
+            .map_err(|e| SessionError::Dht(e.to_string()))
+    }
+
+    /// BEP 51: asks the DHT node at `node` for a sample of the info hashes
+    /// it stores and for the nodes it knows closest to `target`. One query:
+    /// crawling (following [`DhtSamples::nodes`], honouring
+    /// [`DhtSamples::interval`]) is the caller's job.
+    ///
+    /// Fails with [`SessionError::DhtDisabled`] with the DHT off and
+    /// [`SessionError::Dht`] when the node does not answer, answers with an
+    /// error (`204` if it does not support BEP 51) or the DHT shut down.
+    pub async fn dht_sample_infohashes(
+        &self,
+        node: SocketAddr,
+        target: [u8; 20],
+    ) -> Result<DhtSamples, SessionError> {
+        let dht = self.dht()?;
+        dht.sample_infohashes(node, NodeId(target))
+            .await
+            .map_err(|e| SessionError::Dht(e.to_string()))
+    }
+
+    fn dht(&self) -> Result<&Dht, SessionError> {
+        self.inner
+            .shared
+            .dht
+            .as_ref()
+            .ok_or(SessionError::DhtDisabled)
     }
 
     /// Bytes held by the write-back cache of every torrent, against

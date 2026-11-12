@@ -23,14 +23,15 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
+use crate::bloom::BloomFilter;
 use crate::id::{NodeId, bep42_id, canonical, canonical_addr, is_local};
 use crate::krpc::{Body, MAX_DATAGRAM, Message, NodeInfo, Query, QueryMsg, Response, Want};
 use crate::lookup::{self, Goal, PeerLookup};
 use crate::rate::{IpRateLimiter, MAX_IPS, query_limiter};
-use crate::server::{Server, version};
+use crate::server::{SAMPLE_INTERVAL_SECS, Server, version};
 use crate::state::{DhtState, MAX_STATE_NODES};
 use crate::store::PeerStore;
-use crate::table::{Family, Insert, K, RoutingTable};
+use crate::table::{Family, Insert, K, RoutingTable, dialable};
 use crate::token::Tokens;
 
 /// External-address votes kept (one per reporter IP).
@@ -145,8 +146,36 @@ pub struct DhtStats {
     pub external_ip: Option<IpAddr>,
 }
 
+/// BEP 33 scrape result: estimated seeds and other peers of a torrent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DhtScrape {
+    /// Estimated distinct seed IPs.
+    pub seeds: u32,
+    /// Estimated distinct IPs of peers that are not seeds.
+    pub peers: u32,
+}
+
+/// One node's BEP 51 `sample_infohashes` answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DhtSamples {
+    /// How long before the node's samples change: its `interval`, at most
+    /// 6 hours (BEP 51's bound), zero when it sent none.
+    pub interval: Duration,
+    /// Info hashes the node stores (`num`; the sample count when it sent
+    /// none).
+    pub num: u32,
+    /// Sampled info hashes, at most [`MAX_SAMPLES`](crate::MAX_SAMPLES).
+    pub samples: Vec<[u8; 20]>,
+    /// Nodes close to the target, to crawl next: dialable ones only, and no
+    /// local addresses from a remote node.
+    pub nodes: Vec<NodeInfo>,
+}
+
 /// DHT failures.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DhtError {
     /// The IPv4 socket could not be bound.
     #[error("cannot bind the DHT socket: {0}")]
@@ -163,6 +192,30 @@ pub enum DhtError {
     /// A saved state could not be read; names the offending part.
     #[error("invalid DHT state: {0}")]
     InvalidState(&'static str),
+    /// The queried node did not answer in time (or cannot be reached: no
+    /// socket of its address family).
+    #[error("the DHT node did not answer")]
+    Timeout,
+    /// Too many of our queries are in flight.
+    #[error("too many DHT queries in flight")]
+    Busy,
+    /// The queried node answered with a KRPC error.
+    #[error("the DHT node answered with error {code}")]
+    Remote {
+        /// The KRPC error code (`204`: it does not know the method).
+        code: i64,
+    },
+}
+
+impl From<QueryError> for DhtError {
+    fn from(e: QueryError) -> Self {
+        match e {
+            QueryError::Timeout => DhtError::Timeout,
+            QueryError::Busy => DhtError::Busy,
+            QueryError::Remote { code } => DhtError::Remote { code },
+            QueryError::Shutdown => DhtError::Shutdown,
+        }
+    }
 }
 
 /// Why a query got no answer.
@@ -601,9 +654,77 @@ impl Dht {
 
     /// Looks up peers for `info_hash` like [`get_peers`](Dht::get_peers),
     /// then announces us on `port` (`None`: the DHT socket's port, BEP 5
-    /// `implied_port`) to the `K` closest nodes that gave a token.
-    pub fn announce(&self, info_hash: [u8; 20], port: Option<u16>) -> PeerLookup {
-        PeerLookup::start(Link::Strong(self.clone()), Goal::Announce(port), info_hash)
+    /// `implied_port`) to the `K` closest nodes that gave a token, as a
+    /// seed (BEP 33 `seed`) if `seed`.
+    pub fn announce(&self, info_hash: [u8; 20], port: Option<u16>, seed: bool) -> PeerLookup {
+        PeerLookup::start(
+            Link::Strong(self.clone()),
+            Goal::Announce(port, seed),
+            info_hash,
+        )
+    }
+
+    /// BEP 33 scrape: a `get_peers` lookup with `scrape` set, one per bound
+    /// family, whose `K` closest answers' seed and peer bloom filters are
+    /// unioned and estimated. Nodes that do not know the torrent send no
+    /// filters, so an unknown torrent gives zeros. Dropping the future
+    /// cancels the lookups.
+    pub async fn scrape(&self, info_hash: [u8; 20]) -> Result<DhtScrape, DhtError> {
+        let link = Link::Strong(self.clone());
+        let target = NodeId(info_hash);
+        let views = link.closest(Some(target)).await?;
+        let mut set = JoinSet::new();
+        for v in views {
+            set.spawn(lookup::run(
+                link.clone(),
+                v.family,
+                v.own,
+                target,
+                v.closest,
+                Goal::Scrape,
+                None,
+            ));
+        }
+        let (mut seeds, mut peers) = (BloomFilter::default(), BloomFilter::default());
+        while let Some(joined) = set.join_next().await {
+            if let Ok((s, p)) = joined {
+                seeds.union(&s);
+                peers.union(&p);
+            }
+        }
+        Ok(DhtScrape {
+            seeds: seeds.estimate(),
+            peers: peers.estimate(),
+        })
+    }
+
+    /// BEP 51: asks `node` for a sample of the info hashes it stores and
+    /// for the nodes it knows closest to `target`. One query; crawling the
+    /// DHT (following `nodes`, honouring `interval`) is the caller's job.
+    pub async fn sample_infohashes(
+        &self,
+        node: SocketAddr,
+        target: NodeId,
+    ) -> Result<DhtSamples, DhtError> {
+        let r = self.query(node, Query::SampleInfohashes { target }).await?;
+        let remote = !is_local(node.ip());
+        let nodes = r
+            .nodes
+            .iter()
+            .chain(r.nodes6.iter())
+            .filter(|n| dialable(&n.addr) && !(remote && is_local(n.addr.ip())))
+            .copied()
+            .collect();
+        let num = r
+            .num
+            .unwrap_or_else(|| u32::try_from(r.samples.len()).unwrap_or(u32::MAX));
+        let interval = r.interval.unwrap_or(0).min(SAMPLE_INTERVAL_SECS);
+        Ok(DhtSamples {
+            interval: Duration::from_secs(u64::from(interval)),
+            num,
+            samples: r.samples,
+            nodes,
+        })
     }
 
     /// Our ids and the nodes in our tables, to restore with
@@ -1357,7 +1478,7 @@ impl Actor {
         DhtStats {
             nodes_v4: len(&self.table_v4),
             nodes_v6: len(&self.table_v6),
-            stored_info_hashes: self.store.torrents(),
+            stored_info_hashes: self.store.len(),
             bootstrapped: self.tables().any(|t| t.len() >= K),
             local_addrs: self.local.clone(),
             external_ip: self.ext_v4.current().or(self.ext_v6.current()),
@@ -1563,6 +1684,7 @@ mod tests {
                 nodes6: vec![],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         sock.send_to(&r.encode(), from).await.unwrap();
@@ -1585,6 +1707,7 @@ mod tests {
                             nodes6: vec![],
                             values: vec![],
                             token: None,
+                            ..Response::default()
                         }),
                     };
                     let _ = sock.send_to(&r.encode(), from).await;
@@ -1622,9 +1745,16 @@ mod tests {
 
     async fn token_for(sock: &UdpSocket, addr: SocketAddr, ih: [u8; 20]) -> Vec<u8> {
         let r = response(
-            ask(sock, addr, Query::GetPeers { info_hash: ih })
-                .await
-                .unwrap(),
+            ask(
+                sock,
+                addr,
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+            )
+            .await
+            .unwrap(),
         );
         assert!(r.values.is_empty());
         r.token.expect("token")
@@ -1644,15 +1774,23 @@ mod tests {
                 port: 4000,
                 implied_port: false,
                 token,
+                seed: false,
             },
         )
         .await
         .unwrap();
         response(m);
         let r = response(
-            ask(&sock, addr, Query::GetPeers { info_hash: ih })
-                .await
-                .unwrap(),
+            ask(
+                &sock,
+                addr,
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(r.values, vec!["127.0.0.1:4000".parse().unwrap()]);
         assert!(r.token.is_some());
@@ -1673,15 +1811,23 @@ mod tests {
                     port: 4000,
                     implied_port: true,
                     token,
+                    seed: false,
                 },
             )
             .await
             .unwrap(),
         );
         let r = response(
-            ask(&sock, addr, Query::GetPeers { info_hash: ih })
-                .await
-                .unwrap(),
+            ask(
+                &sock,
+                addr,
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(r.values, vec![sock.local_addr().unwrap()]);
         // the store size reaches the stats
@@ -1710,15 +1856,23 @@ mod tests {
                 port: 4000,
                 implied_port: false,
                 token,
+                seed: false,
             },
         )
         .await
         .unwrap();
         assert!(matches!(m.body, Body::Error { code: 203, .. }), "{m:?}");
         let r = response(
-            ask(&sock, addr, Query::GetPeers { info_hash: ih })
-                .await
-                .unwrap(),
+            ask(
+                &sock,
+                addr,
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+            )
+            .await
+            .unwrap(),
         );
         assert!(r.values.is_empty());
     }
@@ -1834,6 +1988,7 @@ mod tests {
                 nodes6: vec![],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         b.send_to(&fake.encode(), addr).await.unwrap();
@@ -2447,6 +2602,7 @@ mod tests {
                 nodes6: vec![],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         a.on_datagram(&answer.encode(), me, now);
@@ -2593,6 +2749,7 @@ mod tests {
                 nodes6: vec![],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         a.on_datagram(&answer.encode(), mapped, now);

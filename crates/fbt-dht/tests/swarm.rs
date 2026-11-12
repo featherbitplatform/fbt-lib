@@ -93,11 +93,76 @@ async fn announce_then_get_peers_finds_the_peer() {
         .await
     );
     let ih = [0x42; 20];
-    let mut announce = nodes[19].announce(ih, Some(4242));
+    let mut announce = nodes[19].announce(ih, Some(4242), false);
     while announce.next().await.is_some() {}
     let want: SocketAddr = "127.0.0.1:4242".parse().unwrap();
     let found = timeout(Duration::from_secs(5), find(&nodes[3], ih, want)).await;
     assert_eq!(found, Ok(true));
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scrape_round_trip() {
+    // every node is 127.0.0.1, so each filter holds at most one address
+    // (synthetic IPs are counted in the store's unit tests)
+    let nodes = swarm(10, "127.0.0.1:0").await;
+    assert!(
+        wait_until(Duration::from_secs(10), || nodes
+            .iter()
+            .all(|n| n.stats().nodes_v4 >= 5))
+        .await
+    );
+    let ih = [0x33; 20];
+    let empty = nodes[2].scrape(ih).await.unwrap();
+    assert_eq!((empty.seeds, empty.peers), (0, 0));
+    let mut seed = nodes[8].announce(ih, Some(5001), true);
+    while seed.next().await.is_some() {}
+    let mut leech = nodes[9].announce(ih, Some(5002), false);
+    while leech.next().await.is_some() {}
+    let got = timeout(Duration::from_secs(10), nodes[2].scrape(ih))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((got.seeds, got.peers), (1, 1));
+    // only a seed: no leecher counted
+    let other = [0x34; 20];
+    let mut seed = nodes[8].announce(other, Some(5001), true);
+    while seed.next().await.is_some() {}
+    let got = nodes[3].scrape(other).await.unwrap();
+    assert_eq!((got.seeds, got.peers), (1, 0));
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sample_infohashes_returns_stored_hashes() {
+    let nodes = swarm(4, "127.0.0.1:0").await;
+    assert!(
+        wait_until(Duration::from_secs(10), || nodes
+            .iter()
+            .all(|n| n.stats().nodes_v4 >= 3))
+        .await
+    );
+    // with 4 nodes every announce reaches node 0 (one of the K closest)
+    let hashes: Vec<[u8; 20]> = (1..=3u8).map(|k| [k; 20]).collect();
+    for ih in &hashes {
+        let mut a = nodes[1].announce(*ih, Some(6000), false);
+        while a.next().await.is_some() {}
+    }
+    let target = fbt_dht::NodeId([0x55; 20]);
+    let addr = nodes[0].local_addrs()[0];
+    let got = nodes[3].sample_infohashes(addr, target).await.unwrap();
+    assert_eq!(got.interval, Duration::from_secs(21600));
+    assert_eq!(got.num, 3);
+    let mut samples = got.samples.clone();
+    samples.sort();
+    assert_eq!(samples, hashes);
+    assert!(!got.nodes.is_empty());
+    assert!(got.nodes.iter().all(|n| n.addr.ip().is_loopback()));
+    // an address nothing listens on times out
+    let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    assert!(nodes[3].sample_infohashes(dead_addr, target).await.is_err());
     shutdown(&nodes).await;
 }
 
@@ -116,7 +181,7 @@ async fn ipv6_swarm_converges_when_available() {
     );
     assert!(nodes.iter().all(|n| n.stats().nodes_v4 == 0));
     let ih = [0x66; 20];
-    let mut announce = nodes[9].announce(ih, Some(4242));
+    let mut announce = nodes[9].announce(ih, Some(4242), false);
     while announce.next().await.is_some() {}
     let want: SocketAddr = "[::1]:4242".parse().unwrap();
     let found = timeout(Duration::from_secs(5), find(&nodes[2], ih, want)).await;
@@ -317,7 +382,7 @@ async fn mixed_standalone_and_shared_nodes_converge() {
     );
     let ih = [7u8; 20];
     // node 4 is on a shared socket, node 9 on a standalone one
-    let mut announce = nodes[4].announce(ih, Some(4242));
+    let mut announce = nodes[4].announce(ih, Some(4242), false);
     while announce.next().await.is_some() {}
     let want: SocketAddr = "127.0.0.1:4242".parse().unwrap();
     let found = timeout(Duration::from_secs(5), find(&nodes[9], ih, want)).await;

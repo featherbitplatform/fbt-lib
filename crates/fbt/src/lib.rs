@@ -94,6 +94,13 @@
 //! [`Session::shutdown`]) and pass the bytes back as [`Settings::dht_state`]
 //! next time. The library never writes files: storing the state is the
 //! caller's job. Peer exchange (BEP 11) is on with [`Settings::pex_enabled`].
+//!
+//! A seeding torrent announces itself as a seed (BEP 33).
+//! [`Session::dht_scrape`] estimates a torrent's seeds and peers from the
+//! DHT's bloom filters ([`DhtScrape`], BEP 33), and
+//! [`Session::dht_sample_infohashes`] asks one node for samples of the info
+//! hashes it stores ([`DhtSamples`], BEP 51).
+//!
 //! Private torrents use neither the DHT nor PEX.
 //!
 //! # Transports
@@ -269,13 +276,13 @@ pub use fbt_core::{
 pub use fbt_metainfo::{FileEntry, Info, Magnet, MagnetError, Metainfo, MetainfoError, RelPath};
 pub use fbt_session::storage::{FileStamp, FsStorage, MemStorage, Storage};
 pub use fbt_session::{
-    AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtStats,
-    DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, ExternalIpSource,
-    FileReader, IpFilter, ListenError, MAX_METADATA_SIZE, MapMethod, MapProtocol, MixedMode,
-    MoveMode, PeerClassLimits, PeerSource, Priority, ProxyConfig, ProxyKind, QueueSettings,
-    RateLimit, ReadAhead, RemoveMode, ResumeError, SeedChokingAlgorithm, Session, SessionError,
-    SessionState, Settings, StorageError, StreamError, TorrentHandle, TorrentSource, TorrentState,
-    TorrentStatus, Transport,
+    AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtSamples,
+    DhtScrape, DhtStats, DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream,
+    ExternalIpSource, FileReader, IpFilter, ListenError, MAX_METADATA_SIZE, MapMethod, MapProtocol,
+    MixedMode, MoveMode, PeerClassLimits, PeerSource, Priority, ProxyConfig, ProxyKind,
+    QueueSettings, RateLimit, ReadAhead, RemoveMode, ResumeError, SeedChokingAlgorithm, Session,
+    SessionError, SessionState, Settings, StorageError, StreamError, TorrentHandle, TorrentSource,
+    TorrentState, TorrentStatus, Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

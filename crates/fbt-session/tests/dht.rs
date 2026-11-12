@@ -368,6 +368,69 @@ async fn dht_disabled_means_none() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_dht_scrape() {
+    let boot = loopback_dht(Vec::new()).await;
+    let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
+    let ih = m.info_hashes.v1.unwrap().0;
+    let mut ss = dht_settings(vec![addr_of(&boot)]);
+    ss.dht_announce_interval = Duration::from_secs(1);
+    let seeder = Session::new(ss).await.unwrap();
+    let _sh = seed_in(&seeder, &m, &payload).await;
+    let asker = Session::new(dht_settings(vec![addr_of(&boot)]))
+        .await
+        .unwrap();
+    assert!(wait_until(|| asker.dht_stats().is_some_and(|s| s.nodes_v4 > 0), T).await);
+    // The seeder announces with `seed` once it seeds: one seed, no leecher
+    // (an announce made while it still checked is replaced by the next).
+    let scraped = tokio::time::timeout(T, async {
+        loop {
+            let s = asker.dht_scrape(ih).await.unwrap();
+            if s.seeds == 1 && s.peers == 0 {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    assert!(scraped.is_ok(), "no seed seen through the DHT");
+    // BEP 51 against the bootstrap node, which stores the announce.
+    let samples = asker
+        .dht_sample_infohashes(boot.local_addrs()[0], [0x11; 20])
+        .await
+        .unwrap();
+    assert_eq!(samples.samples, vec![ih]);
+    assert_eq!(samples.num, 1);
+    asker.shutdown().await;
+    seeder.shutdown().await;
+    boot.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dht_methods_without_dht_are_disabled() {
+    let session = Session::new(test_settings()).await.unwrap();
+    assert!(matches!(
+        session.dht_scrape([1; 20]).await,
+        Err(SessionError::DhtDisabled)
+    ));
+    let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    assert!(matches!(
+        session.dht_sample_infohashes(addr, [1; 20]).await,
+        Err(SessionError::DhtDisabled)
+    ));
+    session.shutdown().await;
+    // With the DHT on, a node that never answers is a DHT error.
+    let on = Session::new(dht_settings(Vec::new())).await.unwrap();
+    let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    assert!(matches!(
+        on.dht_sample_infohashes(dead_addr, [1; 20]).await,
+        Err(SessionError::Dht(_))
+    ));
+    on.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dht_bootstrapped_event_once() {
     // A bootstrap node that already knows more than K (8) nodes.
     let boot = loopback_dht(Vec::new()).await;
