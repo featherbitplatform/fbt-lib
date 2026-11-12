@@ -84,8 +84,9 @@ pub struct TorrentStatus {
     /// Under the queue's control
     /// ([`AddTorrent::auto_managed`](crate::AddTorrent::auto_managed)).
     pub auto_managed: bool,
-    /// Time spent running (neither paused, queued nor in error) since it
-    /// was added.
+    /// Time spent announced and open to peers since it was added: past
+    /// its check (a magnet's check right after its metadata counts) and
+    /// neither paused, queued nor in error.
     pub active_time: Duration,
     /// Time spent running as a seed since it was added.
     pub seeding_time: Duration,

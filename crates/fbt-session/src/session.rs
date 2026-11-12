@@ -31,7 +31,7 @@ use crate::net::{
     Endpoint, ExternalIp, ListenError, LsdHub, bind_all, spawn_lsd_task, spawn_nat_task,
     start_port_mapping, utp_for, utp_sockets,
 };
-use crate::queue::{QueueEntry, QueueSettings, plan};
+use crate::queue::{QueueEntry, QueueSettings, is_slow, plan, running_since};
 use crate::settings::Settings;
 use crate::status::TorrentStatus;
 use crate::storage::cache::{CacheBudget, CacheStats};
@@ -333,8 +333,18 @@ pub(crate) struct TorrentEntry {
     pub queued: bool,
     /// The position the actor was last told.
     pub position_sent: Option<usize>,
-    /// When the queue last saw it start running; `None` while it is not.
+    /// When the queue last saw it start running past its check; `None`
+    /// while it is not.
     pub running_since: Option<std::time::Instant>,
+    /// Paused by the user: the actor's own flag, recorded by the actor (a
+    /// paused torrent still reports its check states, not `Paused`).
+    pub user_paused: bool,
+    /// The last pass found it slow (hysteresis, see `queue::is_slow`).
+    pub slow: bool,
+    /// A `SetQueued` the last pass could not send (the actor's queue was
+    /// full); retried by the next pass, or sent with a wait by the handle
+    /// methods that promise the change is applied.
+    pub pending_queued: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -402,22 +412,24 @@ impl SessionInner {
             let Some(e) = reg.torrents.get(ih) else {
                 continue;
             };
-            entries.push((*ih, queue_entry(e, position)));
+            let (q, active) = queue_entry(e, position);
+            entries.push((*ih, q, active));
         }
         let run = if cfg.unlimited() {
             // Nothing is queued: skip the sort.
             entries
                 .iter()
-                .map(|(_, q)| q.auto_managed && !q.user_paused)
+                .map(|(_, q, _)| q.auto_managed && !q.user_paused)
                 .collect()
         } else {
-            let only: Vec<QueueEntry> = entries.iter().map(|(_, q)| q.clone()).collect();
+            let only: Vec<QueueEntry> = entries.iter().map(|(_, q, _)| q.clone()).collect();
             plan(&only, &cfg, now)
         };
-        for ((ih, q), run) in entries.into_iter().zip(run) {
+        for ((ih, q, active), run) in entries.into_iter().zip(run) {
             let Some(e) = reg.torrents.get_mut(&ih) else {
                 continue;
             };
+            e.slow = is_slow(&q, &cfg, now);
             if e.position_sent != Some(q.position)
                 && e.handle.try_cmd(torrent::Cmd::SetQueuePosition(q.position))
             {
@@ -426,18 +438,94 @@ impl SessionInner {
             // The user's pause and errors are not the queue's to change.
             if !e.auto_managed || q.user_paused {
                 e.running_since = None;
+                e.pending_queued = None;
                 continue;
             }
             let queued = !run;
-            if e.queued != queued && e.handle.try_cmd(torrent::Cmd::SetQueued(queued)) {
-                e.queued = queued;
+            e.pending_queued = None;
+            if e.queued != queued {
+                if e.handle.try_cmd(torrent::Cmd::SetQueued(queued)) {
+                    e.queued = queued;
+                } else {
+                    e.pending_queued = Some(queued);
+                }
             }
-            e.running_since = if e.queued {
-                None
-            } else {
-                e.running_since.or(Some(now))
-            };
+            e.running_since = running_since(e.running_since, e.queued, active, now);
         }
+    }
+
+    /// The queue commands of `ih` the last pass could not send, marked as
+    /// sent: the caller sends them with a wait. Its position is always
+    /// included when it differs from what the actor was told.
+    pub(crate) fn take_unsent_queue_cmds(&self, ih: &InfoHashes) -> Vec<torrent::Cmd> {
+        let mut reg = self.registry();
+        let Some(position) = reg.order.iter().position(|o| o == ih) else {
+            return Vec::new();
+        };
+        let Some(e) = reg.torrents.get_mut(ih) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if e.position_sent != Some(position) {
+            e.position_sent = Some(position);
+            out.push(torrent::Cmd::SetQueuePosition(position));
+        }
+        if let Some(queued) = e.pending_queued.take() {
+            e.queued = queued;
+            out.push(torrent::Cmd::SetQueued(queued));
+        }
+        out
+    }
+
+    /// Records the actor's user-pause flag.
+    pub(crate) fn set_user_paused(&self, ih: &InfoHashes, paused: bool) {
+        if let Some(e) = self.registry().torrents.get_mut(ih) {
+            e.user_paused = paused;
+        }
+    }
+
+    /// Before a user resume of `ih`: whether the queue would hold it back,
+    /// with its pause lifted. If so it is marked queued and true returned,
+    /// so the caller queues it before resuming (no `started`/`stopped`
+    /// pair); the next pass decides from there.
+    pub(crate) fn queue_on_resume(&self, ih: &InfoHashes) -> bool {
+        let cfg = self.shared.queue_settings();
+        if cfg.unlimited() {
+            return false;
+        }
+        let mut reg = self.registry();
+        let reg = &mut *reg;
+        let Some(me) = reg.order.iter().position(|o| o == ih) else {
+            return false;
+        };
+        if reg
+            .torrents
+            .get(ih)
+            .is_none_or(|e| !e.auto_managed || e.queued)
+        {
+            // Not the queue's, or already held: resume decides nothing.
+            return false;
+        }
+        let entries: Vec<QueueEntry> = reg
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                let e = reg.torrents.get(o)?;
+                let (mut q, _) = queue_entry(e, i);
+                if i == me {
+                    q.user_paused = false;
+                }
+                Some(q)
+            })
+            .collect();
+        let run = plan(&entries, &cfg, std::time::Instant::now());
+        let held = !run.get(me).copied().unwrap_or(true);
+        if held && let Some(e) = reg.torrents.get_mut(ih) {
+            e.queued = true;
+            e.pending_queued = None;
+        }
+        held
     }
 
     /// Moves `ih` to `position` in the queue (clamped to the last place)
@@ -889,7 +977,7 @@ impl Session {
                     .order
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, o)| reg.torrents.get(o).map(|e| queue_entry(e, i)))
+                    .filter_map(|(i, o)| reg.torrents.get(o).map(|e| queue_entry(e, i).0))
                     .collect();
                 entries.push(QueueEntry {
                     position,
@@ -899,6 +987,7 @@ impl Session {
                     up_rate: 0,
                     user_paused: false,
                     auto_managed: true,
+                    slow: false,
                 });
                 !plan(&entries, &cfg, std::time::Instant::now())
                     .last()
@@ -907,6 +996,7 @@ impl Session {
             }
         };
         let auto_managed = params.auto_managed;
+        let user_paused = params.paused;
         // A magnet's storage is built once its metadata is known.
         let storage: Option<Arc<dyn Storage>> = match (&params.source, params.storage.clone()) {
             (TorrentSource::Magnet(_), _) => None,
@@ -935,6 +1025,9 @@ impl Session {
                 queued,
                 position_sent: Some(position),
                 running_since: None,
+                user_paused,
+                slow: false,
+                pending_queued: None,
             },
         );
         drop(reg);
@@ -1016,19 +1109,28 @@ impl Session {
     }
 }
 
-/// A torrent as the queue sees it, at `position`, from its latest status.
-fn queue_entry(e: &TorrentEntry, position: usize) -> QueueEntry {
-    e.handle.with_status(|st| QueueEntry {
-        position,
-        seeding: st.has_metadata && st.progress >= 1.0,
-        running_since: e.running_since,
-        down_rate: st.download_rate,
-        up_rate: st.upload_rate,
-        user_paused: matches!(
+/// A torrent as the queue sees it, at `position`, from its latest status
+/// and the user-pause flag its actor recorded; plus whether it is past its
+/// check and running (`Downloading`, `Seeding`, `DownloadingMetadata`), when
+/// its startup grace may start.
+fn queue_entry(e: &TorrentEntry, position: usize) -> (QueueEntry, bool) {
+    use crate::status::TorrentState as S;
+    e.handle.with_status(|st| {
+        let q = QueueEntry {
+            position,
+            seeding: st.has_metadata && st.progress >= 1.0,
+            running_since: e.running_since,
+            down_rate: st.download_rate,
+            up_rate: st.upload_rate,
+            user_paused: e.user_paused || st.state == S::Error,
+            auto_managed: e.auto_managed,
+            slow: e.slow,
+        };
+        let active = matches!(
             st.state,
-            crate::status::TorrentState::Paused | crate::status::TorrentState::Error
-        ),
-        auto_managed: e.auto_managed,
+            S::Downloading | S::Seeding | S::DownloadingMetadata
+        );
+        (q, active)
     })
 }
 

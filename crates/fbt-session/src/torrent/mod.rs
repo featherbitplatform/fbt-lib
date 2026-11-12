@@ -263,8 +263,17 @@ impl TorrentHandle {
         self.call(Cmd::Pause).await?
     }
 
-    /// Undoes [`pause`](Self::pause); also clears a storage error.
+    /// Undoes [`pause`](Self::pause); also clears a storage error. An
+    /// auto-managed torrent returns to the session's queue: with no free
+    /// slot for its position it resumes as
+    /// [`TorrentState::Queued`](crate::TorrentState::Queued) without
+    /// announcing.
     pub async fn resume(&self) -> Result<(), SessionError> {
+        if let Ok(session) = self.session()
+            && session.queue_on_resume(&self.inner.info_hashes)
+        {
+            self.send(Cmd::SetQueued(true)).await?;
+        }
         self.call(Cmd::Resume).await?
     }
 
@@ -457,6 +466,7 @@ impl TorrentHandle {
         self.call(|tx| Cmd::SetAutoManaged(auto_managed, tx))
             .await?;
         session.queue_pass();
+        self.send_unsent(&session).await?;
         self.call(Cmd::Sync).await
     }
 
@@ -469,9 +479,27 @@ impl TorrentHandle {
         if self.inner.shared.is_shutdown() {
             return Err(SessionError::Shutdown);
         }
-        self.session()?
-            .move_in_queue(&self.inner.info_hashes, position)?;
+        let session = self.session()?;
+        session.move_in_queue(&self.inner.info_hashes, position)?;
+        self.send_unsent(&session).await?;
         self.call(Cmd::Sync).await
+    }
+
+    /// Sends, with a wait, the queue commands for this torrent that the
+    /// last pass found no room for.
+    async fn send_unsent(&self, session: &SessionInner) -> Result<(), SessionError> {
+        for cmd in session.take_unsent_queue_cmds(&self.inner.info_hashes) {
+            self.send(cmd).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends `cmd`, waiting for room in the actor's queue.
+    async fn send(&self, cmd: Cmd) -> Result<(), SessionError> {
+        if self.inner.shared.is_shutdown() {
+            return Err(SessionError::Shutdown);
+        }
+        self.inner.cmds.send(cmd).await.map_err(|_| self.gone())
     }
 
     /// The session, while this torrent is in it.

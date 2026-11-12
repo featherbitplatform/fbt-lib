@@ -32,6 +32,7 @@ impl Actor {
                     self.account_time();
                     let was_stopped = self.stopped();
                     self.paused = true;
+                    self.record_user_pause();
                     self.metadata_check = false;
                     if !was_stopped {
                         self.close_all();
@@ -213,6 +214,7 @@ impl Actor {
         let was_error = matches!(self.phase, Phase::Error(_));
         self.account_time();
         self.paused = false;
+        self.record_user_pause();
         if was_error && self.loaded.is_none() {
             // Bad metadata: fetch it again from scratch.
             let max = self.shared.settings.max_metadata_size;
@@ -231,6 +233,14 @@ impl Actor {
             self.start_check();
         }
         self.restart();
+    }
+
+    /// Tells the session's queue the user-pause flag, before the state
+    /// change that wakes the scheduler.
+    pub(super) fn record_user_pause(&self) {
+        if let Some(session) = self.session.upgrade() {
+            session.set_user_paused(&self.ih, self.paused);
+        }
     }
 
     /// After a resume or unqueue: readers' deadlines from now, the new

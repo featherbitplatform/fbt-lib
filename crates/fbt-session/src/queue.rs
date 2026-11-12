@@ -6,6 +6,12 @@
 
 use std::time::{Duration, Instant};
 
+/// Hysteresis of the slow verdict: a torrent found slow stays slow until a
+/// rate reaches this many times its inactive threshold, so one hovering
+/// around the threshold is not queued and started on alternate passes
+/// (each time announcing `stopped` and `started`).
+pub(crate) const SLOW_EXIT_FACTOR: u64 = 2;
+
 /// Limits on the auto-managed torrents running at once
 /// ([`Settings::queue`](crate::Settings::queue), changed at runtime with
 /// [`Session::set_queue_settings`](crate::Session::set_queue_settings)).
@@ -39,7 +45,11 @@ pub struct QueueSettings {
     /// A slow torrent (both rates below `inactive_down_rate` and
     /// `inactive_up_rate` once running for `startup_grace`) does not count
     /// against `active_downloads` or `active_seeds` (true), so it does not
-    /// hold back the next one in the queue.
+    /// hold back the next one in the queue. The grace starts once the
+    /// torrent has finished checking. A slow torrent stays slow until a
+    /// rate reaches twice its threshold; when it counts again, the queue
+    /// order decides once more, so a torrent started in its place may be
+    /// queued.
     pub dont_count_slow_torrents: bool,
     /// Download rate below which a torrent may be slow, bytes per second
     /// (2048).
@@ -104,15 +114,35 @@ pub(crate) struct QueueEntry {
     pub user_paused: bool,
     /// Under the queue's control.
     pub auto_managed: bool,
+    /// The previous pass found it slow (see [`SLOW_EXIT_FACTOR`]).
+    pub slow: bool,
 }
 
 /// `e` is running, past its startup grace, with both rates below the
-/// inactive thresholds.
+/// inactive thresholds; or, found slow by the previous pass, below
+/// [`SLOW_EXIT_FACTOR`] times them.
 pub(crate) fn is_slow(e: &QueueEntry, cfg: &QueueSettings, now: Instant) -> bool {
+    let factor = if e.slow { SLOW_EXIT_FACTOR } else { 1 };
     e.running_since
         .is_some_and(|since| now.saturating_duration_since(since) >= cfg.startup_grace)
-        && e.down_rate < cfg.inactive_down_rate
-        && e.up_rate < cfg.inactive_up_rate
+        && e.down_rate < cfg.inactive_down_rate.saturating_mul(factor)
+        && e.up_rate < cfg.inactive_up_rate.saturating_mul(factor)
+}
+
+/// When the queue counts a torrent's start for its startup grace: from the
+/// first pass that sees it running and past its check (`active`), kept
+/// while it runs, cleared while it is queued, paused or checking.
+pub(crate) fn running_since(
+    prev: Option<Instant>,
+    queued: bool,
+    active: bool,
+    now: Instant,
+) -> Option<Instant> {
+    if queued || !active {
+        None
+    } else {
+        prev.or(Some(now))
+    }
 }
 
 /// Which torrents run: `true` at index `i` lets `entries[i]` run. Entries
@@ -169,6 +199,7 @@ mod tests {
             up_rate: 0,
             user_paused: false,
             auto_managed: true,
+            slow: false,
         }
     }
 
@@ -185,7 +216,10 @@ mod tests {
         #[test]
         fn plan_never_exceeds_limits(
             raw in proptest::collection::vec(
-                (any::<bool>(), 0u8..3, 0u64..5000, 0u64..5000, any::<bool>(), any::<bool>(), any::<u16>()),
+                (
+                    (any::<bool>(), 0u8..3, 0u64..5000, 0u64..5000),
+                    (any::<bool>(), any::<bool>(), any::<u16>(), any::<bool>()),
+                ),
                 0..=40,
             ),
             downloads in proptest::option::of(0usize..6),
@@ -199,11 +233,11 @@ mod tests {
             let n = raw.len();
             // A shuffled permutation of 0..n as positions.
             let mut positions: Vec<usize> = (0..n).collect();
-            positions.sort_by_key(|&p| raw.get(p).map_or(0, |r| r.6));
+            positions.sort_by_key(|&p| raw.get(p).map_or(0, |r| r.1.2));
             let entries: Vec<QueueEntry> = raw
                 .iter()
                 .zip(positions)
-                .map(|(&(seeding, age, down, up, paused, managed, _), position)| QueueEntry {
+                .map(|(&((seeding, age, down, up), (paused, managed, _, slow)), position)| QueueEntry {
                     position,
                     seeding,
                     // Not running, running within its grace, or past it.
@@ -216,6 +250,7 @@ mod tests {
                     up_rate: up,
                     user_paused: paused,
                     auto_managed: managed,
+                    slow,
                 })
                 .collect();
             let run = plan(&entries, &c, now);
@@ -240,6 +275,36 @@ mod tests {
             for (e, r) in entries.iter().zip(&run) {
                 if e.user_paused || !e.auto_managed {
                     prop_assert!(!r, "started a paused or unmanaged entry: {:?}", e);
+                }
+            }
+            // Free slots are filled: walking the queue in position order,
+            // an eligible entry left queued found the total or (not exempt)
+            // its class full at its turn.
+            let mut by_pos: Vec<usize> = (0..n).collect();
+            by_pos.sort_by_key(|&i| entries[i].position);
+            let (mut dl, mut sd, mut total) = (0usize, 0usize, 0usize);
+            let full = |count: usize, limit: Option<usize>| limit.is_some_and(|l| count >= l);
+            for i in by_pos {
+                let e = &entries[i];
+                if e.user_paused || !e.auto_managed {
+                    continue;
+                }
+                let exempt = c.dont_count_slow_torrents && is_slow(e, &c, now);
+                let (count, limit) = if e.seeding {
+                    (sd, c.active_seeds)
+                } else {
+                    (dl, c.active_downloads)
+                };
+                if run[i] {
+                    total += 1;
+                    if !exempt {
+                        if e.seeding { sd += 1 } else { dl += 1 }
+                    }
+                } else {
+                    prop_assert!(
+                        full(total, c.active_limit) || (!exempt && full(count, limit)),
+                        "left {:?} queued with a free slot", e
+                    );
                 }
             }
         }
@@ -277,6 +342,54 @@ mod tests {
             plan(&entries, &cfg(None, None, None), Instant::now()),
             [true; 4]
         );
+    }
+
+    /// A running torrent whose rate hovers between the threshold and twice
+    /// it, pass after pass, keeps one verdict: the plan does not flap.
+    #[test]
+    fn slow_verdict_does_not_flap_near_the_threshold() {
+        let now = Instant::now();
+        let c = cfg(Some(1), None, None);
+        let mut first = entry(0, false);
+        first.running_since = now.checked_sub(Duration::from_secs(120));
+        first.down_rate = 1000;
+        let mut second = entry(1, false);
+        let mut verdicts = Vec::new();
+        for pass in 0..12u64 {
+            // 1900 and 2500 B/s around the 2048 B/s threshold.
+            first.down_rate = if pass % 2 == 0 { 1900 } else { 2500 };
+            let entries = [first.clone(), second.clone()];
+            let run = plan(&entries, &c, now);
+            verdicts.push(run.clone());
+            first.slow = is_slow(&first, &c, now);
+            second.running_since = running_since(second.running_since, !run[1], true, now);
+        }
+        assert!(verdicts.iter().all(|v| *v == [true, true]), "{verdicts:?}");
+        // Well above twice the threshold, it counts again.
+        first.down_rate = 5000;
+        assert!(!is_slow(&first, &c, now));
+        assert_eq!(plan(&[first, second], &c, now), [true, false]);
+        // Without the hysteresis, 2500 B/s would have been fast.
+        let mut fresh = entry(0, false);
+        fresh.running_since = now.checked_sub(Duration::from_secs(120));
+        fresh.down_rate = 2500;
+        assert!(!is_slow(&fresh, &c, now));
+    }
+
+    /// The grace starts after the check: a checking torrent has no start.
+    #[test]
+    fn grace_starts_after_the_check() {
+        let now = Instant::now();
+        let earlier = now.checked_sub(Duration::from_secs(5));
+        assert_eq!(running_since(None, false, false, now), None, "checking");
+        assert_eq!(
+            running_since(earlier, false, false, now),
+            None,
+            "rechecking"
+        );
+        assert_eq!(running_since(None, false, true, now), Some(now));
+        assert_eq!(running_since(earlier, false, true, now), earlier);
+        assert_eq!(running_since(earlier, true, true, now), None, "queued");
     }
 
     #[test]

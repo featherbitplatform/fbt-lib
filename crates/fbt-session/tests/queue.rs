@@ -252,7 +252,7 @@ async fn set_queue_position_moves_it_up() {
     assert_eq!(dense_positions(&h).await, [1, 2, 0]);
     assert!(wait_state(&h[2], is(TorrentState::Downloading), T).await);
     assert!(wait_state(&h[0], is(TorrentState::Queued), T).await);
-    assert_eq!(h[1].status().state, TorrentState::Queued);
+    assert!(wait_state(&h[1], is(TorrentState::Queued), T).await);
     // Clamped: past the end is the bottom.
     h[2].set_queue_position(99).await.unwrap();
     assert_eq!(h[2].status().queue_position, 2);
@@ -295,6 +295,96 @@ async fn user_pause_beats_the_queue() {
     paused.pause().await.unwrap();
     assert!(wait_state(&rest[1], is(TorrentState::Downloading), T).await);
     assert_eq!(paused.status().state, TorrentState::Paused);
+    s.shutdown().await;
+}
+
+/// A paused torrent takes no slot even while it checks: two downloads
+/// added behind it under a limit of two never queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_torrent_checking_takes_no_slot() {
+    // The downloads check beside the slow check, and are done long before.
+    let mut cfg = settings(Some(2));
+    cfg.max_active_checks = 4;
+    let s = Session::new(cfg).await.unwrap();
+    let mut ev = s.subscribe(EventMask::STATUS);
+    // Forty pieces read at 100 ms each: a check of about four seconds.
+    let (m, payload) = make_torrent(&[("a", 40 * 16_384)], 16_384);
+    let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+    p.storage = Some(Arc::new(SlowStorage::new(
+        payload,
+        Duration::from_millis(100),
+    )));
+    p.paused = true;
+    let paused = s.add_torrent(p).await.unwrap();
+    assert!(
+        wait_state(
+            &paused,
+            |st| matches!(st, TorrentState::CheckingFiles { .. }),
+            T
+        )
+        .await
+    );
+    let rest = add_downloads(&s, 2).await;
+    for h in &rest {
+        assert!(wait_state(h, is(TorrentState::Downloading), T).await);
+    }
+    assert!(
+        matches!(paused.status().state, TorrentState::CheckingFiles { .. }),
+        "the slow check ended first"
+    );
+    assert!(wait_state(&paused, is(TorrentState::Paused), T).await);
+    let mut seen = Vec::new();
+    drain(&mut ev, &mut seen).await;
+    for h in &rest {
+        let states = state_events(&seen, h.info_hashes());
+        assert!(
+            !states.contains(&TorrentState::Queued),
+            "queued behind a paused torrent: {states:?}"
+        );
+    }
+    s.shutdown().await;
+}
+
+/// Resuming a paused torrent with no free slot for its position leaves it
+/// queued without announcing: no `started`/`stopped` pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_without_a_slot_stays_queued_silently() {
+    let tracker = FakeTracker::http(Reply::Peers).await;
+    let s = Session::new(settings(Some(2))).await.unwrap();
+    let port = s.local_addr().port();
+    let mut ev = s.subscribe(EventMask::STATUS);
+    let first = add_downloads(&s, 1).await;
+    let (m, payload) = torrent(Some(&tracker.url));
+    let h = add_download(&s, &m, payload.len()).await;
+    assert!(wait_state(&h, is(TorrentState::Downloading), T).await);
+    assert!(wait_until(|| tracker.events_of(port) == ["started"], T).await);
+    h.pause().await.unwrap();
+    assert!(wait_until(|| tracker.events_of(port) == ["started", "stopped"], T).await);
+    // One slot, taken by the first: none left for the paused one.
+    let mut q = settings(None).queue;
+    q.active_downloads = Some(1);
+    s.set_queue_settings(q).unwrap();
+    let mut seen = Vec::new();
+    drain(&mut ev, &mut seen).await;
+    h.resume().await.unwrap();
+    assert!(wait_state(&h, is(TorrentState::Queued), T).await);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(h.status().state, TorrentState::Queued);
+    let mut seen = Vec::new();
+    drain(&mut ev, &mut seen).await;
+    let states = state_events(&seen, h.info_hashes());
+    assert_eq!(states, [TorrentState::Queued], "ran before it was queued");
+    assert_eq!(tracker.events_of(port), ["started", "stopped"]);
+    // A free slot starts it.
+    first[0].pause().await.unwrap();
+    assert!(wait_state(&h, is(TorrentState::Downloading), T).await);
+    assert!(
+        wait_until(
+            || tracker.events_of(port) == ["started", "stopped", "started"],
+            T
+        )
+        .await
+    );
     s.shutdown().await;
 }
 

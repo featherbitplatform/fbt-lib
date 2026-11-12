@@ -762,7 +762,13 @@ impl Actor {
     /// [`Settings::seed_ratio_limit`]: crate::Settings::seed_ratio_limit
     /// [`Settings::seed_time_limit`]: crate::Settings::seed_time_limit
     fn check_seed_limits(&mut self) {
-        if !self.auto_managed || self.stopped() || self.state() != TorrentState::Seeding {
+        // During a storage move the pause could not flush: the check
+        // waits for the tick after the move, when the verdict is the same.
+        if !self.auto_managed
+            || self.stopped()
+            || self.storage_busy
+            || self.state() != TorrentState::Seeding
+        {
             return;
         }
         let s = &self.shared.settings;
@@ -786,6 +792,7 @@ impl Actor {
         }
         // The pause path; nobody waits for the flush.
         self.paused = true;
+        self.record_user_pause();
         self.metadata_check = false;
         self.close_all();
         self.flush(FlushReason::All);
