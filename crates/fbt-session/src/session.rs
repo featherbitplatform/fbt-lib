@@ -637,7 +637,10 @@ impl Session {
         }
     }
 
-    /// The session's IP filter (allow everything by default).
+    /// A copy of the session's IP filter (allow everything by default).
+    /// The copy is deep: a filter near
+    /// [`MAX_RANGES`](fbt_net::ipfilter::MAX_RANGES) costs tens of MB, so
+    /// read it when needed rather than polling it.
     pub fn ip_filter(&self) -> IpFilter {
         let f = self
             .inner

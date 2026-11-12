@@ -15,6 +15,10 @@ use tracing::{debug, warn};
 
 /// Most disjoint ranges an [`IpFilter`] holds, both families together. A
 /// rule that could take it past this is ignored (and logged once).
+///
+/// A full filter takes about 70 to 80 MB (48 bytes of key and value per
+/// range plus the B-tree's node overhead); [`IpFilter::rules`], serialising
+/// and cloning it each take about as much again while they run.
 pub const MAX_RANGES: usize = 1_000_000;
 
 /// Ranges of addresses that are blocked or explicitly allowed; everything
@@ -322,6 +326,45 @@ mod tests {
         v6.block(r("::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"));
         assert!(v6.is_blocked(ip("2001:db8::1")));
         assert_eq!(v6.len(), 1);
+    }
+
+    /// Splits and merges at both ends of the IPv6 space (`u128` 0 and
+    /// `u128::MAX`).
+    #[test]
+    fn v6_splits_at_the_ends_of_the_space() {
+        let max = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
+        let below_max = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe";
+        let mut f = IpFilter::default();
+        f.block(r("::", max));
+        f.allow(r(max, max));
+        assert_eq!(
+            f.rules(),
+            vec![(r("::", below_max), true), (r(max, max), false)]
+        );
+        assert!(f.is_blocked(ip(below_max)));
+        assert!(!f.is_blocked(ip(max)));
+        f.allow(r("::", "::"));
+        assert_eq!(
+            f.rules(),
+            vec![
+                (r("::", "::"), false),
+                (r("::1", below_max), true),
+                (r(max, max), false),
+            ]
+        );
+        assert!(!f.is_blocked(ip("::")));
+        assert!(f.is_blocked(ip("::1")));
+        // A block in the middle of the space splits nothing new.
+        f.block(r("2001:db8::", "2001:db8::ff"));
+        assert_eq!(f.len(), 3);
+        // Blocking both ends again merges everything into one range.
+        f.block(r(max, max));
+        f.block(r("::", "::"));
+        assert_eq!(f.rules(), vec![(r("::", max), true)]);
+        // Allowing the whole space replaces it with one allowed range.
+        f.allow(r("::", max));
+        assert_eq!(f.rules(), vec![(r("::", max), false)]);
+        assert!(!f.is_blocked(ip("2001:db8::1")));
     }
 
     #[test]

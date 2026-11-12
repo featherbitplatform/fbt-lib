@@ -3,7 +3,7 @@
 //! handshake from MSE; MSE connections are answered as responder and
 //! matched to a torrent by `HASH('req2', SKEY)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -32,6 +32,49 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// transports; further connections from that IP are dropped unread.
 const MAX_PENDING_PER_IP: usize = 8;
 
+/// How often an IP whose connections the session refuses (IP filter or
+/// ban) is reported with [`Event::PeerBlocked`](crate::Event::PeerBlocked);
+/// its other refusals in between are only logged, so a blocked host that
+/// reconnects in a loop cannot flood the event channel.
+const BLOCKED_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Refused IPs [`BlockedReports`] remembers; when full, the oldest is
+/// forgotten (and may be reported again).
+const MAX_BLOCKED_REPORTS: usize = 1024;
+
+/// When each recently refused IP was last reported.
+#[derive(Debug, Default)]
+struct BlockedReports {
+    last: HashMap<IpAddr, Instant>,
+    /// `last` in report order, oldest first.
+    order: VecDeque<IpAddr>,
+}
+
+impl BlockedReports {
+    /// Whether a refusal of `ip` at `now` is reported: the first one, and
+    /// then once per [`BLOCKED_REPORT_INTERVAL`].
+    fn should_report(&mut self, ip: IpAddr, now: Instant) -> bool {
+        // `::ffff:a.b.c.d` and `a.b.c.d` are one source.
+        let ip = ip.to_canonical();
+        if let Some(at) = self.last.get(&ip) {
+            if now.saturating_duration_since(*at) < BLOCKED_REPORT_INTERVAL {
+                return false;
+            }
+            self.order.retain(|a| *a != ip);
+            self.last.remove(&ip);
+        }
+        while self.order.len() >= MAX_BLOCKED_REPORTS {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.last.remove(&old);
+        }
+        self.last.insert(ip, now);
+        self.order.push_back(ip);
+        true
+    }
+}
+
 /// Accept-side state shared by every accept loop of the session, so the
 /// limits hold across all listen addresses and both transports together.
 #[derive(Debug)]
@@ -44,6 +87,8 @@ pub(crate) struct ListenerState {
     /// each). One entry per pending handshake at most, so the map is
     /// bounded by `pending`'s permits.
     per_ip: Mutex<HashMap<IpAddr, usize>>,
+    /// Throttles the reports of refused connections.
+    blocked_reports: Mutex<BlockedReports>,
 }
 
 impl ListenerState {
@@ -52,7 +97,17 @@ impl ListenerState {
         ListenerState {
             pending: Arc::new(Semaphore::new(permits)),
             per_ip: Mutex::new(HashMap::new()),
+            blocked_reports: Mutex::new(BlockedReports::default()),
         }
+    }
+
+    /// Whether a refused connection from `ip` is reported now (see
+    /// [`BLOCKED_REPORT_INTERVAL`]).
+    fn report_blocked(&self, ip: IpAddr, now: Instant) -> bool {
+        self.blocked_reports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .should_report(ip, now)
     }
 
     /// Admits a connection from `addr` into the pending-handshake phase:
@@ -103,17 +158,20 @@ impl Drop for PendingHandshake {
     }
 }
 
-/// The session refuses connections from `addr` (IP filter or ban): reported
-/// with no torrent, since nothing was read, and the caller drops the
-/// connection before [`ListenerState::admit`].
-fn refused(shared: &Shared, addr: SocketAddr) -> bool {
-    match shared.blocked(addr) {
-        Some(reason) => {
-            shared.emit_blocked(None, addr, reason);
-            true
-        }
-        None => false,
+/// The session refuses connections from `addr` (IP filter or ban): the
+/// caller drops the connection before [`ListenerState::admit`]. Reported
+/// with no torrent, since nothing was read, at most once per IP per
+/// [`BLOCKED_REPORT_INTERVAL`].
+fn refused(shared: &Shared, state: &ListenerState, addr: SocketAddr) -> bool {
+    let Some(reason) = shared.blocked(addr) else {
+        return false;
+    };
+    if state.report_blocked(addr.ip(), Instant::now()) {
+        shared.emit_blocked(None, addr, reason);
+    } else {
+        debug!(%addr, ?reason, "refused connection from a blocked peer");
     }
+    true
 }
 
 /// Runs one TCP accept loop until the session goes away or the task is
@@ -137,7 +195,7 @@ pub(crate) fn spawn(
             if session.strong_count() == 0 || shared.is_shutdown() {
                 return;
             }
-            if refused(&shared, addr) {
+            if refused(&shared, &state, addr) {
                 continue;
             }
             let Some(permit) = state.admit(addr) else {
@@ -172,7 +230,7 @@ pub(crate) fn spawn_utp(
             if session.strong_count() == 0 || shared.is_shutdown() {
                 return;
             }
-            if refused(&shared, addr) {
+            if refused(&shared, &state, addr) {
                 continue;
             }
             let Some(permit) = state.admit(addr) else {
@@ -317,6 +375,34 @@ mod tests {
         assert!(state.admit(sa("10.0.0.1:2000")).is_some());
         // Nothing is left behind once everything is dropped.
         assert!(state.per_ip.lock().expect("lock").is_empty());
+    }
+
+    /// Repeated refusals of one IP, from any port and in either form, are
+    /// reported once per interval; other IPs have their own; the table
+    /// stays bounded.
+    #[tokio::test(start_paused = true)]
+    async fn refusals_of_one_ip_are_reported_once_per_interval() {
+        let state = ListenerState::new(100);
+        let now = Instant::now();
+        assert!(state.report_blocked(sa("10.0.0.1:1000").ip(), now));
+        for port in 1001..1100 {
+            assert!(!state.report_blocked(sa(&format!("10.0.0.1:{port}")).ip(), now));
+        }
+        assert!(!state.report_blocked(sa("[::ffff:10.0.0.1]:1").ip(), now));
+        assert!(state.report_blocked(sa("10.0.0.2:1").ip(), now));
+        let later = now + BLOCKED_REPORT_INTERVAL - Duration::from_millis(1);
+        assert!(!state.report_blocked(sa("10.0.0.1:1").ip(), later));
+        let due = now + BLOCKED_REPORT_INTERVAL;
+        assert!(state.report_blocked(sa("10.0.0.1:1").ip(), due));
+        assert!(!state.report_blocked(sa("10.0.0.1:1").ip(), due));
+        // Bounded: many IPs push the oldest out.
+        for i in 0..2 * MAX_BLOCKED_REPORTS as u32 {
+            let ip = std::net::Ipv4Addr::from(0x0b00_0000 + i);
+            assert!(state.report_blocked(IpAddr::V4(ip), due));
+        }
+        let r = state.blocked_reports.lock().expect("lock");
+        assert_eq!(r.last.len(), MAX_BLOCKED_REPORTS);
+        assert_eq!(r.order.len(), MAX_BLOCKED_REPORTS);
     }
 
     #[test]

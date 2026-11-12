@@ -260,6 +260,14 @@ impl Actor {
                 self.unreserve_dial();
                 continue;
             }
+            // Its IP is at the per-IP limit: not dialled now, and not a
+            // failure (it stays known for when the IP has room).
+            if self.over_ip_limit(&[], &addr) {
+                debug!(%addr, "IP at its connection limit; not dialling");
+                self.retries.clear_transport_failed(&addr);
+                self.unreserve_dial();
+                continue;
+            }
             // A pending fallback goes first; otherwise the transport the
             // settings and what we know of the address prefer.
             let transport = self
@@ -408,7 +416,7 @@ impl Actor {
         if self.refuse_blocked(addr) {
             return;
         }
-        if self.over_ip_limit(None, &addr) {
+        if self.over_ip_limit(&[], &addr) {
             self.emit_blocked(addr, BlockReason::PerIpLimit);
             return;
         }
@@ -507,9 +515,10 @@ impl Actor {
     }
 
     /// Whether `addr`'s IP already has `max_peers_per_ip` connected peers
-    /// in this torrent, besides `key` (IPv4-mapped addresses count as
-    /// IPv4; loopback is exempt under `per_ip_exempt_loopback`).
-    fn over_ip_limit(&self, key: Option<PeerKey>, addr: &SocketAddr) -> bool {
+    /// in this torrent, not counting those in `ignore` (IPv4-mapped
+    /// addresses count as IPv4; loopback is exempt under
+    /// `per_ip_exempt_loopback`).
+    fn over_ip_limit(&self, ignore: &[PeerKey], addr: &SocketAddr) -> bool {
         let s = &self.shared.settings;
         let ip = addr.ip().to_canonical();
         if s.per_ip_exempt_loopback && ip.is_loopback() {
@@ -519,7 +528,7 @@ impl Actor {
             .peers
             .iter()
             .filter(|(k, p)| {
-                Some(**k) != key
+                !ignore.contains(k)
                     && p.connected
                     && p.tx.is_some()
                     && p.addr.ip().to_canonical() == ip
@@ -576,11 +585,15 @@ impl Actor {
             })
             .map(|(k, o)| (*k, o.outgoing));
         self.on_peer_set_changed();
-        // Another connection to the same peer is the tie-break's to settle
-        // (it leaves the IP's count as it was); any other one counts
-        // against the per-IP limit. Refused, it never was connected: its
-        // end is reported as a failed attempt.
-        if duplicate.is_none() && self.over_ip_limit(Some(key), &addr) {
+        // The per-IP limit, not counting an older connection with the same
+        // peer id: the tie-break keeps one of the two, so a duplicate from
+        // the same IP nets to zero, while one claiming the peer id of a
+        // peer at another IP counts like any other. Refused, it never was
+        // connected: its end is reported as a failed attempt.
+        let ignore: Vec<PeerKey> = std::iter::once(key)
+            .chain(duplicate.map(|(k, _)| k))
+            .collect();
+        if self.over_ip_limit(&ignore, &addr) {
             let Some(p) = self.peers.get_mut(&key) else {
                 return ConnectOutcome::Dropped;
             };

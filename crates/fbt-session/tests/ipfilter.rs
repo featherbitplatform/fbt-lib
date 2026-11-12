@@ -109,6 +109,19 @@ async fn blocked_incoming_is_closed_before_handshake() {
             reason: BlockReason::IpFilter,
         }
     );
+    // Further refusals of that IP within a minute are not reported again.
+    for _ in 0..3 {
+        let mut again = TcpStream::connect(s.local_addr()).await.unwrap();
+        let mut got = Vec::new();
+        let read = tokio::time::timeout(T, again.read_to_end(&mut got)).await;
+        assert!(read.is_ok() && got.is_empty(), "refused unread");
+    }
+    assert!(
+        next_matching(&mut ev, blocked, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "one report per IP per interval"
+    );
     s.shutdown().await;
 }
 
@@ -191,27 +204,62 @@ async fn second_connection_from_one_ip_is_refused() {
     let mut st = plain();
     st.per_ip_exempt_loopback = false;
     assert_eq!(st.max_peers_per_ip, 1);
-    let (s, h, m, [a, b], [_pa, mut pb], [mut ev, mut ev_blocked]) = dial_two(st).await;
-    let e = next_matching(
-        &mut ev,
-        |e| {
-            matches!(
-                e,
-                Event::PeerDisconnected { .. } | Event::PeerConnected { .. }
-            )
-        },
-        T,
-    )
-    .await
-    .expect("the second connection ends");
-    assert_eq!(
-        e,
-        Event::PeerDisconnected {
-            torrent: m.info_hashes,
-            addr: b,
-            reason: DisconnectReason::Blocked(BlockReason::PerIpLimit),
-        }
+    let la = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (a, b, c) = (
+        la.local_addr().unwrap(),
+        lb.local_addr().unwrap(),
+        lc.local_addr().unwrap(),
     );
+    let (s, h, m) = leecher(st).await;
+    let mut ev = s.subscribe(EventMask::PEER);
+    let mut ev_blocked = s.subscribe(EventMask::PEER);
+    // Both are dialled before either finishes its handshake, so the limit
+    // is decided when the second handshake completes.
+    h.add_peer(a).await.unwrap();
+    h.add_peer(b).await.unwrap();
+    let (pa, pb) = tokio::join!(
+        ScriptedPeer::accept_with(&la, Reserved::default()),
+        ScriptedPeer::accept_with(&lb, Reserved::default()),
+    );
+    let mut connected = None;
+    let mut refused = None;
+    while connected.is_none() || refused.is_none() {
+        let e = next_matching(
+            &mut ev,
+            |e| {
+                matches!(
+                    e,
+                    Event::PeerDisconnected { .. } | Event::PeerConnected { .. }
+                )
+            },
+            T,
+        )
+        .await
+        .expect("both handshakes end");
+        match e {
+            Event::PeerConnected { addr, .. } => {
+                assert!(connected.replace(addr).is_none(), "only one connects")
+            }
+            Event::PeerDisconnected {
+                torrent,
+                addr,
+                reason,
+            } => {
+                assert_eq!(torrent, m.info_hashes);
+                assert_eq!(reason, DisconnectReason::Blocked(BlockReason::PerIpLimit));
+                assert!(refused.replace(addr).is_none(), "only one is refused");
+            }
+            _ => unreachable!(),
+        }
+    }
+    let (winner, loser) = (connected.unwrap(), refused.unwrap());
+    let mut sorted = [winner, loser];
+    sorted.sort();
+    let mut want = [a, b];
+    want.sort();
+    assert_eq!(sorted, want);
     let e = next_matching(&mut ev_blocked, blocked, T)
         .await
         .expect("PeerBlocked");
@@ -219,11 +267,21 @@ async fn second_connection_from_one_ip_is_refused() {
         e,
         Event::PeerBlocked {
             torrent: Some(m.info_hashes),
-            addr: b,
+            addr: loser,
             reason: BlockReason::PerIpLimit,
         }
     );
-    assert!(matches!(pb.wait_closed(T).await, PeerEnd::Closed));
+    let mut lost = if loser == a { pa } else { pb };
+    assert!(matches!(lost.wait_closed(T).await, PeerEnd::Closed));
+    // A third address on that IP is not even dialled while the IP is at
+    // its limit.
+    h.add_peer(c).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), lc.accept())
+            .await
+            .is_err(),
+        "an IP at its limit is not dialled"
+    );
     // An incoming connection from the same IP is refused too, unread.
     let mut stream = TcpStream::connect(s.local_addr()).await.unwrap();
     let from = stream.local_addr().unwrap();
@@ -246,13 +304,13 @@ async fn second_connection_from_one_ip_is_refused() {
     );
     let mut rest = Vec::new();
     let _ = tokio::time::timeout(T, stream.read_to_end(&mut rest)).await;
-    // The first peer is still connected (the status catches up within a
+    // The winner is still connected (the status catches up within a
     // status interval).
     assert!(wait_until(|| h.status().num_peers == 1, T).await);
     assert!(
         next_matching(
             &mut ev,
-            |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == a),
+            |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == winner),
             Duration::from_millis(300),
         )
         .await
