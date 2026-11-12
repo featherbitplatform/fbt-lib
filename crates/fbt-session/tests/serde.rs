@@ -56,7 +56,7 @@ fn changed() -> Settings {
     s.enable_outgoing_tcp = false;
     s.enable_incoming_tcp = false;
     s.enable_outgoing_utp = false;
-    s.enable_incoming_utp = true;
+    s.enable_incoming_utp = false;
     s.utp_connect_timeout = Duration::from_secs(4);
     s.enable_holepunch = false;
     s.enable_lsd = false;
@@ -105,6 +105,8 @@ fn missing_fields_take_defaults() {
     let s: Settings = serde_json::from_str(r#"{"num_want": 9}"#).unwrap();
     assert_eq!(s.num_want, 9);
     assert_eq!(s.max_peers_global, Settings::default().max_peers_global);
+    let s: Settings = serde_json::from_str(r#"{"tracker": {}, "rate_limit": {}}"#).unwrap();
+    assert_eq!(format!("{s:?}"), format!("{:?}", Settings::default()));
 }
 
 #[test]
