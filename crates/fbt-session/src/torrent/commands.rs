@@ -213,6 +213,11 @@ impl Actor {
         if self.finish_pending {
             self.flush(FlushReason::All);
             self.maybe_finish();
+        } else if self.finished_emitted && !self.cache.is_idle() {
+            // Still finished, and a dirty skipped piece may be wanted now:
+            // it goes to disk at once (`state` counts a finished torrent's
+            // dirty pieces as skipped ones).
+            self.flush(FlushReason::All);
         }
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {

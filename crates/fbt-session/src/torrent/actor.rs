@@ -547,11 +547,15 @@ impl Actor {
                     .as_ref()
                     .and_then(|l| l.picker.as_ref())
                     .is_some_and(PiecePicker::is_finished)
-                    && self.cache.is_idle()
+                    && (self.cache.is_idle() || self.finished_emitted)
                     && !self.finish_pending
                     && !self.finish_flush
                 {
-                    // Complete on disk, not only in the cache.
+                    // Complete on disk, not only in the cache. Once the
+                    // finish's flush is back (`finished_emitted` and no
+                    // finish under way), whatever is dirty passed after it:
+                    // skipped pieces (a reader's window), which do not
+                    // make the torrent downloading again.
                     TorrentState::Seeding
                 } else {
                     TorrentState::Downloading

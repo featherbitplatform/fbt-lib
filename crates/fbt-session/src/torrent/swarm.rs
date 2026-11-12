@@ -612,6 +612,11 @@ impl Actor {
                 DisconnectReason::IdleTimeout | DisconnectReason::Io(_) | DisconnectReason::Closed
             )
             && (p.from_rate.total() > 0 || p.to_rate.total() > 0)
+            // A seed or upload-only peer that leaves while we are finished
+            // has nothing to trade: `note_seed_gone` keeps it for the
+            // moment we stop being finished, which redials it at once (a
+            // pending backoff would hold that redial back for minutes).
+            && !(self.upload_only_sent && (p.upload_only || p.is_seed()))
         {
             // A peer that traded data and then went away (it closed, its
             // transport timed out, or it went idle) is dialled again after a
@@ -851,6 +856,33 @@ pub(super) mod tests {
         assert!(a.candidates.is_empty(), "nothing queued");
         assert!(a.retries.is_pending(&known), "a known address retries");
         assert_eq!(a.retries.fallback_transport(&known), None, "no fallback");
+    }
+
+    /// A productive seed that closes us while we are upload-only gets no
+    /// drop backoff (it is kept for the redial when we stop being
+    /// finished); while we are not, it does.
+    #[tokio::test]
+    async fn seed_closing_an_upload_only_torrent_gets_no_drop_backoff() {
+        for upload_only in [true, false] {
+            let mut a = actor();
+            a.upload_only_sent = upload_only;
+            let seed_addr = addr(1);
+            assert!(a.remember(seed_addr));
+            let key = a.new_key();
+            let (tx, _rx) = mpsc::channel(4);
+            let mut p = Peer::new(seed_addr, tx, a.generation, 1, Transport::Tcp);
+            p.outgoing = true;
+            p.connected = true;
+            p.seed = true;
+            p.from_rate.record(16_384);
+            a.peers.insert(key, p);
+            a.on_disconnected(key, DisconnectReason::Closed, None);
+            assert_eq!(
+                a.retries.is_pending(&seed_addr),
+                !upload_only,
+                "upload-only sent: {upload_only}"
+            );
+        }
     }
 
     /// `PeerDisconnected` stays paired with `PeerConnected`: an attempt

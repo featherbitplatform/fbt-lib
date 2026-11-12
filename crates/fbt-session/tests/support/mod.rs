@@ -24,6 +24,9 @@ use rand::RngExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
+/// How long a test waits for something that should happen.
+pub const T: Duration = Duration::from_secs(30);
+
 /// Settings for tests: loopback listener on a free port, fast status
 /// updates, and no DHT, LSD, UPnP or NAT-PMP (so no test ever contacts a public DHT node
 /// or a real router; the DHT
@@ -310,8 +313,7 @@ impl ScriptedPeer {
         .await;
     }
 
-    /// The payload of the next extended message with `id` within five
-    /// seconds.
+    /// The payload of the next extended message with `id` within [`T`].
     pub async fn next_ext(&mut self, id: u8) -> Option<Bytes> {
         match self
             .next_matching(|m| matches!(m, Message::Extended { id: i, .. } if *i == id))
@@ -322,9 +324,19 @@ impl ScriptedPeer {
         }
     }
 
-    /// The next message matching `pred` within five seconds.
+    /// The next message matching `pred` within [`T`] (30 s).
     pub async fn next_matching(&mut self, pred: impl Fn(&Message) -> bool) -> Option<Message> {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        self.next_matching_within(T, pred).await
+    }
+
+    /// The next message matching `pred` within `timeout`: for checks that
+    /// expect none, which wait out the whole timeout.
+    pub async fn next_matching_within(
+        &mut self,
+        timeout: Duration,
+        pred: impl Fn(&Message) -> bool,
+    ) -> Option<Message> {
+        tokio::time::timeout(timeout, async {
             while let Some(Ok(m)) = self.framed.next().await {
                 if pred(&m) {
                     return Some(m);

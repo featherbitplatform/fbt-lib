@@ -1309,6 +1309,20 @@ async fn streaming_a_large_skipped_file_keeps_the_seeds() {
             }
         })
     };
+    // Every state change while the reader reads: none, the torrent is
+    // finished and its skipped pieces do not make it downloading again.
+    let mut status = l.subscribe(EventMask::STATUS);
+    let states = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let watch = {
+        let states = Arc::clone(&states);
+        tokio::spawn(async move {
+            while let Some(e) = status.recv().await {
+                if let Event::StateChanged { state, .. } = e {
+                    states.lock().unwrap().push(state);
+                }
+            }
+        })
+    };
     // A 1 MiB window: S is six of them.
     let mut r = lh
         .open_file_with(1, ReadAhead::new(MIB as u64, Duration::from_secs(1), None))
@@ -1359,6 +1373,11 @@ async fn streaming_a_large_skipped_file_keeps_the_seeds() {
         )),
         "{events:?}"
     );
+    assert!(
+        states.lock().unwrap().is_empty(),
+        "no state change while streaming: {:?}",
+        states.lock().unwrap()
+    );
     // The reader goes: finished again, upload-only again.
     drop(r);
     assert!(
@@ -1368,6 +1387,7 @@ async fn streaming_a_large_skipped_file_keeps_the_seeds() {
     );
     collect.abort();
     listen.abort();
+    watch.abort();
     l.shutdown().await;
     seed.shutdown().await;
 }

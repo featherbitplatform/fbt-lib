@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fbt-session`: `FileReader`, a seekable tokio `AsyncRead` and `AsyncSeek` over one file of a torrent that is still downloading, opened with the async `TorrentHandle::open_file` and `open_file_with`; a read of a missing piece waits and returns only hash-verified bytes ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
 - `fbt-session`: `ReadAhead` (bytes, time and optional bitrate) and `Settings::read_ahead`, and `StreamError` for failed reads ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
 - `fbt-session`: the deadline picker: pieces in a reader's window are fetched first, from the fastest peers, with late blocks duplicated to a second peer, and a seek replaces the window ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
-- `fbt-session`: `PiecePicker::{pick_piece, progress, abandon}` and `PieceProgress`; the `picker` module is now public ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
+- `fbt-session`: `PiecePicker::{pick_piece, progress, abandon}` and `PieceProgress` ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
 - `fbt-session`: a sequential read cache: a piece a reader has left is demoted to the front of the clean LRU, and the next pieces are prefetched ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
 - `fbt-core`: `FileLayout::file_range` ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
 - `fbt-example`: the `stream` subcommand and `bench --stream` ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))

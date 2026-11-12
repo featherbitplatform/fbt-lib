@@ -270,7 +270,10 @@ async fn private_torrent_never_relays() {
             }
         )
     };
-    let (a, b) = tokio::join!(p1.next_matching(is_hp), p2.next_matching(is_hp));
+    let (a, b) = tokio::join!(
+        p1.next_matching_within(Duration::from_secs(5), is_hp),
+        p2.next_matching_within(Duration::from_secs(5), is_hp)
+    );
     assert!(a.is_none() && b.is_none(), "relayed: {a:?} {b:?}");
     assert_eq!(r.holepunch_stats(), (0, 0, 0));
     r.shutdown().await;

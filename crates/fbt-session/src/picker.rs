@@ -34,6 +34,7 @@ pub struct BlockResult {
 
 /// Download progress of one piece, from [`PiecePicker::progress`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PieceProgress {
     /// Blocks neither received nor outstanding from any peer.
     pub free: usize,

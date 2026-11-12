@@ -178,7 +178,7 @@ async fn private_torrent_never_touches_dht() {
     .await;
     assert!(!has_dht_bit(&peer.remote.reserved));
     assert!(
-        peer.next_matching(|m| matches!(m, Message::Port(_)))
+        peer.next_matching_within(Duration::from_secs(5), |m| matches!(m, Message::Port(_)))
             .await
             .is_none()
     );
@@ -497,7 +497,7 @@ async fn private_magnet_stops_dht_announcer_at_metadata() {
     .await;
     assert!(!has_dht_bit(&peer.remote.reserved));
     assert!(
-        peer.next_matching(|m| matches!(m, Message::Port(_)))
+        peer.next_matching_within(Duration::from_secs(5), |m| matches!(m, Message::Port(_)))
             .await
             .is_none()
     );

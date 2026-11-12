@@ -701,11 +701,13 @@ impl Actor {
         }
         let base = p.requested.len();
         let rate = p.from_rate.rate(now);
-        // Live peers that do not choke us, by arrival, once per call.
+        // Live peers that neither choke us nor are snubbed, by arrival,
+        // once per call (a snubbed peer is never on time, so it must not
+        // stand in the way of the best-ranked one).
         let mut ranked: Vec<(Duration, PeerKey)> = self
             .peers
             .iter()
-            .filter(|(_, o)| o.live() && !o.choked_us && o.generation == generation)
+            .filter(|(_, o)| o.live() && !o.choked_us && !o.snubbed && o.generation == generation)
             .map(|(&k, o)| (arrival_after(o.requested.len(), o.from_rate.rate(now)), k))
             .collect();
         ranked.sort_unstable();
@@ -1152,6 +1154,31 @@ mod tests {
         assert!(of_piece(&a, slower, 10).is_empty());
         want(&mut a, faster, 4);
         assert_eq!(of_piece(&a, faster, 10), vec![0, 16_384, 32_768, 49_152]);
+    }
+
+    /// A snubbed peer never counts as ahead in the ranking: the piece
+    /// under the position (due now, so nobody is in time) goes to the
+    /// best healthy peer even when the snubbed one measures faster.
+    #[tokio::test(start_paused = true)]
+    async fn snubbed_peer_never_outranks_a_healthy_one() {
+        for snubbed in [true, false] {
+            let mut a = actor_with(&[64 * u64::from(P4)], P4, 64 * MIB);
+            let (fast, _r1) = add_peer(&mut a, 1, MIB, None);
+            let (healthy, _r2) = add_peer(&mut a, 2, 100 * KIB, None);
+            a.peers.get_mut(&fast).expect("fast").snubbed = snubbed;
+            let (_id, _link) = open(&mut a, 0, 0);
+            want(&mut a, healthy, 4);
+            let got = of_piece(&a, healthy, 0);
+            if snubbed {
+                assert_eq!(
+                    got,
+                    vec![0, 16_384, 32_768, 49_152],
+                    "the best healthy peer"
+                );
+            } else {
+                assert!(got.is_empty(), "the faster peer ranks first");
+            }
+        }
     }
 
     /// An owner that chokes us (fast extension: its requests stay
