@@ -41,6 +41,8 @@ use crate::settings::Settings;
 /// connection is still noticed. That is the floor of any download limit,
 /// about one message per idle timeout and connection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct RateLimit {
     /// Bytes per second received; 0 is unlimited.
@@ -61,6 +63,8 @@ impl RateLimit {
 /// CGNAT, IPv6 unique-local) is in `local` as well. Class limits apply to
 /// local peers whatever [`Settings::rate_limit_local_peers`] says.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct PeerClassLimits {
     /// Peers connected over TCP.
@@ -75,6 +79,7 @@ pub struct PeerClassLimits {
 /// only while a global limit is set; without one, LEDBAT's own yielding to
 /// TCP is the balance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum MixedMode {
     /// The global limit is split between the TCP and uTP classes by their

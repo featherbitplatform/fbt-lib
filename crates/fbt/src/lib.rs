@@ -250,6 +250,12 @@
 //!   provider. Depend on `fbt` with
 //!   `default-features = false, features = ["pure-rust"]` for a build with no
 //!   C or assembly.
+//! - `serde` (off by default): `Serialize` and `Deserialize` for the public
+//!   config structs and enums ([`Settings`], [`ReadAhead`], [`RateLimit`],
+//!   [`PeerClassLimits`], [`MixedMode`], [`ChokingAlgorithm`],
+//!   [`SeedChokingAlgorithm`], [`EncryptionPolicy`], [`Priority`],
+//!   [`RemoveMode`]). Structs use `#[serde(default)]`, so a saved config
+//!   missing newer fields still loads; a `Duration` is `{secs, nanos}`.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

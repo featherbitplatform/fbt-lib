@@ -145,6 +145,8 @@ pub enum TrackerError {
 ///
 /// Build with [`TrackerConfig::default`] and assign the fields to change.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct TrackerConfig {
     /// `User-Agent` header value.

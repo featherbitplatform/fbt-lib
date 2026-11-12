@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 default = []
+serde = ["dep:serde", "fbt-tracker/serde"]
 tls-ring = ["fbt-tracker/tls-ring"]
 tls-rustcrypto = ["fbt-tracker/tls-rustcrypto"]
 
@@ -35,8 +36,10 @@ bitflags.workspace = true
 futures-core.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 fbt-bencode = { path = "../fbt-bencode" }
 tempfile.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }

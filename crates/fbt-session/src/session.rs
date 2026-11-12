@@ -36,6 +36,7 @@ use crate::torrent::{self, TorrentHandle};
 
 /// Download priority of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum Priority {
     /// Not downloaded.
@@ -63,6 +64,7 @@ impl Priority {
 
 /// What to do with a removed torrent's files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum RemoveMode {
     /// Leave the files on disk.

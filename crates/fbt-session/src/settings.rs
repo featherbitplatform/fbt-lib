@@ -37,6 +37,7 @@ pub const DEFAULT_DHT_BOOTSTRAP: [&str; 3] = [
 
 /// Whether peer connections use MSE/PE (message stream encryption).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum EncryptionPolicy {
     /// Encrypted (RC4) connections only, in both directions.
@@ -63,6 +64,8 @@ pub enum EncryptionPolicy {
 /// `read_ahead.time` or `read_ahead.bitrate`) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Settings {
     /// Addresses the session listens on (non-empty, no duplicates). Each
