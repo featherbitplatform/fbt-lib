@@ -1449,6 +1449,8 @@ mod tests {
                         assert!(got.len() <= max);
                         for b in &got {
                             assert!(peer_has_piece(peers[k].pieces(), b.piece));
+                            // `pick` never continues a skipped piece, even in end-game.
+                            assert!(p.prio_of(b.piece) > 0, "{b:?} of a skipped piece");
                         }
                     }
                     2 | 3 => {
@@ -1495,20 +1497,24 @@ mod tests {
                             .filter(|_| r.random_bool(0.4))
                             .map(PeerKey)
                             .collect();
-                        let before: Vec<Vec<PeerKey>> = (0..blocks_per_piece)
+                        let before: Vec<(bool, Vec<PeerKey>)> = (0..blocks_per_piece)
                             .map(|bi| {
                                 p.downloading
                                     .get(&i)
                                     .and_then(|d| d.blocks.get(bi as usize))
-                                    .map_or_else(Vec::new, |s| s.owners.clone())
+                                    .map_or_else(
+                                        || (false, Vec::new()),
+                                        |s| (s.received, s.owners.clone()),
+                                    )
                             })
                             .collect();
                         let got = p.pick_piece(key, i, max, &late);
                         assert!(got.len() <= max);
                         for b in &got {
                             assert_eq!(b.piece, i);
-                            // Free before, or held by one late owner only.
-                            let owners = &before[(b.offset / B) as usize];
+                            // Not received, and free before or held by one late owner only.
+                            let (received, owners) = &before[(b.offset / B) as usize];
+                            assert!(!received, "{b:?} was received");
                             assert!(
                                 owners.is_empty()
                                     || (owners.len() == 1

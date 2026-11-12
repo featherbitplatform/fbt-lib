@@ -36,7 +36,11 @@ impl Deadlines {
         window.sort_unstable();
         window.dedup_by_key(|e| e.0);
         window.truncate(MAX_DEADLINE_PIECES);
-        if self.windows.get(&reader) == Some(&window) {
+        let unchanged = match self.windows.get(&reader) {
+            Some(old) => *old == window,
+            None => window.is_empty(),
+        };
+        if unchanged {
             return Vec::new();
         }
         let old = if window.is_empty() {
@@ -186,6 +190,9 @@ mod tests {
         assert_eq!(d.remove(B), vec![2, 3]);
         assert!(d.is_empty());
         assert!(d.ordered().is_empty());
+        // An empty window for a reader with none is a no-op.
+        assert!(d.set(ReaderId(9), vec![]).is_empty());
+        assert!(d.is_empty());
     }
 
     #[test]

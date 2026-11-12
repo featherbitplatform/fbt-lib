@@ -9,8 +9,9 @@ use tokio::time::Instant;
 
 use super::ReadAhead;
 
-/// Most pieces with a deadline per reader (and per torrent): a window never
-/// covers more.
+/// Most pieces in one reader's window. The torrent's merged deadlines can
+/// hold up to this many per reader; the number of readers is capped
+/// separately.
 #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
 pub(crate) const MAX_DEADLINE_PIECES: usize = 512;
 
