@@ -259,12 +259,22 @@ async fn limit_change_applies_mid_transfer() {
     let l = leecher(st, &m, payload.len()).await;
     l.handle.add_peer(seed.local_addr()).await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(l.handle.status().state, TorrentState::Downloading);
+    let st = l.handle.status();
+    assert_eq!(st.state, TorrentState::Downloading);
+    // What is left would take about 30 s at the old limit; lifted, it
+    // takes under a second here. The bound is a third of the limited time,
+    // not a wall-clock budget: the unlimited rest is CPU-bound in a debug
+    // build and takes several seconds on a loaded CI runner.
+    let left = payload.len() as u64 - st.total_downloaded.min(payload.len() as u64);
+    let limited = Duration::from_secs_f64(left as f64 / (256 * KIB) as f64);
     l.session.set_rate_limit(RateLimit::default());
     let t0 = Instant::now();
     l.finish(&payload, T).await;
     let rest = t0.elapsed();
-    assert!(rest < Duration::from_secs(3), "rest took {rest:?}");
+    assert!(
+        rest < limited / 3,
+        "rest took {rest:?}; at the old limit it takes {limited:?}"
+    );
     l.session.shutdown().await;
     seed.shutdown().await;
 }
