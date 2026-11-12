@@ -199,9 +199,25 @@ pub(super) struct RawNames {
 impl RawNames {
     /// Read from `meta`'s raw info dictionary; should it not match the
     /// parsed files (it always does for a parsed torrent), from the parsed
-    /// names instead.
+    /// names instead. A file with a raw component that is empty, `.` or
+    /// `..` (which would change the URL's path rather than name a file) is
+    /// named by its parsed path instead, and so is the torrent's name.
     pub(super) fn of(meta: &Metainfo) -> RawNames {
-        Self::parse(meta).unwrap_or_else(|| Self::parsed(meta))
+        let parsed = Self::parsed(meta);
+        let Some(mut raw) = Self::parse(meta) else {
+            return parsed;
+        };
+        if !plain_component(&raw.name) {
+            raw.name.clone_from(&parsed.name);
+        }
+        if let (Some(raw_files), Some(parsed_files)) = (raw.files.as_mut(), parsed.files.as_ref()) {
+            for (r, p) in raw_files.iter_mut().zip(parsed_files) {
+                if r.is_empty() || !r.iter().all(|c| plain_component(c)) {
+                    r.clone_from(p);
+                }
+            }
+        }
+        raw
     }
 
     fn parse(meta: &Metainfo) -> Option<RawNames> {
@@ -251,6 +267,11 @@ impl RawNames {
             files,
         }
     }
+}
+
+/// A path component that names something: not empty, `.` or `..`.
+fn plain_component(c: &[u8]) -> bool {
+    !matches!(c, b"" | b"." | b"..")
 }
 
 /// Nesting cap when decoding the raw info dictionary (as `fbt_metainfo`).
@@ -832,6 +853,64 @@ mod tests {
                 "http://h/t%3A1/%FF.bin",
                 "http://h/t%3A1/con",
             ]
+        );
+    }
+
+    /// Raw components that would move the URL's path (`..`, `.`, empty)
+    /// never reach it: such a file is named by its sanitised path.
+    #[test]
+    fn dot_components_fall_back_to_the_sanitised_path() {
+        let paths: [&[&[u8]]; 4] = [&[b"a", b"..", b"b"], &[b".", b"c"], &[b"", b"d"], &[b"ok?"]];
+        let list = paths
+            .iter()
+            .map(|comps| {
+                let mut f = DictBuilder::new();
+                f.insert(b"length", 5i64);
+                f.insert(
+                    b"path",
+                    OwnedValue::List(comps.iter().map(|c| OwnedValue::from(*c)).collect()),
+                );
+                f.build()
+            })
+            .collect();
+        let mut info = DictBuilder::new();
+        info.insert(b"files", OwnedValue::List(list));
+        info.insert(b"name", "t");
+        info.insert(b"piece length", 16_384i64);
+        info.insert(b"pieces", vec![0u8; 20]);
+        let mut root = DictBuilder::new();
+        root.insert(b"info", info.build());
+        let m = Metainfo::from_bytes(&encode(&root.build())).unwrap();
+        let names = RawNames::of(&m);
+        for i in 0..3 {
+            let url = url_for("http://h/", &names, i);
+            let sanitised: Vec<String> = m.info.files[i].path.components()[1..]
+                .iter()
+                .map(|c| url_encode_bytes(c.as_bytes()))
+                .collect();
+            assert_eq!(url, format!("http://h/t/{}", sanitised.join("/")));
+            let path = url.trim_start_matches("http://h/");
+            assert!(
+                path.split('/').all(|c| plain_component(c.as_bytes())),
+                "{url}"
+            );
+        }
+        // A plain raw name is still used as the torrent spells it.
+        assert_eq!(url_for("http://h/", &names, 3), "http://h/t/ok%3F");
+        // A torrent name of `..` is replaced too.
+        let mut info = DictBuilder::new();
+        info.insert(b"length", 5i64);
+        info.insert(b"name", "..");
+        info.insert(b"piece length", 16_384i64);
+        info.insert(b"pieces", vec![0u8; 20]);
+        let mut root = DictBuilder::new();
+        root.insert(b"info", info.build());
+        let s = Metainfo::from_bytes(&encode(&root.build())).unwrap();
+        let url = url_for("http://h/", &RawNames::of(&s), 0);
+        assert!(!url.ends_with("/.."), "{url}");
+        assert_eq!(
+            url,
+            format!("http://h/{}", url_encode_bytes(s.info.name.as_bytes()))
         );
     }
 

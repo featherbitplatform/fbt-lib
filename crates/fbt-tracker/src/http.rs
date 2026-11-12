@@ -34,15 +34,16 @@ const MAX_RANGE_PREALLOC: usize = 1 << 20;
 /// [`RANGE_RATE_GRACE`] has passed (time spent waiting on the caller's
 /// [`RangePace`] excluded): a server trickling bytes would otherwise hold
 /// the request for ever, each byte arriving within the per-frame timeout.
-pub const MIN_RANGE_RATE: u64 = 4 * 1024;
+pub(crate) const MIN_RANGE_RATE: u64 = 4 * 1024;
 /// How long a range request runs before [`MIN_RANGE_RATE`] applies.
-pub const RANGE_RATE_GRACE: Duration = Duration::from_secs(30);
+pub(crate) const RANGE_RATE_GRACE: Duration = Duration::from_secs(30);
 
 /// Paces the body of a range fetch, as a download rate limit does for a
 /// peer connection: before each read the fetch waits for
 /// [`ready`](Self::ready), and after it reports the bytes read to
 /// [`charge`](Self::charge). TCP backpressure then holds the server to
 /// the limit.
+#[doc(hidden)]
 pub trait RangePace: Send + Sync {
     /// Completes once the next bytes may be read.
     fn ready(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;

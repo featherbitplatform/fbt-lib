@@ -27,9 +27,8 @@ use bytes::Bytes;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_net::proxy::ProxyConfig;
 
-pub use http::{MIN_RANGE_RATE, RANGE_RATE_GRACE, RangePace};
 #[doc(hidden)]
-pub use http::{parse_content_range, parse_http_announce};
+pub use http::{RangePace, parse_content_range, parse_http_announce};
 #[doc(hidden)]
 pub use scrape::{parse_http_scrape, parse_udp_scrape};
 pub use types::{
@@ -132,8 +131,8 @@ impl TrackerClient {
     /// shorter body is [`TrackerError::InvalidResponse`]. `http_timeout`
     /// bounds each wait (for the response head, then for each piece of the
     /// body), not the whole transfer, so a slow but live server is not
-    /// cut; past [`RANGE_RATE_GRACE`] a body averaging less than
-    /// [`MIN_RANGE_RATE`] fails with [`TrackerError::TooSlow`]. An empty
+    /// cut; past 30 s a body averaging less than 4 KiB/s fails with
+    /// [`TrackerError::TooSlow`]. An empty
     /// range returns no bytes without a request.
     pub async fn fetch_range(&self, url: &str, range: Range<u64>) -> Result<Bytes, TrackerError> {
         self.inner.http.fetch_range(url, range, None).await
@@ -142,6 +141,7 @@ impl TrackerClient {
     /// [`fetch_range`](Self::fetch_range) with the body paced by `pace`
     /// (a download rate limit): each read waits for it and is charged to
     /// it, and that waiting does not count against the minimum rate.
+    #[doc(hidden)]
     pub async fn fetch_range_paced(
         &self,
         url: &str,

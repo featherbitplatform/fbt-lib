@@ -155,7 +155,7 @@ pub enum TrackerError {
     #[error("too many info hashes in one scrape")]
     TooManyHashes,
     /// A range fetch (a web seed) averaged less than
-    /// [`MIN_RANGE_RATE`](crate::MIN_RANGE_RATE) past its grace period.
+    /// 4 KiB/s once it had run for 30 s.
     #[error("the server sends slower than the minimum rate")]
     TooSlow,
 }

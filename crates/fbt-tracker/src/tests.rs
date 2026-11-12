@@ -628,7 +628,7 @@ async fn fetch_range_refuses_a_body_too_long_or_short() {
 
 #[test]
 fn minimum_rate_after_the_grace() {
-    use crate::http::too_slow;
+    use crate::http::{MIN_RANGE_RATE, RANGE_RATE_GRACE, too_slow};
     let grace = RANGE_RATE_GRACE;
     // Within the grace nothing is too slow.
     assert!(!too_slow(0, grace));
