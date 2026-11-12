@@ -34,10 +34,19 @@
 //! libtorrent does. At [`Event::MetadataReceived`] a private torrent stops
 //! its DHT announcer and PEX at once and ignores later `Port` and `ut_pex`
 //! messages.
+//!
+//! # Peer filtering
+//!
+//! [`Session::set_ip_filter`] blocks ranges of peer addresses ([`IpFilter`])
+//! from every source, incoming and outgoing; the session also keeps a ban
+//! list ([`Session::banned_peers`]) and each torrent accepts at most
+//! [`Settings::max_peers_per_ip`] connections from one IP. Every refusal is
+//! reported as [`Event::PeerBlocked`] with its [`BlockReason`].
 
 #![forbid(unsafe_code)]
 
 mod bandwidth;
+mod bans;
 pub mod choker;
 mod disk;
 pub mod error;
@@ -55,10 +64,12 @@ pub mod stream;
 mod torrent;
 
 pub use bandwidth::{MixedMode, PeerClassLimits, RateLimit};
+pub use bans::BlockReason;
 pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::{SessionError, StreamError};
 pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
 pub use fbt_dht::DhtStats;
+pub use fbt_net::ipfilter::IpFilter;
 pub use fbt_net::proxy::{ProxyConfig, ProxyKind};
 pub use fbt_net::{MapMethod, MapProtocol};
 pub use net::ListenError;

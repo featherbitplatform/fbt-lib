@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_core::{InfoHashes, PeerId};
@@ -12,6 +12,7 @@ use fbt_dht::{Dht, DhtConfig, DhtState, DhtStats};
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::PortMapper;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
+use fbt_net::ipfilter::IpFilter;
 use fbt_net::proxy::{ProxyKind, udp_associate};
 use fbt_tracker::TrackerClient;
 use fbt_utp::UtpSocket;
@@ -21,6 +22,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::bandwidth::{Bandwidth, PeerClassLimits, RateLimit};
+use crate::bans::{BanList, BlockReason};
 use crate::disk::DiskPool;
 use crate::error::SessionError;
 use crate::event::{Event, EventMask, EventStream, ExternalIpSource};
@@ -188,6 +190,11 @@ pub(crate) struct Shared {
     pub portmap: Option<PortMapper>,
     /// The external address as the router and peers report it.
     pub external_ip: Arc<ExternalIp>,
+    /// The session's IP filter ([`Session::set_ip_filter`]); swapped whole,
+    /// so a reader holds the lock only for the lookup.
+    pub ip_filter: RwLock<Arc<IpFilter>>,
+    /// Peers banned for the rest of the session (smart ban).
+    pub bans: Mutex<BanList>,
 }
 
 /// BEP 55 holepunch messages handled, over every torrent of the session.
@@ -240,6 +247,41 @@ impl Shared {
     pub(crate) fn emit(&self, ev: Event) {
         // No subscribers is fine.
         let _ = self.events.send(ev);
+    }
+
+    /// Why a connection to or from `addr` is refused: the IP filter blocks
+    /// its IP, or it is banned (its IP, or with `ban_endpoints` that
+    /// endpoint). `None` lets it through. The per-IP limit is the
+    /// torrent's to check.
+    pub(crate) fn blocked(&self, addr: SocketAddr) -> Option<BlockReason> {
+        let filtered = self
+            .ip_filter
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_blocked(addr.ip());
+        if filtered {
+            return Some(BlockReason::IpFilter);
+        }
+        self.bans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_banned(addr)
+            .then_some(BlockReason::Banned)
+    }
+
+    /// Reports a refused peer ([`Event::PeerBlocked`]).
+    pub(crate) fn emit_blocked(
+        &self,
+        torrent: Option<InfoHashes>,
+        addr: SocketAddr,
+        reason: BlockReason,
+    ) {
+        tracing::debug!(%addr, ?reason, "peer blocked");
+        self.emit(Event::PeerBlocked {
+            torrent,
+            addr,
+            reason,
+        });
     }
 
     pub(crate) fn is_shutdown(&self) -> bool {
@@ -459,6 +501,8 @@ impl Session {
             lsd,
             portmap,
             external_ip,
+            ip_filter: RwLock::new(Arc::new(IpFilter::default())),
+            bans: Mutex::new(BanList::default()),
         });
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
@@ -569,6 +613,50 @@ impl Session {
     /// apply at once, and to waiting connections within a second.
     pub fn set_peer_class_limits(&self, limits: PeerClassLimits) {
         self.inner.shared.bandwidth.set_classes(limits);
+    }
+
+    /// Replaces the session's IP filter. Every torrent closes its peers the
+    /// new filter blocks (with
+    /// [`DisconnectReason::Blocked`](crate::DisconnectReason::Blocked) and
+    /// [`Event::PeerBlocked`]) before this returns, and from then on no
+    /// blocked address is dialled or accepted. The filter applies to peers
+    /// from every source (trackers, the DHT, PEX, LSD, `add_peer`,
+    /// holepunch introductions, incoming connections) and to the peer's own
+    /// address when dialling through a proxy, never to the proxy, trackers
+    /// or DHT nodes. Bans are kept apart: a new filter lifts none.
+    pub async fn set_ip_filter(&self, filter: IpFilter) {
+        *self
+            .inner
+            .shared
+            .ip_filter
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(filter);
+        for h in self.torrents() {
+            // A torrent that is gone has no peers to close.
+            let _ = h.filter_changed().await;
+        }
+    }
+
+    /// The session's IP filter (allow everything by default).
+    pub fn ip_filter(&self) -> IpFilter {
+        let f = self
+            .inner
+            .shared
+            .ip_filter
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        IpFilter::clone(&f)
+    }
+
+    /// The peers banned for the rest of the session, oldest first: an
+    /// address with port 0 bans the whole IP.
+    pub fn banned_peers(&self) -> Vec<SocketAddr> {
+        self.inner
+            .shared
+            .bans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .list()
     }
 
     /// The address of the first peer listener (the first of
@@ -913,6 +1001,8 @@ mod tests {
             lsd: LsdHub::disabled(),
             portmap: None,
             external_ip: Arc::new(ExternalIp::new(broadcast::channel(1).0)),
+            ip_filter: RwLock::new(Arc::new(IpFilter::default())),
+            bans: Mutex::new(BanList::default()),
         };
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();

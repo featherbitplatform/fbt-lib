@@ -401,7 +401,7 @@ impl Actor {
             .unwrap_or_default();
         let mut count = 0usize;
         for addr in hints {
-            if dialable(&addr) {
+            if dialable(&addr) && !self.refuse_blocked(addr) {
                 count = count.saturating_add(1);
                 if self.remember(addr) {
                     self.queue_addr(addr);
@@ -668,11 +668,12 @@ impl Actor {
 
     /// Peers from a tracker reply, a DHT lookup or PEX join the known addresses,
     /// as `add_peer` does (bounded, oldest unused evicted); addresses nobody
-    /// can dial (port 0, unspecified, multicast) are dropped.
+    /// can dial (port 0, unspecified, multicast) are dropped, and blocked
+    /// ones are reported and dropped.
     pub(super) fn on_found_peers(&mut self, source: PeerSource, peers: Vec<SocketAddr>) {
         let mut count = 0usize;
         for addr in peers {
-            if !dialable(&addr) {
+            if !dialable(&addr) || self.refuse_blocked(addr) {
                 continue;
             }
             count = count.saturating_add(1);

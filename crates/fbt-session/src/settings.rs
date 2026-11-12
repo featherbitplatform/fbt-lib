@@ -62,7 +62,7 @@ pub enum EncryptionPolicy {
 /// 16 KiB..=[`MAX_METADATA_SIZE`], a DHT bootstrap entry that is not
 /// `host:port`, an empty or duplicated `listen_addrs`, every transport
 /// switched off, `disk_threads` or `max_active_checks` outside 1..=64, a zero
-/// `read_ahead.time` or `read_ahead.bitrate`) with
+/// `max_peers_per_ip`, a zero `read_ahead.time` or `read_ahead.bitrate`) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -82,6 +82,20 @@ pub struct Settings {
     pub max_peers_per_torrent: usize,
     /// Connected peers across all torrents.
     pub max_peers_global: usize,
+    /// Connections a torrent accepts from one IP address (non-zero; an
+    /// IPv4-mapped address counts as its IPv4 address). Further ones are
+    /// closed with [`BlockReason::PerIpLimit`](crate::BlockReason::PerIpLimit).
+    /// 1 by default, as libtorrent's `allow_multiple_connections_per_ip`
+    /// off.
+    pub max_peers_per_ip: usize,
+    /// Loopback peers are exempt from `max_peers_per_ip`, so clients on the
+    /// same host (and test suites) can connect to each other.
+    #[doc(hidden)]
+    pub per_ip_exempt_loopback: bool,
+    /// Bans name one endpoint (address and port) instead of the whole IP,
+    /// so loopback tests can ban one of several peers on `127.0.0.1`.
+    #[doc(hidden)]
+    pub ban_endpoints: bool,
     /// Outgoing connections still connecting or handshaking.
     pub max_half_open: usize,
     /// Upload slots per torrent (regular plus optimistic). With
@@ -450,6 +464,9 @@ impl Settings {
         {
             return Err(format!("listen_addrs has {dup} twice"));
         }
+        if self.max_peers_per_ip == 0 {
+            return Err("max_peers_per_ip must be greater than zero".to_owned());
+        }
         if self.dht_query_rate_per_ip == 0 {
             return Err("dht_query_rate_per_ip must be greater than zero".to_owned());
         }
@@ -491,6 +508,9 @@ impl Default for Settings {
             ],
             max_peers_per_torrent: 50,
             max_peers_global: 200,
+            max_peers_per_ip: 1,
+            per_ip_exempt_loopback: true,
+            ban_endpoints: false,
             max_half_open: 10,
             unchoke_slots: 4,
             choking_algorithm: ChokingAlgorithm::default(),

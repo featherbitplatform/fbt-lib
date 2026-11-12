@@ -1,5 +1,6 @@
 //! fbt-net: the shared UDP socket, local service discovery, port mapping
-//! (UPnP IGD, PCP and NAT-PMP) and proxy clients (SOCKS5, HTTP CONNECT).
+//! (UPnP IGD, PCP and NAT-PMP), proxy clients (SOCKS5, HTTP CONNECT) and the
+//! IP filter.
 //!
 //! Everything here receives bytes from untrusted hosts: no panics, no
 //! unbounded allocation.
@@ -17,6 +18,7 @@
 
 pub mod demux;
 pub mod gateway;
+pub mod ipfilter;
 pub mod lsd;
 pub mod natpmp;
 pub mod portmap;

@@ -103,6 +103,19 @@ impl Drop for PendingHandshake {
     }
 }
 
+/// The session refuses connections from `addr` (IP filter or ban): reported
+/// with no torrent, since nothing was read, and the caller drops the
+/// connection before [`ListenerState::admit`].
+fn refused(shared: &Shared, addr: SocketAddr) -> bool {
+    match shared.blocked(addr) {
+        Some(reason) => {
+            shared.emit_blocked(None, addr, reason);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Runs one TCP accept loop until the session goes away or the task is
 /// aborted.
 pub(crate) fn spawn(
@@ -123,6 +136,9 @@ pub(crate) fn spawn(
             };
             if session.strong_count() == 0 || shared.is_shutdown() {
                 return;
+            }
+            if refused(&shared, addr) {
+                continue;
             }
             let Some(permit) = state.admit(addr) else {
                 debug!(%addr, "too many pending handshakes; dropping connection");
@@ -155,6 +171,9 @@ pub(crate) fn spawn_utp(
             };
             if session.strong_count() == 0 || shared.is_shutdown() {
                 return;
+            }
+            if refused(&shared, addr) {
+                continue;
             }
             let Some(permit) = state.admit(addr) else {
                 debug!(%addr, "too many pending handshakes; dropping uTP connection");

@@ -75,6 +75,8 @@ pub(crate) enum Cmd {
     SetRateLimit(RateLimit, oneshot::Sender<()>),
     /// Peers discovered outside the torrent (local service discovery).
     FoundPeers(PeerSource, Vec<SocketAddr>),
+    /// The session's IP filter changed: close the peers it blocks now.
+    FilterChanged(oneshot::Sender<()>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -396,6 +398,12 @@ impl TorrentHandle {
             .cmds
             .try_send(Cmd::FoundPeers(source, peers))
             .is_ok()
+    }
+
+    /// Tells the actor the IP filter changed; returns once it closed the
+    /// peers the new filter blocks.
+    pub(crate) async fn filter_changed(&self) -> Result<(), SessionError> {
+        self.call(Cmd::FilterChanged).await
     }
 
     /// Asks the actor to stop; the receiver completes once it has.

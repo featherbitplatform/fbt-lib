@@ -11,6 +11,7 @@ use fbt::{
     SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
     TrackerConfig, TrackerError, Transport,
 };
+use fbt::{BlockReason, IpFilter};
 use fbt::{
     CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
     PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
@@ -77,6 +78,8 @@ fn names(
     _: Option<StreamError>,
     _: Option<ProxyConfig>,
     _: Option<ProxyKind>,
+    _: Option<IpFilter>,
+    _: Option<BlockReason>,
 ) {
 }
 
@@ -110,4 +113,36 @@ fn surface_compiles() {
     let _: (ProxyKind, String, u16, Option<String>, Option<String>) =
         (p.kind, p.host, p.port, p.username, p.password);
     let _: (bool, bool, bool) = (p.proxy_peers, p.proxy_trackers, p.proxy_hostnames);
+    let _: usize = Settings::default().max_peers_per_ip;
+    let _ = [
+        BlockReason::IpFilter,
+        BlockReason::Banned,
+        BlockReason::PerIpLimit,
+    ];
+    let _ = DisconnectReason::Blocked(BlockReason::Banned);
+    let mut f = IpFilter::default();
+    let ip: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+    f.block(ip..=ip);
+    f.allow(ip..=ip);
+    let _: (bool, usize, bool) = (f.is_blocked(ip), f.len(), f.is_empty());
+    let _: Vec<(std::ops::RangeInclusive<std::net::IpAddr>, bool)> = f.rules();
+}
+
+/// The fields `PeerBlocked` carries.
+fn peer_blocked(e: &Event) -> Option<(Option<InfoHashes>, std::net::SocketAddr, BlockReason)> {
+    match e {
+        Event::PeerBlocked {
+            torrent,
+            addr,
+            reason,
+        } => Some((*torrent, *addr, *reason)),
+        _ => None,
+    }
+}
+
+/// The session's filter and ban list.
+async fn filter_methods(s: &Session, f: IpFilter) {
+    s.set_ip_filter(f).await;
+    let _: IpFilter = s.ip_filter();
+    let _: Vec<std::net::SocketAddr> = s.banned_peers();
 }

@@ -14,6 +14,8 @@ use tracing::debug;
 use super::actor::{Actor, Phase};
 use super::peer::Peer;
 use super::retries::AfterFailure;
+use crate::bans::BlockReason;
+use crate::event::Event;
 use crate::peer::DisconnectReason;
 use crate::peer::conn::{PeerCtx, PeerStream, spawn_incoming, spawn_outgoing};
 use crate::peer::ext::ExtConfig;
@@ -141,9 +143,13 @@ impl Actor {
     }
 
     /// Queues `addr` for connecting unless it is ourselves, waiting for a
-    /// retry, already connected or already queued.
+    /// retry, already connected, already queued, or blocked by the session
+    /// (silently: where it came from reported that).
     pub(super) fn queue_addr(&mut self, addr: SocketAddr) {
-        if self.retries.is_never(&addr) || self.retries.is_pending(&addr) {
+        if self.retries.is_never(&addr)
+            || self.retries.is_pending(&addr)
+            || self.shared.blocked(addr).is_some()
+        {
             return;
         }
         // Finished: a seed has nothing to trade (BEP 21).
@@ -239,6 +245,13 @@ impl Actor {
                 self.unreserve_dial();
                 break;
             };
+            // The filter may have changed since it was queued. Through a
+            // proxy too it is the peer's own address that counts.
+            if self.refuse_blocked(addr) {
+                self.retries.clear_transport_failed(&addr);
+                self.unreserve_dial();
+                continue;
+            }
             // It may have connected (or connected to us) since it was
             // queued; an IP that sent bad metadata waits for the metadata.
             if self.addr_busy(&addr) || self.metadata_ip_banned(&addr) {
@@ -275,6 +288,9 @@ impl Actor {
             || self.metadata_ip_banned(&addr)
             || !self.transport_usable(&addr, Transport::Utp)
         {
+            return false;
+        }
+        if self.refuse_blocked(addr) {
             return false;
         }
         if !self.reserve_dial() {
@@ -389,6 +405,13 @@ impl Actor {
             debug!(%addr, "IP sent bad metadata; dropping incoming connection");
             return;
         }
+        if self.refuse_blocked(addr) {
+            return;
+        }
+        if self.over_ip_limit(None, &addr) {
+            self.emit_blocked(addr, BlockReason::PerIpLimit);
+            return;
+        }
         if !try_reserve(&self.shared.global_peers, s.max_peers_global) {
             debug!(%addr, "global peer limit reached; dropping incoming connection");
             return;
@@ -461,6 +484,70 @@ impl Actor {
         }
     }
 
+    /// Reports a refused peer of this torrent ([`Event::PeerBlocked`]).
+    pub(super) fn emit_blocked(&self, addr: SocketAddr, reason: BlockReason) {
+        debug!(%addr, ?reason, "peer blocked");
+        self.emit(Event::PeerBlocked {
+            torrent: Some(self.ih),
+            addr,
+            reason,
+        });
+    }
+
+    /// Whether the session blocks `addr` (IP filter or ban); a blocked
+    /// address is reported.
+    pub(super) fn refuse_blocked(&self, addr: SocketAddr) -> bool {
+        match self.shared.blocked(addr) {
+            Some(reason) => {
+                self.emit_blocked(addr, reason);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `addr`'s IP already has `max_peers_per_ip` connected peers
+    /// in this torrent, besides `key` (IPv4-mapped addresses count as
+    /// IPv4; loopback is exempt under `per_ip_exempt_loopback`).
+    fn over_ip_limit(&self, key: Option<PeerKey>, addr: &SocketAddr) -> bool {
+        let s = &self.shared.settings;
+        let ip = addr.ip().to_canonical();
+        if s.per_ip_exempt_loopback && ip.is_loopback() {
+            return false;
+        }
+        let same_ip = self
+            .peers
+            .iter()
+            .filter(|(k, p)| {
+                Some(**k) != key
+                    && p.connected
+                    && p.tx.is_some()
+                    && p.addr.ip().to_canonical() == ip
+            })
+            .count();
+        same_ip >= s.max_peers_per_ip
+    }
+
+    /// The session's IP filter changed: closes every live peer it (or a
+    /// ban) now blocks, and unqueues blocked addresses.
+    pub(super) fn on_filter_changed(&mut self) {
+        let blocked: Vec<(PeerKey, SocketAddr, BlockReason)> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.tx.is_some())
+            .filter_map(|(k, p)| self.shared.blocked(p.addr).map(|r| (*k, p.addr, r)))
+            .collect();
+        for (key, addr, reason) in blocked {
+            if let Some(p) = self.peers.get_mut(&key) {
+                p.close_reason = Some(DisconnectReason::Blocked(reason));
+            }
+            self.emit_blocked(addr, reason);
+            self.close_peer(key);
+        }
+        let shared = &self.shared;
+        self.candidates.retain(|a| shared.blocked(*a).is_none());
+    }
+
     pub(super) fn close_all(&mut self) {
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
@@ -489,6 +576,19 @@ impl Actor {
             })
             .map(|(k, o)| (*k, o.outgoing));
         self.on_peer_set_changed();
+        // Another connection to the same peer is the tie-break's to settle
+        // (it leaves the IP's count as it was); any other one counts
+        // against the per-IP limit. Refused, it never was connected: its
+        // end is reported as a failed attempt.
+        if duplicate.is_none() && self.over_ip_limit(Some(key), &addr) {
+            let Some(p) = self.peers.get_mut(&key) else {
+                return ConnectOutcome::Dropped;
+            };
+            p.close_reason = Some(DisconnectReason::Blocked(BlockReason::PerIpLimit));
+            self.emit_blocked(addr, BlockReason::PerIpLimit);
+            self.close_peer(key);
+            return ConnectOutcome::Dropped;
+        }
         let Some(p) = self.peers.get_mut(&key) else {
             return ConnectOutcome::Dropped;
         };
@@ -556,7 +656,14 @@ impl Actor {
             release(&self.shared.half_open);
         }
         release(&self.shared.global_peers);
-        if p.holepunch && p.outgoing && !p.connected {
+        if matches!(reason, DisconnectReason::Blocked(_)) {
+            // We refused it: no fallback, retry or rendezvous. An address
+            // the filter or a ban blocks is not queued again while it is;
+            // one refused for the per-IP limit may be, once there is room.
+            if p.outgoing && !p.connected {
+                self.retries.clear_transport_failed(&p.addr);
+            }
+        } else if p.holepunch && p.outgoing && !p.connected {
             // A relay's introduction that did not work out. The address
             // came from a remote: no fallback, no rendezvous, and retries
             // only for an address we knew before (never from a `Connect`
@@ -704,6 +811,8 @@ pub(super) mod tests {
             lsd: crate::net::LsdHub::disabled(),
             portmap: None,
             external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
+            ip_filter: Default::default(),
+            bans: Default::default(),
         })
     }
 

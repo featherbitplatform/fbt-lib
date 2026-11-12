@@ -255,7 +255,8 @@
 //!   [`PeerClassLimits`], [`MixedMode`], [`ChokingAlgorithm`],
 //!   [`SeedChokingAlgorithm`], [`EncryptionPolicy`], [`Priority`],
 //!   [`RemoveMode`]). Structs use `#[serde(default)]`, so a saved config
-//!   missing newer fields still loads; a `Duration` is `{secs, nanos}`.
+//!   missing newer fields still loads; a `Duration` is `{secs, nanos}`. An
+//!   [`IpFilter`] is a list of `{ start, end, blocked }` rules.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -268,12 +269,12 @@ pub use fbt_core::{
 pub use fbt_metainfo::{FileEntry, Info, Magnet, MagnetError, Metainfo, MetainfoError, RelPath};
 pub use fbt_session::storage::{FsStorage, MemStorage, Storage};
 pub use fbt_session::{
-    AddTorrent, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtStats, DisconnectReason,
-    EncryptionPolicy, Event, EventMask, EventStream, ExternalIpSource, FileReader, ListenError,
-    MAX_METADATA_SIZE, MapMethod, MapProtocol, MixedMode, PeerClassLimits, PeerSource, Priority,
-    ProxyConfig, ProxyKind, RateLimit, ReadAhead, RemoveMode, SeedChokingAlgorithm, Session,
-    SessionError, Settings, StorageError, StreamError, TorrentHandle, TorrentSource, TorrentState,
-    TorrentStatus, Transport,
+    AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtStats,
+    DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, ExternalIpSource,
+    FileReader, IpFilter, ListenError, MAX_METADATA_SIZE, MapMethod, MapProtocol, MixedMode,
+    PeerClassLimits, PeerSource, Priority, ProxyConfig, ProxyKind, RateLimit, ReadAhead,
+    RemoveMode, SeedChokingAlgorithm, Session, SessionError, Settings, StorageError, StreamError,
+    TorrentHandle, TorrentSource, TorrentState, TorrentStatus, Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

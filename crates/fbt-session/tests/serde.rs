@@ -14,6 +14,9 @@ fn changed() -> Settings {
     s.listen_addrs = vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 7001))];
     s.max_peers_per_torrent = 11;
     s.max_peers_global = 22;
+    s.max_peers_per_ip = 2;
+    s.per_ip_exempt_loopback = false;
+    s.ban_endpoints = true;
     s.max_half_open = 3;
     s.unchoke_slots = 7;
     s.choking_algorithm = ChokingAlgorithm::RateBased;

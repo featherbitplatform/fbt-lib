@@ -61,7 +61,10 @@ impl Actor {
                 let _ = tx.send(());
             }
             Cmd::AddPeer(addr, tx) => {
-                if !self.retries.is_never(&addr) && self.remember(addr) {
+                if !self.refuse_blocked(addr)
+                    && !self.retries.is_never(&addr)
+                    && self.remember(addr)
+                {
                     self.queue_addr(addr);
                     self.try_connect();
                 }
@@ -106,6 +109,10 @@ impl Actor {
                 if !(source == PeerSource::Lsd && self.is_private()) {
                     self.on_found_peers(source, peers);
                 }
+            }
+            Cmd::FilterChanged(tx) => {
+                self.on_filter_changed();
+                let _ = tx.send(());
             }
             Cmd::Shutdown(tx) => {
                 let _ = self.stop(None).await;

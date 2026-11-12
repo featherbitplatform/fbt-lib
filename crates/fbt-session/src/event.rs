@@ -10,6 +10,7 @@ use fbt_net::{MapMethod, MapProtocol};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::sync::ReusableBoxFuture;
 
+use crate::bans::BlockReason;
 use crate::peer::{DisconnectReason, Transport};
 use crate::status::TorrentState;
 
@@ -173,6 +174,20 @@ pub enum Event {
         /// Why.
         reason: DisconnectReason,
     },
+    /// A peer was refused: not dialled, or its connection closed (an
+    /// incoming one before its handshake is read when the session-wide
+    /// checks refuse it). A connection that was reported connected also
+    /// gets its [`PeerDisconnected`](Event::PeerDisconnected) with
+    /// [`DisconnectReason::Blocked`].
+    PeerBlocked {
+        /// The torrent; `None` for an incoming connection refused before
+        /// its handshake named one.
+        torrent: Option<InfoHashes>,
+        /// The peer's address.
+        addr: SocketAddr,
+        /// Why.
+        reason: BlockReason,
+    },
     /// Reading or writing torrent data failed; the torrent stopped, except
     /// for a piece found missing on disk while serving a peer: that piece
     /// is downloaded again and the torrent keeps running.
@@ -238,7 +253,7 @@ bitflags::bitflags! {
         const PIECE = 1 << 1;
         /// Tracker replies and errors, scrapes included.
         const TRACKER = 1 << 2;
-        /// Peer connects and disconnects, peers found.
+        /// Peer connects and disconnects, peers found, peers blocked.
         const PEER = 1 << 3;
         /// Storage errors.
         const STORAGE = 1 << 4;
@@ -273,7 +288,8 @@ impl Event {
             | Event::ScrapeFailed { .. } => EventMask::TRACKER,
             Event::PeerConnected { .. }
             | Event::PeerDisconnected { .. }
-            | Event::PeersFound { .. } => EventMask::PEER,
+            | Event::PeersFound { .. }
+            | Event::PeerBlocked { .. } => EventMask::PEER,
             Event::DhtBootstrapped { .. } => EventMask::DHT,
             Event::FileError { .. } => EventMask::STORAGE,
             Event::PortMapped { .. }
