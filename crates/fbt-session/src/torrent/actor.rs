@@ -8,7 +8,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use fbt_core::{InfoHashes, PieceLayout};
@@ -109,6 +109,44 @@ pub(super) struct Loaded {
     pub sequential: bool,
     /// Partially downloaded pieces, by index.
     pub bufs: HashMap<u32, Vec<u8>>,
+    /// Which files the storage is told are wanted; follows `file_prio`.
+    pub wanted: Arc<WantedFiles>,
+}
+
+/// The wanted flag of each file, for
+/// [`Storage::set_file_priorities`]. The check and the priority jobs both
+/// apply it on their disk thread; the last one to run reads the latest
+/// flags, so an older job never undoes a newer change.
+#[derive(Debug)]
+pub(super) struct WantedFiles {
+    flags: Mutex<Vec<bool>>,
+    /// Held by a job from reading `flags` until the storage has them.
+    turn: Mutex<()>,
+}
+
+impl WantedFiles {
+    fn new(file_prio: &[Priority]) -> Self {
+        WantedFiles {
+            flags: Mutex::new(wanted_flags(file_prio)),
+            turn: Mutex::new(()),
+        }
+    }
+
+    /// Records new priorities; the next `apply` passes them on.
+    pub(super) fn set(&self, file_prio: &[Priority]) {
+        *self.flags.lock().unwrap_or_else(|e| e.into_inner()) = wanted_flags(file_prio);
+    }
+
+    /// Tells `storage` the latest flags. Blocking: disk threads only.
+    pub(super) fn apply(&self, storage: &dyn Storage) -> io::Result<()> {
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        let flags = self.flags.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        storage.set_file_priorities(&flags)
+    }
+}
+
+fn wanted_flags(file_prio: &[Priority]) -> Vec<bool> {
+    file_prio.iter().map(|p| *p != Priority::Skip).collect()
 }
 
 impl Loaded {
@@ -116,6 +154,7 @@ impl Loaded {
         let layout = meta.piece_layout();
         let piece_prio = piece_priorities(&meta, &file_prio);
         let total_wanted = wanted_bytes(&layout, &piece_prio);
+        let wanted = Arc::new(WantedFiles::new(&file_prio));
         Loaded {
             meta,
             layout,
@@ -125,6 +164,7 @@ impl Loaded {
             file_prio,
             sequential,
             bufs: HashMap::new(),
+            wanted,
         }
     }
 }

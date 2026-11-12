@@ -69,6 +69,7 @@ impl Actor {
         };
         let storage = Arc::clone(storage);
         let meta = Arc::clone(&l.meta);
+        let wanted = Arc::clone(&l.wanted);
         let layout = l.layout;
         let done = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -79,6 +80,14 @@ impl Actor {
         let generation = self.generation;
         self.shared.disk.spawn_check(&mut self.jobs, move || {
             let _slot = permit;
+            // The storage learns which files are skipped before it is read
+            // (the part file).
+            if let Err(e) = wanted.apply(&*storage) {
+                return Job::Checked {
+                    generation,
+                    result: Err(e),
+                };
+            }
             let result = check_pieces(&*storage, &layout, &meta.info.pieces, |i| {
                 done.store(i.saturating_add(1), Ordering::Relaxed);
                 if cancel.load(Ordering::Relaxed) {

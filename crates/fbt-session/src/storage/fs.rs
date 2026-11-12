@@ -1,29 +1,30 @@
 use super::Storage;
-use fbt_core::FileLayout;
+use super::part::PartFile;
+use fbt_core::{FileLayout, PieceLayout};
 use fbt_metainfo::Metainfo;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Maximum number of simultaneously open file handles.
 const MAX_OPEN: usize = 64;
 
 #[cfg(unix)]
-fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+pub(super) fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.read_exact_at(buf, off)
 }
 
 #[cfg(unix)]
-fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
+pub(super) fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.write_all_at(buf, off)
 }
 
 #[cfg(windows)]
-fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+pub(super) fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         let n = f.seek_read(buf, off)?;
@@ -37,7 +38,7 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
+pub(super) fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         let n = f.seek_write(buf, off)?;
@@ -123,9 +124,29 @@ struct State {
     /// Files written through a handle evicted since the last flush, which
     /// reopens them to sync.
     unsynced: HashSet<usize>,
+    /// Per file, from the last `set_file_priorities`: wanted. Empty (every
+    /// file wanted) until then. Zero-length skipped files are not created.
+    wanted: Vec<bool>,
     /// Files synced to disk, recorded for the flush-coverage tests.
     #[cfg(test)]
     synced: HashSet<usize>,
+}
+
+/// Which files live in the part file, and the part file itself.
+#[derive(Debug, Default)]
+struct Routing {
+    /// Per file: its bytes go to the part file (a skipped file that did not
+    /// exist on disk when the priorities were set). Empty until the first
+    /// `set_file_priorities`.
+    routed: Vec<bool>,
+    /// Opened by the first `set_file_priorities`.
+    part: Option<Mutex<PartFile>>,
+}
+
+impl Routing {
+    fn is_routed(&self, idx: usize) -> bool {
+        self.routed.get(idx).copied().unwrap_or(false)
+    }
 }
 
 /// Test hook run by every file read between taking the handle and reading.
@@ -146,11 +167,28 @@ impl std::fmt::Debug for ReadHook {
 /// cached up to 64 open files; [`flush`](Storage::flush) syncs every file
 /// written since the last flush, evicted ones included. I/O errors name
 /// their file ([`StorageError`]).
+///
+/// Skipped files are never created (as libtorrent's part file): once
+/// [`set_file_priorities`](Storage::set_file_priorities) has run, a skipped
+/// file that does not exist on disk has its bytes (those of the pieces it
+/// shares with wanted files, or that a reader streams) kept in
+/// [`part_path`](Self::part_path) instead, piece by piece. A skipped file
+/// that exists (a seed adding with files skipped, or a file skipped after
+/// it was downloaded) is read and written in place. Making a file wanted
+/// again moves its bytes out of the part file into the file, which is
+/// created sparse where the platform supports it; the part file is deleted
+/// once it holds nothing, and by [`delete_files`](Storage::delete_files).
 #[derive(Debug)]
 pub struct FsStorage {
     save_path: PathBuf,
     entries: Vec<Entry>,
     layout: FileLayout,
+    pieces: PieceLayout,
+    part_path: PathBuf,
+    /// Taken shared by every read and write for its whole I/O, and
+    /// exclusively by `set_file_priorities` and `delete_files`: a file
+    /// never changes place under a read. Always taken before `state`.
+    routing: RwLock<Routing>,
     state: Mutex<State>,
     #[cfg(test)]
     read_hook: std::sync::OnceLock<ReadHook>,
@@ -171,6 +209,9 @@ impl FsStorage {
             .collect();
         FsStorage {
             layout: FileLayout::new(entries.iter().map(|e| e.len)),
+            pieces: metainfo.piece_layout(),
+            part_path: save_path.join(format!(".{}.parts", metainfo.info_hashes)),
+            routing: RwLock::new(Routing::default()),
             save_path,
             entries,
             state: Mutex::new(State::default()),
@@ -179,7 +220,14 @@ impl FsStorage {
         }
     }
 
-    /// Creates every zero-length non-pad file (and its directories).
+    /// The part file: `<save_path>/.<info hash>.parts` (the v1 hash in hex
+    /// for v1 and hybrid torrents). It exists only while it holds data.
+    pub fn part_path(&self) -> PathBuf {
+        self.part_path.clone()
+    }
+
+    /// Creates every zero-length non-pad file that is not skipped (and its
+    /// directories).
     pub fn create_empty_files(&self) -> io::Result<()> {
         let mut st = self.lock();
         self.create_empty_locked(&mut st)
@@ -200,15 +248,30 @@ impl FsStorage {
         let _ = self.read_hook.set(ReadHook(Box::new(hook)));
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn read_routing(&self) -> RwLockReadGuard<'_, Routing> {
+        self.routing.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_routing(&self) -> RwLockWriteGuard<'_, Routing> {
+        self.routing.write().unwrap_or_else(|e| e.into_inner())
     }
 
     fn create_empty_locked(&self, st: &mut State) -> io::Result<()> {
         if st.empties_created {
             return Ok(());
         }
-        for e in self.entries.iter().filter(|e| e.len == 0 && !e.pad) {
+        let wanted = |i: usize| st.wanted.get(i).copied().unwrap_or(true);
+        for e in self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|&(i, e)| e.len == 0 && !e.pad && wanted(i))
+            .map(|(_, e)| e)
+        {
             create_parent(&e.path).map_err(|err| at(&e.path, err))?;
             OpenOptions::new()
                 .write(true)
@@ -303,6 +366,100 @@ impl FsStorage {
             .get(idx)
             .map_or(self.save_path.as_path(), |e| e.path.as_path())
     }
+
+    /// The piece holding torrent offset `at`, the offset in it, and how
+    /// many of `len` bytes from `at` lie in that piece.
+    fn piece_span(&self, at: u64, len: usize) -> io::Result<(u32, u32, usize)> {
+        let plen = u64::from(self.pieces.piece_len());
+        let piece = at
+            .checked_div(plen)
+            .and_then(|p| u32::try_from(p).ok())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let off = at % plen;
+        let n = (plen - off).min(len as u64) as usize;
+        Ok((piece, off as u32, n))
+    }
+
+    /// Fills `buf` from torrent offset `at` out of the part file.
+    fn part_read(&self, r: &Routing, mut at: u64, buf: &mut [u8]) -> io::Result<()> {
+        let part = r
+            .part
+            .as_ref()
+            .ok_or_else(|| at_part(self, io::ErrorKind::NotFound.into()))?;
+        let part = part.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let (piece, off, n) = self.piece_span(at, rest.len())?;
+            let (head, tail) = rest.split_at_mut(n);
+            part.read(piece, off, head).map_err(|e| at_part(self, e))?;
+            rest = tail;
+            at += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Writes `data` at torrent offset `at` into the part file.
+    fn part_write(&self, r: &Routing, mut at: u64, data: &[u8]) -> io::Result<()> {
+        let part = r
+            .part
+            .as_ref()
+            .ok_or_else(|| at_part(self, io::ErrorKind::NotFound.into()))?;
+        let mut part = part.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rest = data;
+        while !rest.is_empty() {
+            let (piece, off, n) = self.piece_span(at, rest.len())?;
+            let (head, tail) = rest.split_at(n);
+            part.write(piece, off, head).map_err(|e| at_part(self, e))?;
+            rest = tail;
+            at += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Copies the bytes of file `idx` that `part` holds into the file.
+    fn export(&self, idx: usize, part: &PartFile) -> io::Result<()> {
+        let Some(range) = self.layout.file_range(idx).filter(|r| !r.is_empty()) else {
+            return Ok(());
+        };
+        let plen = u64::from(self.pieces.piece_len());
+        let (first, last) = (range.start / plen, (range.end - 1) / plen);
+        for p in first..=last {
+            let Ok(piece) = u32::try_from(p) else {
+                break;
+            };
+            if !part.has(piece) {
+                continue;
+            }
+            let lo = range.start.max(p * plen);
+            let hi = range.end.min((p + 1) * plen);
+            let mut buf = vec![0u8; (hi - lo) as usize];
+            match part.read(piece, (lo - p * plen) as u32, &mut buf) {
+                Ok(()) => {}
+                // Never fully written: nothing of it to keep.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(at(part.path(), e)),
+            }
+            // Created (sparse where the platform supports it) and sized
+            // by the first export, as by a first write.
+            let file = self.handle(idx, true)?;
+            write_all_at(&file, &buf, lo - range.start).map_err(|e| at(self.path_of(idx), e))?;
+        }
+        Ok(())
+    }
+
+    /// Whether a file of `piece` lives in the part file.
+    fn piece_routed(&self, routed: &[bool], piece: u32) -> bool {
+        let off = self.pieces.piece_offset(piece);
+        let len = u64::from(self.pieces.piece_size(piece));
+        self.layout
+            .files_overlapping(off, len)
+            .any(|i| routed.get(i).copied().unwrap_or(false))
+    }
+}
+
+/// `e` naming the part file.
+fn at_part(s: &FsStorage, e: io::Error) -> io::Error {
+    at(&s.part_path, e)
 }
 
 fn create_parent(path: &Path) -> io::Result<()> {
@@ -315,15 +472,21 @@ fn create_parent(path: &Path) -> io::Result<()> {
 impl Storage for FsStorage {
     fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         self.check_range(offset, buf.len())?;
+        let routing = self.read_routing();
         let mut pos = 0usize;
         for s in self.layout.map(offset, buf.len() as u64) {
             let end = pos + s.len as usize;
             let chunk = buf
                 .get_mut(pos..end)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let at_torrent = offset + pos as u64;
             pos = end;
             if self.is_pad(s.file) {
                 chunk.fill(0);
+                continue;
+            }
+            if routing.is_routed(s.file) {
+                self.part_read(&routing, at_torrent, chunk)?;
                 continue;
             }
             let file = self.handle(s.file, false)?;
@@ -345,6 +508,7 @@ impl Storage for FsStorage {
 
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
         self.check_range(offset, data.len())?;
+        let routing = self.read_routing();
         {
             let mut st = self.lock();
             self.create_empty_locked(&mut st)?;
@@ -366,8 +530,15 @@ impl Storage for FsStorage {
                 ));
             }
         }
+        let mut at_torrent = offset;
         for (s, chunk) in slices.iter().zip(parts) {
+            let here = at_torrent;
+            at_torrent += s.len;
             if self.is_pad(s.file) {
+                continue;
+            }
+            if routing.is_routed(s.file) {
+                self.part_write(&routing, here, chunk)?;
                 continue;
             }
             let file = self.handle(s.file, true)?;
@@ -432,6 +603,12 @@ impl Storage for FsStorage {
                 }
             }
         }
+        if let Some(part) = self.read_routing().part.as_ref() {
+            let part = part.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = part.sync() {
+                first_err.get_or_insert_with(|| at_part(self, e));
+            }
+        }
         let mut st = self.lock();
         st.unsynced.extend(retry);
         #[cfg(test)]
@@ -440,6 +617,20 @@ impl Storage for FsStorage {
     }
 
     fn delete_files(&self) -> io::Result<()> {
+        let mut routing = self.write_routing();
+        match routing.part.as_mut() {
+            Some(part) => part
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove()
+                .map_err(|e| at_part(self, e))?,
+            // Never opened by this instance: one may be left from before.
+            None => match std::fs::remove_file(&self.part_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(at_part(self, e)),
+            },
+        }
         let mut st = self.lock();
         st.open.clear();
         st.sized.clear();
@@ -474,6 +665,59 @@ impl Storage for FsStorage {
                     ) => {}
                 Err(err) => return Err(at(&d, err)),
             }
+        }
+        Ok(())
+    }
+
+    fn set_file_priorities(&self, wanted: &[bool]) -> io::Result<()> {
+        let want = |i: usize| wanted.get(i).copied().unwrap_or(true);
+        let mut guard = self.write_routing();
+        let Routing { routed, part } = &mut *guard;
+        let part = match part {
+            Some(p) => p,
+            None => {
+                let pf = PartFile::open(
+                    self.part_path.clone(),
+                    self.pieces.num_pieces(),
+                    self.pieces.piece_len(),
+                )
+                .map_err(|e| at_part(self, e))?;
+                part.insert(Mutex::new(pf))
+            }
+        };
+        let part = part.get_mut().unwrap_or_else(|e| e.into_inner());
+        routed.resize(self.entries.len(), false);
+        {
+            let mut st = self.lock();
+            st.wanted = (0..self.entries.len()).map(want).collect();
+            // Zero-length files wanted now are created at once if the
+            // others were already (by a write), else with them.
+            let created = std::mem::take(&mut st.empties_created);
+            if created {
+                self.create_empty_locked(&mut st)?;
+            }
+        }
+        for (i, (e, r)) in self.entries.iter().zip(routed.iter_mut()).enumerate() {
+            if e.pad || e.len == 0 {
+                *r = false;
+            } else if *r && want(i) {
+                self.export(i, part)?;
+                *r = false;
+            } else if !*r && !want(i) && matches!(e.path.try_exists(), Ok(false)) {
+                *r = true;
+                let mut st = self.lock();
+                st.open.remove(&i);
+                st.sized.remove(&i);
+            }
+        }
+        // Slots of pieces whose files all left the part file.
+        for piece in 0..self.pieces.num_pieces() {
+            if part.has(piece) && !self.piece_routed(routed, piece) {
+                part.free(piece).map_err(|e| at_part(self, e))?;
+            }
+        }
+        if part.is_empty() {
+            part.remove().map_err(|e| at_part(self, e))?;
         }
         Ok(())
     }

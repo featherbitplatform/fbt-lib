@@ -1,6 +1,7 @@
 //! Commands the torrent actor accepts, and the actions behind them.
 
 use std::io;
+use std::sync::Arc;
 
 use fbt_core::Bitfield;
 use tokio::task::JoinSet;
@@ -58,6 +59,7 @@ impl Actor {
             }
             Cmd::SetPriorities(p, tx) => {
                 self.set_priorities(p);
+                self.apply_file_priorities().await;
                 let _ = tx.send(());
             }
             Cmd::AddPeer(addr, tx) => {
@@ -203,6 +205,7 @@ impl Actor {
             return;
         };
         l.file_prio = p;
+        l.wanted.set(&l.file_prio);
         l.piece_prio = piece_priorities(&l.meta, &l.file_prio);
         l.total_wanted = wanted_bytes(&l.layout, &l.piece_prio);
         if let Some(picker) = l.picker.as_mut() {
@@ -247,6 +250,28 @@ impl Actor {
         }
         self.top_up_all(None);
         self.refresh_state();
+    }
+
+    /// Tells the storage which files are wanted now (the part file moves
+    /// bytes in or out), once every piece verified under the old priorities
+    /// is on disk. A failure stops the torrent with the error.
+    async fn apply_file_priorities(&mut self) {
+        let (Some(storage), Some(l)) = (self.storage.clone(), self.loaded.as_ref()) else {
+            return;
+        };
+        let wanted = Arc::clone(&l.wanted);
+        self.flush_and_wait().await;
+        let mut job = JoinSet::new();
+        self.shared
+            .disk
+            .spawn(&mut job, move || wanted.apply(&*storage));
+        let r = match job.join_next().await {
+            Some(r) => r.unwrap_or_else(|e| Err(io::Error::other(e))),
+            None => Ok(()),
+        };
+        if let Err(e) = r {
+            self.fail(&e, "setting file priorities");
+        }
     }
 
     /// Closes every peer, writes every verified piece (or, deleting,

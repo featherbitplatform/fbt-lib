@@ -295,8 +295,17 @@ impl Actor {
                 message: format!("reading a block: {e}"),
             });
         }
-        // Wanted again, so the torrent is no longer finished.
-        self.finished_emitted = false;
+        // Wanted again, so the torrent is no longer finished, unless no
+        // wanted file overlaps what was lost (a skipped file's piece that a
+        // reader fetched): getting it back must not finish it twice.
+        if self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.picker.as_ref())
+            .is_none_or(|p| !p.is_finished())
+        {
+            self.finished_emitted = false;
+        }
         self.refresh_state();
         for key in keys {
             self.update_interest(key);
