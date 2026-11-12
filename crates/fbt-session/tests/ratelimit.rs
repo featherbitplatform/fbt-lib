@@ -265,6 +265,8 @@ async fn limit_change_applies_mid_transfer() {
     // takes under a second here. The bound is a third of the limited time,
     // not a wall-clock budget: the unlimited rest is CPU-bound in a debug
     // build and takes several seconds on a loaded CI runner.
+    // It catches a limit that is not lifted at all, not a partial lift
+    // (about 1 MiB/s would still pass).
     let left = payload.len() as u64 - st.total_downloaded.min(payload.len() as u64);
     let limited = Duration::from_secs_f64(left as f64 / (256 * KIB) as f64);
     l.session.set_rate_limit(RateLimit::default());

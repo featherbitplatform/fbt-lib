@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `fbt-session`: skipping the files still missing while a piece of one of them was being hashed no longer leaves that piece in the write-back cache until `cache_expiry`, which held `Seeding` back as long (or reported `TorrentFinished` before it)
+- `fbt-session`: skipping the files still missing while a piece of one of them was being hashed no longer leaves that piece in the write-back cache until `cache_expiry`, which held `Seeding` back as long (or reported `TorrentFinished` before it) ([#11](https://github.com/featherbitplatform/fbt-lib/pull/11))
 
 ## [0.3.0] - 2026-11-11
 
