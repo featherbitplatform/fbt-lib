@@ -812,6 +812,20 @@ async fn seeding_round_robin_serves_every_leecher() {
     for (_, lh, _) in &leechers {
         lh.add_peer(s.local_addr()).await.unwrap();
     }
+    // Start timing only once every leecher is connected to the seeder (and
+    // has had time to say it is interested): on a loaded runner the
+    // connection setup would otherwise eat the first turns, and the first
+    // leechers to arrive could finish before the late ones were served.
+    let connected = tokio::time::Instant::now() + T;
+    while h.status().num_peers < 6 {
+        assert!(
+            tokio::time::Instant::now() < connected,
+            "only {} of 6 leechers connected",
+            h.status().num_peers
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let deadline = tokio::time::Instant::now() + T;
     let served = loop {
         let statuses: Vec<_> = leechers.iter().map(|(_, lh, _)| lh.status()).collect();
