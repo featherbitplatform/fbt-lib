@@ -51,6 +51,7 @@ mod session;
 pub mod settings;
 mod status;
 pub mod storage;
+pub mod stream;
 mod torrent;
 
 pub use bandwidth::{MixedMode, PeerClassLimits, RateLimit};
@@ -68,6 +69,7 @@ pub use settings::{
 };
 pub use status::{TorrentState, TorrentStatus};
 pub use storage::{CacheStats, StorageError};
+pub use stream::ReadAhead;
 pub use torrent::TorrentHandle;
 
 #[cfg(test)]

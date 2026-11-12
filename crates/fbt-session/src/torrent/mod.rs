@@ -12,12 +12,14 @@
 //! - `announcer`, `tiers`: announcing to the trackers (BEP 12 tiers).
 //! - `dht`: looking up and announcing on the session's DHT.
 //! - `pex`: peer exchange (BEP 11) with connected peers.
+//! - `deadline`: the pieces open file readers wait for, and when.
 
 mod actor;
 mod announcer;
 mod check;
 mod commands;
 mod data;
+mod deadline;
 mod dht;
 mod holepunch;
 mod known;
@@ -30,6 +32,9 @@ mod retries;
 mod serve;
 mod swarm;
 mod tiers;
+
+#[expect(unused_imports, reason = "wired up in Task 5/6")]
+pub(crate) use deadline::ReaderId;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock, Weak};

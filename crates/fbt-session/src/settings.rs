@@ -10,6 +10,7 @@ use fbt_tracker::TrackerConfig;
 
 use crate::bandwidth::{MixedMode, PeerClassLimits, RateLimit};
 use crate::choker::{ChokingAlgorithm, SeedChokingAlgorithm};
+use crate::stream::ReadAhead;
 
 /// Largest accepted [`Settings::event_queue`]; the queue is allocated up
 /// front.
@@ -58,7 +59,8 @@ pub enum EncryptionPolicy {
 /// [`MAX_EVENT_QUEUE`] / [`MAX_INCOMING_REQUESTS`], a metadata cap outside
 /// 16 KiB..=[`MAX_METADATA_SIZE`], a DHT bootstrap entry that is not
 /// `host:port`, an empty or duplicated `listen_addrs`, every transport
-/// switched off, `disk_threads` or `max_active_checks` outside 1..=64) with
+/// switched off, `disk_threads` or `max_active_checks` outside 1..=64, a zero
+/// `read_ahead.time` or `read_ahead.bitrate`) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -338,6 +340,10 @@ pub struct Settings {
     pub rate_limit_local_peers: bool,
     /// How a global limit is shared between TCP and uTP peers.
     pub mixed_mode: MixedMode,
+    /// How far ahead of a file reader its torrent fetches (16 MiB, or 10 s
+    /// at the stream's bitrate when that is more). Its `time` and a known
+    /// `bitrate` must be non-zero.
+    pub read_ahead: ReadAhead,
 }
 
 impl Settings {
@@ -427,7 +433,7 @@ impl Settings {
                 "dht_bootstrap_nodes entries must be host:port, got {bad:?}"
             ));
         }
-        Ok(())
+        self.read_ahead.validate()
     }
 }
 
@@ -519,6 +525,31 @@ impl Default for Settings {
             peer_class_limits: PeerClassLimits::default(),
             rate_limit_local_peers: false,
             mixed_mode: MixedMode::default(),
+            read_ahead: ReadAhead::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_read_ahead_time_is_invalid() {
+        let mut s = Settings::default();
+        assert_eq!(s.read_ahead, ReadAhead::default());
+        assert!(s.validate().is_ok());
+        s.read_ahead = ReadAhead::new(16 << 20, Duration::ZERO, None);
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "read_ahead.time must be greater than zero"
+        );
+        s.read_ahead = ReadAhead::new(16 << 20, Duration::from_secs(10), Some(0));
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "read_ahead.bitrate must be greater than zero"
+        );
+        s.read_ahead = ReadAhead::new(16 << 20, Duration::from_secs(10), Some(1));
+        assert!(s.validate().is_ok());
     }
 }

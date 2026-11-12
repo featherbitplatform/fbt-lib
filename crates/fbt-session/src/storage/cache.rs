@@ -63,14 +63,34 @@ pub struct CacheStats {
 /// A clean entry's key: the torrent's cache id and the piece.
 type CleanKey = (u64, u32);
 
+/// Where use stamps start: every demoted entry's stamp (counting up from
+/// 0) sorts before every used one's.
+const FIRST_USE: u64 = 1 << 62;
+
 /// The session's clean entries, least recently used first.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CleanLru {
     entries: HashMap<CleanKey, (Arc<[u8]>, u64)>,
     /// Last use -> key.
     order: BTreeMap<u64, CleanKey>,
     by_torrent: HashMap<u64, HashSet<u32>>,
+    /// Stamp of the next use, from [`FIRST_USE`].
     next_use: u64,
+    /// Stamp of the next demotion, from 0: demoted entries go first, the
+    /// earliest demoted first.
+    next_cold: u64,
+}
+
+impl Default for CleanLru {
+    fn default() -> Self {
+        CleanLru {
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            by_torrent: HashMap::new(),
+            next_use: FIRST_USE,
+            next_cold: 0,
+        }
+    }
 }
 
 impl CleanLru {
@@ -92,6 +112,18 @@ impl CleanLru {
         self.by_torrent.entry(key.0).or_default().insert(key.1);
         self.entries.insert(key, (data, used));
         true
+    }
+
+    /// Makes `key` the next eviction after the entries demoted before it.
+    fn demote(&mut self, key: CleanKey) {
+        let cold = self.next_cold;
+        let Some((_, at)) = self.entries.get_mut(&key) else {
+            return;
+        };
+        let old = std::mem::replace(at, cold);
+        self.next_cold = self.next_cold.wrapping_add(1);
+        self.order.remove(&old);
+        self.order.insert(cold, key);
     }
 
     fn remove(&mut self, key: CleanKey, evictable: &AtomicU64) -> Option<Arc<[u8]>> {
@@ -269,6 +301,14 @@ impl CacheBudget {
         Some(data)
     }
 
+    fn clean_demote(&self, key: CleanKey) {
+        self.lru().demote(key);
+    }
+
+    fn clean_contains(&self, key: CleanKey) -> bool {
+        self.lru().entries.contains_key(&key)
+    }
+
     /// Adds an entry whose bytes are already reserved as `Clean`; a
     /// duplicate gives them back.
     fn clean_insert_reserved(&self, key: CleanKey, data: Arc<[u8]>) {
@@ -426,6 +466,26 @@ impl PieceCache {
             return Some(Arc::clone(d));
         }
         self.budget.clean_get((self.id, piece))
+    }
+
+    /// A clean entry of `piece` becomes the session's next eviction (after
+    /// the entries demoted before it): a sequential reader left it behind.
+    /// Dirty pieces and pieces being written are unaffected.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
+    pub(crate) fn demote(&mut self, piece: u32) {
+        if self.dirty.contains_key(&piece) || self.writing.contains_key(&piece) {
+            return;
+        }
+        self.budget.clean_demote((self.id, piece));
+    }
+
+    /// The piece's verified bytes are here (dirty, being written or clean),
+    /// without counting as a use of a clean entry.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 5/6"))]
+    pub(crate) fn is_cached(&self, piece: u32) -> bool {
+        self.dirty.contains_key(&piece)
+            || self.writing.contains_key(&piece)
+            || self.budget.clean_contains((self.id, piece))
     }
 
     /// A piece read from disk, kept to serve peers if the budget has room
@@ -997,5 +1057,75 @@ mod tests {
         other.release_partials();
         drop(c);
         assert_eq!(budget.stats(), empty(2 * P));
+    }
+
+    #[test]
+    fn demoted_entry_is_evicted_first() {
+        let (budget, mut c) = cache(4 * P);
+        let t0 = Instant::now();
+        for i in 0..4 {
+            c.insert_clean(i, piece(i), t0);
+        }
+        // 2 then 1 are demoted: they go first, 2 before 1, then 0.
+        c.demote(2);
+        c.demote(1);
+        c.insert_dirty(10, piece(10), t0);
+        assert!(!c.is_cached(2));
+        assert!(c.is_cached(1) && c.is_cached(0) && c.is_cached(3));
+        c.insert_dirty(11, piece(11), t0);
+        assert!(!c.is_cached(1));
+        assert!(c.is_cached(0) && c.is_cached(3));
+        c.insert_dirty(12, piece(12), t0);
+        assert!(!c.is_cached(0));
+        assert!(c.is_cached(3));
+        assert_eq!(budget.stats().clean, P);
+    }
+
+    #[test]
+    fn demote_leaves_dirty_pieces_alone() {
+        let (budget, mut c) = cache(3 * P);
+        let mut d = other(&budget);
+        let t0 = Instant::now();
+        c.insert_clean(1, piece(1), t0);
+        d.insert_clean(5, piece(5), t0);
+        c.insert_dirty(5, piece(5), t0);
+        // A dirty piece, then one being written: nothing to demote.
+        c.demote(5);
+        assert!(c.is_cached(5));
+        let _ = c.take_flush(FlushReason::All, t0);
+        c.demote(5);
+        assert!(c.is_cached(5));
+        // Another torrent's piece 5 was not demoted either: 1 is the oldest.
+        assert!(c.reserve_clean(P));
+        assert!(!c.is_cached(1));
+        assert!(d.is_cached(5));
+        c.release_clean(P);
+        // Pieces nobody holds are ignored.
+        c.demote(99);
+        d.demote(99);
+        c.written(5, 1);
+        assert!(c.is_cached(5));
+        c.demote(5);
+        assert!(c.reserve_clean(P) && c.reserve_clean(P));
+        assert!(!c.is_cached(5));
+        assert!(d.is_cached(5));
+        c.release_clean(2 * P);
+    }
+
+    #[test]
+    fn is_cached_does_not_touch_the_lru() {
+        let (_budget, mut c) = cache(2 * P);
+        let t0 = Instant::now();
+        c.insert_clean(0, piece(0), t0);
+        c.insert_clean(1, piece(1), t0);
+        assert!(c.is_cached(0));
+        // 0 is still the oldest.
+        c.insert_dirty(2, piece(2), t0);
+        assert!(!c.is_cached(0));
+        assert!(c.is_cached(1) && c.is_cached(2));
+        // A partial buffer is not cached data.
+        assert!(c.reserve_partial(3, 1));
+        assert!(!c.is_cached(3));
+        c.release_partials();
     }
 }

@@ -177,6 +177,12 @@ impl FileLayout {
         self.starts.len()
     }
 
+    /// Byte range of file `index` in the concatenated content; `None` out
+    /// of range, an empty range for a zero-length file.
+    pub fn file_range(&self, index: usize) -> Option<std::ops::Range<u64>> {
+        Some(*self.starts.get(index)?..*self.ends.get(index)?)
+    }
+
     fn clamp_end(&self, offset: u64, len: u64) -> u64 {
         offset.saturating_add(len).min(self.total_len)
     }
@@ -223,5 +229,19 @@ impl FileLayout {
         }
         let last = self.starts.partition_point(|&s| s < end);
         first..last.max(first)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_range_of_each_file() {
+        let l = FileLayout::new([10, 0, 5]);
+        assert_eq!(l.file_range(0), Some(0..10));
+        assert_eq!(l.file_range(1), Some(10..10));
+        assert_eq!(l.file_range(2), Some(10..15));
+        assert_eq!(l.file_range(3), None);
     }
 }
