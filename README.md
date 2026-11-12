@@ -142,7 +142,7 @@ All three are on by default; set them to `false` to stay off the LAN. Private to
 
 `Settings::encryption` defaults to `EncryptionPolicy::Preferred`: outgoing connections open with an MSE handshake and may fall back to plain text. `Forced` refuses plain text, `Disabled` never encrypts.
 
-`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`, plus `--transport tcp|utp|both`, `--listen ADDR`, `--download-limit` and `--upload-limit`, `--cache-mb`, and `--lsd` and `--nat` (both off in the CLI); `fbt-example stream <torrent> --file N --out DIR` downloads only file `N` and streams it to stdout or a sink while it downloads, with `--seek`, `--length`, `--bitrate` and `--peer`; `fbt-example dht-node` runs a bare DHT node.
+`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`, plus `--transport tcp|utp|both`, `--listen ADDR`, `--download-limit` and `--upload-limit`, `--cache-mb`, and `--lsd` and `--nat` (both off in the CLI); `fbt-example stream <torrent> --file N --out DIR` streams file `N` to stdout or a file while it downloads, fetching only what is read plus the read-ahead window, with `--seek`, `--length`, `--bitrate` and `--peer`; `fbt-example dht-node` runs a bare DHT node.
 
 ## Feature flags
 

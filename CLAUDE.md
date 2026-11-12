@@ -54,8 +54,7 @@ bash dev/bench.sh
 
 # Live interop vs qBittorrent-nox and Transmission via opentracker, plus magnet via DHT, forced
 # encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent and LSD between two
-# fbt-example containers, on isolated
-# networks with our own dht-node (Docker; see dev/interop/README.md)
+# fbt-example containers, on isolated networks with our own dht-node (Docker; see dev/interop/README.md)
 bash dev/interop/run.sh
 
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec
