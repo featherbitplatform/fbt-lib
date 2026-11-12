@@ -614,9 +614,9 @@ impl Actor {
             && (p.from_rate.total() > 0 || p.to_rate.total() > 0)
         {
             // A peer that traded data and then went away (it closed, its
-            // transport timed out, or it went idle): dialled again as the
-            // first retry of a series, a twelfth of `peer_retry_delay`, then ever later while it keeps
-            // dropping (`Retries::dropped`).
+            // transport timed out, or it went idle) is dialled again after a
+            // twelfth of `peer_retry_delay`, and later each time it drops
+            // again (`Retries::dropped`).
             // Otherwise only a tracker or PEX naming it again would, and a
             // lone seed lost mid-download stalls it for an announce
             // interval. One that never traded data is left alone, so a peer
