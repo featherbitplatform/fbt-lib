@@ -55,6 +55,8 @@ jobs:
           - ssdp
           - upnp_xml
           - natpmp
+          - socks5
+          - http_connect
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

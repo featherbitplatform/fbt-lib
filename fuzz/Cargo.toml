@@ -147,3 +147,17 @@ path = "fuzz_targets/natpmp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "socks5"
+path = "fuzz_targets/socks5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_connect"
+path = "fuzz_targets/http_connect.rs"
+test = false
+doc = false
+bench = false

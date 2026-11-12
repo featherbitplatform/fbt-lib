@@ -1,7 +1,7 @@
-//! fbt-net: the shared UDP socket, local service discovery and port mapping
-//! (UPnP IGD, PCP and NAT-PMP).
+//! fbt-net: the shared UDP socket, local service discovery, port mapping
+//! (UPnP IGD, PCP and NAT-PMP) and proxy clients (SOCKS5, HTTP CONNECT).
 //!
-//! Everything here receives datagrams from untrusted hosts: no panics, no
+//! Everything here receives bytes from untrusted hosts: no panics, no
 //! unbounded allocation.
 
 #![forbid(unsafe_code)]
@@ -20,6 +20,7 @@ pub mod gateway;
 pub mod lsd;
 pub mod natpmp;
 pub mod portmap;
+pub mod proxy;
 pub mod upnp;
 
 pub use natpmp::{MapMethod, MapProtocol};

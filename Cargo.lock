@@ -591,6 +591,7 @@ dependencies = [
  "fbt-core",
  "proptest",
  "rand",
+ "serde",
  "socket2",
  "thiserror",
  "tokio",
