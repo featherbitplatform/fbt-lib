@@ -60,14 +60,13 @@ impl Deadlines {
     }
 
     /// The earliest deadline of `piece` over the readers holding it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 6"))]
     pub fn deadline(&self, piece: u32) -> Option<Instant> {
         self.merged.get(&piece).map(|&(t, _)| t)
     }
 
     /// Some reader's window holds `piece`.
     pub fn contains(&self, piece: u32) -> bool {
-        self.merged.contains_key(&piece)
+        self.deadline(piece).is_some()
     }
 
     /// Every piece with a deadline, earliest first (ties by index). Kept
@@ -95,7 +94,6 @@ impl Deadlines {
     }
 
     /// No reader holds any piece.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in Task 6"))]
     pub fn is_empty(&self) -> bool {
         self.merged.is_empty()
     }

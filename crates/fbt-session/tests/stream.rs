@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use fbt_core::BlockRef;
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_session::storage::{MemStorage, Storage};
 use fbt_session::{
-    AddTorrent, Event, EventMask, FileReader, ReadAhead, RemoveMode, Session, SessionError,
-    Settings, StreamError, TorrentHandle, TorrentState,
+    AddTorrent, DisconnectReason, Event, EventMask, FileReader, Priority, RateLimit, ReadAhead,
+    RemoveMode, Session, SessionError, Settings, StreamError, TorrentHandle, TorrentState,
 };
 use fbt_wire::Message;
 use futures_util::{SinkExt, StreamExt};
@@ -715,5 +716,513 @@ async fn dropped_reader_frees_its_slot() {
     assert!(!d.is_empty());
     assert!(d.iter().all(|&(p, _)| p < 12), "{d:?}");
     drop(seventeenth);
+    l.shutdown().await;
+}
+
+// ----- deadline picking -------------------------------------------------------
+
+/// A leech of `m` over memory with `prio` as its file priorities, waited
+/// until `state`.
+async fn leech_with(
+    st: Settings,
+    m: &Metainfo,
+    prio: Vec<Priority>,
+    state: TorrentState,
+) -> (Session, TorrentHandle) {
+    let s = Session::new(st).await.unwrap();
+    let mut p = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+    p.storage = Some(Arc::new(MemStorage::new(m.total_len())));
+    p.file_priorities = prio;
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(wait_state(&h, |x| *x == state, T).await, "{state:?}");
+    (s, h)
+}
+
+/// A bitfield message of `n` pieces with `has(i)` set.
+fn bitfield(n: usize, has: impl Fn(usize) -> bool) -> Message {
+    let mut bytes = vec![0u8; n.div_ceil(8)];
+    for i in (0..n).filter(|&i| has(i)) {
+        bytes[i / 8] |= 0x80 >> (i % 8);
+    }
+    Message::Bitfield(Bytes::from(bytes))
+}
+
+/// A scripted peer connected to `l`, with `has` of `m`'s pieces, that
+/// unchokes it.
+async fn scripted_seed(l: &Session, m: &Metainfo, has: impl Fn(usize) -> bool) -> ScriptedPeer {
+    let mut peer = ScriptedPeer::connect(l.local_addr(), m.info_hashes.wire_hash()).await;
+    let n = m.piece_layout().num_pieces() as usize;
+    peer.send(bitfield(n, has)).await;
+    peer.send(Message::Unchoke).await;
+    peer
+}
+
+type Log = Arc<std::sync::Mutex<Vec<BlockRef>>>;
+
+fn log() -> Log {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn logged(log: &Log) -> Vec<BlockRef> {
+    log.lock().unwrap().clone()
+}
+
+/// Waits up to `within` until the merged deadlines satisfy `pred`.
+async fn wait_deadlines(
+    h: &TorrentHandle,
+    within: Duration,
+    pred: impl Fn(&[(u32, Duration)]) -> bool,
+) -> Vec<(u32, Duration)> {
+    let end = tokio::time::Instant::now() + within;
+    loop {
+        let d = h.debug_deadlines().await;
+        if pred(&d) || tokio::time::Instant::now() >= end {
+            return d;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_reads_ahead_of_the_rest() {
+    let (m, payload) = make_torrent(&[("big", 64 * MIB)], PL as u32);
+    let (seed, _sh) = seeder(&m, &payload).await;
+    let mut st = settings();
+    st.rate_limit_local_peers = true;
+    st.rate_limit = RateLimit::new(4 * MIB as u64, 0);
+    let storage = Arc::new(MemStorage::new(m.total_len()));
+    let (l, lh) = session_with(st, &m, storage, TorrentState::Downloading).await;
+    let mut r = lh.open_file(0).await.unwrap();
+    let at = 48 * MIB;
+    r.seek(SeekFrom::Start(at as u64)).await.unwrap();
+    let read = tokio::spawn(async move {
+        let mut buf = vec![0u8; MIB];
+        r.read_exact(&mut buf).await.map(|_| buf)
+    });
+    lh.add_peer(seed.local_addr()).await.unwrap();
+    let got = tokio::time::timeout(T, read)
+        .await
+        .expect("read in time")
+        .unwrap()
+        .unwrap();
+    let downloaded = lh.status().total_downloaded;
+    assert!(got == payload[at..at + MIB]);
+    // Rarest first alone reaches 48 MiB at a random point of the 64 MiB.
+    assert!(
+        downloaded < 24 * MIB as u64,
+        "{downloaded} bytes downloaded before the read completed"
+    );
+    l.shutdown().await;
+    seed.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_readers_on_one_torrent() {
+    let (m, payload) = torrent();
+    let (seed, _sh) = seeder(&m, &payload).await;
+    let (l, lh) = leech(&m).await;
+    let mut r0 = lh.open_file(0).await.unwrap();
+    let mut r2 = lh.open_file(2).await.unwrap();
+    let d = lh.debug_deadlines().await;
+    assert!(d.iter().any(|&(p, _)| p < 12), "file 0's window: {d:?}");
+    assert!(d.iter().any(|&(p, _)| p >= 12), "file 2's window: {d:?}");
+    let a = tokio::spawn(async move {
+        let mut out = Vec::new();
+        r0.read_to_end(&mut out).await.map(|_| out)
+    });
+    let b = tokio::spawn(async move {
+        let mut out = Vec::new();
+        r2.read_to_end(&mut out).await.map(|_| out)
+    });
+    lh.add_peer(seed.local_addr()).await.unwrap();
+    let a = tokio::time::timeout(T, a).await.unwrap().unwrap().unwrap();
+    let b = tokio::time::timeout(T, b).await.unwrap().unwrap().unwrap();
+    assert!(a == payload[..3 * MIB], "file 0");
+    assert!(b == payload[B_START..], "file 2");
+    l.shutdown().await;
+    seed.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_reader_clears_its_deadlines_only() {
+    let (m, _payload) = torrent();
+    let (l, lh) = leech(&m).await;
+    let _r0 = lh.open_file(0).await.unwrap();
+    let r2 = lh.open_file(2).await.unwrap();
+    let d = lh.debug_deadlines().await;
+    assert!(d.iter().any(|&(p, _)| p < 12) && d.iter().any(|&(p, _)| p >= 12));
+    drop(r2);
+    let d = wait_deadlines(&lh, Duration::from_secs(5), |d| {
+        !d.is_empty() && d.iter().all(|&(p, _)| p < 12)
+    })
+    .await;
+    assert!(!d.is_empty(), "file 0's window stays");
+    assert!(
+        d.iter().all(|&(p, _)| p < 12),
+        "only file 0's window: {d:?}"
+    );
+    l.shutdown().await;
+}
+
+/// A (3 MiB + 1000 B), B (2 MiB + 100 B) and C (3 MiB), in 256 KiB pieces:
+/// A is pieces 0 to 12, B 12 to 20, C 20 to 32.
+const STRADDLE: [(&str, usize); 3] = [("a", 3 * MIB + 1000), ("b", 2 * MIB + 100), ("c", 3 * MIB)];
+const STRADDLE_B: usize = 3 * MIB + 1000;
+const STRADDLE_C: usize = 5 * MIB + 1100;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn straddling_pieces_fetch_only_the_boundaries() {
+    let (m, payload) = make_torrent(&STRADDLE, PL as u32);
+    let (l, lh) = leech_with(
+        settings(),
+        &m,
+        vec![Priority::Skip, Priority::Normal, Priority::Skip],
+        TorrentState::Downloading,
+    )
+    .await;
+    let mut r = lh.open_file(1).await.unwrap();
+    let requests = log();
+    let mut seed = scripted_seed(&l, &m, |_| true).await;
+    let (p, rq) = (payload.clone(), Arc::clone(&requests));
+    let serve = tokio::spawn(async move { seed.serve_recording(&p, PL as u32, rq).await });
+    let mut out = Vec::new();
+    tokio::time::timeout(T, r.read_to_end(&mut out))
+        .await
+        .expect("read in time")
+        .unwrap();
+    assert!(out == payload[STRADDLE_B..STRADDLE_C], "B exactly");
+    let asked = logged(&requests);
+    assert!(!asked.is_empty());
+    // Pieces 0 to 11 lie inside A, 21 to 32 inside C.
+    assert!(
+        asked.iter().all(|b| (12..=20).contains(&b.piece)),
+        "{:?}",
+        asked
+            .iter()
+            .map(|b| b.piece)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    serve.abort();
+    l.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reader_on_a_skipped_file_downloads_its_window() {
+    let (m, payload) = make_torrent(&STRADDLE, PL as u32);
+    let (l, lh) = leech_with(
+        settings(),
+        &m,
+        vec![Priority::Normal, Priority::Normal, Priority::Skip],
+        TorrentState::Downloading,
+    )
+    .await;
+    let mut r = lh
+        .open_file_with(2, ReadAhead::new(MIB as u64, Duration::from_secs(1), None))
+        .await
+        .unwrap();
+    let requests = log();
+    let mut seed = scripted_seed(&l, &m, |_| true).await;
+    let (p, rq) = (payload.clone(), Arc::clone(&requests));
+    let serve = tokio::spawn(async move { seed.serve_recording(&p, PL as u32, rq).await });
+    let mut buf = vec![0u8; MIB];
+    tokio::time::timeout(T, r.read_exact(&mut buf))
+        .await
+        .expect("read in time")
+        .unwrap();
+    assert!(buf == payload[STRADDLE_C..STRADDLE_C + MIB]);
+    // The window after the read ends at C + 2 MiB.
+    let limit = STRADDLE_C + 2 * MIB;
+    let asked = logged(&requests);
+    assert!(
+        asked.iter().all(|b| (b.piece as usize) * PL < limit),
+        "{:?}",
+        asked
+            .iter()
+            .map(|b| b.piece)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    serve.abort();
+    l.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finished_torrent_keeps_seeds_for_a_skipped_file_reader() {
+    let (m, payload) = make_torrent(&STRADDLE, PL as u32);
+    let (seed, _sh) = seeder(&m, &payload).await;
+    let seed_addr = seed.local_addr();
+    let (l, lh) = leech_with(
+        settings(),
+        &m,
+        vec![Priority::Normal, Priority::Normal, Priority::Skip],
+        TorrentState::Downloading,
+    )
+    .await;
+    let mut ev = l.subscribe(EventMask::PEER);
+    lh.add_peer(seed_addr).await.unwrap();
+    assert!(wait_state(&lh, |s| *s == TorrentState::Seeding, T).await);
+    // The only peer is a seed: closed as upload-only.
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == seed_addr),
+        T,
+    )
+    .await
+    .expect("the seed is closed");
+    // A peer that hears our upload-only state.
+    let mut reserved = fbt_wire::Reserved::default();
+    reserved.set_extended();
+    let mut observer =
+        ScriptedPeer::connect_with(l.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    let mut hs = fbt_wire::ExtHandshake::default();
+    hs.m.insert(fbt_wire::UPLOAD_ONLY.to_owned(), 7);
+    observer.send_ext_handshake(&hs).await;
+    let upload_only = |m: &Message| matches!(m, Message::Extended { id: 7, .. });
+    match observer.next_matching(upload_only).await {
+        Some(Message::Extended { payload, .. }) => {
+            assert!(fbt_wire::decode_upload_only(&payload).unwrap());
+        }
+        other => panic!("no UploadOnly(true): {other:?}"),
+    }
+    // Every peer event from here on.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collect = {
+        let seen = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(e) = ev.recv().await {
+                seen.lock().unwrap().push(e);
+            }
+        })
+    };
+    // A reader on the skipped file.
+    let mut r = lh.open_file(2).await.unwrap();
+    match observer.next_matching(upload_only).await {
+        Some(Message::Extended { payload, .. }) => {
+            assert!(!fbt_wire::decode_upload_only(&payload).unwrap());
+        }
+        other => panic!("no UploadOnly(false): {other:?}"),
+    }
+    let observe = tokio::spawn(async move { observer.wait_closed(T).await });
+    let got = tokio::time::timeout(T, read_at(&mut r, 0, 64 * 1024))
+        .await
+        .expect("read in time")
+        .unwrap();
+    assert!(got == payload[STRADDLE_C..STRADDLE_C + 64 * 1024]);
+    let events = seen.lock().unwrap().clone();
+    // Our redial, or the seed's own dial if it wins the race: the only
+    // peer with C's bytes is connected again (the observer connected
+    // before these events).
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::PeerConnected { .. })),
+        "the seed is connected again: {events:?}"
+    );
+    // The default window covers all of C: still missing, so nobody is
+    // closed as upload-only.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::PeerDisconnected {
+                reason: DisconnectReason::UploadOnly,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    collect.abort();
+    observe.abort();
+    l.shutdown().await;
+    seed.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_away_from_skipped_file_drops_its_partial_pieces() {
+    // W (pieces 0 to 3) is wanted, S (pieces 4 to 11) skipped.
+    let (m, payload) = make_torrent(&[("w", MIB), ("s", 2 * MIB)], PL as u32);
+    let (l, lh) = leech_with(
+        settings(),
+        &m,
+        vec![Priority::Normal, Priority::Skip],
+        TorrentState::Downloading,
+    )
+    .await;
+    let mut rs = lh.open_file(1).await.unwrap();
+    let pending = tokio::spawn(async move { read_at(&mut rs, 0, 4096).await });
+    let (requests, cancels) = (log(), log());
+    let answer = Arc::new(AtomicBool::new(false));
+    let mut seed = scripted_seed(&l, &m, |i| i >= 4).await;
+    let serve = {
+        let (p, rq, cn, an) = (
+            payload.clone(),
+            Arc::clone(&requests),
+            Arc::clone(&cancels),
+            Arc::clone(&answer),
+        );
+        tokio::spawn(async move { seed.serve_recording_with(&p, PL as u32, rq, cn, an).await })
+    };
+    assert!(
+        wait_until(
+            || !logged(&requests).is_empty() && l.cache_stats().partial > 0,
+            T
+        )
+        .await,
+        "S's window is requested"
+    );
+    // The reader moves to W (a reader reads one file: the one on S goes,
+    // one on W comes). No peer has W, so nothing new starts.
+    let mut rw = lh.open_file(0).await.unwrap();
+    pending.abort();
+    let _ = pending.await;
+    let waiting = tokio::spawn(async move { read_at(&mut rw, 0, 4096).await });
+    assert!(
+        wait_until(|| l.cache_stats().partial == 0, Duration::from_secs(5)).await,
+        "partial pieces dropped: {:?}",
+        l.cache_stats()
+    );
+    let all_cancelled = || {
+        let asked: std::collections::HashSet<BlockRef> = logged(&requests).into_iter().collect();
+        let cancelled: std::collections::HashSet<BlockRef> = logged(&cancels).into_iter().collect();
+        asked == cancelled
+    };
+    assert!(
+        wait_until(all_cancelled, Duration::from_secs(5)).await,
+        "every held block cancelled: {} requests, {} cancels",
+        logged(&requests).len(),
+        logged(&cancels).len()
+    );
+    assert!(logged(&requests).iter().all(|b| b.piece >= 4));
+    waiting.abort();
+    serve.abort();
+    l.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn choked_deadline_blocks_go_to_another_peer() {
+    let (m, payload) = torrent();
+    let (l, lh) = leech(&m).await;
+    let ih = m.info_hashes.wire_hash();
+    let mut r = lh.open_file(0).await.unwrap();
+    let read = tokio::spawn(async move { read_at(&mut r, 0, 4096).await });
+    // The first seed takes the window's first requests, then chokes us
+    // without rejecting them (fast extension on).
+    let mut first = ScriptedPeer::connect_fast(l.local_addr(), ih).await;
+    first.send(Message::HaveAll).await;
+    first.send(Message::Unchoke).await;
+    let held = match first
+        .next_matching(|m| matches!(m, Message::Request(_)))
+        .await
+    {
+        Some(Message::Request(b)) => b,
+        other => panic!("no request: {other:?}"),
+    };
+    first.send(Message::Choke).await;
+    let keep = tokio::spawn(async move { first.wait_closed(T).await });
+    let requests = log();
+    let mut second = ScriptedPeer::connect_fast(l.local_addr(), ih).await;
+    second.send(Message::HaveAll).await;
+    second.send(Message::Unchoke).await;
+    let (p, rq) = (payload.clone(), Arc::clone(&requests));
+    let serve = tokio::spawn(async move { second.serve_recording(&p, PL as u32, rq).await });
+    assert!(
+        wait_until(|| logged(&requests).contains(&held), Duration::from_secs(5)).await,
+        "{held:?} asked of the second seed: {:?}",
+        logged(&requests)
+    );
+    let got = tokio::time::timeout(T, read)
+        .await
+        .expect("read in time")
+        .unwrap()
+        .unwrap();
+    assert!(got == payload[..4096]);
+    keep.abort();
+    serve.abort();
+    l.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_peer_chokes_then_unchokes() {
+    let (m, payload) = torrent();
+    let (l, lh) = leech(&m).await;
+    let mut r = lh.open_file(0).await.unwrap();
+    let read = tokio::spawn(async move { read_at(&mut r, 0, 4096).await });
+    let mut seed = scripted_seed(&l, &m, |_| true).await;
+    // Requests the seed receives, with when.
+    let log: Arc<std::sync::Mutex<Vec<(tokio::time::Instant, BlockRef)>>> = Arc::default();
+    let choked_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>> = Arc::default();
+    let (go, mut go_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = {
+        let (log, choked_at) = (Arc::clone(&log), Arc::clone(&choked_at));
+        let payload = payload.clone();
+        tokio::spawn(async move {
+            let reply = |b: BlockRef| {
+                let start = b.piece as usize * PL + b.offset as usize;
+                Message::Piece {
+                    piece: b.piece,
+                    offset: b.offset,
+                    data: Bytes::copy_from_slice(&payload[start..start + b.len as usize]),
+                }
+            };
+            // Two blocks of the first piece, then a choke.
+            let mut answered = 0;
+            while answered < 2 {
+                match seed.framed.next().await {
+                    Some(Ok(Message::Request(b))) => {
+                        log.lock().unwrap().push((tokio::time::Instant::now(), b));
+                        seed.send(reply(b)).await;
+                        answered += 1;
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return,
+                }
+            }
+            seed.send(Message::Choke).await;
+            *choked_at.lock().unwrap() = Some(tokio::time::Instant::now());
+            loop {
+                tokio::select! {
+                    _ = &mut go_rx => break,
+                    m = seed.framed.next() => match m {
+                        Some(Ok(Message::Request(b))) => {
+                            log.lock().unwrap().push((tokio::time::Instant::now(), b));
+                        }
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    },
+                }
+            }
+            seed.send(Message::Unchoke).await;
+            while let Some(Ok(m)) = seed.framed.next().await {
+                if let Message::Request(b) = m
+                    && seed.framed.send(reply(b)).await.is_err()
+                {
+                    return;
+                }
+            }
+        })
+    };
+    assert!(
+        wait_until(|| choked_at.lock().unwrap().is_some(), T).await,
+        "the seed choked us"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!read.is_finished(), "the read waits, with no error");
+    let at = choked_at.lock().unwrap().expect("choked");
+    // Requests already on the wire when the choke went out may still
+    // arrive; none is sent once it is a second old.
+    let late: Vec<BlockRef> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(t, _)| *t > at + Duration::from_secs(1))
+        .map(|(_, b)| *b)
+        .collect();
+    assert!(late.is_empty(), "requests while choked: {late:?}");
+    let _ = go.send(());
+    let got = tokio::time::timeout(T, read)
+        .await
+        .expect("read in time after the unchoke")
+        .unwrap()
+        .unwrap();
+    assert!(got == payload[..4096]);
+    task.abort();
     l.shutdown().await;
 }

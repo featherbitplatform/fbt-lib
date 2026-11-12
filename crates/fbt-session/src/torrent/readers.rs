@@ -13,18 +13,42 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::ops::{Range, RangeInclusive};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use bytes::Bytes;
+use fbt_core::{BLOCK_SIZE, BlockRef};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::ReaderId;
 use super::actor::{Actor, Phase};
 use super::data::Job;
+use super::peers::partial_cap;
 use super::serve::{MAX_PIECE_READS, WHOLE_PIECE_READ_MAX, Waiter, read_guarded};
 use crate::error::{SessionError, StreamError};
+use crate::peer::messages::PeerCommand;
+use crate::picker::PeerKey;
 use crate::stream::reader::{MAX_READ_CHUNK, MAX_READERS, READ_PREFETCH_PIECES, ReaderLink};
 use crate::stream::window::window;
+
+/// The download rate [`Actor::arrival`] assumes of a peer that measures
+/// slower (a new peer measures 0).
+pub(super) const MIN_DEADLINE_RATE: u64 = 16 * 1024;
+
+/// When the next block asked of a peer with `requested` blocks outstanding
+/// and a download rate of `rate` would arrive.
+fn arrival_after(requested: usize, rate: u64) -> Duration {
+    let bytes = (requested as u128 + 1) * u128::from(BLOCK_SIZE);
+    let nanos = bytes * 1_000_000_000 / u128::from(rate.max(MIN_DEADLINE_RATE));
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// How many blocks a peer at `rate` delivers within `left`, counting those
+/// it already has outstanding.
+fn blocks_within(left: Duration, rate: u64) -> usize {
+    let bytes = left.as_nanos() * u128::from(rate.max(MIN_DEADLINE_RATE)) / 1_000_000_000;
+    usize::try_from(bytes / u128::from(BLOCK_SIZE)).unwrap_or(usize::MAX)
+}
 
 /// Where a read's answer goes.
 pub(super) type Answer = oneshot::Sender<Result<Bytes, StreamError>>;
@@ -405,8 +429,9 @@ impl Actor {
 
     fn forget_reader(&mut self, id: ReaderId) {
         self.readers.open.remove(&id);
-        self.deadlines.remove(id);
+        let orphans = self.deadlines.remove(id);
         self.remove_reader_waiters(id);
+        self.deadlines_changed(&[], &orphans);
     }
 
     /// Reads the reader's link and sets its window (missing pieces only)
@@ -447,7 +472,13 @@ impl Actor {
         r.span = span;
         let old = std::mem::replace(&mut r.piece, piece);
         let own: Vec<u32> = missing.iter().map(|&(p, _)| p).collect();
-        self.deadlines.set(id, missing);
+        let added: Vec<u32> = own
+            .iter()
+            .copied()
+            .filter(|&p| !self.deadlines.contains(p))
+            .collect();
+        let orphans = self.deadlines.set(id, missing);
+        self.deadlines_changed(&added, &orphans);
         if old == piece {
             return;
         }
@@ -508,6 +539,227 @@ impl Actor {
             }
             self.start_piece_read(p, size, Vec::new());
         }
+    }
+
+    // ----- deadline picking -------------------------------------------------
+
+    /// After the merged deadlines changed: `added` pieces are new to them,
+    /// `orphans` left every window. An orphan of priority 0 has no other
+    /// reason to finish: its outstanding blocks are cancelled and its
+    /// buffer freed (one pending its hash check keeps going). Peers that
+    /// have an added piece may become interesting, and a seeding torrent
+    /// is upload-only only while no deadline piece is missing.
+    pub(super) fn deadlines_changed(&mut self, added: &[u32], orphans: &[u32]) {
+        for &piece in orphans {
+            self.abandon_skipped(piece);
+        }
+        if !added.is_empty() {
+            let keys: Vec<PeerKey> = self
+                .peers
+                .iter()
+                .filter(|(_, p)| p.live() && !p.am_interested && added.iter().any(|&i| p.has(i)))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in keys {
+                self.update_interest(key);
+            }
+        }
+        self.sync_upload_only();
+        if !added.is_empty() {
+            self.top_up_all(None);
+        }
+    }
+
+    /// Drops the download of `piece` if it has priority 0: its blocks are
+    /// cancelled, its buffer and budget reservation given back.
+    fn abandon_skipped(&mut self, piece: u32) {
+        let generation = self.generation;
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        if l.piece_prio.get(piece as usize).is_none_or(|&p| p > 0) {
+            return;
+        }
+        let Some(picker) = l.picker.as_mut() else {
+            return;
+        };
+        let cancel = picker.abandon(piece);
+        // Passed, or pending its hash check: the result stands.
+        if picker.have().get(piece) || picker.is_in_progress(piece) {
+            return;
+        }
+        l.bufs.remove(&piece);
+        self.cache.release_partial(piece);
+        for (key, block) in cancel {
+            let Some(p) = self.peers.get_mut(&key) else {
+                continue;
+            };
+            if p.generation == generation && p.requested.remove(&block) {
+                self.send(key, PeerCommand::Cancel(block));
+            }
+        }
+    }
+
+    /// Some piece with a deadline is missing.
+    pub(super) fn deadline_missing(&self) -> bool {
+        self.loaded
+            .as_ref()
+            .and_then(|l| l.picker.as_ref())
+            .is_some_and(|pk| {
+                self.deadlines
+                    .ordered()
+                    .iter()
+                    .any(|&(p, _)| !pk.have().get(p))
+            })
+    }
+
+    /// When one more block asked of `key` would arrive: its outstanding
+    /// blocks plus that one, at its download rate (at least
+    /// [`MIN_DEADLINE_RATE`]).
+    pub(super) fn arrival(&self, key: PeerKey, now: Instant) -> Duration {
+        self.peers.get(&key).map_or(Duration::MAX, |p| {
+            arrival_after(p.requested.len(), p.from_rate.rate(now))
+        })
+    }
+
+    /// Blocks of deadline pieces for `key`, at most `room`, earliest
+    /// deadline first (spec 5.5). Free blocks of a piece go to a peer whose
+    /// [`arrival`](Self::arrival) is within the piece's time left, or to
+    /// the best-ranked peer that has it; blocks held by a late owner (one
+    /// that would deliver after the deadline, chokes us or is snubbed) are
+    /// duplicated to a peer that would deliver them sooner, never to more
+    /// than two holders. A piece starts only within the partial-piece cap
+    /// and with its buffer reserved; one that cannot reserve waits.
+    pub(super) fn fill_deadlines(
+        &mut self,
+        key: PeerKey,
+        room: usize,
+        now: Instant,
+    ) -> Vec<BlockRef> {
+        let mut out = Vec::new();
+        if room == 0 || self.deadlines.is_empty() {
+            return out;
+        }
+        let generation = self.generation;
+        let Some(p) = self.peers.get(&key) else {
+            return out;
+        };
+        let choked = p.choked_us;
+        if choked && !p.can_request_fast() {
+            return out;
+        }
+        let base = p.requested.len();
+        let rate = p.from_rate.rate(now);
+        // Live peers that do not choke us, by arrival, once per call.
+        let mut ranked: Vec<(Duration, PeerKey)> = self
+            .peers
+            .iter()
+            .filter(|(_, o)| o.live() && !o.choked_us && o.generation == generation)
+            .map(|(&k, o)| (arrival_after(o.requested.len(), o.from_rate.rate(now)), k))
+            .collect();
+        ranked.sort_unstable();
+        // The peers ranked before `key` (all of them if it is not ranked).
+        let ahead: Vec<PeerKey> = ranked
+            .iter()
+            .map(|&(_, k)| k)
+            .take_while(|&k| k != key)
+            .collect();
+        let owner_arrival = |o: PeerKey| -> Duration {
+            match self.peers.get(&o) {
+                Some(q) if q.live() && !q.choked_us && !q.snubbed => ranked
+                    .iter()
+                    .find(|&&(_, k)| k == o)
+                    .map_or(Duration::MAX, |&(t, _)| t),
+                // Choking, snubbed or gone: never on time.
+                _ => Duration::MAX,
+            }
+        };
+        let Some(l) = self.loaded.as_mut() else {
+            return out;
+        };
+        let layout = l.layout;
+        let Some(picker) = l.picker.as_mut() else {
+            return out;
+        };
+        let cap = partial_cap(
+            picker.num_in_progress(),
+            self.cache.partial_room(u64::from(layout.piece_len())),
+        );
+        for &(piece, deadline) in self.deadlines.ordered() {
+            let left_room = room.saturating_sub(out.len());
+            if left_room == 0 {
+                break;
+            }
+            let has = if choked {
+                p.fast_has.as_ref().is_some_and(|f| f.get(piece))
+            } else {
+                p.has(piece)
+            };
+            if !has {
+                continue;
+            }
+            let left = deadline.saturating_duration_since(now);
+            let mine = arrival_after(base.saturating_add(out.len()), rate);
+            // Free blocks: as many as arrive in time, or all for the best.
+            let best = !choked
+                && !ahead
+                    .iter()
+                    .any(|k| self.peers.get(k).is_some_and(|o| o.has(piece)));
+            let free = if best {
+                left_room
+            } else {
+                blocks_within(left, rate)
+                    .saturating_sub(base.saturating_add(out.len()))
+                    .min(left_room)
+            };
+            let Some(progress) = picker.progress(piece) else {
+                continue;
+            };
+            let take_free = free > 0 && progress.free > 0;
+            let late: Vec<PeerKey> = if progress.owners.contains(&key) {
+                Vec::new()
+            } else {
+                progress
+                    .owners
+                    .iter()
+                    .copied()
+                    .filter(|&o| {
+                        let t = owner_arrival(o);
+                        t > left && t > mine
+                    })
+                    .collect()
+            };
+            if !take_free && late.is_empty() {
+                continue;
+            }
+            // Its buffer first; a new piece also needs room under the cap.
+            if !self.cache.has_partial(piece) {
+                if !picker.is_in_progress(piece) && picker.num_in_progress() >= cap {
+                    continue;
+                }
+                if !self
+                    .cache
+                    .reserve_partial(piece, u64::from(layout.piece_size(piece)))
+                {
+                    continue;
+                }
+            }
+            if take_free {
+                out.extend(picker.pick_piece(key, piece, free, &[]));
+            }
+            // Copies only once no block is free (`pick_piece` takes free
+            // blocks first, and those were offered above).
+            let n = room.saturating_sub(out.len());
+            let none_free = picker.progress(piece).is_some_and(|pr| pr.free == 0);
+            if !late.is_empty() && n > 0 && none_free {
+                out.extend(picker.pick_piece(key, piece, n, &late));
+            }
+            if !picker.is_in_progress(piece) {
+                // Nothing taken after all.
+                self.cache.release_partial(piece);
+            }
+        }
+        out
     }
 
     /// Tests: the merged deadlines as time left.
@@ -667,5 +919,307 @@ mod tests {
         assert_eq!(waiting[0].0, id);
         assert!(!waiting[0].3.is_closed());
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    // ----- deadline picking -------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use fbt_core::{Bitfield, BlockRef};
+    use tokio::sync::mpsc;
+
+    use super::super::peer::Peer;
+    use super::super::swarm::tests::addr;
+    use crate::peer::messages::PeerCommand;
+    use crate::peer::transport::Transport;
+    use crate::picker::PeerKey;
+    use crate::session::Priority;
+    use crate::storage::cache::PROGRESS_FLOOR_PIECES;
+
+    /// Pieces of four blocks.
+    const P4: u32 = 65_536;
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+
+    /// A connected peer that unchokes us, downloading to us at `rate`
+    /// bytes per second (recorded now: the test runs on paused time), with
+    /// `bits` (`None`: a seed) and no demand yet. It counts in the
+    /// picker's availability.
+    fn add_peer(
+        a: &mut Actor,
+        i: u32,
+        rate: u64,
+        bits: Option<Bitfield>,
+    ) -> (PeerKey, mpsc::Receiver<PeerCommand>) {
+        let n = a.loaded.as_ref().expect("loaded").layout.num_pieces();
+        let (tx, rx) = mpsc::channel(1 << 16);
+        let mut p = Peer::new(addr(i), tx, a.generation, n, Transport::Tcp);
+        p.outgoing = true;
+        p.connected = true;
+        p.choked_us = false;
+        match bits {
+            None => p.seed = true,
+            Some(b) => p.bits = b,
+        }
+        p.from_rate.record(rate);
+        let key = a.new_key();
+        a.loaded
+            .as_mut()
+            .and_then(|l| l.picker.as_mut())
+            .expect("picker")
+            .add_peer_pieces(p.pieces());
+        a.peers.insert(key, p);
+        (key, rx)
+    }
+
+    /// Opens a reader of `file` at `pos` with `ra`.
+    fn open_with(
+        a: &mut Actor,
+        file: usize,
+        pos: u64,
+        ra: ReadAhead,
+    ) -> (ReaderId, Arc<ReaderLink>) {
+        let link = Arc::new(ReaderLink::new(pos, ra));
+        let (tx, mut rx) = oneshot::channel();
+        a.on_open_reader(file, Arc::clone(&link), tx);
+        let id = rx.try_recv().expect("answered").expect("opened");
+        (id, link)
+    }
+
+    /// Asks `key` for `demand` blocks, as its `WantBlocks` does.
+    fn want(a: &mut Actor, key: PeerKey, demand: usize) {
+        a.peers.get_mut(&key).expect("peer").demand = demand;
+        a.fill(key);
+    }
+
+    fn requested(a: &Actor, key: PeerKey) -> Vec<BlockRef> {
+        let mut v: Vec<BlockRef> = a.peers[&key].requested.iter().copied().collect();
+        v.sort_by_key(|b| (b.piece, b.offset));
+        v
+    }
+
+    fn of_piece(a: &Actor, key: PeerKey, piece: u32) -> Vec<u32> {
+        requested(a, key)
+            .into_iter()
+            .filter(|b| b.piece == piece)
+            .map(|b| b.offset)
+            .collect()
+    }
+
+    fn picker(a: &mut Actor) -> &mut crate::picker::PiecePicker {
+        a.loaded
+            .as_mut()
+            .and_then(|l| l.picker.as_mut())
+            .expect("picker")
+    }
+
+    /// `key` holds `n` free blocks of `piece`, as an earlier `fill` left
+    /// them.
+    fn hold(a: &mut Actor, key: PeerKey, piece: u32, n: usize) {
+        assert!(a.cache.reserve_partial(piece, u64::from(P4)) || a.cache.has_partial(piece));
+        let got = picker(a).pick_piece(key, piece, n, &[]);
+        assert_eq!(got.len(), n);
+        a.peers.get_mut(&key).expect("peer").requested.extend(got);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fastest_peer_gets_the_first_deadline_piece() {
+        let mut a = actor_with(&[64 * u64::from(P4)], P4, 64 * MIB);
+        let (fast, _rf) = add_peer(&mut a, 1, MIB, None);
+        let (slow, _rs) = add_peer(&mut a, 2, 20 * KIB, None);
+        // The default window covers the whole 4 MiB file, at 1.6 MiB/s.
+        let (_id, _link) = open(&mut a, 0, 0);
+        assert_eq!(a.deadlines.ordered().len(), 64);
+        // The slow peer asks first.
+        want(&mut a, slow, 32);
+        want(&mut a, fast, 32);
+        assert_eq!(of_piece(&a, fast, 0), vec![0, 16_384, 32_768, 49_152]);
+        assert!(of_piece(&a, slow, 0).is_empty());
+        // One block from the slow peer takes 0.8 s at least.
+        let now = Instant::now();
+        let slow_arrival = Duration::from_millis(800);
+        for b in requested(&a, slow) {
+            let left = a
+                .deadlines
+                .deadline(b.piece)
+                .expect("a deadline piece")
+                .saturating_duration_since(now);
+            assert!(left >= slow_arrival, "piece {} left {left:?}", b.piece);
+        }
+    }
+
+    /// Pieces 0 to 9 are there: piece 10 is the window's first, due in
+    /// about 390 ms.
+    fn late_setup() -> Actor {
+        let mut a = actor_with(&[64 * u64::from(P4)], P4, 64 * MIB);
+        for i in 0..10 {
+            picker(&mut a).piece_passed(i);
+        }
+        a
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_block_is_duplicated_to_a_faster_peer() {
+        let mut a = late_setup();
+        let (slow, _r1) = add_peer(&mut a, 1, 20 * KIB, None);
+        let (fast_owner, _r2) = add_peer(&mut a, 2, MIB, None);
+        let (c, _r3) = add_peer(&mut a, 3, MIB, None);
+        let (d, _r4) = add_peer(&mut a, 4, MIB, None);
+        let (_id, _link) = open(&mut a, 0, 0);
+        assert_eq!(a.deadlines.ordered().first().map(|e| e.0), Some(10));
+        // The slow peer holds blocks 0 and 1 (2.4 s away), the fast owner
+        // blocks 2 and 3 (47 ms away).
+        hold(&mut a, slow, 10, 2);
+        hold(&mut a, fast_owner, 10, 2);
+        want(&mut a, c, 4);
+        assert_eq!(of_piece(&a, c, 10), vec![0, 16_384], "the slow peer's");
+        // Every late block has two owners now; the fast owner's are on time.
+        want(&mut a, d, 4);
+        assert!(of_piece(&a, d, 10).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_never_goes_to_a_slower_peer() {
+        let mut a = late_setup();
+        // Blocks 0 and 1 at 100 KiB/s: 480 ms away, late for piece 10.
+        let (owner, _r1) = add_peer(&mut a, 1, 100 * KIB, None);
+        let (slower, _r2) = add_peer(&mut a, 2, 20 * KIB, None);
+        let (faster, _r3) = add_peer(&mut a, 3, MIB, None);
+        let (_id, _link) = open(&mut a, 0, 0);
+        hold(&mut a, owner, 10, 2);
+        // 800 ms away: no copy, and the free blocks wait for a peer in time.
+        want(&mut a, slower, 4);
+        assert!(of_piece(&a, slower, 10).is_empty());
+        want(&mut a, faster, 4);
+        assert_eq!(of_piece(&a, faster, 10), vec![0, 16_384, 32_768, 49_152]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn endgame_and_deadline_never_exceed_two_owners() {
+        let mut a = actor_with(&[16 * u64::from(P4)], P4, 64 * MIB);
+        let rates = [MIB, 500 * KIB, 100 * KIB, 20 * KIB];
+        let mut keys = Vec::new();
+        let mut rxs = Vec::new();
+        for (i, &r) in (1u32..).zip(&rates) {
+            let (k, rx) = add_peer(&mut a, i, r, None);
+            keys.push(k);
+            rxs.push(rx);
+        }
+        // A window of four pieces; the rest goes to the normal pick.
+        let (_id, _link) = open_with(
+            &mut a,
+            0,
+            0,
+            ReadAhead::new(4 * u64::from(P4), Duration::from_secs(1), None),
+        );
+        assert_eq!(a.deadlines.ordered().len(), 4);
+        for _ in 0..4 {
+            for &k in &keys {
+                want(&mut a, k, 500);
+            }
+        }
+        assert!(picker(&mut a).is_endgame());
+        let mut count: HashMap<BlockRef, usize> = HashMap::new();
+        for &k in &keys {
+            for b in &a.peers[&k].requested {
+                *count.entry(*b).or_default() += 1;
+            }
+        }
+        assert_eq!(count.len(), 16 * 4, "every block requested");
+        assert!(count.values().all(|&n| n <= 2), "{count:?}");
+        assert!(count.values().any(|&n| n == 2), "some duplicates");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_piece_with_deadline_is_requested_and_wanted() {
+        let plen = u64::from(P4);
+        let mut a = actor_with(&[8 * plen, 8 * plen], P4, 64 * MIB);
+        a.set_priorities(vec![Priority::Normal, Priority::Skip]);
+        let mut only_12 = Bitfield::new(16);
+        only_12.set(12);
+        let (p, _rp) = add_peer(&mut a, 1, MIB, Some(only_12));
+        let (seed, _rs) = add_peer(&mut a, 2, MIB, None);
+        // Every wanted piece is there.
+        for i in 0..8 {
+            picker(&mut a).piece_passed(i);
+        }
+        a.update_interest(p);
+        a.update_interest(seed);
+        assert!(!a.wants_piece(12));
+        assert!(!a.peers[&p].am_interested);
+        assert!(!a.peers[&seed].am_interested);
+        // A reader on the skipped file, at piece 12.
+        let (_id, _link) = open(&mut a, 1, 12 * plen);
+        assert!(a.wants_piece(12));
+        assert!(!a.wants_piece(11), "behind the reader: not in its window");
+        assert!(a.peers[&p].am_interested);
+        assert!(a.peers[&seed].am_interested);
+        want(&mut a, p, 8);
+        assert_eq!(of_piece(&a, p, 12), vec![0, 16_384, 32_768, 49_152]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seek_storm_leaves_only_the_last_window() {
+        let plen = u64::from(P4);
+        let cache_pieces = 8u64;
+        let mut a = actor_with(&[32 * plen], P4, cache_pieces * plen);
+        // Odd pieces are skipped.
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            for (i, p) in l.piece_prio.iter_mut().enumerate() {
+                *p = if i % 2 == 1 { 0 } else { 4 };
+            }
+            let prio = l.piece_prio.clone();
+            l.picker
+                .as_mut()
+                .expect("picker")
+                .set_piece_priorities(&prio);
+        }
+        let (k1, mut r1) = add_peer(&mut a, 1, MIB, None);
+        let (k2, mut r2) = add_peer(&mut a, 2, 200 * KIB, None);
+        let ra = ReadAhead::new(3 * plen, Duration::from_secs(1), None);
+        let (id, link) = open_with(&mut a, 0, 0, ra);
+        let file = 0..32 * plen;
+        let mut pos = 0;
+        for i in 0..1000u64 {
+            pos = (i * 7_919 * 1_013) % (32 * plen);
+            link.moved(pos, || true);
+            a.on_reader_moved(id);
+            want(&mut a, k1, 64);
+            want(&mut a, k2, 64);
+            while r1.try_recv().is_ok() {}
+            while r2.try_recv().is_ok() {}
+            let in_progress = picker(&mut a).num_in_progress();
+            assert!(
+                in_progress <= (cache_pieces as usize) + PROGRESS_FLOOR_PIECES,
+                "step {i}: {in_progress} in progress"
+            );
+            assert_eq!(
+                a.shared.cache.stats().partial,
+                in_progress as u64 * plen,
+                "step {i}: one reservation per piece in progress"
+            );
+        }
+        let layout = a.loaded.as_ref().expect("loaded").layout;
+        let last: Vec<u32> = crate::stream::window::window(file, pos, &layout, &ra, Instant::now())
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        let mut got: Vec<u32> = a.deadlines.ordered().iter().map(|e| e.0).collect();
+        got.sort_unstable();
+        assert_eq!(got, last);
+        assert!(!last.is_empty());
+        // Skipped pieces outside the last window were abandoned; wanted
+        // ones of earlier windows are still in progress.
+        let pk = picker(&mut a);
+        let stale_skipped: Vec<u32> = (0..32)
+            .filter(|&p| p % 2 == 1 && !last.contains(&p) && pk.is_in_progress(p))
+            .collect();
+        assert!(stale_skipped.is_empty(), "{stale_skipped:?}");
+        assert!(
+            (0..32).any(|p| p % 2 == 0 && !last.contains(&p) && pk.is_in_progress(p)),
+            "old windows' wanted pieces continue"
+        );
     }
 }

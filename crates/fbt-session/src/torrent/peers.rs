@@ -46,9 +46,14 @@ impl Actor {
             PeerEvent::DontHave { key, piece } => self.on_donthave(key, piece),
             PeerEvent::UploadOnly { key, on } => self.on_upload_only(key, on),
             PeerEvent::Choked { key } => {
-                if let Some(p) = self.peers.get_mut(&key) {
-                    p.choked_us = true;
-                    p.demand = 0;
+                let Some(p) = self.peers.get_mut(&key) else {
+                    return;
+                };
+                p.choked_us = true;
+                p.demand = 0;
+                // Its deadline blocks are late now: others may copy them.
+                if p.requested.iter().any(|b| self.deadlines.contains(b.piece)) {
+                    self.top_up_all(Some(key));
                 }
             }
             PeerEvent::Unchoked { key } => {
@@ -269,9 +274,10 @@ impl Actor {
     }
 
     /// While we are finished and on disk, a peer that is a seed or
-    /// upload-only has nothing to trade with us: closed.
+    /// upload-only has nothing to trade with us: closed. Nobody is while a
+    /// reader's deadline piece is missing.
     pub(super) fn close_if_upload_only(&mut self, key: PeerKey) {
-        if !self.upload_only_sent {
+        if !self.upload_only_sent || self.deadline_missing() {
             return;
         }
         let Some(p) = self.peers.get_mut(&key) else {
@@ -287,9 +293,10 @@ impl Actor {
     /// Follows the seeding state: peers learn when we become (or stop
     /// being) upload-only, and upload-only peers are dropped once we are.
     /// "Finished" means seeding, with the data on disk, not merely every
-    /// piece verified.
+    /// piece verified, and no reader's deadline piece missing (a reader on
+    /// a skipped file needs the seeds).
     pub(super) fn sync_upload_only(&mut self) {
-        let on = matches!(self.last_state, TorrentState::Seeding);
+        let on = matches!(self.last_state, TorrentState::Seeding) && !self.deadline_missing();
         if on == self.upload_only_sent {
             return;
         }
@@ -826,10 +833,12 @@ impl Actor {
 
     // ----- interest and requests ----------------------------------------------
 
-    /// We want `piece`: wanted priority and not verified yet.
+    /// We want `piece`: not verified yet, and of a wanted priority or with
+    /// a reader's deadline.
     pub(super) fn wants_piece(&self, piece: u32) -> bool {
         self.loaded.as_ref().is_some_and(|l| {
-            l.piece_prio.get(piece as usize).is_some_and(|&p| p > 0)
+            (l.piece_prio.get(piece as usize).is_some_and(|&p| p > 0)
+                || self.deadlines.contains(piece))
                 && l.picker.as_ref().is_some_and(|pk| !pk.have().get(piece))
         })
     }
@@ -848,6 +857,7 @@ impl Actor {
                     .as_ref()
                     .and_then(|l| l.picker.as_ref())
                     .is_some_and(|pk| !pk.is_finished())
+                    || self.deadline_missing()
             } else {
                 p.bits.iter_ones().any(|i| self.wants_piece(i))
             };
@@ -859,7 +869,9 @@ impl Actor {
         }
     }
 
-    /// Hands blocks to a peer up to its unmet demand.
+    /// Hands blocks to a peer up to its unmet demand: blocks of deadline
+    /// pieces first ([`fill_deadlines`](Self::fill_deadlines)), then the
+    /// normal pick, which leaves deadline pieces to the former.
     pub(super) fn fill(&mut self, key: PeerKey) {
         if !self.active() {
             return;
@@ -893,21 +905,41 @@ impl Actor {
         if room == 0 {
             return;
         }
-        let mut blocks = if p.choked_us {
-            let (true, Some(fast)) = (p.can_request_fast(), p.fast_has.as_ref()) else {
-                return;
-            };
-            pick_capped(
-                picker,
-                key,
-                PeerPieces::Some(fast),
-                room,
-                cap,
-                &mut self.rng,
-            )
-        } else {
-            pick_capped(picker, key, p.pieces(), room, cap, &mut self.rng)
+        if p.choked_us && !p.can_request_fast() {
+            return;
+        }
+        let deadline_blocks = self.fill_deadlines(key, room, Instant::now());
+        let room = room.saturating_sub(deadline_blocks.len());
+        let Some(l) = self.loaded.as_mut() else {
+            return;
         };
+        let (Some(picker), Some(p)) = (l.picker.as_mut(), self.peers.get(&key)) else {
+            return;
+        };
+        let has = if p.choked_us {
+            p.fast_has
+                .as_ref()
+                .map_or(PeerPieces::Some(&p.bits), PeerPieces::Some)
+        } else {
+            p.pieces()
+        };
+        // Deadline pieces go only through `fill_deadlines`, which knows
+        // whether this peer is in time for them.
+        let without_deadlines = (!self.deadlines.is_empty()).then(|| {
+            let mut mask = match has {
+                PeerPieces::Some(bf) => bf.clone(),
+                _ => Bitfield::full(picker.have().len()),
+            };
+            for &(piece, _) in self.deadlines.ordered() {
+                mask.clear(piece);
+            }
+            mask
+        });
+        let has = without_deadlines.as_ref().map_or(has, PeerPieces::Some);
+        let mut blocks = deadline_blocks;
+        if room > 0 {
+            blocks.extend(pick_capped(picker, key, has, room, cap, &mut self.rng));
+        }
         // Every piece started here reserves its buffer from the cache
         // budget; one that cannot (the budget moved since `partial_room`)
         // goes back to the picker.
@@ -940,14 +972,19 @@ impl Actor {
         self.send(key, PeerCommand::Request(blocks));
     }
 
-    /// Tops up every peer with unmet demand, except `skip`.
+    /// Tops up every peer with unmet demand, except `skip`; while a reader
+    /// has deadlines, the peers that would deliver soonest first.
     pub(super) fn top_up_all(&mut self, skip: Option<PeerKey>) {
-        let keys: Vec<PeerKey> = self
+        let mut keys: Vec<PeerKey> = self
             .peers
             .iter()
             .filter(|(k, p)| p.demand > 0 && Some(**k) != skip)
             .map(|(k, _)| *k)
             .collect();
+        if !self.deadlines.is_empty() && keys.len() > 1 {
+            let now = Instant::now();
+            keys.sort_by_cached_key(|&k| (self.arrival(k, now), k));
+        }
         for key in keys {
             self.fill(key);
         }

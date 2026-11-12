@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fbt_bencode::{DictBuilder, OwnedValue, encode};
-use fbt_core::PeerId;
+use fbt_core::{BlockRef, PeerId};
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage, sha1_piece};
 use fbt_session::{Event, EventStream, Settings, TorrentHandle, TorrentState};
@@ -368,6 +368,58 @@ impl ScriptedPeer {
                 if self.framed.send(piece).await.is_err() {
                     return;
                 }
+            }
+        }
+    }
+}
+
+impl ScriptedPeer {
+    /// [`serve`](Self::serve) that also logs every `Request` it receives
+    /// into `log`.
+    pub async fn serve_recording(
+        &mut self,
+        payload: &[u8],
+        piece_len: u32,
+        log: Arc<Mutex<Vec<BlockRef>>>,
+    ) {
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        let answer = Arc::new(AtomicBool::new(true));
+        self.serve_recording_with(payload, piece_len, log, cancels, answer)
+            .await;
+    }
+
+    /// Logs every `Request` into `log` and every `Cancel` into `cancels`,
+    /// and answers requests with the matching bytes of `payload` while
+    /// `answer` is set (a request that arrives while it is clear stays
+    /// unanswered), until the connection closes.
+    pub async fn serve_recording_with(
+        &mut self,
+        payload: &[u8],
+        piece_len: u32,
+        log: Arc<Mutex<Vec<BlockRef>>>,
+        cancels: Arc<Mutex<Vec<BlockRef>>>,
+        answer: Arc<AtomicBool>,
+    ) {
+        while let Some(Ok(m)) = self.framed.next().await {
+            match m {
+                Message::Request(b) => {
+                    log.lock().unwrap().push(b);
+                    if !answer.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let start = b.piece as usize * piece_len as usize + b.offset as usize;
+                    let data = Bytes::copy_from_slice(&payload[start..start + b.len as usize]);
+                    let piece = Message::Piece {
+                        piece: b.piece,
+                        offset: b.offset,
+                        data,
+                    };
+                    if self.framed.send(piece).await.is_err() {
+                        return;
+                    }
+                }
+                Message::Cancel(b) => cancels.lock().unwrap().push(b),
+                _ => {}
             }
         }
     }
