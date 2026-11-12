@@ -42,8 +42,9 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
 
 impl BanList {
     /// The key banning `addr`: its whole IP (port 0), or with `endpoint`
-    /// only `addr` itself.
+    /// only `addr` itself; an IPv4-mapped IP written as IPv4.
     pub(crate) fn key(addr: SocketAddr, endpoint: bool) -> SocketAddr {
+        let addr = canonical(addr);
         if endpoint {
             addr
         } else {
@@ -98,6 +99,14 @@ mod tests {
         assert!(b.is_banned(sa("10.0.0.1:1")));
         assert!(b.is_banned(sa("[::ffff:10.0.0.1]:6881")));
         assert!(!b.is_banned(sa("10.0.0.2:6881")));
+        assert_eq!(
+            BanList::key(sa("[::ffff:10.0.0.2]:7000"), true),
+            sa("10.0.0.2:7000")
+        );
+        assert_eq!(
+            BanList::key(sa("[::ffff:10.0.0.2]:7000"), false),
+            sa("10.0.0.2:0")
+        );
         assert!(b.ban(BanList::key(sa("[::ffff:10.0.0.2]:7000"), true)));
         assert!(b.is_banned(sa("10.0.0.2:7000")));
         assert!(!b.is_banned(sa("10.0.0.2:7001")));

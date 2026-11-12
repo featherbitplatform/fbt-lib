@@ -219,6 +219,11 @@ async fn honest_contributor_keeps_its_trust() {
     let disconnected_b =
         |e: &Event| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == l.b);
     assert!(!l.seen.iter().any(disconnected_b), "B stays connected");
+    // B lost 2 points for the failed piece and got them back when the
+    // retry proved its blocks right (plus 1 if it sent blocks of the
+    // retry): its trust is back where it was.
+    let trust = l.h.peer_trust(l.b).await.unwrap();
+    assert!((0..=1).contains(&trust), "B's trust is {trust}");
     // Now the rest is wanted; only B has it.
     let served_before = l.log_b.lock().unwrap().len();
     l.h.set_file_priorities(vec![Priority::Normal; 4])
@@ -331,5 +336,67 @@ async fn banned_peer_is_not_redialled() {
             .is_err(),
         "no connection reaches the banned peer"
     );
+    s.shutdown().await;
+}
+
+/// A peer that sends bad data to one torrent is banned session-wide: its
+/// connection to another torrent closes too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ban_reaches_every_torrent() {
+    let (m1, payload) = make_torrent(&[("a", 8 * 16_384)], 16_384);
+    let (m2, _) = make_torrent(&[("b", 8 * 16_384)], 16_384);
+    let wrong: Vec<u8> = payload.iter().map(|x| !x).collect();
+    let (la, a) = listener().await;
+    let s = Session::new(plain()).await.unwrap();
+    let mut ev = s.subscribe(EventMask::PEER);
+    let mut handles = Vec::new();
+    for m in [&m1, &m2] {
+        let mut add = AddTorrent::new(m.clone(), PathBuf::from("unused"));
+        add.storage = Some(Arc::new(MemStorage::new(payload.len() as u64)));
+        let h = s.add_torrent(add).await.unwrap();
+        assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+        handles.push(h);
+    }
+    // Torrent 2 first: A stays connected there, idle (it has nothing).
+    handles[1].add_peer(a).await.unwrap();
+    let mut idle = ScriptedPeer::accept_with(&la, Reserved::default()).await;
+    assert_eq!(idle.remote.info_hash, m2.info_hashes.v1.unwrap().0);
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::PeerConnected { torrent, .. } if *torrent == m2.info_hashes),
+        T,
+    )
+    .await
+    .expect("A connects to torrent 2");
+    // Torrent 1: A sends data that never matches, and is banned.
+    handles[0].add_peer(a).await.unwrap();
+    let mut liar = ScriptedPeer::accept_with(&la, Reserved::default()).await;
+    assert_eq!(liar.remote.info_hash, m1.info_hashes.v1.unwrap().0);
+    liar.send(Message::Bitfield(Bytes::from_static(&[0xff])))
+        .await;
+    liar.send(Message::Unchoke).await;
+    tokio::spawn(async move {
+        liar.serve_corrupt(&wrong, 16_384, HashSet::new(), Arc::default())
+            .await;
+    });
+    let closed = next_matching(
+        &mut ev,
+        |e| {
+            matches!(e, Event::PeerDisconnected { torrent, addr, .. }
+                if *torrent == m2.info_hashes && *addr == a)
+        },
+        T,
+    )
+    .await
+    .expect("A's connection to torrent 2 closes");
+    let Event::PeerDisconnected { reason, .. } = closed else {
+        unreachable!()
+    };
+    assert_eq!(
+        reason,
+        fbt_session::DisconnectReason::Blocked(BlockReason::Banned)
+    );
+    assert_eq!(s.banned_peers(), vec![a]);
+    assert_eq!(idle.wait_closed(T).await, PeerEnd::Closed);
     s.shutdown().await;
 }

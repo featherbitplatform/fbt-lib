@@ -751,17 +751,21 @@ impl Actor {
     /// whole IP (port 0), or with `ban_endpoints` its address.
     pub(super) fn block_source(&self, key: PeerKey) -> Option<BlockSource> {
         let p = self.peers.get(&key)?;
-        Some(BlockSource::Peer(BanList::key(
-            p.addr,
-            self.shared.settings.ban_endpoints,
-        )))
+        Some(self.peer_block_source(p.addr))
+    }
+
+    /// The smart-ban source of a peer at `addr` (IPv4-mapped written as
+    /// IPv4, as in the ban list).
+    pub(super) fn peer_block_source(&self, addr: SocketAddr) -> BlockSource {
+        BlockSource::Peer(BanList::key(addr, self.shared.settings.ban_endpoints))
     }
 
     /// Bans a source of bad blocks (smart ban). A peer key goes into the
     /// session's ban list and every matching peer is closed with
     /// `Blocked(Banned)` and reported ([`Event::PeerBlocked`]), or the key
-    /// is reported if none is connected. Unlike [`ban`](Self::ban) (bad
-    /// metadata, this torrent only), the ban is session-wide.
+    /// is reported if none is connected here. Unlike [`ban`](Self::ban)
+    /// (bad metadata, this torrent only), the ban is session-wide: every
+    /// other torrent is told to close its matching peers too.
     pub(super) fn smart_ban(&mut self, s: BlockSource) {
         match s {
             BlockSource::Peer(key) => {
@@ -775,11 +779,32 @@ impl Actor {
                 if self.close_blocked() == 0 && added {
                     self.emit_blocked(key, BlockReason::Banned);
                 }
+                if added {
+                    self.tell_other_torrents_bans_changed();
+                }
             }
             BlockSource::WebSeed(key) => {
                 // Retiring the web seed comes with web seeds (Task 11).
                 debug!(torrent = %self.name(), ?key, "a web seed sent bad blocks");
             }
+        }
+    }
+
+    /// Sends [`Cmd::BansChanged`](super::Cmd::BansChanged) to every other
+    /// torrent of the session, without waiting.
+    fn tell_other_torrents_bans_changed(&self) {
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        let others: Vec<_> = session
+            .registry()
+            .torrents
+            .iter()
+            .filter(|(ih, _)| **ih != self.ih)
+            .map(|(_, e)| e.handle.clone())
+            .collect();
+        for h in others {
+            h.bans_changed();
         }
     }
 

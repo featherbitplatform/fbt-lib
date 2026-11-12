@@ -93,7 +93,10 @@ pub struct Settings {
     #[doc(hidden)]
     pub per_ip_exempt_loopback: bool,
     /// Bans name one endpoint (address and port) instead of the whole IP,
-    /// so loopback tests can ban one of several peers on `127.0.0.1`.
+    /// so loopback tests can ban one of several peers on `127.0.0.1`. An
+    /// incoming peer's endpoint is its source port, so a banned incoming
+    /// peer gets back in by reconnecting from another port: endpoint bans
+    /// hold only against peers we dial.
     #[doc(hidden)]
     pub ban_endpoints: bool,
     /// Outgoing connections still connecting or handshaking.

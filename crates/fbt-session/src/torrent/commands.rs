@@ -114,6 +114,13 @@ impl Actor {
                 self.on_filter_changed();
                 let _ = tx.send(());
             }
+            Cmd::BansChanged => {
+                self.close_blocked();
+            }
+            Cmd::PeerTrust(addr, tx) => {
+                let s = self.peer_block_source(addr);
+                let _ = tx.send(self.smartban.trust_of(s));
+            }
             Cmd::Shutdown(tx) => {
                 let _ = self.stop(None).await;
                 let _ = tx.send(());

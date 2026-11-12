@@ -4,10 +4,12 @@
 //! the picker accepts remembers its sender. When a piece fails, the SHA-1 of
 //! each of its blocks is kept with that sender (at most
 //! [`MAX_SMART_BAN_PIECES`] pieces); when the piece later passes, every
-//! sender whose block differs from the good one is banned. Independently,
-//! each sender's trust drops by 2 per failed piece it contributed to and
-//! rises by 1 per passed piece (up to 8): at −7 it is banned, so a peer
-//! whose data never passes goes after its fourth failed piece.
+//! sender whose block differs from the good one is banned, and every other
+//! sender of the failed piece gets back the trust the failure cost it.
+//! Independently, each sender's trust drops by 2 per failed piece it
+//! contributed to and rises by 1 per passed piece (up to 8): at −7 it is
+//! banned, so a peer whose data never passes goes after its fourth failed
+//! piece.
 //!
 //! This is separate from the per-torrent ban of peers that sent bad
 //! metadata (`BanTarget`).
@@ -22,6 +24,12 @@ pub(super) const MAX_SMART_BAN_PIECES: usize = 64;
 /// Most senders whose trust is tracked; beyond it the most trusted entry
 /// is dropped.
 pub(super) const MAX_TRUST_ENTRIES: usize = 4096;
+/// Most distinct (sender, hash) records kept per block of a failed piece
+/// across its failures; the oldest goes first.
+const MAX_RECORDS_PER_BLOCK: usize = 4;
+/// Most contributors whose penalties a failed piece remembers for a
+/// refund; later ones are not refunded.
+const MAX_RECORD_CONTRIBUTORS: usize = 64;
 
 /// Trust lost per failed piece a sender contributed to.
 const FAIL_POINTS: i32 = -2;
@@ -42,11 +50,48 @@ pub(super) enum BlockSource {
     WebSeed(PeerKey),
 }
 
-/// A failed piece's blocks: each block's sender and SHA-1, by block index
-/// (`None` where no sender was recorded).
-#[derive(Debug)]
+/// What the failures of one piece recorded.
+#[derive(Debug, Default)]
 struct Failed {
-    blocks: Vec<Option<(BlockSource, [u8; 20])>>,
+    /// By block index: each distinct sender and SHA-1 the block had in a
+    /// failed attempt, oldest first, at most [`MAX_RECORDS_PER_BLOCK`].
+    blocks: Vec<Vec<(BlockSource, [u8; 20])>>,
+    /// Each contributor and how many failed attempts it lost trust for,
+    /// at most [`MAX_RECORD_CONTRIBUTORS`].
+    penalties: Vec<(BlockSource, u32)>,
+}
+
+impl Failed {
+    /// Merges one failed attempt: block `i` was `blocks[i]` (sender and
+    /// hash), and `contributors` lost trust for it.
+    fn merge(
+        &mut self,
+        blocks: impl Iterator<Item = (usize, BlockSource, [u8; 20])>,
+        contributors: &[BlockSource],
+    ) {
+        for (i, s, h) in blocks {
+            if self.blocks.len() <= i {
+                self.blocks.resize_with(i + 1, Vec::new);
+            }
+            let Some(recs) = self.blocks.get_mut(i) else {
+                continue;
+            };
+            if recs.contains(&(s, h)) {
+                continue;
+            }
+            recs.push((s, h));
+            if recs.len() > MAX_RECORDS_PER_BLOCK {
+                recs.remove(0);
+            }
+        }
+        for &s in contributors {
+            if let Some((_, n)) = self.penalties.iter_mut().find(|(c, _)| *c == s) {
+                *n = n.saturating_add(1);
+            } else if self.penalties.len() < MAX_RECORD_CONTRIBUTORS {
+                self.penalties.push((s, 1));
+            }
+        }
+    }
 }
 
 /// One torrent's smart-ban state.
@@ -85,24 +130,26 @@ impl SmartBan {
     }
 
     /// `piece` failed its hash check with these block hashes. Records each
-    /// block's sender and hash (replacing an earlier record of the piece),
-    /// takes trust from every contributor and returns those whose trust
-    /// fell to [`BAN_TRUST`] or below.
+    /// block's sender and hash (merged into an earlier record of the
+    /// piece, which becomes the newest), takes trust from every contributor
+    /// and returns those whose trust fell to [`BAN_TRUST`] or below.
     pub(super) fn piece_failed(
         &mut self,
         piece: u32,
         block_hashes: Vec<[u8; 20]>,
     ) -> Vec<BlockSource> {
         let senders = self.senders.remove(&piece).unwrap_or_default();
-        let blocks: Vec<Option<(BlockSource, [u8; 20])>> = block_hashes
+        let contributors = distinct(senders.iter().copied().flatten());
+        let blocks = block_hashes
             .into_iter()
             .enumerate()
-            .map(|(i, h)| senders.get(i).copied().flatten().map(|s| (s, h)))
-            .collect();
-        let contributors = distinct(senders.iter().copied().flatten());
-        if self.failed.insert(piece, Failed { blocks }).is_none() {
-            self.failed_order.push_back(piece);
-        }
+            .filter_map(|(i, h)| senders.get(i).copied().flatten().map(|s| (i, s, h)));
+        self.failed
+            .entry(piece)
+            .or_default()
+            .merge(blocks, &contributors);
+        self.failed_order.retain(|&p| p != piece);
+        self.failed_order.push_back(piece);
         while self.failed_order.len() > MAX_SMART_BAN_PIECES {
             if let Some(old) = self.failed_order.pop_front() {
                 self.failed.remove(&old);
@@ -120,8 +167,9 @@ impl SmartBan {
 
     /// `piece` passed. With an earlier failure on record and the good
     /// block hashes, returns every sender of a block that differs from the
-    /// good one (and drops the record). Every contributor of the passed
-    /// piece gains trust.
+    /// good one (and drops the record); every other sender on record gets
+    /// back the trust its failures of this piece cost it. Every contributor
+    /// of the passed piece gains trust.
     pub(super) fn piece_passed(
         &mut self,
         piece: u32,
@@ -132,12 +180,32 @@ impl SmartBan {
         if let Some(failed) = self.failed.remove(&piece) {
             self.failed_order.retain(|&p| p != piece);
             if let Some(good) = block_hashes {
-                let liars = failed
+                let records = failed
                     .blocks
                     .iter()
                     .zip(&good)
-                    .filter_map(|(rec, g)| rec.filter(|(_, h)| h != g).map(|(s, _)| s));
-                banned = distinct(liars);
+                    .flat_map(|(recs, g)| recs.iter().map(move |r| (r, g)));
+                banned = distinct(
+                    records
+                        .clone()
+                        .filter(|((_, h), g)| h != *g)
+                        .map(|((s, _), _)| *s),
+                );
+                // Proven right: every block of theirs on record matched.
+                let cleared = distinct(records.map(|((s, _), _)| *s));
+                for s in cleared.into_iter().filter(|s| !banned.contains(s)) {
+                    let n = failed
+                        .penalties
+                        .iter()
+                        .find(|(c, _)| *c == s)
+                        .map_or(0, |&(_, n)| n);
+                    let refund = i32::try_from(n)
+                        .unwrap_or(i32::MAX)
+                        .saturating_mul(-FAIL_POINTS);
+                    if refund > 0 {
+                        self.adjust(s, refund);
+                    }
+                }
             }
         }
         for s in &banned {
@@ -149,6 +217,11 @@ impl SmartBan {
             }
         }
         banned
+    }
+
+    /// `s`'s trust points (0 for a sender never seen).
+    pub(super) fn trust_of(&self, s: BlockSource) -> i32 {
+        self.trust.get(&s).copied().unwrap_or(0)
     }
 
     /// Drops what is recorded of `piece`: its download was abandoned or it
@@ -240,9 +313,9 @@ mod tests {
         for piece in 0..3 {
             assert!(fail_alone(&mut sb, piece, a).is_empty());
         }
-        // Two good pieces (the same data as recorded: nobody is blamed).
-        assert!(pass_alone(&mut sb, 0, a).is_empty());
-        assert!(pass_alone(&mut sb, 1, a).is_empty());
+        // Two good pieces that never failed (no refund, just pass points).
+        assert!(pass_alone(&mut sb, 100, a).is_empty());
+        assert!(pass_alone(&mut sb, 101, a).is_empty());
         assert_eq!(sb.trust.get(&a), Some(&-4));
         // A fourth failure no longer bans; a fifth does.
         assert!(fail_alone(&mut sb, 10, a).is_empty());
@@ -272,10 +345,24 @@ mod tests {
         assert!(fail_alone(&mut sb, total - 1, peer(9)).is_empty());
         assert_eq!(sb.failed.len(), MAX_SMART_BAN_PIECES);
 
-        for i in 0..=MAX_TRUST_ENTRIES as u64 {
+        // The trust map is full of distrusted senders and one trusted one:
+        // the trusted one makes room for the next.
+        sb.trust.clear();
+        let trusted = BlockSource::WebSeed(PeerKey(999));
+        sb.adjust(trusted, 5);
+        for i in 0..MAX_TRUST_ENTRIES as u64 - 1 {
             sb.adjust(BlockSource::WebSeed(PeerKey(1_000 + i)), -1);
         }
         assert_eq!(sb.trust.len(), MAX_TRUST_ENTRIES);
+        let newcomer = BlockSource::WebSeed(PeerKey(1));
+        sb.adjust(newcomer, -1);
+        assert_eq!(sb.trust.len(), MAX_TRUST_ENTRIES);
+        assert!(!sb.trust.contains_key(&trusted), "the most trusted goes");
+        assert_eq!(sb.trust.get(&newcomer), Some(&-1));
+        assert_eq!(
+            sb.trust.get(&BlockSource::WebSeed(PeerKey(1_000))),
+            Some(&-1)
+        );
 
         sb.forget(total - 1);
         assert!(!sb.wants_block_hashes(total - 1));
@@ -300,8 +387,32 @@ mod tests {
         sb.record_block(7, 2, c);
         assert_eq!(sb.piece_passed(7, Some(vec![h(1), h(2), h(3)])), vec![a]);
         assert!(!sb.wants_block_hashes(7), "the record is used up");
-        assert_eq!(sb.trust.get(&b), Some(&-2), "B keeps its trust");
+        assert_eq!(sb.trust_of(b), 0, "B's trust is back where it was");
         assert_eq!(sb.trust.get(&c), Some(&1));
         assert!(!sb.trust.contains_key(&a));
+    }
+
+    #[test]
+    fn a_second_failure_is_merged() {
+        let mut sb = SmartBan::default();
+        let (a, b, c, d) = (peer(1), peer(2), peer(3), peer(4));
+        // Attempt 1: A lies on block 0, B sends block 1.
+        sb.record_block(5, 0, a);
+        sb.record_block(5, 1, b);
+        assert!(sb.piece_failed(5, vec![h(9), h(2)]).is_empty());
+        // Attempt 2: C lies on block 0 with other data, B again sends 1.
+        sb.record_block(5, 0, c);
+        sb.record_block(5, 1, b);
+        assert!(sb.piece_failed(5, vec![h(8), h(2)]).is_empty());
+        assert_eq!(sb.trust_of(b), -4);
+        // D sends the good piece: both liars are caught, and B gets back
+        // both failures' points.
+        sb.record_block(5, 0, d);
+        sb.record_block(5, 1, d);
+        let mut liars = sb.piece_passed(5, Some(vec![h(1), h(2)]));
+        liars.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(liars, vec![a, c]);
+        assert_eq!(sb.trust_of(b), 0);
+        assert_eq!(sb.trust_of(d), 1);
     }
 }

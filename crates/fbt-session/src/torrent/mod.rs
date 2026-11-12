@@ -80,6 +80,11 @@ pub(crate) enum Cmd {
     FoundPeers(PeerSource, Vec<SocketAddr>),
     /// The session's IP filter changed: close the peers it blocks now.
     FilterChanged(oneshot::Sender<()>),
+    /// Another torrent smart-banned a peer: close the peers the session's
+    /// bans now block. Sent without waiting for an answer.
+    BansChanged,
+    /// Tests: the smart-ban trust points of the peer at this address.
+    PeerTrust(SocketAddr, oneshot::Sender<i32>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -407,6 +412,27 @@ impl TorrentHandle {
     /// peers the new filter blocks.
     pub(crate) async fn filter_changed(&self) -> Result<(), SessionError> {
         self.call(Cmd::FilterChanged).await
+    }
+
+    /// Tells the actor, without waiting, that a ban was added elsewhere in
+    /// the session. If its queue is full the command is sent from a task of
+    /// its own, so the caller never waits and the ban still reaches it.
+    pub(crate) fn bans_changed(&self) {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) =
+            self.inner.cmds.try_send(Cmd::BansChanged)
+        {
+            let cmds = self.inner.cmds.clone();
+            tokio::spawn(async move {
+                let _ = cmds.send(cmd).await;
+            });
+        }
+    }
+
+    /// The smart-ban trust points this torrent holds for the peer at
+    /// `addr` (0 if it never sent a block). For tests.
+    #[doc(hidden)]
+    pub async fn peer_trust(&self, addr: SocketAddr) -> Result<i32, SessionError> {
+        self.call(|tx| Cmd::PeerTrust(addr, tx)).await
     }
 
     /// Asks the actor to stop; the receiver completes once it has.
