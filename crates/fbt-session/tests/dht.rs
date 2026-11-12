@@ -323,15 +323,24 @@ async fn dht_falls_back_per_family() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dht_on_listener_port_when_free() {
-    let session = Session::new(dht_settings(Vec::new())).await.unwrap();
-    let dht = session.dht_stats().expect("DHT running");
-    assert_eq!(
-        dht.local_addrs,
-        vec![SocketAddr::from((
+    // The listener takes a free TCP port and then binds UDP on the same
+    // number. A parallel test can hold that UDP port (seen on Windows), and
+    // the DHT then rightly falls back, so retry until the port was free.
+    let mut attempt = 0;
+    let (session, dht) = loop {
+        let session = Session::new(dht_settings(Vec::new())).await.unwrap();
+        let dht = session.dht_stats().expect("DHT running");
+        let want = vec![SocketAddr::from((
             [127, 0, 0, 1],
-            session.local_addr().port()
-        ))]
-    );
+            session.local_addr().port(),
+        ))];
+        attempt += 1;
+        if dht.local_addrs == want || attempt == 5 {
+            assert_eq!(dht.local_addrs, want);
+            break (session, dht);
+        }
+        session.shutdown().await;
+    };
     // The DHT runs on the shared socket: a ping reaches its demultiplexer.
     let node = loopback_dht(Vec::new()).await;
     node.add_node(dht.local_addrs[0]);
