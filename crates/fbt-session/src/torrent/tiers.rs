@@ -48,6 +48,14 @@ impl Tiers {
         self.tiers.iter().map(Vec::len).sum()
     }
 
+    /// The first URL of each tier: the one that answered last, if any did.
+    pub(crate) fn firsts(&self) -> Vec<String> {
+        self.tiers
+            .iter()
+            .filter_map(|t| t.first().cloned())
+            .collect()
+    }
+
     /// The URL to try next.
     pub(crate) fn current(&self) -> Option<&str> {
         self.tiers

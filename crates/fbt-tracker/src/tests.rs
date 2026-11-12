@@ -291,3 +291,163 @@ fn tracker_strings_are_bounded() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn http_scrape_url_rule() {
+    use crate::scrape::scrape_url;
+    assert_eq!(
+        scrape_url("http://t.example:80/announce").unwrap(),
+        "http://t.example:80/scrape"
+    );
+    assert_eq!(
+        scrape_url("http://t.example/x/announce.php?k=1").unwrap(),
+        "http://t.example/x/scrape.php?k=1"
+    );
+    assert_eq!(
+        scrape_url("https://t.example/announce?a=b#frag").unwrap(),
+        "https://t.example/scrape?a=b"
+    );
+    for bad in [
+        "http://t.example/a",
+        "http://t.example/x/a/announce/y",
+        "http://t.example",
+        "http://t.example/",
+        "http://t.example/x?q=/announce",
+    ] {
+        assert!(
+            matches!(scrape_url(bad), Err(TrackerError::ScrapeUnsupported)),
+            "{bad}"
+        );
+    }
+}
+
+fn scrape_files(entries: &[([u8; 20], i64, i64, i64)]) -> Vec<u8> {
+    let mut files = DictBuilder::new();
+    for (h, c, d, i) in entries {
+        let mut e = DictBuilder::new();
+        e.insert(b"complete", *c);
+        e.insert(b"downloaded", *d);
+        e.insert(b"incomplete", *i);
+        files.insert(h, e.build());
+    }
+    dict(|b| {
+        b.insert(b"files", files.build());
+    })
+}
+
+#[tokio::test]
+async fn http_scrape_parses_files() {
+    let body = scrape_files(&[([1; 20], 5, 9, 7), ([2; 20], 1, 2, 3)]);
+    let mut got = parse_http_scrape(&body).unwrap();
+    got.sort_by_key(|s| s.info_hash);
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        (
+            got[0].info_hash,
+            got[0].complete,
+            got[0].downloaded,
+            got[0].incomplete
+        ),
+        ([1; 20], 5, 9, 7)
+    );
+    assert_eq!(
+        (
+            got[1].info_hash,
+            got[1].complete,
+            got[1].downloaded,
+            got[1].incomplete
+        ),
+        ([2; 20], 1, 2, 3)
+    );
+    // Keys that are not info hashes and non-dict entries are skipped.
+    let mut files = DictBuilder::new();
+    files.insert(b"short", 1);
+    files.insert(&[3u8; 20], 1);
+    let odd = dict(|b| {
+        b.insert(b"files", files.build());
+    });
+    assert!(parse_http_scrape(&odd).unwrap().is_empty());
+    // A failure reason, a missing `files` and garbage are errors.
+    let fail = dict(|b| {
+        b.insert(b"failure reason", "no scrape here");
+    });
+    assert!(matches!(
+        parse_http_scrape(&fail),
+        Err(TrackerError::Failure(m)) if m == "no scrape here"
+    ));
+    assert!(matches!(
+        parse_http_scrape(&dict(|b| {
+            b.insert(b"x", 1);
+        })),
+        Err(TrackerError::InvalidResponse(_))
+    ));
+    assert!(parse_http_scrape(b"garbage").is_err());
+
+    // Against a server: one `info_hash` per hash on the scrape path, the
+    // query kept; a hash the tracker left out is left out, one we did not
+    // ask for is dropped.
+    let reply = scrape_files(&[([1; 20], 5, 9, 7), ([9; 20], 1, 1, 1)]);
+    let (addr, lines) = serve(vec![http_ok(&reply)]).await;
+    let got = client()
+        .scrape(
+            &format!("http://{addr}/x/announce?passkey=k"),
+            &[[1; 20], [2; 20]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        (
+            got[0].info_hash,
+            got[0].complete,
+            got[0].downloaded,
+            got[0].incomplete
+        ),
+        ([1; 20], 5, 9, 7)
+    );
+    let line = lines.lock().unwrap()[0].clone();
+    let one = "%01".repeat(20);
+    let two = "%02".repeat(20);
+    assert!(
+        line.starts_with(&format!(
+            "GET /x/scrape?passkey=k&info_hash={one}&info_hash={two} "
+        )),
+        "{line}"
+    );
+}
+
+#[tokio::test]
+async fn scrape_caps_hashes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let hashes = vec![[7u8; 20]; MAX_SCRAPE_HASHES + 1];
+    assert_eq!(hashes.len(), 75);
+    for url in [
+        format!("http://{addr}/announce"),
+        format!("udp://{udp_addr}"),
+    ] {
+        let err = client().scrape(&url, &hashes).await.unwrap_err();
+        assert!(matches!(err, TrackerError::TooManyHashes), "{err:?}");
+    }
+    // 74 is fine as far as the cap goes (the tracker then fails to answer).
+    assert!(matches!(
+        client()
+            .scrape(&format!("http://{addr}/a"), &hashes[..74])
+            .await,
+        Err(TrackerError::ScrapeUnsupported)
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let mut buf = [0u8; 64];
+    let got = tokio::time::timeout(Duration::from_millis(100), udp.recv_from(&mut buf)).await;
+    assert!(got.is_err(), "no datagram sent");
+}

@@ -17,7 +17,9 @@ use crate::connector::ProxyConnector;
 use crate::tls::{self, Connector};
 use crate::types::{MAX_TRACKER_ID_BYTES, MIN_INTERVAL, bounded_text};
 use crate::urlencode::url_encode_bytes;
-use crate::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerConfig, TrackerError};
+use crate::{
+    AnnounceEvent, AnnounceRequest, AnnounceResponse, ScrapeInfo, TrackerConfig, TrackerError,
+};
 
 const MAX_REDIRECTS: usize = 3;
 const MIN_MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -69,6 +71,19 @@ impl HttpClient {
         let full = build_url(url, req);
         match tokio::time::timeout(self.timeout, self.fetch(full)).await {
             Ok(body) => parse_http_announce(&body?),
+            Err(_) => Err(TrackerError::Timeout),
+        }
+    }
+
+    /// Scrapes `scrape` (a scrape URL) for `hashes`.
+    pub(crate) async fn scrape(
+        &self,
+        scrape: &str,
+        hashes: &[[u8; 20]],
+    ) -> Result<Vec<ScrapeInfo>, TrackerError> {
+        let full = crate::scrape::with_hashes(scrape, hashes);
+        match tokio::time::timeout(self.timeout, self.fetch(full)).await {
+            Ok(body) => crate::scrape::parse_http_scrape_for(&body?, Some(hashes)),
             Err(_) => Err(TrackerError::Timeout),
         }
     }

@@ -13,6 +13,7 @@
 
 mod connector;
 mod http;
+mod scrape;
 mod tls;
 mod types;
 mod udp;
@@ -25,7 +26,12 @@ use fbt_net::proxy::ProxyConfig;
 
 #[doc(hidden)]
 pub use http::parse_http_announce;
-pub use types::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerConfig, TrackerError};
+#[doc(hidden)]
+pub use scrape::{parse_http_scrape, parse_udp_scrape};
+pub use types::{
+    AnnounceEvent, AnnounceRequest, AnnounceResponse, MAX_SCRAPE_HASHES, ScrapeInfo, TrackerConfig,
+    TrackerError,
+};
 #[doc(hidden)]
 pub use udp::parse_udp_announce;
 pub use urlencode::url_encode_bytes;
@@ -100,6 +106,42 @@ impl TrackerClient {
         match scheme.as_str() {
             "http" | "https" => self.inner.http.announce(url, req).await,
             "udp" => self.inner.udp.announce(url, req).await,
+            other => Err(TrackerError::UnsupportedScheme(other.to_owned())),
+        }
+    }
+
+    /// Scrapes `url` for `hashes` (BEP 48 over HTTP, BEP 15 action 2 over
+    /// UDP), through the same transport, proxy included, as
+    /// [`announce`](Self::announce).
+    ///
+    /// An HTTP URL is scraped when the last segment of its path starts
+    /// with `announce` (replaced by `scrape`, the query kept), else this is
+    /// [`TrackerError::ScrapeUnsupported`]. More than [`MAX_SCRAPE_HASHES`]
+    /// hashes is [`TrackerError::TooManyHashes`], before any request. A UDP
+    /// scrape shares the announces' connection ids. Hashes the tracker left
+    /// out of its reply are left out of the result; no hashes, no request.
+    pub async fn scrape(
+        &self,
+        url: &str,
+        hashes: &[[u8; 20]],
+    ) -> Result<Vec<ScrapeInfo>, TrackerError> {
+        if hashes.len() > MAX_SCRAPE_HASHES {
+            return Err(TrackerError::TooManyHashes);
+        }
+        let scheme = url
+            .split_once("://")
+            .map(|(s, _)| s.to_ascii_lowercase())
+            .ok_or_else(|| TrackerError::InvalidUrl("missing scheme".to_owned()))?;
+        match scheme.as_str() {
+            "http" | "https" => {
+                let scrape = scrape::scrape_url(url)?;
+                if hashes.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.inner.http.scrape(&scrape, hashes).await
+            }
+            "udp" if hashes.is_empty() => Ok(Vec::new()),
+            "udp" => self.inner.udp.scrape(url, hashes).await,
             other => Err(TrackerError::UnsupportedScheme(other.to_owned())),
         }
     }

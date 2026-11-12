@@ -57,6 +57,7 @@ jobs:
           - natpmp
           - socks5
           - http_connect
+          - scrape
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

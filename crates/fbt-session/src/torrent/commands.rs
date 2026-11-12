@@ -49,6 +49,13 @@ impl Actor {
                 });
                 let _ = tx.send(());
             }
+            Cmd::Scrape(tx) => {
+                self.signal(|s| {
+                    s.scrapes = s.scrapes.wrapping_add(1);
+                    true
+                });
+                let _ = tx.send(());
+            }
             Cmd::SetPriorities(p, tx) => {
                 self.set_priorities(p);
                 let _ = tx.send(());

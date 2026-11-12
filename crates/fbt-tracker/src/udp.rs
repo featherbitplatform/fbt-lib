@@ -16,8 +16,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::scrape::{build_udp_scrape, parse_udp_scrape};
 use crate::types::{MIN_INTERVAL, bounded_text};
-use crate::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerConfig, TrackerError};
+use crate::{
+    AnnounceEvent, AnnounceRequest, AnnounceResponse, ScrapeInfo, TrackerConfig, TrackerError,
+};
 
 const PROTOCOL_ID: u64 = 0x0417_2710_1980;
 const ACTION_CONNECT: u32 = 0;
@@ -137,6 +140,12 @@ impl ConnCache {
 }
 
 type Pending = Arc<Mutex<HashMap<u32, (SocketAddr, oneshot::Sender<Vec<u8>>)>>>;
+
+/// Builds a request datagram from the connection id, the transaction id
+/// and the address family (`true` for IPv6).
+type BuildFn<'a> = &'a (dyn Fn(u64, u32, bool) -> Vec<u8> + Sync);
+/// Parses a reply datagram, given the transaction id and the family.
+type ParseFn<'a, T> = &'a (dyn Fn(&[u8], u32, bool) -> Result<T, TrackerError> + Sync);
 
 /// A bound socket plus its receive task; the task dies with this value.
 struct Sock {
@@ -430,6 +439,49 @@ impl UdpClient {
         url: &str,
         req: &AnnounceRequest,
     ) -> Result<AnnounceResponse, TrackerError> {
+        self.request(
+            url,
+            &|cid, tid, ipv6| build_announce(cid, tid, req, ipv6),
+            &parse_udp_announce,
+        )
+        .await
+    }
+
+    /// Scrapes `url` for `hashes` (at most
+    /// [`MAX_SCRAPE_HASHES`](crate::MAX_SCRAPE_HASHES); the caller checks).
+    pub(crate) async fn scrape(
+        &self,
+        url: &str,
+        hashes: &[[u8; 20]],
+    ) -> Result<Vec<ScrapeInfo>, TrackerError> {
+        let counts = self
+            .request(
+                url,
+                &|cid, tid, _| build_udp_scrape(cid, tid, hashes),
+                &|buf, tid, _| parse_udp_scrape(buf, tid, hashes.len()),
+            )
+            .await?;
+        Ok(hashes
+            .iter()
+            .zip(counts)
+            .map(|(h, (complete, downloaded, incomplete))| ScrapeInfo {
+                info_hash: *h,
+                complete,
+                downloaded,
+                incomplete,
+            })
+            .collect())
+    }
+
+    /// One request after a connect (or a cached connection id): `build`
+    /// makes the datagram from the connection id, the transaction id and
+    /// the address family (`true` for IPv6), `parse` reads the reply.
+    async fn request<T>(
+        &self,
+        url: &str,
+        build: BuildFn<'_>,
+        parse: ParseFn<'_, T>,
+    ) -> Result<T, TrackerError> {
         if self.route == Route::Unsupported {
             return Err(TrackerError::ProxyUnsupported);
         }
@@ -447,23 +499,24 @@ impl UdpClient {
         let first = *addrs
             .first()
             .ok_or_else(|| TrackerError::InvalidUrl("host did not resolve".to_owned()))?;
-        match self.announce_to(first, req).await {
+        match self.request_to(first, build, parse).await {
             // Unreachable over the first family (no IPv6 route, say): one
             // address of the other family gets a chance.
             Err(e) if unreachable(&e) => match other_family(&addrs, first) {
-                Some(second) => self.announce_to(second, req).await,
+                Some(second) => self.request_to(second, build, parse).await,
                 None => Err(e),
             },
             r => r,
         }
     }
 
-    /// Announces to one resolved tracker address.
-    async fn announce_to(
+    /// One request to one resolved tracker address.
+    async fn request_to<T>(
         &self,
         addr: SocketAddr,
-        req: &AnnounceRequest,
-    ) -> Result<AnnounceResponse, TrackerError> {
+        build: BuildFn<'_>,
+        parse: ParseFn<'_, T>,
+    ) -> Result<T, TrackerError> {
         let ipv6 = addr.is_ipv6();
         let shared = if self.route == Route::Relayed {
             // The relay carries either family; never a direct socket.
@@ -499,9 +552,9 @@ impl UdpClient {
                 None => (self.connect(sock, addr).await?, false),
             };
             let tid = new_tid(sock.pending());
-            let dgram = build_announce(cid, tid, req, ipv6);
+            let dgram = build(cid, tid, ipv6);
             let resp = self.exchange(sock, addr, tid, &dgram).await?;
-            match parse_udp_announce(&resp, tid, ipv6) {
+            match parse(&resp, tid, ipv6) {
                 // A cached connection id the tracker no longer knows:
                 // reconnect once.
                 Err(TrackerError::Failure(_)) if from_cache => {
@@ -1022,5 +1075,84 @@ mod tests {
             parse_udp_announce(&low, 7, false).unwrap().interval,
             Duration::from_secs(60)
         );
+    }
+
+    fn scrape_reply(tid: &[u8], counts: &[[u32; 3]]) -> Vec<u8> {
+        let mut r = vec![0, 0, 0, 2];
+        r.extend_from_slice(tid);
+        for c in counts {
+            for n in c {
+                r.extend_from_slice(&n.to_be_bytes());
+            }
+        }
+        r
+    }
+
+    #[tokio::test]
+    async fn udp_scrape_round_trip() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let (c, s) = (connects.clone(), seen.clone());
+        let url = fake(move |b, _, _| {
+            if is_connect(b) {
+                c.fetch_add(1, Ordering::SeqCst);
+                vec![connect_reply(&b[12..16], CID)]
+            } else if b[8..12] == 2u32.to_be_bytes() {
+                s.lock().unwrap().push(b.to_vec());
+                // seeders, completed, leechers per hash, in order.
+                vec![scrape_reply(&b[12..16], &[[5, 9, 7], [1, 2, 3]])]
+            } else {
+                vec![announce_reply(&b[12..16], &PEERS)]
+            }
+        })
+        .await;
+        let cl = client();
+        let got = cl.scrape(&url, &[[0xaa; 20], [0xbb; 20]]).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (
+                got[0].info_hash,
+                got[0].complete,
+                got[0].downloaded,
+                got[0].incomplete
+            ),
+            ([0xaa; 20], 5, 9, 7)
+        );
+        assert_eq!(
+            (
+                got[1].info_hash,
+                got[1].complete,
+                got[1].downloaded,
+                got[1].incomplete
+            ),
+            ([0xbb; 20], 1, 2, 3)
+        );
+        {
+            let seen = seen.lock().unwrap();
+            let b = &seen[0];
+            assert_eq!(b.len(), 16 + 40);
+            assert_eq!(&b[0..8], &CID.to_be_bytes());
+            assert_eq!(&b[16..36], &[0xaa; 20]);
+            assert_eq!(&b[36..56], &[0xbb; 20]);
+        }
+        // Announce and scrape share the connection id cache.
+        cl.announce(&url, &request()).await.unwrap();
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+
+        // The parser: fewer entries than asked keep what is there; a
+        // ragged tail, a wrong tid or an error action are errors.
+        let tid = 7u32.to_be_bytes();
+        let one = scrape_reply(&tid, &[[1, 2, 3]]);
+        assert_eq!(parse_udp_scrape(&one, 7, 2).unwrap(), vec![(1, 2, 3)]);
+        assert_eq!(parse_udp_scrape(&one, 7, 0).unwrap(), vec![]);
+        let mut ragged = one.clone();
+        ragged.push(0);
+        assert!(parse_udp_scrape(&ragged, 7, 2).is_err());
+        assert!(parse_udp_scrape(&one, 8, 2).is_err());
+        assert!(matches!(
+            parse_udp_scrape(&error_reply(&tid, "nope"), 7, 1),
+            Err(TrackerError::Failure(m)) if m == "nope"
+        ));
+        assert!(parse_udp_scrape(&announce_reply(&tid, &[]), 7, 1).is_err());
     }
 }

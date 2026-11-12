@@ -68,6 +68,7 @@ pub(crate) enum Cmd {
     Remove(RemoveMode, oneshot::Sender<Result<(), SessionError>>),
     Recheck(oneshot::Sender<()>),
     Reannounce(oneshot::Sender<()>),
+    Scrape(oneshot::Sender<()>),
     SetPriorities(Vec<Priority>, oneshot::Sender<()>),
     AddPeer(SocketAddr, oneshot::Sender<()>),
     Pieces(oneshot::Sender<Bitfield>),
@@ -234,6 +235,17 @@ impl TorrentHandle {
     /// Announces to the trackers now.
     pub async fn force_reannounce(&self) -> Result<(), SessionError> {
         self.call(Cmd::Reannounce).await
+    }
+
+    /// Scrapes the first working tracker of each tier for this torrent's
+    /// counts. Returns once the scrape is asked for; each tracker reports
+    /// through [`Event::ScrapeReply`](crate::Event::ScrapeReply) or
+    /// [`Event::ScrapeFailed`](crate::Event::ScrapeFailed)
+    /// ([`EventMask::TRACKER`](crate::EventMask::TRACKER)). A torrent
+    /// without trackers reports nothing. A scrape asked for while one is
+    /// running replaces it.
+    pub async fn scrape_trackers(&self) -> Result<(), SessionError> {
+        self.call(Cmd::Scrape).await
     }
 
     /// Sets one priority per file (pad files included).

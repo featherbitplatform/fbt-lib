@@ -161,3 +161,10 @@ path = "fuzz_targets/http_connect.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "scrape"
+path = "fuzz_targets/scrape.rs"
+test = false
+doc = false
+bench = false

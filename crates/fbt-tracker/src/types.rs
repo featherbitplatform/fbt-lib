@@ -146,6 +146,32 @@ pub enum TrackerError {
     /// carry UDP.
     #[error("UDP trackers cannot go through an HTTP proxy")]
     ProxyUnsupported,
+    /// The HTTP tracker has no scrape URL: the last segment of its announce
+    /// path does not start with `announce` (BEP 48).
+    #[error("tracker does not support scrape")]
+    ScrapeUnsupported,
+    /// A scrape of more than [`MAX_SCRAPE_HASHES`](crate::MAX_SCRAPE_HASHES)
+    /// info hashes; nothing was sent.
+    #[error("too many info hashes in one scrape")]
+    TooManyHashes,
+}
+
+/// Most info hashes in one scrape: what fits a UDP scrape request in a
+/// 1500-byte datagram (BEP 15), and the HTTP limit too.
+pub const MAX_SCRAPE_HASHES: usize = 74;
+
+/// One torrent's counts from a scrape (BEP 48, BEP 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScrapeInfo {
+    /// The torrent's info hash.
+    pub info_hash: [u8; 20],
+    /// Seeds.
+    pub complete: u32,
+    /// Completed downloads the tracker has seen.
+    pub downloaded: u32,
+    /// Leechers.
+    pub incomplete: u32,
 }
 
 /// Tracker client configuration.

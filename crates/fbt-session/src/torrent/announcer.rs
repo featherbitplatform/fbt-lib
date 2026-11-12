@@ -7,12 +7,20 @@
 //!
 //! - `started` when the torrent becomes active (after checking, on resume;
 //!   a magnet at once, and it keeps running through the check that follows
-//!   its metadata);
+//!   its metadata). `started` is per tracker, as libtorrent's `start_sent`:
+//!   a tracker that has not answered a `started` in the current run gets
+//!   one, whatever event the run is at (a later tier reached after the
+//!   first fails, say);
 //! - `none` after the tracker's `interval`, or on a forced re-announce once
 //!   `min interval` has passed since the last announce;
 //! - `completed` once, when the torrent finished during this session;
 //! - `stopped` when it stops being active (pause, error, remove, shutdown):
-//!   one attempt to the last tracker that answered, with a 5 s timeout.
+//!   one attempt to every tracker that answered a `started` in the run, in
+//!   parallel under one 5 s timeout; trackers that never answered get
+//!   nothing.
+//!
+//! A scrape request (`Signals::scrapes`) scrapes the first working tracker
+//! of each tier in a task of its own; scrape errors never drop a tracker.
 //!
 //! A walk through the tiers that fails everywhere backs off for
 //! `Settings::tracker_retry_base` × 2^n (n = earlier consecutive failed
@@ -22,7 +30,7 @@
 //! Private torrents (BEP 27) announce to their trackers as any other; the
 //! actor keeps them off the DHT (see `dht`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +39,7 @@ use fbt_core::InfoHashes;
 use fbt_tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerClient, TrackerError};
 use rand::RngExt;
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tracing::debug;
 
@@ -50,6 +58,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const PEER_QUEUE: usize = 16;
 /// Peers taken from one reply.
 const MAX_PEERS_PER_REPLY: usize = 200;
+/// Trackers remembered as having taken a `started` in one run: the tracker
+/// cap of a torrent and of a magnet (64 URLs). A tracker beyond it is sent
+/// `started` again and never `stopped`.
+const MAX_STARTED_URLS: usize = 64;
 /// `left` reported while a magnet has no metadata, so trackers treat us as
 /// a leecher (what libtorrent reports).
 pub(super) const NO_METADATA_LEFT: u64 = 16_384;
@@ -69,6 +81,9 @@ pub(super) struct Signals {
     pub reannounces: u64,
     /// The torrent is going away: announce `stopped` and exit.
     pub exit: bool,
+    /// Bumped by each scrape request: scrape the first working tracker of
+    /// each tier.
+    pub scrapes: u64,
     /// Bytes left as of the last moment the torrent was not checking its
     /// files; reported while a recheck makes the live figure meaningless.
     pub left: u64,
@@ -112,8 +127,9 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
         signals: p.signals,
         peers: peers_tx,
         tracker_ids: HashMap::new(),
-        last_ok: None,
         failed_walks: 0,
+        scrapes_seen: 0,
+        scrape: None,
     };
     let task = tokio::spawn(task.run());
     Some((Announcer { task }, peers_rx))
@@ -121,7 +137,8 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
 
 /// How a walk through the tiers ended.
 enum Walk {
-    Ok(AnnounceResponse),
+    /// The reply, the tracker that answered and the event it was sent.
+    Ok(AnnounceResponse, String, AnnounceEvent),
     Failed,
     /// Every tracker was dropped as unusable.
     NoTrackers,
@@ -147,9 +164,70 @@ struct Task {
     peers: mpsc::Sender<Vec<SocketAddr>>,
     /// `tracker id` per URL, echoed back.
     tracker_ids: HashMap<String, Vec<u8>>,
-    /// The tracker that last answered: `stopped` goes there.
-    last_ok: Option<String>,
     failed_walks: u32,
+    /// `scrapes` already served.
+    scrapes_seen: u64,
+    /// The scrape running, if any; aborted with the task.
+    scrape: Option<ScrapeTask>,
+}
+
+/// A running scrape, aborted when dropped.
+struct ScrapeTask(JoinHandle<()>);
+
+impl Drop for ScrapeTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Scrapes each of `urls` for `info_hash` in parallel and reports each
+/// outcome as [`Event::ScrapeReply`] or [`Event::ScrapeFailed`]. Scrape
+/// errors never drop a tracker.
+fn start_scrape(
+    client: &TrackerClient,
+    shared: &Arc<Shared>,
+    ih: InfoHashes,
+    info_hash: [u8; 20],
+    urls: Vec<String>,
+) -> ScrapeTask {
+    let client = client.clone();
+    let shared = Arc::clone(shared);
+    ScrapeTask(tokio::spawn(async move {
+        let mut set = JoinSet::new();
+        for url in urls {
+            let client = client.clone();
+            set.spawn(async move {
+                let r = client.scrape(&url, &[info_hash]).await;
+                (url, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let Ok((url, r)) = joined else { continue };
+            let found = r.map(|infos| infos.into_iter().find(|i| i.info_hash == info_hash));
+            match found {
+                Ok(Some(info)) => shared.emit(Event::ScrapeReply {
+                    torrent: ih,
+                    url,
+                    complete: info.complete,
+                    incomplete: info.incomplete,
+                    downloaded: info.downloaded,
+                }),
+                Ok(None) => shared.emit(Event::ScrapeFailed {
+                    torrent: ih,
+                    url,
+                    message: "the scrape reply left the torrent out".to_owned(),
+                }),
+                Err(e) => {
+                    debug!(%url, error = %e, "scrape failed");
+                    shared.emit(Event::ScrapeFailed {
+                        torrent: ih,
+                        url,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+    }))
 }
 
 /// Where the current run (since the last `started`) stands.
@@ -157,8 +235,9 @@ struct Task {
 struct Run {
     /// `starts` value this run belongs to.
     starts: u64,
-    /// `started` was answered.
-    started: bool,
+    /// Trackers that answered a `started` in this run (at most
+    /// [`MAX_STARTED_URLS`]): each gets the `stopped`.
+    started_urls: HashSet<String>,
     /// `completed` was answered (at most once per session).
     completed: bool,
     /// `reannounces` already served.
@@ -175,9 +254,20 @@ impl Task {
         let mut completed_sent = false;
         loop {
             let sig = self.signals.borrow_and_update().clone();
+            if !sig.exit && sig.scrapes != self.scrapes_seen {
+                self.scrapes_seen = sig.scrapes;
+                let urls = self.tiers.firsts();
+                self.scrape = Some(start_scrape(
+                    &self.client,
+                    &self.shared,
+                    self.ih,
+                    self.info_hash,
+                    urls,
+                ));
+            }
             if sig.exit || !sig.running {
-                if run.started {
-                    self.stopped(sig.left).await;
+                if !run.started_urls.is_empty() {
+                    self.stopped(&run.started_urls, sig.left).await;
                 }
                 run = Run::default();
                 if sig.exit {
@@ -208,7 +298,10 @@ impl Task {
                 // may have sent) the request already.
                 completed_sent = true;
             }
-            match self.walk_interruptible(event, sig.left).await {
+            match self
+                .walk_interruptible(event, sig.left, &run.started_urls)
+                .await
+            {
                 Err(Interrupt::Closed) => return,
                 Err(Interrupt::Lifecycle) => continue,
                 Ok(Walk::NoTrackers) => {
@@ -226,16 +319,25 @@ impl Task {
                     self.failed_walks = self.failed_walks.saturating_add(1);
                     run.reannounces = sig.reannounces;
                 }
-                Ok(Walk::Ok(resp)) => {
+                Ok(Walk::Ok(resp, url, sent)) => {
                     self.failed_walks = 0;
                     run.not_before = None;
                     run.reannounces = sig.reannounces;
                     let (interval, min_interval) = clamp_intervals(&resp);
                     run.last = Some((Instant::now(), interval, min_interval));
-                    match event {
-                        AnnounceEvent::Started => run.started = true,
+                    match sent {
+                        AnnounceEvent::Started => {
+                            if run.started_urls.len() < MAX_STARTED_URLS {
+                                run.started_urls.insert(url);
+                            }
+                        }
                         AnnounceEvent::Completed => run.completed = true,
                         _ => {}
+                    }
+                    if event == AnnounceEvent::Completed && sent != AnnounceEvent::Completed {
+                        // The tracker that answered took a `started`
+                        // instead: `completed` is still to go.
+                        completed_sent = false;
                     }
                 }
             }
@@ -271,14 +373,18 @@ impl Task {
         &mut self,
         event: AnnounceEvent,
         checking_left: u64,
+        started_urls: &HashSet<String>,
     ) -> Result<Walk, Interrupt> {
         let before = self.signals.borrow_and_update().clone();
         let mut signals = self.signals.clone();
         let req = self.request_template(event, checking_left);
+        // Where a scrape asked for during the walk goes.
+        let scrape_urls = self.tiers.firsts();
         let walk = walk(
             &self.client,
             &mut self.tiers,
             req,
+            started_urls,
             &self.shared,
             self.ih,
             &mut self.tracker_ids,
@@ -289,16 +395,15 @@ impl Task {
                 // The walk goes first, so its first request is issued
                 // before a lifecycle change can abandon it.
                 biased;
-                (w, ok) = &mut walk => {
-                    if let (Walk::Ok(resp), Some(url)) = (&w, ok) {
-                        self.last_ok = Some(url);
-                        if !resp.peers.is_empty() {
-                            let mut peers = resp.peers.clone();
-                            peers.truncate(MAX_PEERS_PER_REPLY);
-                            // Dropped if the actor is behind; the next reply
-                            // brings more.
-                            let _ = self.peers.try_send(peers);
-                        }
+                w = &mut walk => {
+                    if let Walk::Ok(resp, ..) = &w
+                        && !resp.peers.is_empty()
+                    {
+                        let mut peers = resp.peers.clone();
+                        peers.truncate(MAX_PEERS_PER_REPLY);
+                        // Dropped if the actor is behind; the next reply
+                        // brings more.
+                        let _ = self.peers.try_send(peers);
                     }
                     return Ok(w);
                 }
@@ -309,6 +414,16 @@ impl Task {
                     let now = signals.borrow_and_update().clone();
                     if now.exit || now.running != before.running || now.starts != before.starts {
                         return Err(Interrupt::Lifecycle);
+                    }
+                    if now.scrapes != self.scrapes_seen {
+                        self.scrapes_seen = now.scrapes;
+                        self.scrape = Some(start_scrape(
+                            &self.client,
+                            &self.shared,
+                            self.ih,
+                            self.info_hash,
+                            scrape_urls.clone(),
+                        ));
                     }
                 }
             }
@@ -337,26 +452,39 @@ impl Task {
         }
     }
 
-    /// One `stopped` announce to the last tracker that answered, never
-    /// retried.
-    async fn stopped(&mut self, left: u64) {
-        let Some(url) = self.last_ok.clone() else {
-            return;
-        };
-        let mut req = request_for(
-            &url,
-            &self.request_template(AnnounceEvent::Stopped, left),
-            &self.tracker_ids,
-        );
-        req.num_want = Some(0);
-        match tokio::time::timeout(STOPPED_TIMEOUT, self.client.announce(&url, &req)).await {
-            Ok(Ok(resp)) => self.shared.emit(Event::TrackerReply {
-                torrent: self.ih,
-                url,
-                peers: resp.peers.len(),
-            }),
-            Ok(Err(e)) => self.error(url, &e),
-            Err(_) => self.error(url, &TrackerError::Timeout),
+    /// One `stopped` announce to each of `urls` (the trackers that took
+    /// a `started` in the run), in parallel under one [`STOPPED_TIMEOUT`],
+    /// never retried.
+    async fn stopped(&mut self, urls: &HashSet<String>, left: u64) {
+        let base = self.request_template(AnnounceEvent::Stopped, left);
+        let mut set = JoinSet::new();
+        for url in urls {
+            let mut req = request_for(url, &base, &self.tracker_ids);
+            req.num_want = Some(0);
+            let client = self.client.clone();
+            let url = url.clone();
+            set.spawn(async move {
+                let r = client.announce(&url, &req).await;
+                (url, r)
+            });
+        }
+        let mut pending = urls.clone();
+        let deadline = Instant::now() + STOPPED_TIMEOUT;
+        while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, set.join_next()).await {
+            let Ok((url, r)) = joined else { continue };
+            pending.remove(&url);
+            match r {
+                Ok(resp) => self.shared.emit(Event::TrackerReply {
+                    torrent: self.ih,
+                    url,
+                    peers: resp.peers.len(),
+                }),
+                Err(e) => self.error(url, &e),
+            }
+        }
+        // Those still out are abandoned with the set.
+        for url in pending {
+            self.error(url, &TrackerError::Timeout);
         }
     }
 
@@ -384,7 +512,7 @@ fn announce_left(st: &TorrentStatus, checking_left: u64) -> u64 {
 fn plan(run: &Run, sig: &Signals, completed_sent: bool, now: Instant) -> (AnnounceEvent, Instant) {
     let backoff = run.not_before.unwrap_or(now);
     let forced = sig.reannounces != run.reannounces;
-    if !run.started {
+    if run.started_urls.is_empty() {
         let due = if forced { now } else { backoff };
         return (AnnounceEvent::Started, due);
     }
@@ -441,7 +569,9 @@ fn emit_error(shared: &Shared, ih: InfoHashes, url: String, e: &TrackerError) {
     });
 }
 
-/// A URL that can never work in this build.
+/// A URL that can never work in this build. Scrape errors
+/// (`ScrapeUnsupported`, `TooManyHashes`) and `ProxyUnsupported` are not
+/// among them: they say nothing about the URL itself.
 fn unusable(e: &TrackerError) -> bool {
     matches!(
         e,
@@ -451,22 +581,34 @@ fn unusable(e: &TrackerError) -> bool {
     )
 }
 
+/// The event `url` is sent: `started` if it has not answered one in this
+/// run, else the run's `event`.
+fn event_for(url: &str, event: AnnounceEvent, started_urls: &HashSet<String>) -> AnnounceEvent {
+    if started_urls.contains(url) {
+        event
+    } else {
+        AnnounceEvent::Started
+    }
+}
+
 /// One walk through the tiers from the first URL until a tracker answers or
-/// every one has failed. Returns the outcome and the URL that answered.
+/// every one has failed. Each tracker is sent [`event_for`] it.
 async fn walk(
     client: &TrackerClient,
     tiers: &mut Tiers,
     req: AnnounceRequest,
+    started_urls: &HashSet<String>,
     shared: &Shared,
     ih: InfoHashes,
     tracker_ids: &mut HashMap<String, Vec<u8>>,
-) -> (Walk, Option<String>) {
+) -> Walk {
     tiers.restart();
     loop {
         let Some(url) = tiers.current().map(str::to_owned) else {
-            return (Walk::NoTrackers, None);
+            return Walk::NoTrackers;
         };
-        let req = request_for(&url, &req, tracker_ids);
+        let mut req = request_for(&url, &req, tracker_ids);
+        req.event = event_for(&url, req.event, started_urls);
         match client.announce(&url, &req).await {
             Ok(resp) => {
                 tiers.report_success();
@@ -478,7 +620,7 @@ async fn walk(
                     url: url.clone(),
                     peers: resp.peers.len(),
                 });
-                return (Walk::Ok(resp), Some(url));
+                return Walk::Ok(resp, url, req.event);
             }
             Err(e) => {
                 let drop_it = unusable(&e);
@@ -486,13 +628,13 @@ async fn walk(
                 if drop_it {
                     tiers.remove_current();
                     if tiers.is_empty() {
-                        return (Walk::NoTrackers, None);
+                        return Walk::NoTrackers;
                     }
                 } else {
                     tiers.report_failure();
                 }
                 if tiers.all_failed_once() {
-                    return (Walk::Failed, None);
+                    return Walk::Failed;
                 }
             }
         }
@@ -507,7 +649,7 @@ mod tests {
 
     fn started_run(at: Instant) -> Run {
         Run {
-            started: true,
+            started_urls: HashSet::from(["http://a/".to_owned()]),
             last: Some((at, Duration::from_secs(1800), Some(Duration::from_secs(60)))),
             ..Run::default()
         }
@@ -621,6 +763,34 @@ mod tests {
         assert_eq!(announce_left(&st, 7), 7);
         st.state = TorrentState::QueuedForChecking;
         assert_eq!(announce_left(&st, 7), 7);
+    }
+
+    #[test]
+    fn started_goes_to_each_tracker_once_per_run() {
+        let started = HashSet::from(["http://a/".to_owned()]);
+        assert_eq!(
+            event_for("http://a/", AnnounceEvent::None, &started),
+            AnnounceEvent::None
+        );
+        assert_eq!(
+            event_for("http://a/", AnnounceEvent::Completed, &started),
+            AnnounceEvent::Completed
+        );
+        for ev in [
+            AnnounceEvent::None,
+            AnnounceEvent::Completed,
+            AnnounceEvent::Started,
+        ] {
+            assert_eq!(event_for("http://b/", ev, &started), AnnounceEvent::Started);
+        }
+    }
+
+    #[test]
+    fn scrape_and_proxy_errors_never_drop_a_tracker() {
+        assert!(!unusable(&TrackerError::ScrapeUnsupported));
+        assert!(!unusable(&TrackerError::TooManyHashes));
+        assert!(!unusable(&TrackerError::ProxyUnsupported));
+        assert!(unusable(&TrackerError::UnsupportedScheme("wss".to_owned())));
     }
 
     #[test]

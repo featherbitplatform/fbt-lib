@@ -106,6 +106,30 @@ pub enum Event {
         /// What went wrong.
         message: String,
     },
+    /// A tracker answered a scrape
+    /// ([`TorrentHandle::scrape_trackers`](crate::TorrentHandle::scrape_trackers)).
+    ScrapeReply {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// Tracker URL (the announce URL).
+        url: String,
+        /// Seeds.
+        complete: u32,
+        /// Leechers.
+        incomplete: u32,
+        /// Completed downloads the tracker has seen.
+        downloaded: u32,
+    },
+    /// A scrape failed, or the reply left the torrent out. The tracker
+    /// stays in use for announces.
+    ScrapeFailed {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// Tracker URL (the announce URL).
+        url: String,
+        /// What went wrong.
+        message: String,
+    },
     /// A batch of peer addresses arrived for a torrent.
     PeersFound {
         /// The torrent.
@@ -212,7 +236,7 @@ bitflags::bitflags! {
         const STATUS = 1;
         /// Piece finished, hash failed.
         const PIECE = 1 << 1;
-        /// Tracker replies and errors.
+        /// Tracker replies and errors, scrapes included.
         const TRACKER = 1 << 2;
         /// Peer connects and disconnects, peers found.
         const PEER = 1 << 3;
@@ -243,7 +267,10 @@ impl Event {
             | Event::MetadataReceived { .. }
             | Event::TorrentFinished { .. } => EventMask::STATUS,
             Event::PieceFinished { .. } | Event::HashFailed { .. } => EventMask::PIECE,
-            Event::TrackerReply { .. } | Event::TrackerError { .. } => EventMask::TRACKER,
+            Event::TrackerReply { .. }
+            | Event::TrackerError { .. }
+            | Event::ScrapeReply { .. }
+            | Event::ScrapeFailed { .. } => EventMask::TRACKER,
             Event::PeerConnected { .. }
             | Event::PeerDisconnected { .. }
             | Event::PeersFound { .. } => EventMask::PEER,
