@@ -25,6 +25,10 @@ pub(super) async fn connect(
     };
     let mut req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let Some(user) = &cfg.username {
+        if user.contains(':') {
+            // RFC 7617 section 2: the user-id cannot contain a colon.
+            return Err(ProxyError::Protocol("HTTP proxy username contains ':'"));
+        }
         let pass = cfg.password.as_deref().unwrap_or("");
         let token = base64(format!("{user}:{pass}").as_bytes());
         req.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
@@ -55,6 +59,10 @@ pub(super) async fn connect(
 
 /// Parses a `CONNECT` response head.
 ///
+/// The head must end with `\r\n\r\n`: bare-LF heads (`\n\n`, which RFC 9112
+/// section 2.2 lets recipients accept) are not recognised, so such a proxy
+/// fails at the cap or the timeout.
+///
 /// `Ok(None)` means the blank line has not arrived yet;
 /// `Ok(Some((status, len)))` gives the status code and the head's length,
 /// terminator included. A head that reaches [`MAX_CONNECT_HEAD`] bytes without
@@ -80,8 +88,9 @@ pub fn parse_connect_head(buf: &[u8]) -> Result<Option<(u16, usize)>, ProxyError
     let line = window.split(|&b| b == b'\r').next().unwrap_or_default();
     let rest = line
         .strip_prefix(b"HTTP/1.")
-        .and_then(|r| r.get(1..))
-        .and_then(|r| r.strip_prefix(b" "))
+        .and_then(|r| r.split_first())
+        .filter(|(minor, _)| minor.is_ascii_digit())
+        .and_then(|(_, r)| r.strip_prefix(b" "))
         .ok_or(ProxyError::Protocol("CONNECT response is not HTTP/1.x"))?;
     let (code, after) = rest
         .split_first_chunk::<3>()

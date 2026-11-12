@@ -27,9 +27,12 @@ pub(super) async fn negotiate(s: &mut TcpStream, cfg: &ProxyConfig) -> Result<()
     let creds = match &cfg.username {
         Some(user) => {
             let pass = cfg.password.as_deref().unwrap_or("");
-            let (Ok(ulen), Ok(plen)) = (u8::try_from(user.len()), u8::try_from(pass.len())) else {
+            // RFC 1929: ULEN and PLEN are 1 to 255.
+            let (Ok(ulen @ 1..), Ok(plen @ 1..)) =
+                (u8::try_from(user.len()), u8::try_from(pass.len()))
+            else {
                 return Err(ProxyError::Protocol(
-                    "SOCKS5 username or password longer than 255 bytes",
+                    "SOCKS5 username and password must be 1 to 255 bytes",
                 ));
             };
             let mut msg = Vec::with_capacity(3 + user.len() + pass.len());
@@ -99,6 +102,11 @@ pub(super) async fn request(
             return Ok(addr);
         }
         let want = reply_len(filled).unwrap_or(5).min(MAX_REPLY);
+        if want <= have {
+            // The parser wants more than the header says: never spin on an
+            // empty read.
+            return Err(ProxyError::Protocol("SOCKS5 reply length is inconsistent"));
+        }
         let Some(dst) = buf.get_mut(have..want) else {
             return Err(ProxyError::Protocol("SOCKS5 reply too long"));
         };

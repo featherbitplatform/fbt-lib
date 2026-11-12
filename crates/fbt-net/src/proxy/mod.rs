@@ -61,9 +61,11 @@ pub struct ProxyConfig {
     /// Proxy port (default 1080).
     pub port: u16,
     /// Username: SOCKS5 offers username/password authentication and HTTP sends
-    /// `Proxy-Authorization: Basic` when it is set.
+    /// `Proxy-Authorization: Basic` when it is set. SOCKS5 needs 1 to 255
+    /// bytes; HTTP Basic refuses a `:` in it.
     pub username: Option<String>,
-    /// Password, used with `username` (empty when unset).
+    /// Password, used with `username`. SOCKS5 needs 1 to 255 bytes; HTTP
+    /// sends an unset password as empty.
     pub password: Option<String>,
     /// Route peer connections (and web seeds) through the proxy.
     pub proxy_peers: bool,
@@ -128,6 +130,11 @@ pub enum ProxyTarget {
     Addr(SocketAddr),
     /// A host name and port, resolved by the proxy when
     /// [`ProxyConfig::proxy_hostnames`] is set, else locally.
+    ///
+    /// The name is 1 to 255 bytes of `[A-Za-z0-9._-]`, else
+    /// [`ProxyError::Protocol`]: internationalised names must be given in
+    /// their punycode (`xn--`) form. An IP literal (`[::1]` or bare) is used
+    /// as an address.
     Host(String, u16),
 }
 
@@ -193,11 +200,20 @@ async fn connect_inner(cfg: &ProxyConfig, target: ProxyTarget) -> Result<TcpStre
     }
 }
 
-/// Turns IP literals into addresses, refuses host names that cannot be sent,
-/// and resolves names locally when the proxy should not.
+/// Turns IP literals into addresses, refuses host names that cannot be sent
+/// and scoped IPv6 addresses a proxy cannot express, and resolves names
+/// locally when the proxy should not.
 async fn prepare_target(cfg: &ProxyConfig, target: ProxyTarget) -> Result<ProxyTarget, ProxyError> {
-    let ProxyTarget::Host(host, port) = target else {
-        return Ok(target);
+    let (host, port) = match target {
+        ProxyTarget::Addr(SocketAddr::V6(a))
+            if a.scope_id() != 0 && cfg.kind != ProxyKind::None =>
+        {
+            return Err(ProxyError::Protocol(
+                "a scoped IPv6 address cannot be sent to a proxy",
+            ));
+        }
+        ProxyTarget::Addr(_) => return Ok(target),
+        ProxyTarget::Host(host, port) => (host, port),
     };
     let bare = host
         .strip_prefix('[')
@@ -206,12 +222,7 @@ async fn prepare_target(cfg: &ProxyConfig, target: ProxyTarget) -> Result<ProxyT
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return Ok(ProxyTarget::Addr(SocketAddr::new(ip, port)));
     }
-    if host.is_empty()
-        || host.len() > 255
-        || !host
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && b != b'/' && b != b'@')
-    {
+    if host.is_empty() || host.len() > 255 || !host.bytes().all(is_host_byte) {
         return Err(ProxyError::Protocol("invalid target host name"));
     }
     if cfg.kind == ProxyKind::None || cfg.proxy_hostnames {
@@ -224,6 +235,11 @@ async fn prepare_target(cfg: &ProxyConfig, target: ProxyTarget) -> Result<ProxyT
             "target host name did not resolve",
         ))),
     }
+}
+
+/// The bytes a target host name may hold: letters, digits, `.`, `_`, `-`.
+fn is_host_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
 }
 
 async fn dial_proxy(cfg: &ProxyConfig) -> Result<TcpStream, ProxyError> {

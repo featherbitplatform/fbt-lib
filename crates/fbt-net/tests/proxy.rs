@@ -77,6 +77,121 @@ async fn socks5_connect_by_addr_and_host() {
     );
 }
 
+async fn expect_early(s: &mut tokio::net::TcpStream) {
+    let mut early = [0u8; 5];
+    s.read_exact(&mut early).await.unwrap();
+    assert_eq!(&early, b"early");
+}
+
+#[tokio::test]
+async fn socks5_reply_and_tunnel_bytes_in_one_segment() {
+    // The reply names a domain `BND.ADDR` and `early` follows it in the same
+    // write: the client reads exactly the reply.
+    let echo = echo_server().await;
+    let proxy = FakeSocks5::start(Script::Trailer(b"early".to_vec())).await;
+    let c = cfg(ProxyKind::Socks5, proxy.addr());
+    let mut s = connect_tcp(&c, ProxyTarget::Addr(echo), T).await.unwrap();
+    expect_early(&mut s).await;
+    check_echo(&mut s).await;
+}
+
+#[tokio::test]
+async fn target_host_allowlist() {
+    let socks = FakeSocks5::start(Script::Ok).await;
+    let http = FakeHttpProxy::start(HttpScript::Ok).await;
+    let bad = [
+        "".to_string(),
+        "a:1".into(),
+        "a b".into(),
+        "x\r\nX-Evil: 1".into(),
+        "user@host".into(),
+        "a/b".into(),
+        "[fe80::1%eth0]".into(),
+        "fe80::1%2".into(),
+        "b\u{fc}cher.example".into(),
+        "a".repeat(256),
+    ];
+    for c in [
+        cfg(ProxyKind::Socks5, socks.addr()),
+        cfg(ProxyKind::Http, http.addr()),
+    ] {
+        for host in &bad {
+            let err = connect_tcp(&c, ProxyTarget::Host(host.clone(), 80), T)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::Protocol(_)), "{host:?}: {err:?}");
+        }
+    }
+    // Nothing reached either proxy's CONNECT.
+    assert!(socks.connects().is_empty());
+    assert!(http.connects().is_empty());
+    // Allowed bytes and IP literals still go through.
+    let echo = echo_server().await;
+    let c = cfg(ProxyKind::Http, http.addr());
+    for host in ["localhost", "127.0.0.1", "[127.0.0.1]"] {
+        let mut s = connect_tcp(&c, ProxyTarget::Host(host.into(), echo.port()), T)
+            .await
+            .unwrap();
+        check_echo(&mut s).await;
+    }
+}
+
+#[tokio::test]
+async fn scoped_ipv6_is_refused() {
+    let socks = FakeSocks5::start(Script::Ok).await;
+    let http = FakeHttpProxy::start(HttpScript::Ok).await;
+    let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+        "fe80::1".parse().unwrap(),
+        80,
+        0,
+        2,
+    ));
+    for c in [
+        cfg(ProxyKind::Socks5, socks.addr()),
+        cfg(ProxyKind::Http, http.addr()),
+    ] {
+        let err = connect_tcp(&c, ProxyTarget::Addr(scoped), T)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::Protocol(_)), "{err:?}");
+    }
+    assert!(socks.connects().is_empty());
+    assert!(http.connects().is_empty());
+}
+
+#[tokio::test]
+async fn basic_username_with_colon_is_refused() {
+    let proxy = FakeHttpProxy::start(HttpScript::RequireBasic("a:b".into(), "c".into())).await;
+    let mut c = cfg(ProxyKind::Http, proxy.addr());
+    c.username = Some("a:b".into());
+    c.password = Some("c".into());
+    let target = ProxyTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 9)));
+    let err = connect_tcp(&c, target, T).await.unwrap_err();
+    assert!(matches!(err, ProxyError::Protocol(_)), "{err:?}");
+    assert!(proxy.connects().is_empty());
+}
+
+#[tokio::test]
+async fn socks5_empty_credentials_are_refused() {
+    let proxy = FakeSocks5::start(Script::RequireAuth("a".into(), "b".into())).await;
+    let target = ProxyTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 9)));
+    for (user, pass) in [
+        (Some(""), Some("b")),
+        (Some("a"), None),
+        (Some("a"), Some("")),
+        (Some(""), None),
+    ] {
+        let mut c = cfg(ProxyKind::Socks5, proxy.addr());
+        c.username = user.map(String::from);
+        c.password = pass.map(String::from);
+        let err = connect_tcp(&c, target.clone(), T).await.unwrap_err();
+        assert!(
+            matches!(err, ProxyError::Protocol(_)),
+            "{user:?}/{pass:?}: {err:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn socks5_user_pass() {
     let echo = echo_server().await;
@@ -168,14 +283,16 @@ async fn silent_proxy_times_out() {
 #[tokio::test]
 async fn http_connect_tunnels_and_keeps_bytes() {
     let echo = echo_server().await;
-    let proxy = FakeHttpProxy::start(HttpScript::Ok).await;
+    // `early` follows the 200 head in the same write.
+    let proxy = FakeHttpProxy::start(HttpScript::Trailer(b"early".to_vec())).await;
     let c = cfg(ProxyKind::Http, proxy.addr());
-    // The fake sends the target's `hello` in the same write as the head.
     let mut s = connect_tcp(&c, ProxyTarget::Addr(echo), T).await.unwrap();
+    expect_early(&mut s).await;
     check_echo(&mut s).await;
     let mut s = connect_tcp(&c, ProxyTarget::Host("localhost".into(), echo.port()), T)
         .await
         .unwrap();
+    expect_early(&mut s).await;
     check_echo(&mut s).await;
     assert_eq!(
         proxy.connects(),
@@ -245,6 +362,15 @@ fn connect_head_parses_status_and_length() {
     );
     assert_eq!(parse_connect_head(b"HTTP/1.0 407 No\r\n").unwrap(), None);
     assert!(parse_connect_head(b"SSH-2.0-x\r\n\r\n").is_err());
+    // The minor version is a digit.
+    assert!(parse_connect_head(b"HTTP/1.x 200 OK\r\n\r\n").is_err());
+    assert!(parse_connect_head(b"HTTP/1. 200 OK\r\n\r\n").is_err());
+    assert_eq!(
+        parse_connect_head(b"HTTP/1.0 204 OK\r\n\r\n").unwrap(),
+        Some((204, 19))
+    );
+    // Bare-LF heads are not recognised.
+    assert_eq!(parse_connect_head(b"HTTP/1.1 200 OK\n\n").unwrap(), None);
 }
 
 /// A UDP server on loopback that echoes every datagram.

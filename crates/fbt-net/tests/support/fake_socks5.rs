@@ -25,6 +25,11 @@ pub enum Script {
     RelayFromStranger,
     /// UDP is relayed, but datagrams to the client carry `FRAG = 1`.
     Fragmented,
+    /// CONNECT is relayed, but the reply names a domain (`proxy.invalid`) as
+    /// `BND.ADDR` and these bytes follow it in the same write, as if the
+    /// target had already spoken: a client that reads past the reply loses
+    /// them.
+    Trailer(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -129,7 +134,7 @@ async fn serve(mut s: TcpStream, script: Script, log: Arc<Mutex<Log>>) -> std::i
         return Ok(());
     }
     match req[1] {
-        1 => connect(s, target, log).await,
+        1 => connect(s, target, script, log).await,
         3 => associate(s, script, log).await,
         _ => {
             s.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
@@ -185,7 +190,12 @@ fn reply(rep: u8, bnd: SocketAddr) -> Vec<u8> {
     out
 }
 
-async fn connect(mut s: TcpStream, target: Target, log: Arc<Mutex<Log>>) -> std::io::Result<()> {
+async fn connect(
+    mut s: TcpStream,
+    target: Target,
+    script: Script,
+    log: Arc<Mutex<Log>>,
+) -> std::io::Result<()> {
     let (text, dialled) = match target {
         Target::Addr(a) => (a.to_string(), TcpStream::connect(a).await),
         Target::Host(h, p) => (
@@ -202,7 +212,15 @@ async fn connect(mut s: TcpStream, target: Target, log: Arc<Mutex<Log>>) -> std:
             return Ok(());
         }
     };
-    s.write_all(&reply(0, up.local_addr()?)).await?;
+    if let Script::Trailer(bytes) = &script {
+        let mut out = vec![5, 0, 0, 3, 13];
+        out.extend_from_slice(b"proxy.invalid");
+        out.extend_from_slice(&1080u16.to_be_bytes());
+        out.extend_from_slice(bytes);
+        s.write_all(&out).await?;
+    } else {
+        s.write_all(&reply(0, up.local_addr()?)).await?;
+    }
     let _ = tokio::io::copy_bidirectional(&mut s, &mut up).await;
     Ok(())
 }

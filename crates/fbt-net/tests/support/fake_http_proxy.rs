@@ -4,7 +4,6 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -21,6 +20,10 @@ pub enum Script {
     /// CONNECT needs `Proxy-Authorization: Basic` with these credentials;
     /// anything else gets 407.
     RequireBasic(String, String),
+    /// Tunnels like `Ok`, but these bytes follow the 200 head in the same
+    /// write, as if the target had already spoken: a client that reads past
+    /// the head loses them.
+    Trailer(Vec<u8>),
 }
 
 pub struct FakeHttpProxy {
@@ -120,7 +123,7 @@ async fn serve(
                 return Ok(());
             }
         }
-        Script::Ok => {}
+        Script::Ok | Script::Trailer(_) => {}
     }
     log.lock().unwrap().push(authority.clone());
     let mut up = match TcpStream::connect(authority.as_str()).await {
@@ -130,15 +133,10 @@ async fn serve(
             return Ok(());
         }
     };
-    // Whatever the target says first goes out in the same write as the
-    // response head, so a client that over-reads the head loses it.
-    let mut first = vec![0u8; 4096];
-    let n = match tokio::time::timeout(Duration::from_millis(200), up.read(&mut first)).await {
-        Ok(Ok(n)) => n,
-        _ => 0,
-    };
     let mut out = b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec();
-    out.extend_from_slice(&first[..n]);
+    if let Script::Trailer(bytes) = &script {
+        out.extend_from_slice(bytes);
+    }
     s.write_all(&out).await?;
     let _ = tokio::io::copy_bidirectional(&mut s, &mut up).await;
     Ok(())
