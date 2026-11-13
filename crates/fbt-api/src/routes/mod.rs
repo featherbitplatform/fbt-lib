@@ -36,6 +36,7 @@ use utoipa_axum::routes;
 use crate::config::ApiConfig;
 
 pub(crate) mod control;
+pub(crate) mod create;
 pub(crate) mod session;
 pub(crate) mod torrents;
 
@@ -57,6 +58,10 @@ pub(crate) struct AppState {
     /// Permits for open event streams ([`ApiConfig::max_event_streams`]).
     #[allow(dead_code, reason = "the event route takes its permits")]
     pub(crate) events: Arc<Semaphore>,
+    /// Permits for running torrent creations
+    /// ([`create::MAX_CONCURRENT_CREATES`]); each blocking build holds one
+    /// until it ends, even if the client has gone.
+    pub(crate) creates: Arc<Semaphore>,
     /// Cancelled by [`ApiServer::shutdown`](crate::ApiServer::shutdown).
     /// Every long-lived body (events, file streams) ends when it fires:
     /// wrap it in `.take_until(state.shutdown.clone().cancelled_owned())`.
@@ -75,6 +80,7 @@ impl AppState {
         AppState {
             streams: Arc::new(Semaphore::new(config.max_streams)),
             events: Arc::new(Semaphore::new(config.max_event_streams)),
+            creates: Arc::new(Semaphore::new(create::MAX_CONCURRENT_CREATES)),
             session,
             config: Arc::new(config),
             roots,
@@ -130,6 +136,7 @@ pub(crate) fn api_router() -> OpenApiRouter<AppState> {
         .merge(session::router())
         .merge(torrents::router())
         .merge(control::router())
+        .merge(create::router())
         .routes(routes!(openapi_json))
 }
 

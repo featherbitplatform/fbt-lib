@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use fbt::{
-    FileStatus, MoveMode, PeerSource, PeerStatus, Priority, Session, TorrentHandle, TorrentState,
-    TorrentStatus, TorrentVersion, TrackerStatus, Transport,
+    FileStatus, IpFilter, MoveMode, PeerSource, PeerStatus, Priority, QueueSettings, Session,
+    TorrentHandle, TorrentState, TorrentStatus, TorrentVersion, TrackerStatus, Transport,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -38,7 +38,7 @@ pub(crate) struct ErrorDetail {
     /// `no_metadata`, `duplicate_torrent`, `busy`, `already_exists` (409);
     /// `body_too_large` (413); `range_not_satisfiable` (416); `internal`
     /// (500); `unsupported` (501); `too_many_streams`, `shutting_down`,
-    /// `dht_disabled` (503).
+    /// `dht_disabled`, `busy` (503).
     #[schema(example = "not_found")]
     pub(crate) code: String,
     /// Human-readable message.
@@ -62,11 +62,16 @@ pub(crate) struct SessionInfo {
     pub(crate) upload_rate: u64,
     /// Torrents in the session.
     pub(crate) torrents: usize,
+    /// Session-wide download limit, bytes per second; 0 is unlimited.
+    pub(crate) download_limit: u64,
+    /// Session-wide upload limit, bytes per second; 0 is unlimited.
+    pub(crate) upload_limit: u64,
 }
 
 impl From<&Session> for SessionInfo {
     fn from(session: &Session) -> Self {
         let status = session.torrents_status();
+        let limit = session.rate_limit();
         SessionInfo {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             listen_addrs: session
@@ -85,6 +90,8 @@ impl From<&Session> for SessionInfo {
                 .iter()
                 .fold(0u64, |sum, t| sum.saturating_add(t.upload_rate)),
             torrents: status.len(),
+            download_limit: limit.download,
+            upload_limit: limit.upload,
         }
     }
 }
@@ -602,4 +609,201 @@ pub(crate) struct AddPeerRequest {
     /// The peer's address, `ip:port` (`[ip]:port` for IPv6).
     #[schema(value_type = String, example = "192.0.2.1:6881")]
     pub(crate) addr: SocketAddr,
+}
+
+/// The session's queue limits (`GET`/`PUT /api/v1/session/queue`). `PUT`
+/// replaces them all: a limit left out or null is unlimited.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QueueSettingsDto {
+    /// Auto-managed downloading torrents running at once; null is
+    /// unlimited.
+    pub(crate) active_downloads: Option<usize>,
+    /// Auto-managed seeding torrents running at once; null is unlimited.
+    pub(crate) active_seeds: Option<usize>,
+    /// Auto-managed torrents running at once, downloading or seeding; null
+    /// is unlimited.
+    pub(crate) active_limit: Option<usize>,
+    /// A slow torrent does not count against the download and seed limits.
+    pub(crate) dont_count_slow_torrents: bool,
+    /// Download rate below which a torrent may be slow, bytes per second.
+    pub(crate) inactive_down_rate: u64,
+    /// Upload rate below which a torrent may be slow, bytes per second.
+    pub(crate) inactive_up_rate: u64,
+    /// Seconds a torrent runs before it may count as slow.
+    pub(crate) startup_grace: f64,
+    /// Seconds between scheduler passes (greater than zero).
+    pub(crate) interval: f64,
+}
+
+impl From<&QueueSettings> for QueueSettingsDto {
+    fn from(q: &QueueSettings) -> Self {
+        QueueSettingsDto {
+            active_downloads: q.active_downloads,
+            active_seeds: q.active_seeds,
+            active_limit: q.active_limit,
+            dont_count_slow_torrents: q.dont_count_slow_torrents,
+            inactive_down_rate: q.inactive_down_rate,
+            inactive_up_rate: q.inactive_up_rate,
+            startup_grace: q.startup_grace.as_secs_f64(),
+            interval: q.interval.as_secs_f64(),
+        }
+    }
+}
+
+impl QueueSettingsDto {
+    /// The settings, or why a duration is not one.
+    pub(crate) fn into_settings(self) -> Result<QueueSettings, String> {
+        let secs = |name: &str, v: f64| {
+            std::time::Duration::try_from_secs_f64(v)
+                .map_err(|_| format!("{name} must be a non-negative number of seconds"))
+        };
+        // `QueueSettings` is non-exhaustive: start from the default.
+        let mut q = QueueSettings::default();
+        q.active_downloads = self.active_downloads;
+        q.active_seeds = self.active_seeds;
+        q.active_limit = self.active_limit;
+        q.dont_count_slow_torrents = self.dont_count_slow_torrents;
+        q.inactive_down_rate = self.inactive_down_rate;
+        q.inactive_up_rate = self.inactive_up_rate;
+        q.startup_grace = secs("startup_grace", self.startup_grace)?;
+        q.interval = secs("interval", self.interval)?;
+        Ok(q)
+    }
+}
+
+/// What an IP filter rule does to its range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IpFilterAction {
+    /// Peers in the range are refused.
+    Block,
+    /// Peers in the range are accepted, overriding earlier blocks.
+    Allow,
+}
+
+/// One IP filter rule: an inclusive range of one address family.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IpFilterRule {
+    /// The first address of the range.
+    #[schema(example = "10.0.0.0")]
+    pub(crate) first: String,
+    /// The last address of the range (not below `first`, same family).
+    #[schema(example = "10.0.0.255")]
+    pub(crate) last: String,
+    /// Block or allow the range.
+    pub(crate) action: IpFilterAction,
+}
+
+/// The session's IP filter (`GET`/`PUT /api/v1/session/ip-filter`). `PUT`
+/// replaces the filter; rules apply in order and the last one covering an
+/// address decides. `GET` returns the disjoint ranges the filter holds.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IpFilterDto {
+    /// The rules.
+    pub(crate) rules: Vec<IpFilterRule>,
+}
+
+/// Most rules a `PUT /api/v1/session/ip-filter` body may hold.
+pub(crate) const MAX_IP_FILTER_RULES: usize = 65_536;
+
+impl From<&IpFilter> for IpFilterDto {
+    fn from(f: &IpFilter) -> Self {
+        IpFilterDto {
+            rules: f
+                .rules()
+                .into_iter()
+                .map(|(range, blocked)| IpFilterRule {
+                    first: range.start().to_string(),
+                    last: range.end().to_string(),
+                    action: if blocked {
+                        IpFilterAction::Block
+                    } else {
+                        IpFilterAction::Allow
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+impl IpFilterDto {
+    /// The filter, or what is wrong with a rule.
+    pub(crate) fn into_filter(self) -> Result<IpFilter, String> {
+        if self.rules.len() > MAX_IP_FILTER_RULES {
+            return Err(format!(
+                "at most {MAX_IP_FILTER_RULES} rules are accepted, got {}",
+                self.rules.len()
+            ));
+        }
+        let mut filter = IpFilter::default();
+        for (i, rule) in self.rules.iter().enumerate() {
+            let parse = |what: &str, s: &str| {
+                s.parse::<std::net::IpAddr>()
+                    .map(|ip| ip.to_canonical())
+                    .map_err(|_| format!("rule {i}: `{what}` is not an IP address"))
+            };
+            let first = parse("first", &rule.first)?;
+            let last = parse("last", &rule.last)?;
+            if first.is_ipv4() != last.is_ipv4() {
+                return Err(format!("rule {i}: `first` and `last` differ in family"));
+            }
+            if first > last {
+                return Err(format!("rule {i}: `first` is above `last`"));
+            }
+            match rule.action {
+                IpFilterAction::Block => filter.block(first..=last),
+                IpFilterAction::Allow => filter.allow(first..=last),
+            }
+        }
+        Ok(filter)
+    }
+}
+
+/// A metainfo version to create.
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CreateVersion {
+    /// BEP 3 only.
+    V1,
+    /// BEP 52 only.
+    V2,
+    /// Both (the default).
+    #[default]
+    Hybrid,
+}
+
+impl From<CreateVersion> for TorrentVersion {
+    fn from(v: CreateVersion) -> Self {
+        match v {
+            CreateVersion::V1 => TorrentVersion::V1,
+            CreateVersion::V2 => TorrentVersion::V2,
+            CreateVersion::Hybrid => TorrentVersion::Hybrid,
+        }
+    }
+}
+
+/// `POST /api/v1/create-torrent`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateTorrentRequest {
+    /// The file or directory to hash; subject to `allowed_roots`.
+    pub(crate) path: String,
+    /// Which versions to write (default hybrid).
+    #[serde(default)]
+    pub(crate) version: CreateVersion,
+    /// The piece length in bytes: a power of two of at least 16 KiB
+    /// (default: automatic).
+    pub(crate) piece_length: Option<u32>,
+    /// Announce tiers.
+    pub(crate) trackers: Option<Vec<Vec<String>>>,
+    /// BEP 19 web seed URLs.
+    pub(crate) web_seeds: Option<Vec<String>>,
+    /// A free-form comment.
+    pub(crate) comment: Option<String>,
+    /// The BEP 27 private flag.
+    #[serde(default)]
+    pub(crate) private: bool,
 }

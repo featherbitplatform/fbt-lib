@@ -57,7 +57,7 @@ pub enum ApiError {
 /// `no_metadata`, `duplicate_torrent`, `busy`, `already_exists`; `413`
 /// `body_too_large`; `416` `range_not_satisfiable`; `501` `unsupported`;
 /// `503` `too_many_streams` (with `Retry-After: 1`), `shutting_down`,
-/// `dht_disabled`; `500` `internal`.
+/// `dht_disabled`, `busy` (too many torrent creations); `500` `internal`.
 #[derive(Debug)]
 pub(crate) struct ApiErrorResponse {
     /// The response status.
