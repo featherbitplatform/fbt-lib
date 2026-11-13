@@ -47,9 +47,6 @@ pub(crate) mod torrents;
 pub(crate) struct AppState {
     /// The session the API controls.
     pub(crate) session: Session,
-    /// The validated config.
-    #[allow(dead_code, reason = "the routes read their caps from it")]
-    pub(crate) config: Arc<ApiConfig>,
     /// [`ApiConfig::allowed_roots`], as given and canonicalised once;
     /// `None` allows any path.
     pub(crate) roots: Option<Arc<[crate::paths::Root]>>,
@@ -62,7 +59,9 @@ pub(crate) struct AppState {
     /// ([`create::MAX_CONCURRENT_CREATES`]); each blocking build holds one
     /// until it ends, even if the client has gone.
     pub(crate) creates: Arc<Semaphore>,
-    /// Cancelled by [`ApiServer::shutdown`](crate::ApiServer::shutdown).
+    /// Cancelled by [`ApiServer::shutdown`](crate::ApiServer::shutdown), or
+    /// when the future given to
+    /// [`router_with_shutdown`](crate::router_with_shutdown) completes.
     /// Every long-lived body (events, file streams) ends when it fires:
     /// wrap it in `.take_until(state.shutdown.clone().cancelled_owned())`.
     pub(crate) shutdown: CancellationToken,
@@ -72,7 +71,7 @@ impl AppState {
     /// The state for `session` and a validated `config`.
     pub(crate) fn new(
         session: Session,
-        config: ApiConfig,
+        config: &ApiConfig,
         roots: Option<Arc<[crate::paths::Root]>>,
         shutdown: CancellationToken,
     ) -> Self {
@@ -81,7 +80,6 @@ impl AppState {
             events: Arc::new(Semaphore::new(config.max_event_streams)),
             creates: Arc::new(Semaphore::new(create::MAX_CONCURRENT_CREATES)),
             session,
-            config: Arc::new(config),
             roots,
             shutdown,
         }
@@ -156,6 +154,7 @@ fn document() -> &'static Result<String, String> {
     security(()),
     responses(
         (status = 200, description = "The OpenAPI document.", content_type = "application/json", body = Object),
+        (status = 500, description = "The document could not be serialised (`internal`).", body = crate::dto::ErrorBody),
     ),
 )]
 async fn openapi_json() -> Response {

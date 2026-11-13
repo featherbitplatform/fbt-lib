@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use fbt::Session;
 use fbt_api::range::{RangeOutcome, parse_range};
-use fbt_api::{ApiConfig, ApiError, ApiServer, Auth, MAX_BODY_BYTES, openapi, router};
+use fbt_api::{
+    ApiConfig, ApiError, ApiServer, Auth, MAX_BODY_BYTES, openapi, router, router_with_shutdown,
+};
 
 const _: usize = MAX_BODY_BYTES;
 
@@ -33,6 +35,10 @@ fn range_variants(r: &RangeOutcome) -> bool {
     )
 }
 
+fn mounted(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiError> {
+    router_with_shutdown(session, config, std::future::pending::<()>())
+}
+
 async fn server(session: Session, config: ApiConfig) -> Result<(), ApiError> {
     let server: ApiServer = ApiServer::start(session, config).await?;
     server.shutdown().await;
@@ -47,6 +53,7 @@ fn config_fields(c: &mut ApiConfig) {
     let _: &mut usize = &mut c.max_body_bytes;
     let _: &mut usize = &mut c.max_streams;
     let _: &mut usize = &mut c.max_event_streams;
+    let _: &mut usize = &mut c.max_connections;
 }
 
 fn variants(a: &Auth, e: &ApiError) -> bool {
@@ -71,5 +78,6 @@ fn defaults() {
     assert_eq!(c.max_body_bytes, 32 << 20);
     assert_eq!(c.max_streams, 32);
     assert_eq!(c.max_event_streams, 16);
+    assert_eq!(c.max_connections, 256);
     assert!(matches!(&ApiConfig::new("t").auth, Auth::Token(t) if t == "t"));
 }

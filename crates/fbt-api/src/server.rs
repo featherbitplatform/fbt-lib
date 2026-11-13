@@ -8,6 +8,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -16,6 +17,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -67,7 +69,7 @@ impl ApiServer {
         let listener = TcpListener::bind(config.bind)
             .await
             .map_err(ApiError::Bind)?;
-        ApiServer::serve(listener, router, shutdown)
+        ApiServer::serve(listener, router, shutdown, config.max_connections)
     }
 
     /// Serves `router` on `listener` until `shutdown` fires.
@@ -75,9 +77,13 @@ impl ApiServer {
         listener: TcpListener,
         router: Router,
         shutdown: CancellationToken,
+        max_connections: usize,
     ) -> Result<ApiServer, ApiError> {
         let local_addr = listener.local_addr().map_err(ApiError::Bind)?;
-        let task = tokio::spawn(accept_loop(listener, router, shutdown.clone()));
+        let limit = Arc::new(Semaphore::new(
+            max_connections.clamp(1, Semaphore::MAX_PERMITS),
+        ));
+        let task = tokio::spawn(accept_loop(listener, router, shutdown.clone(), limit));
         Ok(ApiServer {
             local_addr,
             shutdown,
@@ -116,14 +122,33 @@ impl Drop for ApiServer {
 /// Accepts connections until `shutdown` fires, then drains them: idle
 /// ones close at once, busy ones get [`SHUTDOWN_GRACE`], the rest are
 /// aborted. Returns once every connection task is gone.
-async fn accept_loop(listener: TcpListener, router: Router, shutdown: CancellationToken) {
+///
+/// It takes a permit of `limit` before each `accept`, and the connection
+/// holds it until it closes: with every permit taken, new clients wait in
+/// the listener's backlog and cost no file descriptor.
+async fn accept_loop(
+    listener: TcpListener,
+    router: Router,
+    shutdown: CancellationToken,
+    limit: Arc<Semaphore>,
+) {
     let mut conns = JoinSet::new();
+    let mut permit: Option<OwnedSemaphorePermit> = None;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
-            accepted = listener.accept() => match accepted {
+            acquired = Arc::clone(&limit).acquire_owned(), if permit.is_none() => {
+                // The semaphore is never closed.
+                permit = acquired.ok();
+            }
+            accepted = listener.accept(), if permit.is_some() => match accepted {
                 Ok((stream, _)) => {
-                    conns.spawn(connection(stream, router.clone(), shutdown.clone()));
+                    conns.spawn(connection(
+                        stream,
+                        router.clone(),
+                        shutdown.clone(),
+                        permit.take(),
+                    ));
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "api accept failed");
@@ -147,8 +172,15 @@ async fn accept_loop(listener: TcpListener, router: Router, shutdown: Cancellati
 }
 
 /// Serves one connection; on `shutdown` it finishes the request in flight
-/// and closes.
-async fn connection(stream: TcpStream, router: Router, shutdown: CancellationToken) {
+/// and closes. `permit` (a slot of [`ApiConfig::max_connections`]) is
+/// released when it returns.
+async fn connection(
+    stream: TcpStream,
+    router: Router,
+    shutdown: CancellationToken,
+    permit: Option<OwnedSemaphorePermit>,
+) {
+    let _permit = permit;
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT)
@@ -172,7 +204,6 @@ async fn connection(stream: TcpStream, router: Router, shutdown: CancellationTok
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::time::Instant;
 
     use axum::routing::get;
@@ -193,7 +224,7 @@ mod tests {
             }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server = ApiServer::serve(listener, router, CancellationToken::new()).unwrap();
+        let server = ApiServer::serve(listener, router, CancellationToken::new(), 256).unwrap();
 
         let mut client = TcpStream::connect(server.local_addr()).await.unwrap();
         client
@@ -222,11 +253,55 @@ mod tests {
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
     }
 
+    /// Sends `GET /` on `client` and reads the response head.
+    async fn get_ok(client: &mut TcpStream) -> bool {
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = client.read(&mut buf).await.unwrap();
+        buf[..n].starts_with(b"HTTP/1.1 200")
+    }
+
+    #[tokio::test]
+    async fn connection_cap_holds_extra_clients_in_the_backlog() {
+        let router = Router::new().route("/", get(|| async { "ok" }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = ApiServer::serve(listener, router, CancellationToken::new(), 2).unwrap();
+        let mut a = TcpStream::connect(server.local_addr()).await.unwrap();
+        let mut b = TcpStream::connect(server.local_addr()).await.unwrap();
+        assert!(get_ok(&mut a).await);
+        assert!(get_ok(&mut b).await);
+
+        // The kernel completes the handshake, but the server does not
+        // accept the third connection while two are open.
+        let mut c = TcpStream::connect(server.local_addr()).await.unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let early = tokio::time::timeout(Duration::from_millis(500), c.read(&mut buf)).await;
+        assert!(
+            early.is_err(),
+            "the third connection is not served: {early:?}"
+        );
+
+        drop(a);
+        let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .expect("served once a slot frees")
+            .unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"));
+        drop(b);
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn shutdown_closes_idle_connections_at_once() {
         let router = Router::new().route("/", get(|| async { "ok" }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server = ApiServer::serve(listener, router, CancellationToken::new()).unwrap();
+        let server = ApiServer::serve(listener, router, CancellationToken::new(), 256).unwrap();
         let mut client = TcpStream::connect(server.local_addr()).await.unwrap();
         client
             .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")

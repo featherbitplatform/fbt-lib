@@ -73,6 +73,12 @@ pub struct ApiConfig {
     pub max_streams: usize,
     /// Event streams served at once; more get `503`. Default 16.
     pub max_event_streams: usize,
+    /// Connections [`ApiServer`](crate::ApiServer) serves at once,
+    /// authenticated or not. It accepts no more until one closes: further
+    /// clients wait in the listener's backlog instead of taking file
+    /// descriptors from the session. Default 256; 0 counts as 1. A client
+    /// mounting [`router`](crate::router) applies its own limit.
+    pub max_connections: usize,
 }
 
 impl Default for ApiConfig {
@@ -85,6 +91,7 @@ impl Default for ApiConfig {
             max_body_bytes: MAX_BODY_BYTES,
             max_streams: 32,
             max_event_streams: 16,
+            max_connections: 256,
         }
     }
 }

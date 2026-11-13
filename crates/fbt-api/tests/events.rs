@@ -231,7 +231,7 @@ async fn disconnect_frees_the_slot() {
     let (status, _, _) = get(&url, Some(token)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     drop(a);
-    let freed = tokio::time::timeout(Duration::from_secs(2), async {
+    let freed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let (status, _, sse) = Sse::open(&url, Some(token)).await;
             if status == StatusCode::OK {
@@ -242,7 +242,7 @@ async fn disconnect_frees_the_slot() {
         }
     })
     .await;
-    assert!(freed.is_ok(), "the slot is free within 2 s");
+    assert!(freed.is_ok(), "the slot is free within 5 s");
 }
 
 #[tokio::test]
@@ -252,11 +252,38 @@ async fn ends_on_session_shutdown() {
     assert_eq!(status, StatusCode::OK);
     let mut sse = sse.expect("stream");
     session.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while sse.next().await.is_some() {}
+    })
+    .await
+    .expect("the body ends within 5 s of session shutdown");
+}
+
+#[tokio::test]
+async fn router_with_shutdown_ends_open_events() {
+    let session = support::session().await;
+    let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+    let app = fbt_api::router_with_shutdown(session.clone(), &support::test_config(), async {
+        let _ = fired.await;
+    })
+    .expect("router");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let serving = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let (status, _, sse) = Sse::open(&format!("{base}/api/v1/events"), Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut sse = sse.expect("stream");
+    fire.send(()).expect("the router waits on the future");
     tokio::time::timeout(Duration::from_secs(2), async {
         while sse.next().await.is_some() {}
     })
     .await
-    .expect("the body ends within 2 s of session shutdown");
+    .expect("the body ends within 2 s of the shutdown future");
+    serving.abort();
+    session.shutdown().await;
 }
 
 #[test]

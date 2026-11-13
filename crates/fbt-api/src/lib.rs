@@ -2,7 +2,8 @@
 //! torrent and session setting, server-sent events and byte-range file
 //! streaming, with an OpenAPI document at `/api/v1/openapi.json`.
 //!
-//! Mount [`router`] in your own axum server, or run [`ApiServer`].
+//! Mount [`router`] (or [`router_with_shutdown`]) in your own axum
+//! server, or run [`ApiServer`].
 //!
 //! # Mounting the router
 //!
@@ -16,6 +17,11 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Open event and file streams end only when their client hangs up or the
+//! session shuts down, so shut the session down before awaiting a
+//! graceful shutdown of your server, or mount [`router_with_shutdown`],
+//! whose streams also end when a future of yours completes.
 //!
 //! # Running the standalone server
 //!
@@ -86,6 +92,8 @@ pub mod range;
 mod routes;
 mod server;
 
+use std::sync::Arc;
+
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Method, header};
 use fbt::Session;
@@ -102,8 +110,14 @@ pub use server::ApiServer;
 /// Mount it in your own server with [`axum::Router::merge`] (or `nest` it
 /// under a prefix); the auth rules follow the routes. You promise to serve
 /// it on [`ApiConfig::bind`]: with [`Auth::Disabled`] that address must be
-/// loopback. Long-lived bodies (events, file streams) end when the client
-/// hangs up; [`ApiServer`] also ends them on shutdown.
+/// loopback.
+///
+/// Long-lived bodies (events, file streams) end when the client hangs up,
+/// or when the session shuts down (events within 1 s, file streams as
+/// their torrents go). Nothing else ends them, so a graceful shutdown of
+/// your server waits for them: shut the session down first, or use
+/// [`router_with_shutdown`] and complete its future before (or as) your
+/// server's graceful shutdown starts.
 ///
 /// # Errors
 ///
@@ -114,6 +128,68 @@ pub use server::ApiServer;
 /// exist.
 pub fn router(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiError> {
     build_router(session, config, CancellationToken::new())
+}
+
+/// [`router`], whose long-lived bodies (events, file streams) also end
+/// when `shutdown` completes, so a server mounting it can shut down
+/// gracefully while clients keep them open:
+///
+/// ```no_run
+/// # async fn demo(session: fbt::Session) -> Result<(), Box<dyn std::error::Error>> {
+/// use fbt_api::{ApiConfig, router_with_shutdown};
+///
+/// let (stop, stopped) = tokio::sync::watch::channel(false);
+/// let mut ends_streams = stopped.clone();
+/// let mut ends_server = stopped;
+/// let app = router_with_shutdown(session.clone(), &ApiConfig::new("secret-token"), async move {
+///     let _ = ends_streams.wait_for(|stop| *stop).await;
+/// })?;
+/// let listener = tokio::net::TcpListener::bind("127.0.0.1:8090").await?;
+/// let server = tokio::spawn(async move {
+///     axum::serve(listener, app)
+///         .with_graceful_shutdown(async move {
+///             let _ = ends_server.wait_for(|stop| *stop).await;
+///         })
+///         .await
+/// });
+/// // ... later: end the streams and the server, then the session.
+/// stop.send(true)?;
+/// server.await??;
+/// session.shutdown().await;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Without that future completing (or the session shutting down), open
+/// event and file streams keep a graceful shutdown waiting, as with
+/// [`router`]. The future runs on a task of its own until it completes
+/// or every clone of the router is dropped.
+///
+/// # Errors
+///
+/// Those of [`router`].
+///
+/// # Panics
+///
+/// Outside a Tokio runtime, which it spawns the task on.
+pub fn router_with_shutdown(
+    session: Session,
+    config: &ApiConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<axum::Router, ApiError> {
+    let token = CancellationToken::new();
+    let router = build_router(session, config, token.clone())?;
+    // Cancelled when the last router clone goes, so the task does not
+    // outlive the router when `shutdown` never completes.
+    let dropped = CancellationToken::new();
+    let guard = Arc::new(dropped.clone().drop_guard());
+    tokio::spawn(async move {
+        tokio::select! {
+            () = shutdown => token.cancel(),
+            () = dropped.cancelled() => {}
+        }
+    });
+    Ok(router.layer(axum::Extension(guard)))
 }
 
 /// [`router`], whose long-lived bodies also end when `shutdown` fires.
@@ -127,7 +203,7 @@ pub(crate) fn build_router(
         auth: config.auth.clone(),
         origins: validated.origins.clone().into(),
     };
-    let state = routes::AppState::new(session, config.clone(), validated.roots, shutdown);
+    let state = routes::AppState::new(session, config, validated.roots, shutdown);
     let (router, _) = routes::api_router().split_for_parts();
     // `layer` wraps outside what came before: routes, then auth, then CORS.
     let router = router
