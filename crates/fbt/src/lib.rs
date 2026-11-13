@@ -101,11 +101,6 @@
 //! [`Session::dht_sample_infohashes`] asks one node for samples of the info
 //! hashes it stores ([`DhtSamples`], BEP 51).
 //!
-//! The DHT also stores small items (BEP 44, values of at most 1000 bencoded
-//! bytes): [`Session::dht_put_immutable`] and [`Session::dht_get_immutable`]
-//! by the value's SHA-1, [`Session::dht_put_mutable`] and
-//! [`Session::dht_get_mutable`] signed with an ed25519 key ([`MutableItem`]).
-//!
 //! Private torrents use neither the DHT nor PEX.
 //!
 //! # Transports
@@ -254,6 +249,166 @@
 //! # }
 //! ```
 //!
+//! # Resume data and session state
+//!
+//! The library never writes state files; it hands out bytes and takes them
+//! back. [`TorrentHandle::save_resume_data`] returns one torrent's resume
+//! data (its `info` dictionary, so a magnet restarts without fetching the
+//! metadata again, plus the save path, priorities, renamed files, verified
+//! pieces, web seeds, queue position, counters, peers and a stamp of each
+//! file) and [`AddTorrent::from_resume`] turns it back into add parameters.
+//! [`Session::save_state`] collects every torrent's resume data and the DHT
+//! state in queue order as a [`SessionState`]; [`Session::shutdown_and_save`]
+//! does the same as it shuts down, and [`Session::restore`] starts a session
+//! from it. Both return, beside the state, the torrents whose resume data
+//! could not be taken, with their error.
+//!
+//! When a resume file is trusted: at the add, every file that holds a saved
+//! piece (and the part file, when it holds one) must still have the length
+//! and modification time, in whole seconds, it had at the save; then the
+//! saved pieces are taken without a check. Anything else runs the normal
+//! full check, and [`TorrentStatus::resume_trusted`] says which way it went.
+//! Since a file written after the save no longer matches, save after
+//! [`TorrentHandle::pause`] or through [`Session::shutdown_and_save`]: data
+//! saved from a running torrent is valid, but the next add checks it in
+//! full. A custom [`Storage`] without stamps ([`Storage::stamps`]) is always
+//! trusted. [`TorrentStatus::need_save_resume`] is set whenever something
+//! worth saving changed. Resume data is hostile input: anything malformed,
+//! of another version or for another torrent fails with a [`ResumeError`]
+//! naming the field, never a panic.
+//!
+//! ```no_run
+//! use fbt::{AddTorrent, Metainfo, Session, SessionState, Settings};
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let metainfo = Metainfo::from_bytes(&std::fs::read("example.torrent")?)?;
+//! let session = Session::new(Settings::default()).await?;
+//! let torrent = session
+//!     .add_torrent(AddTorrent::new(metainfo, "downloads".into()))
+//!     .await?;
+//!
+//! // One torrent: pause first, so nothing is written after the save.
+//! torrent.pause().await?;
+//! std::fs::write("example.resume", torrent.save_resume_data().await?)?;
+//! session.shutdown().await;
+//!
+//! // Next run: the saved pieces are trusted if the files are unchanged.
+//! let session = Session::new(Settings::default()).await?;
+//! let mut params = AddTorrent::from_resume(&std::fs::read("example.resume")?)?;
+//! params.paused = false; // it was saved paused
+//! let torrent = session.add_torrent(params).await?;
+//! println!("{} added", torrent.status().name);
+//!
+//! // The whole session: every torrent and the DHT state at shutdown.
+//! let (state, failed) = session.shutdown_and_save().await;
+//! for (info_hash, error) in failed {
+//!     eprintln!("{info_hash} not saved: {error}");
+//! }
+//! std::fs::write("session.state", state.to_bytes())?;
+//!
+//! // Next run: one call restores them all.
+//! let state = SessionState::from_bytes(&std::fs::read("session.state")?)?;
+//! let (session, failed) = Session::restore(Settings::default(), &state).await?;
+//! for (index, error) in failed {
+//!     eprintln!("torrent {index} not restored: {error}");
+//! }
+//! session.shutdown().await;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Queueing
+//!
+//! Torrents are auto-managed by default ([`AddTorrent::auto_managed`]): in
+//! queue order, at most 3 downloads and 5 seeds run at once, and 500 in all
+//! ([`QueueSettings`] in [`Settings::queue`], changed at runtime with
+//! [`Session::set_queue_settings`]; `None` lifts a limit). The others wait
+//! as [`TorrentState::Queued`], stopped like a paused torrent. A torrent
+//! slower than 2 KiB/s each way after a 60 s grace does not count against
+//! the download and seed limits, so it does not hold the next one back. A
+//! torrent the user paused is never started by the queue.
+//! [`TorrentHandle::set_queue_position`] and
+//! [`TorrentHandle::set_auto_managed`] change one torrent, and
+//! [`TorrentStatus::queue_position`] reports its place. Seed limits are off
+//! by default: an auto-managed seed that reaches
+//! [`Settings::seed_ratio_limit`] or [`Settings::seed_time_limit`] pauses,
+//! stops being auto-managed and emits [`Event::SeedLimitReached`].
+//!
+//! # Moving, renaming and skipped files
+//!
+//! [`TorrentHandle::move_storage`] moves a torrent's files to a new save
+//! path ([`MoveMode`] decides what happens to files already there) after
+//! writing every cached piece, and a failure moves back what moved.
+//! [`TorrentHandle::rename_file`] renames one file below the save path.
+//! Files skipped with [`Priority::Skip`] are never created: the parts of
+//! their pieces that a wanted neighbour needs live in a part file,
+//! `.<info hash>.parts` in the save path, and move into the file if it
+//! becomes wanted. Colliding paths in a `.torrent` (`A.txt` and `a.txt`, or
+//! one name in two Unicode normalisations) are renamed `stem.N.ext`.
+//!
+//! # Proxies
+//!
+//! [`Settings::proxy`] ([`ProxyConfig`]) sends peer connections, web seeds
+//! and trackers through a SOCKS5 or HTTP `CONNECT` proxy ([`ProxyKind`]),
+//! with `proxy_peers`, `proxy_trackers` and `proxy_hostnames` choosing what
+//! goes through it (all on). Listening is unchanged. The caveats:
+//!
+//! - SOCKS5 proxies all UDP or none: with `proxy_peers` or
+//!   `proxy_trackers`, outgoing uTP, the DHT and UDP trackers all go through
+//!   one UDP ASSOCIATE. The session then listens on TCP only, the DHT runs
+//!   over the relay's address family only (IPv4 in practice), and incoming
+//!   uTP arrives only as the relay forwards it.
+//! - An HTTP proxy cannot carry UDP: with `proxy_peers` outgoing uTP is off,
+//!   with `proxy_trackers` UDP trackers fail, and the DHT runs directly
+//!   unless [`Settings::dht_enabled`] is off.
+//! - Many HTTP proxies refuse `CONNECT` to port 80, so plain-HTTP trackers
+//!   may fail through them.
+//! - UDP tracker and DHT bootstrap host names are resolved locally whatever
+//!   `proxy_hostnames` says, and LSD, UPnP and NAT-PMP stay direct on the
+//!   local network.
+//!
+//! # IP filter and bans
+//!
+//! [`Session::set_ip_filter`] installs an [`IpFilter`] (block and allow
+//! ranges, the last rule wins) and closes the peers it now blocks. It
+//! applies to peers from every source and to incoming connections, never
+//! to trackers, DHT nodes or the proxy. A torrent also accepts at most
+//! [`Settings::max_peers_per_ip`] connections from one IP address (1;
+//! loopback is exempt). Smart ban: when a piece fails its hash check and
+//! later passes, the peer whose blocks differed is banned for the rest of
+//! the session, and a peer that keeps contributing to failed pieces loses
+//! trust until it is banned; an honest co-contributor of a failed piece is
+//! never banned. Bans live apart from the filter, so replacing the filter
+//! lifts none ([`Session::banned_peers`] lists them). Refusals and closes
+//! for any of these reasons are reported as [`Event::PeerBlocked`] with a
+//! [`BlockReason`], and closes as [`DisconnectReason::Blocked`]. The
+//! metadata ban is separate: a peer that sends bad metadata for a magnet
+//! ([`DisconnectReason::BadMetadata`]) is never dialled again by that
+//! torrent.
+//!
+//! # Web seeds
+//!
+//! HTTP and HTTPS web seeds (BEP 19) come from a `.torrent`'s `url-list`
+//! ([`Metainfo::web_seeds`]), a magnet's `ws` ([`Magnet::web_seeds`]) or
+//! [`TorrentHandle::add_web_seed`] (at most 16 per torrent;
+//! [`TorrentHandle::remove_web_seed`] and [`TorrentHandle::web_seeds`]).
+//! Each is fetched with ranged requests of up to 4 MiB of whole pieces,
+//! one at a time, while the torrent downloads, under the download limits and
+//! through the proxy with `proxy_peers`. A failed request backs off 30 s,
+//! doubling to 30 minutes; a 4xx other than 408 and 429, or data that fails
+//! the hash check, retires the seed. Both are reported as
+//! [`Event::WebSeedError`].
+//!
+//! # DHT items
+//!
+//! The DHT also stores small items (BEP 44, one bencoded value of at most
+//! 1000 bytes, kept about 2 hours on a node):
+//! [`Session::dht_put_immutable`] and [`Session::dht_get_immutable`] by the
+//! value's SHA-1, [`Session::dht_put_mutable`] and
+//! [`Session::dht_get_mutable`] signed with an ed25519 key and ordered by a
+//! sequence number ([`MutableItem`]). With the DHT off they fail with
+//! [`SessionError::DhtDisabled`].
+//!
 //! # Features
 //!
 //! - `tls` (default): HTTPS trackers over rustls with the `ring` provider,
@@ -266,7 +421,8 @@
 //!   config structs and enums ([`Settings`], [`ReadAhead`], [`RateLimit`],
 //!   [`PeerClassLimits`], [`MixedMode`], [`ChokingAlgorithm`],
 //!   [`SeedChokingAlgorithm`], [`EncryptionPolicy`], [`Priority`],
-//!   [`RemoveMode`]). Structs use `#[serde(default)]`, so a saved config
+//!   [`RemoveMode`], [`MoveMode`], [`QueueSettings`], [`ProxyConfig`],
+//!   [`ProxyKind`], [`TrackerConfig`]). Structs use `#[serde(default)]`, so a saved config
 //!   missing newer fields still loads; a `Duration` is `{secs, nanos}`. An
 //!   [`IpFilter`] is a list of `{ start, end, blocked }` rules.
 
