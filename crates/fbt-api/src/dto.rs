@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use fbt::{
-    FileStatus, IpFilter, MoveMode, PeerSource, PeerStatus, Priority, QueueSettings, Session,
+    BlockReason, DisconnectReason, Event, ExternalIpSource, FileStatus, InfoHashes, IpFilter,
+    MapMethod, MapProtocol, MoveMode, PeerSource, PeerStatus, Priority, QueueSettings, Session,
     TorrentHandle, TorrentState, TorrentStatus, TorrentVersion, TrackerStatus, Transport,
 };
 use serde::{Deserialize, Serialize};
@@ -334,11 +335,7 @@ impl From<&PeerStatus> for PeerInfo {
         PeerInfo {
             addr: p.addr.to_string(),
             client: p.client.clone(),
-            transport: match p.transport {
-                Transport::Tcp => "tcp",
-                Transport::Utp => "utp",
-                _ => "unknown",
-            },
+            transport: transport_name(p.transport),
             encrypted: p.encrypted,
             incoming: p.incoming,
             download_rate: p.download_rate,
@@ -350,19 +347,35 @@ impl From<&PeerStatus> for PeerInfo {
             am_choking: p.am_choking,
             am_interested: p.am_interested,
             progress: p.progress,
-            source: match p.source {
-                PeerSource::Tracker => "tracker",
-                PeerSource::Dht => "dht",
-                PeerSource::Pex => "pex",
-                PeerSource::Magnet => "magnet",
-                PeerSource::Lsd => "lsd",
-                PeerSource::Incoming => "incoming",
-                PeerSource::Manual => "manual",
-                PeerSource::Resume => "resume",
-                PeerSource::Holepunch => "holepunch",
-                _ => "unknown",
-            },
+            source: peer_source_name(p.source),
         }
+    }
+}
+
+/// The snake_case name of a peer source.
+fn peer_source_name(source: PeerSource) -> &'static str {
+    match source {
+        PeerSource::Tracker => "tracker",
+        PeerSource::Dht => "dht",
+        PeerSource::Pex => "pex",
+        PeerSource::Magnet => "magnet",
+        PeerSource::Lsd => "lsd",
+        PeerSource::Incoming => "incoming",
+        PeerSource::Manual => "manual",
+        PeerSource::Resume => "resume",
+        PeerSource::Holepunch => "holepunch",
+        // A source a later `fbt` adds.
+        _ => "unknown",
+    }
+}
+
+/// The snake_case name of a transport.
+fn transport_name(transport: Transport) -> &'static str {
+    match transport {
+        Transport::Tcp => "tcp",
+        Transport::Utp => "utp",
+        // A transport a later `fbt` adds.
+        _ => "unknown",
     }
 }
 
@@ -806,4 +819,544 @@ pub(crate) struct CreateTorrentRequest {
     /// The BEP 27 private flag.
     #[serde(default)]
     pub(crate) private: bool,
+}
+
+/// One session event, as the `data:` of a server-sent event whose
+/// `event:` field equals `type`. Torrent ids are the 40-hex wire hash.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum EventDto {
+    /// A torrent was added.
+    TorrentAdded {
+        /// The torrent's id.
+        torrent: String,
+    },
+    /// A torrent was removed.
+    TorrentRemoved {
+        /// The torrent's id.
+        torrent: String,
+    },
+    /// A torrent changed state.
+    StateChanged {
+        /// The torrent's id.
+        torrent: String,
+        /// The new state, as in `TorrentInfo.state`.
+        state: &'static str,
+        /// Fraction of the file check done, when `state` is
+        /// `checking_files`.
+        checking_progress: Option<f64>,
+    },
+    /// A piece passed its hash check.
+    PieceFinished {
+        /// The torrent's id.
+        torrent: String,
+        /// Piece index.
+        piece: u32,
+    },
+    /// A downloaded piece failed its hash check.
+    HashFailed {
+        /// The torrent's id.
+        torrent: String,
+        /// Piece index.
+        piece: u32,
+    },
+    /// A magnet torrent received its metadata.
+    MetadataReceived {
+        /// The torrent's id.
+        torrent: String,
+    },
+    /// Every wanted piece was downloaded, verified and written.
+    TorrentFinished {
+        /// The torrent's id.
+        torrent: String,
+    },
+    /// An auto-managed seed reached its ratio or time limit and was paused.
+    SeedLimitReached {
+        /// The torrent's id.
+        torrent: String,
+    },
+    /// A tracker answered an announce.
+    TrackerReply {
+        /// The torrent's id.
+        torrent: String,
+        /// The hash announced, lowercase hex (20 bytes).
+        info_hash: String,
+        /// Tracker URL.
+        url: String,
+        /// Peers in the reply.
+        peers: usize,
+    },
+    /// An announce failed.
+    TrackerError {
+        /// The torrent's id.
+        torrent: String,
+        /// Tracker URL.
+        url: String,
+        /// What went wrong.
+        message: String,
+    },
+    /// A tracker answered a scrape.
+    ScrapeReply {
+        /// The torrent's id.
+        torrent: String,
+        /// Tracker URL.
+        url: String,
+        /// Seeds.
+        complete: u32,
+        /// Leechers.
+        incomplete: u32,
+        /// Completed downloads the tracker has seen.
+        downloaded: u32,
+    },
+    /// A scrape failed.
+    ScrapeFailed {
+        /// The torrent's id.
+        torrent: String,
+        /// Tracker URL.
+        url: String,
+        /// What went wrong.
+        message: String,
+    },
+    /// A web seed request failed.
+    WebSeedError {
+        /// The torrent's id.
+        torrent: String,
+        /// The web seed's URL.
+        url: String,
+        /// What went wrong.
+        message: String,
+        /// The seed is never asked again.
+        retired: bool,
+    },
+    /// A batch of peer addresses arrived.
+    PeersFound {
+        /// The torrent's id.
+        torrent: String,
+        /// Where they came from, as in `PeerInfo.source`.
+        source: &'static str,
+        /// Dialable addresses in the batch.
+        count: usize,
+    },
+    /// The DHT node filled its routing table for the first time.
+    DhtBootstrapped {
+        /// Nodes in the routing tables.
+        nodes: usize,
+    },
+    /// A peer completed the handshake.
+    PeerConnected {
+        /// The torrent's id.
+        torrent: String,
+        /// Remote address.
+        addr: String,
+        /// `tcp`, `utp` or `unknown`.
+        transport: &'static str,
+        /// The connection is RC4-encrypted (MSE).
+        encrypted: bool,
+    },
+    /// A peer connection ended.
+    PeerDisconnected {
+        /// The torrent's id.
+        torrent: String,
+        /// Remote address.
+        addr: String,
+        /// Why: `self_connection`, `info_hash_mismatch`,
+        /// `handshake_timeout`, `idle_timeout`, `encryption`, `protocol`,
+        /// `io`, `closed`, `shutdown`, `duplicate`, `bad_metadata`,
+        /// `upload_only`, `blocked` or `unknown`.
+        reason: &'static str,
+        /// Details: the error text, or for `blocked` the block reason.
+        detail: Option<String>,
+    },
+    /// A peer was refused.
+    PeerBlocked {
+        /// The torrent's id; null for an incoming connection refused
+        /// before its handshake.
+        torrent: Option<String>,
+        /// The peer's address.
+        addr: String,
+        /// `ip_filter`, `banned`, `per_ip_limit` or `unknown`.
+        reason: &'static str,
+    },
+    /// Reading or writing torrent data failed.
+    FileError {
+        /// The torrent's id.
+        torrent: String,
+        /// The file involved, when known.
+        path: Option<String>,
+        /// The error.
+        message: String,
+    },
+    /// A storage move finished.
+    StorageMoved {
+        /// The torrent's id.
+        torrent: String,
+        /// The new save path.
+        path: String,
+    },
+    /// A storage move failed.
+    StorageMoveFailed {
+        /// The torrent's id.
+        torrent: String,
+        /// The error.
+        message: String,
+    },
+    /// A file rename finished.
+    FileRenamed {
+        /// The torrent's id.
+        torrent: String,
+        /// The file's index.
+        index: usize,
+        /// Its new path, relative to the save path, `/`-separated.
+        path: String,
+    },
+    /// A file rename failed.
+    FileRenameFailed {
+        /// The torrent's id.
+        torrent: String,
+        /// The file's index.
+        index: usize,
+        /// The error.
+        message: String,
+    },
+    /// The router mapped a listen port.
+    PortMapped {
+        /// `tcp`, `udp` or `unknown`.
+        protocol: &'static str,
+        /// `upnp`, `nat_pmp`, `pcp` or `unknown`.
+        method: &'static str,
+        /// The public address and port.
+        external: String,
+    },
+    /// Mapping a listen port failed.
+    PortMappingFailed {
+        /// `tcp`, `udp` or `unknown`.
+        protocol: &'static str,
+        /// `upnp`, `nat_pmp`, `pcp` or `unknown`.
+        method: &'static str,
+        /// Why.
+        message: String,
+    },
+    /// A source learned our external address.
+    ExternalIpChanged {
+        /// The address.
+        ip: String,
+        /// `port_mapping`, `dht`, `peers` or `unknown`.
+        source: &'static str,
+    },
+    /// The proxy failed in a way that affects the whole session.
+    ProxyError {
+        /// What happened.
+        message: String,
+    },
+    /// The subscriber fell behind and `missed` events were dropped.
+    Lagged {
+        /// Number of events dropped.
+        missed: u64,
+    },
+    /// An event this API version does not know.
+    Other {
+        /// The event's Rust `Debug` form.
+        debug: String,
+    },
+}
+
+impl EventDto {
+    /// The snake_case `type` of this event, used as the SSE `event:` field.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            EventDto::TorrentAdded { .. } => "torrent_added",
+            EventDto::TorrentRemoved { .. } => "torrent_removed",
+            EventDto::StateChanged { .. } => "state_changed",
+            EventDto::PieceFinished { .. } => "piece_finished",
+            EventDto::HashFailed { .. } => "hash_failed",
+            EventDto::MetadataReceived { .. } => "metadata_received",
+            EventDto::TorrentFinished { .. } => "torrent_finished",
+            EventDto::SeedLimitReached { .. } => "seed_limit_reached",
+            EventDto::TrackerReply { .. } => "tracker_reply",
+            EventDto::TrackerError { .. } => "tracker_error",
+            EventDto::ScrapeReply { .. } => "scrape_reply",
+            EventDto::ScrapeFailed { .. } => "scrape_failed",
+            EventDto::WebSeedError { .. } => "web_seed_error",
+            EventDto::PeersFound { .. } => "peers_found",
+            EventDto::DhtBootstrapped { .. } => "dht_bootstrapped",
+            EventDto::PeerConnected { .. } => "peer_connected",
+            EventDto::PeerDisconnected { .. } => "peer_disconnected",
+            EventDto::PeerBlocked { .. } => "peer_blocked",
+            EventDto::FileError { .. } => "file_error",
+            EventDto::StorageMoved { .. } => "storage_moved",
+            EventDto::StorageMoveFailed { .. } => "storage_move_failed",
+            EventDto::FileRenamed { .. } => "file_renamed",
+            EventDto::FileRenameFailed { .. } => "file_rename_failed",
+            EventDto::PortMapped { .. } => "port_mapped",
+            EventDto::PortMappingFailed { .. } => "port_mapping_failed",
+            EventDto::ExternalIpChanged { .. } => "external_ip_changed",
+            EventDto::ProxyError { .. } => "proxy_error",
+            EventDto::Lagged { .. } => "lagged",
+            EventDto::Other { .. } => "other",
+        }
+    }
+}
+
+/// The 40-hex wire hash of a torrent.
+fn torrent_id(torrent: &InfoHashes) -> String {
+    hex(&torrent.wire_hash())
+}
+
+fn disconnect_reason(reason: &DisconnectReason) -> (&'static str, Option<String>) {
+    match reason {
+        DisconnectReason::SelfConnection => ("self_connection", None),
+        DisconnectReason::InfoHashMismatch => ("info_hash_mismatch", None),
+        DisconnectReason::HandshakeTimeout => ("handshake_timeout", None),
+        DisconnectReason::IdleTimeout => ("idle_timeout", None),
+        DisconnectReason::Encryption(m) => ("encryption", Some(m.clone())),
+        DisconnectReason::Protocol(m) => ("protocol", Some(m.clone())),
+        DisconnectReason::Io(m) => ("io", Some(m.clone())),
+        DisconnectReason::Closed => ("closed", None),
+        DisconnectReason::Shutdown => ("shutdown", None),
+        DisconnectReason::Duplicate => ("duplicate", None),
+        DisconnectReason::BadMetadata => ("bad_metadata", None),
+        DisconnectReason::UploadOnly => ("upload_only", None),
+        DisconnectReason::Blocked(r) => ("blocked", Some(block_reason(*r).to_owned())),
+        // A reason a later `fbt` adds.
+        _ => ("unknown", None),
+    }
+}
+
+fn block_reason(reason: BlockReason) -> &'static str {
+    match reason {
+        BlockReason::IpFilter => "ip_filter",
+        BlockReason::Banned => "banned",
+        BlockReason::PerIpLimit => "per_ip_limit",
+        // A reason a later `fbt` adds.
+        _ => "unknown",
+    }
+}
+
+fn map_protocol(protocol: MapProtocol) -> &'static str {
+    match protocol {
+        MapProtocol::Tcp => "tcp",
+        MapProtocol::Udp => "udp",
+        // A protocol a later `fbt` adds.
+        _ => "unknown",
+    }
+}
+
+fn map_method(method: MapMethod) -> &'static str {
+    match method {
+        MapMethod::Upnp => "upnp",
+        MapMethod::NatPmp => "nat_pmp",
+        MapMethod::Pcp => "pcp",
+        // A method a later `fbt` adds.
+        _ => "unknown",
+    }
+}
+
+fn external_ip_source(source: ExternalIpSource) -> &'static str {
+    match source {
+        ExternalIpSource::PortMapping => "port_mapping",
+        ExternalIpSource::Dht => "dht",
+        ExternalIpSource::Peers => "peers",
+        // A source a later `fbt` adds.
+        _ => "unknown",
+    }
+}
+
+impl From<&Event> for EventDto {
+    fn from(event: &Event) -> Self {
+        match event {
+            Event::TorrentAdded { torrent } => EventDto::TorrentAdded {
+                torrent: torrent_id(torrent),
+            },
+            Event::TorrentRemoved { torrent } => EventDto::TorrentRemoved {
+                torrent: torrent_id(torrent),
+            },
+            Event::StateChanged { torrent, state } => EventDto::StateChanged {
+                torrent: torrent_id(torrent),
+                state: state_name(state),
+                checking_progress: match state {
+                    TorrentState::CheckingFiles { progress } => Some(*progress),
+                    _ => None,
+                },
+            },
+            Event::PieceFinished { torrent, piece } => EventDto::PieceFinished {
+                torrent: torrent_id(torrent),
+                piece: *piece,
+            },
+            Event::HashFailed { torrent, piece } => EventDto::HashFailed {
+                torrent: torrent_id(torrent),
+                piece: *piece,
+            },
+            Event::MetadataReceived { torrent } => EventDto::MetadataReceived {
+                torrent: torrent_id(torrent),
+            },
+            Event::TorrentFinished { torrent } => EventDto::TorrentFinished {
+                torrent: torrent_id(torrent),
+            },
+            Event::SeedLimitReached { torrent } => EventDto::SeedLimitReached {
+                torrent: torrent_id(torrent),
+            },
+            Event::TrackerReply {
+                torrent,
+                info_hash,
+                url,
+                peers,
+            } => EventDto::TrackerReply {
+                torrent: torrent_id(torrent),
+                info_hash: hex(info_hash),
+                url: url.clone(),
+                peers: *peers,
+            },
+            Event::TrackerError {
+                torrent,
+                url,
+                message,
+            } => EventDto::TrackerError {
+                torrent: torrent_id(torrent),
+                url: url.clone(),
+                message: message.clone(),
+            },
+            Event::ScrapeReply {
+                torrent,
+                url,
+                complete,
+                incomplete,
+                downloaded,
+            } => EventDto::ScrapeReply {
+                torrent: torrent_id(torrent),
+                url: url.clone(),
+                complete: *complete,
+                incomplete: *incomplete,
+                downloaded: *downloaded,
+            },
+            Event::ScrapeFailed {
+                torrent,
+                url,
+                message,
+            } => EventDto::ScrapeFailed {
+                torrent: torrent_id(torrent),
+                url: url.clone(),
+                message: message.clone(),
+            },
+            Event::WebSeedError {
+                torrent,
+                url,
+                message,
+                retired,
+            } => EventDto::WebSeedError {
+                torrent: torrent_id(torrent),
+                url: url.clone(),
+                message: message.clone(),
+                retired: *retired,
+            },
+            Event::PeersFound {
+                torrent,
+                source,
+                count,
+            } => EventDto::PeersFound {
+                torrent: torrent_id(torrent),
+                source: peer_source_name(*source),
+                count: *count,
+            },
+            Event::DhtBootstrapped { nodes } => EventDto::DhtBootstrapped { nodes: *nodes },
+            Event::PeerConnected {
+                torrent,
+                addr,
+                transport,
+                encrypted,
+            } => EventDto::PeerConnected {
+                torrent: torrent_id(torrent),
+                addr: addr.to_string(),
+                transport: transport_name(*transport),
+                encrypted: *encrypted,
+            },
+            Event::PeerDisconnected {
+                torrent,
+                addr,
+                reason,
+            } => {
+                let (reason, detail) = disconnect_reason(reason);
+                EventDto::PeerDisconnected {
+                    torrent: torrent_id(torrent),
+                    addr: addr.to_string(),
+                    reason,
+                    detail,
+                }
+            }
+            Event::PeerBlocked {
+                torrent,
+                addr,
+                reason,
+            } => EventDto::PeerBlocked {
+                torrent: torrent.as_ref().map(torrent_id),
+                addr: addr.to_string(),
+                reason: block_reason(*reason),
+            },
+            Event::FileError {
+                path,
+                torrent,
+                message,
+            } => EventDto::FileError {
+                torrent: torrent_id(torrent),
+                path: path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                message: message.clone(),
+            },
+            Event::StorageMoved { torrent, path } => EventDto::StorageMoved {
+                torrent: torrent_id(torrent),
+                path: path.to_string_lossy().into_owned(),
+            },
+            Event::StorageMoveFailed { torrent, message } => EventDto::StorageMoveFailed {
+                torrent: torrent_id(torrent),
+                message: message.clone(),
+            },
+            Event::FileRenamed {
+                torrent,
+                index,
+                path,
+            } => EventDto::FileRenamed {
+                torrent: torrent_id(torrent),
+                index: *index,
+                path: path.clone(),
+            },
+            Event::FileRenameFailed {
+                torrent,
+                index,
+                message,
+            } => EventDto::FileRenameFailed {
+                torrent: torrent_id(torrent),
+                index: *index,
+                message: message.clone(),
+            },
+            Event::PortMapped {
+                protocol,
+                method,
+                external,
+                ..
+            } => EventDto::PortMapped {
+                protocol: map_protocol(*protocol),
+                method: map_method(*method),
+                external: external.to_string(),
+            },
+            Event::PortMappingFailed {
+                protocol,
+                method,
+                message,
+            } => EventDto::PortMappingFailed {
+                protocol: map_protocol(*protocol),
+                method: map_method(*method),
+                message: message.clone(),
+            },
+            Event::ExternalIpChanged { ip, source } => EventDto::ExternalIpChanged {
+                ip: ip.to_string(),
+                source: external_ip_source(*source),
+            },
+            Event::ProxyError { message } => EventDto::ProxyError {
+                message: message.clone(),
+            },
+            Event::Lagged { missed } => EventDto::Lagged { missed: *missed },
+            // An event a later `fbt` adds.
+            other => EventDto::Other {
+                debug: format!("{other:?}"),
+            },
+        }
+    }
 }

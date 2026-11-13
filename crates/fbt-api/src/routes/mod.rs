@@ -37,6 +37,7 @@ use crate::config::ApiConfig;
 
 pub(crate) mod control;
 pub(crate) mod create;
+pub(crate) mod events;
 pub(crate) mod session;
 pub(crate) mod torrents;
 
@@ -56,7 +57,6 @@ pub(crate) struct AppState {
     #[allow(dead_code, reason = "the streaming route takes its permits")]
     pub(crate) streams: Arc<Semaphore>,
     /// Permits for open event streams ([`ApiConfig::max_event_streams`]).
-    #[allow(dead_code, reason = "the event route takes its permits")]
     pub(crate) events: Arc<Semaphore>,
     /// Permits for running torrent creations
     /// ([`create::MAX_CONCURRENT_CREATES`]); each blocking build holds one
@@ -65,7 +65,6 @@ pub(crate) struct AppState {
     /// Cancelled by [`ApiServer::shutdown`](crate::ApiServer::shutdown).
     /// Every long-lived body (events, file streams) ends when it fires:
     /// wrap it in `.take_until(state.shutdown.clone().cancelled_owned())`.
-    #[allow(dead_code, reason = "the event and streaming bodies end on it")]
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -108,6 +107,7 @@ event routes also take `?token=<token>`. Errors are \
     tags(
         (name = "session", description = "The session: status and settings."),
         (name = "torrents", description = "Torrents: add, remove and control them; list, status, files, peers, trackers, pieces."),
+        (name = "events", description = "Server-sent session events."),
         (name = "meta", description = "This document."),
     ),
 )]
@@ -137,6 +137,7 @@ pub(crate) fn api_router() -> OpenApiRouter<AppState> {
         .merge(torrents::router())
         .merge(control::router())
         .merge(create::router())
+        .merge(events::router())
         .routes(routes!(openapi_json))
 }
 
