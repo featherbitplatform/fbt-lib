@@ -409,3 +409,46 @@ async fn hash_messages_on_a_v1_torrent_close() {
     }
     s.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_request_burst_is_answered_and_frees_its_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::V2, PIECE);
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let root = m
+        .info
+        .files
+        .iter()
+        .find(|f| f.len == 300_000)
+        .and_then(|f| f.pieces_root)
+        .unwrap();
+    let (s, _h) = seed(&bytes, dir.path()).await;
+    let mut peer =
+        ScriptedPeer::connect_with(s.local_addr(), m.info_hashes.wire_hash(), v2_reserved()).await;
+    // Far more than the per-torrent serving cap (8) at once: every request
+    // gets an answer, hashes or a reject past the cap.
+    const BURST: usize = 40;
+    for i in 0..BURST as u32 {
+        peer.send(Message::HashRequest(hash_request(root, 1, (i % 8) * 2, 2)))
+            .await;
+    }
+    let mut answered = 0;
+    while answered < BURST {
+        let got = peer
+            .next_matching(|m| matches!(m, Message::Hashes { .. } | Message::HashReject(_)))
+            .await;
+        assert!(got.is_some(), "only {answered} of {BURST} answered");
+        answered += 1;
+    }
+    // Every slot came back: a lone request is served.
+    peer.send(Message::HashRequest(hash_request(root, 1, 0, 2)))
+        .await;
+    let got = peer
+        .next_matching(|m| matches!(m, Message::Hashes { .. } | Message::HashReject(_)))
+        .await;
+    assert!(
+        matches!(got, Some(Message::Hashes { req, .. }) if req == hash_request(root, 1, 0, 2)),
+        "{got:?}"
+    );
+    s.shutdown().await;
+}

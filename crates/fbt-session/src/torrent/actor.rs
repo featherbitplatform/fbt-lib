@@ -25,7 +25,7 @@ use super::data::Job;
 use super::deadline::Deadlines;
 use super::dht::{self, DhtAnnouncer, DhtParams};
 use super::known::{Known, dialable};
-use super::layers::LayerBuilder;
+use super::layers::{HashServing, LayerBuilder};
 use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
 use super::peer::Peer;
@@ -128,6 +128,8 @@ pub(super) struct Loaded {
     pub built_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
     /// When `meta` last took built layers.
     pub layers_swapped: Option<Instant>,
+    /// Cached Merkle trees and serving jobs for peers' `hash request`s.
+    pub hash_serving: HashServing,
 }
 
 /// The wanted flag of each file, for
@@ -187,6 +189,7 @@ impl Loaded {
             layer_builder,
             built_layers: BTreeMap::new(),
             layers_swapped: None,
+            hash_serving: HashServing::default(),
         }
     }
 }

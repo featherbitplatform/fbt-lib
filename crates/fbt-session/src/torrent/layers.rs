@@ -2,6 +2,7 @@
 //! subtree roots of its verified pieces, and answering peers' `hash
 //! request`s from the layers we hold.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,10 @@ use crate::picker::PeerKey;
 /// rejected.
 pub(super) const MAX_PENDING_HASH_REQUESTS: usize = 64;
 
+/// Most serving jobs of one torrent in flight, all peers together; further
+/// requests are rejected. Bounds the tree builds on the blocking pool.
+pub(super) const MAX_SERVING_JOBS: usize = 8;
+
 /// Why a `hash request` gets no hashes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ServeError {
@@ -38,44 +43,102 @@ pub(super) enum ServeError {
 /// hashes, then the uncles bottom-up (`min(proof_layers, tree_height -
 /// base - log2(length))` of them), 32 bytes each. The tree height comes
 /// from the file's length, never from the request.
+#[cfg(test)]
 pub(super) fn serve_hash_request(
     meta: &Metainfo,
     req: &HashRequest,
 ) -> Result<Vec<u8>, ServeError> {
-    let length = req.length;
-    if !length.is_power_of_two()
-        || length > MAX_HASH_REQUEST_LEN
-        || !req.index.is_multiple_of(length)
-    {
-        return Err(ServeError::Malformed);
+    serve_from(meta, req, None).0
+}
+
+/// [`serve_hash_request`] with the file's tree when it is `cached`;
+/// otherwise the tree is built from the piece layer and also returned, for
+/// the cache.
+fn serve_from(
+    meta: &Metainfo,
+    req: &HashRequest,
+    cached: Option<Arc<MerkleTree>>,
+) -> (Result<Vec<u8>, ServeError>, Option<Arc<MerkleTree>>) {
+    let mut built = None;
+    let result = (|| {
+        let length = req.length;
+        if !length.is_power_of_two()
+            || length > MAX_HASH_REQUEST_LEN
+            || !req.index.is_multiple_of(length)
+        {
+            return Err(ServeError::Malformed);
+        }
+        let file = meta
+            .info
+            .files
+            .iter()
+            .find(|f| !f.pad && f.pieces_root == Some(req.pieces_root))
+            .ok_or(ServeError::Reject)?;
+        let tree_height = file_tree_height(file.len);
+        if req.base_layer >= tree_height {
+            return Err(ServeError::Malformed);
+        }
+        let piece_height = (meta.info.piece_len / MERKLE_BLOCK_LEN).trailing_zeros();
+        if req.base_layer < piece_height {
+            return Err(ServeError::Reject);
+        }
+        let (Ok(index), Ok(len)) = (usize::try_from(req.index), usize::try_from(length)) else {
+            return Err(ServeError::Reject);
+        };
+        let tree = match cached {
+            Some(t) => t,
+            None => {
+                let layer = meta
+                    .piece_layers
+                    .get(&req.pieces_root)
+                    .ok_or(ServeError::Reject)?;
+                let t = Arc::new(
+                    MerkleTree::from_layer(layer, piece_height, tree_height)
+                        .ok_or(ServeError::Reject)?,
+                );
+                built = Some(Arc::clone(&t));
+                t
+            }
+        };
+        let (hashes, uncles) = tree
+            .hashes(req.base_layer, index, len, req.proof_layers)
+            .ok_or(ServeError::Reject)?;
+        Ok(hashes.iter().chain(&uncles).flatten().copied().collect())
+    })();
+    (result, built)
+}
+
+/// The torrent's hash serving: the Merkle tree of each file served so far
+/// and the serving jobs in flight.
+#[derive(Debug, Default)]
+pub(super) struct HashServing {
+    /// Built on a file's first request; a tree stays valid for its root
+    /// whatever later layer swaps add. Bounded by the layers held (each
+    /// tree is at most twice its layer).
+    trees: HashMap<[u8; 32], Arc<MerkleTree>>,
+    /// Serving jobs in flight, at most [`MAX_SERVING_JOBS`].
+    jobs: usize,
+}
+
+impl HashServing {
+    /// Takes a job slot for a peer with `peer_pending` requests in flight:
+    /// false (nothing taken) at either cap.
+    fn try_start(&mut self, peer_pending: &mut usize) -> bool {
+        if self.jobs >= MAX_SERVING_JOBS || *peer_pending >= MAX_PENDING_HASH_REQUESTS {
+            return false;
+        }
+        self.jobs += 1;
+        *peer_pending += 1;
+        true
     }
-    let file = meta
-        .info
-        .files
-        .iter()
-        .find(|f| !f.pad && f.pieces_root == Some(req.pieces_root))
-        .ok_or(ServeError::Reject)?;
-    let tree_height = file_tree_height(file.len);
-    if req.base_layer >= tree_height {
-        return Err(ServeError::Malformed);
+
+    /// Gives back a job slot, and the peer's if it is still there.
+    fn finish(&mut self, peer_pending: Option<&mut usize>) {
+        self.jobs = self.jobs.saturating_sub(1);
+        if let Some(p) = peer_pending {
+            *p = p.saturating_sub(1);
+        }
     }
-    let piece_height = (meta.info.piece_len / MERKLE_BLOCK_LEN).trailing_zeros();
-    if req.base_layer < piece_height {
-        return Err(ServeError::Reject);
-    }
-    let layer = meta
-        .piece_layers
-        .get(&req.pieces_root)
-        .ok_or(ServeError::Reject)?;
-    let (Ok(index), Ok(len)) = (usize::try_from(req.index), usize::try_from(length)) else {
-        return Err(ServeError::Reject);
-    };
-    let tree =
-        MerkleTree::from_layer(layer, piece_height, tree_height).ok_or(ServeError::Reject)?;
-    let (hashes, uncles) = tree
-        .hashes(req.base_layer, index, len, req.proof_layers)
-        .ok_or(ServeError::Reject)?;
-    Ok(hashes.iter().chain(&uncles).flatten().copied().collect())
 }
 
 /// Least time between two swaps of the actor's metainfo for built layers
@@ -265,41 +328,55 @@ impl Actor {
         v1
     }
 
-    /// A peer's `hash request`: served off the actor from `Loaded.meta`,
-    /// at most [`MAX_PENDING_HASH_REQUESTS`] at once per peer; rejected
-    /// beyond that and before the metadata.
+    /// A peer's `hash request`: served off the actor from `Loaded.meta`
+    /// and the file's cached tree, at most [`MAX_PENDING_HASH_REQUESTS`]
+    /// at once per peer and [`MAX_SERVING_JOBS`] per torrent; rejected
+    /// beyond either and before the metadata.
     pub(super) fn on_hash_request(&mut self, key: PeerKey, req: HashRequest) {
         if !self.peers.contains_key(&key) || self.close_if_v1_only(key) {
             return;
         }
-        let meta = self.loaded.as_ref().map(|l| Arc::clone(&l.meta));
-        let Some(p) = self.peers.get_mut(&key) else {
-            return;
-        };
-        let Some(meta) = meta.filter(|_| p.hash_requests < MAX_PENDING_HASH_REQUESTS) else {
+        let (Some(l), Some(p)) = (self.loaded.as_mut(), self.peers.get_mut(&key)) else {
             self.send(key, PeerCommand::RejectHashes(req));
             return;
         };
-        p.hash_requests += 1;
-        self.jobs.spawn_blocking(move || Job::HashesServed {
-            key,
-            req,
-            result: serve_hash_request(&meta, &req),
+        if !l.hash_serving.try_start(&mut p.hash_requests) {
+            self.send(key, PeerCommand::RejectHashes(req));
+            return;
+        }
+        let meta = Arc::clone(&l.meta);
+        let cached = l.hash_serving.trees.get(&req.pieces_root).cloned();
+        self.jobs.spawn_blocking(move || {
+            let (result, built) = serve_from(&meta, &req, cached);
+            Job::HashesServed {
+                key,
+                req,
+                result,
+                built,
+            }
         });
     }
 
     /// A served `hash request` came back: answered, rejected, or the peer
-    /// closed for a malformed request.
+    /// closed for a malformed request. A tree it built joins the cache.
     pub(super) fn on_hashes_served(
         &mut self,
         key: PeerKey,
         req: HashRequest,
         result: Result<Vec<u8>, ServeError>,
+        built: Option<Arc<MerkleTree>>,
     ) {
-        let Some(p) = self.peers.get_mut(&key) else {
+        let peer = self.peers.get_mut(&key).map(|p| &mut p.hash_requests);
+        let present = peer.is_some();
+        if let Some(l) = self.loaded.as_mut() {
+            l.hash_serving.finish(peer);
+            if let Some(tree) = built {
+                l.hash_serving.trees.entry(req.pieces_root).or_insert(tree);
+            }
+        }
+        if !present {
             return;
-        };
-        p.hash_requests = p.hash_requests.saturating_sub(1);
+        }
         match result {
             Ok(hashes) => {
                 let hashes = Bytes::from(hashes);
@@ -512,5 +589,48 @@ mod tests {
         for base in [5, 9, u32::MAX] {
             assert_eq!(serve(req(root, base, 0, 1, 0)), Err(ServeError::Malformed));
         }
+    }
+
+    #[test]
+    fn cached_tree_serves_the_same_bytes() {
+        let (m, root) = hybrid_with_layer();
+        let r = req(root, PIECE_HEIGHT, 4, 4, 10);
+        let (fresh, built) = serve_from(&m, &r, None);
+        let tree = built.expect("a tree was built");
+        let (cached, again) = serve_from(&m, &r, Some(tree));
+        assert!(again.is_none(), "a cached tree is not rebuilt");
+        assert_eq!(fresh, cached);
+        assert!(fresh.is_ok());
+        // Nothing is built for requests refused before the layer.
+        assert!(serve_from(&m, &req(root, 0, 0, 4, 0), None).1.is_none());
+    }
+
+    #[test]
+    fn serving_slots_are_capped_and_given_back() {
+        let mut s = HashServing::default();
+        let mut peers = [0usize; MAX_SERVING_JOBS + 1];
+        // One peer reaches the torrent cap alone.
+        for _ in 0..MAX_SERVING_JOBS {
+            assert!(s.try_start(&mut peers[0]));
+        }
+        assert!(!s.try_start(&mut peers[1]), "torrent cap");
+        assert_eq!(
+            (s.jobs, peers[0], peers[1]),
+            (MAX_SERVING_JOBS, MAX_SERVING_JOBS, 0)
+        );
+        for _ in 0..MAX_SERVING_JOBS {
+            s.finish(Some(&mut peers[0]));
+        }
+        assert_eq!((s.jobs, peers[0]), (0, 0));
+        // The per-peer cap holds below the torrent's.
+        let mut full = MAX_PENDING_HASH_REQUESTS;
+        assert!(!s.try_start(&mut full));
+        assert_eq!(s.jobs, 0);
+        // A job whose peer left gives back the torrent's slot only.
+        assert!(s.try_start(&mut peers[2]));
+        s.finish(None);
+        assert_eq!(s.jobs, 0);
+        s.finish(None);
+        assert_eq!(s.jobs, 0, "never below zero");
     }
 }

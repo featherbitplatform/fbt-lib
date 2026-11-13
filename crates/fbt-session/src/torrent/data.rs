@@ -7,6 +7,7 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use fbt_core::merkle::MerkleTree;
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef};
 use fbt_metainfo::{Metainfo, MetainfoError};
 use fbt_wire::HashRequest;
@@ -106,6 +107,8 @@ pub(crate) enum Job {
         key: PeerKey,
         req: HashRequest,
         result: Result<Vec<u8>, ServeError>,
+        /// The file's tree, when this job built it (for the cache).
+        built: Option<Arc<MerkleTree>>,
     },
     /// The storage operation (move or rename) returned.
     StorageOp { result: io::Result<()> },
@@ -149,7 +152,12 @@ impl Actor {
                 generation,
                 trusted,
             } => self.on_resume_checked(generation, trusted),
-            Job::HashesServed { key, req, result } => self.on_hashes_served(key, req, result),
+            Job::HashesServed {
+                key,
+                req,
+                result,
+                built,
+            } => self.on_hashes_served(key, req, result, built),
             Job::Hashed {
                 generation,
                 piece,
