@@ -102,3 +102,4 @@ from peers.
 | 2026-11-11 | 0.3.0 | Darwin arm64 | 5238 | 4.9 | 603 | 39.9 | - | - | 1000 | 1.13 | 18.5 KiB | seed and leech in one process |
 | 2026-11-12 | 0.4.0 | Darwin arm64 | 4247 | 4.9 | 615 | 40.4 | 4139 | 0.05 | 1000 | 1.15 | 19.4 KiB | seed and leech in one process |
 | 2026-11-13 | 0.5.0 | Darwin arm64 | 4920 | 5.0 | 630 | 39.2 | 4032 | 0.05 | 1000 | 1.55 | 23.9 KiB | seed and leech in one process |
+| 2026-11-13 | 0.6.0 | Darwin arm64 | 5105 | 5.0 | 621 | 40.4 | 4118 | 0.05 | 1000 | 0.82 | 25.6 KiB | seed and leech in one process |
