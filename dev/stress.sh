@@ -103,37 +103,57 @@ if [ -z "$bin" ] || [ ! -x "$bin" ]; then
   exit 1
 fi
 
-# Children are listed before their parent is signalled, so a process cannot
-# escape by forking after its parent died. Depth-first, parents first: nothing
-# below is left running, and a process that already exited is not an error.
-# shellcheck disable=SC2329 # invoked from traps and through xargs below
-kill_tree() {
+# shellcheck disable=SC2329 # these run from traps, and in the xargs workers
+# A pid and all of its descendants, parents first. bash 3 (what macOS ships)
+# has no mapfile, so the walk prints and the caller reads it back.
+tree_pids() {
   pid=$1
-  sig=$2
-  kids=$(pgrep -P "$pid" 2>/dev/null || true)
-  kill "-$sig" "$pid" 2>/dev/null || true
-  for kid in $kids; do
-    kill_tree "$kid" "$sig"
+  printf '%s\n' "$pid"
+  for kid in $(pgrep -P "$pid" 2>/dev/null || true); do
+    tree_pids "$kid"
   done
+}
+
+# shellcheck disable=SC2086,SC2329 # $1 is a pid list on purpose; called from traps and xargs workers
+kill_pids() {
+  sig=$2
+  for pid in $1; do
+    kill "-$sig" "$pid" 2>/dev/null || true
+  done
+}
+
+# TERM the whole tree, wait a beat, then KILL whatever is left. Collecting the
+# tree *before* signalling is what makes this work: killing `xargs` reparents
+# its live children to init, and a walk that enumerates after that finds nothing
+# to kill. The last re-walk catches anything forked in between.
+# shellcheck disable=SC2329 # called from traps and xargs workers
+kill_tree() {
+  root=$1
+  if [ -z "$root" ]; then
+    return 0
+  fi
+  first=$(tree_pids "$root")
+  kill_pids "$first" TERM
+  sleep 1
+  kill_pids "$first" KILL
+  kill_pids "$(tree_pids "$root")" KILL
 }
 
 work_pid=''
 
-# shellcheck disable=SC2329 # invoked from the traps below
+# shellcheck disable=SC2086,SC2329 # $kids is a pid list on purpose; run from the traps
 cleanup() {
   # Only while the run is actually alive: after a normal `wait` its pid is
   # reaped, and signalling a recycled pid would hit someone else's process.
   if [ -n "$work_pid" ] && kill -0 "$work_pid" 2>/dev/null; then
-    kill_tree "$work_pid" TERM
-    sleep 1
-    kill_tree "$work_pid" KILL
+    kill_tree "$work_pid"
     return 0
   fi
   # Interrupted before or during the build: no repetitions are running, but a
   # cargo process belongs to this script all the same.
   kids=$(pgrep -P "$$" 2>/dev/null || true)
   for kid in $kids; do
-    kill_tree "$kid" TERM
+    kill_pids "$(tree_pids "$kid")" TERM
   done
 }
 
@@ -164,13 +184,20 @@ run_one() {
         # Tree first, while the test binary is still there to be asked: a CLI
         # test's seed process is its child and would otherwise outlive it.
         : >"$timeout_marker"
-        kill_tree "$test_pid" TERM
-        sleep 1
-        kill_tree "$test_pid" KILL
+        kill_tree "$test_pid"
       fi
     ) &
+    watcher=$!
     wait "$test_pid"
-    printf '%s' "$?" >"$status_file"
+    rc=$?
+    printf '%s' "$rc" >"$status_file"
+    # The watcher is usually still asleep when the test finishes. Left alone it
+    # outlives its wrapper as an orphan (its parent exits, so init adopts it) and
+    # stays for the whole timeout; both it and its `sleep` go here instead — one
+    # walk, because killing the subshell first would reparent the sleep away
+    # from the tree.
+    kill_pids "$(tree_pids "$watcher")" KILL
+    exit "$rc"
   ) &
   job_pid=$!
 
@@ -182,7 +209,7 @@ run_one() {
   if [ -e "$timeout_marker" ]; then
     printf 'stress: repetition %s timed out after %ss; killed pid %s and its children\n' \
       "$idx" "$stress_timeout" "$job_pid" >&2
-    kill_tree "$job_pid" KILL
+    kill_pids "$(tree_pids "$job_pid")" KILL
     printf fail
     return 1
   fi
@@ -190,7 +217,7 @@ run_one() {
   if [ -z "$code" ]; then
     printf 'stress: repetition %s left no exit code (pid %s died oddly)\n' \
       "$idx" "$job_pid" >&2
-    kill_tree "$job_pid" KILL
+    kill_pids "$(tree_pids "$job_pid")" KILL
     printf fail
     return 1
   fi
@@ -213,7 +240,7 @@ run_one() {
 }
 
 export bin out_dir name pkg target list_cmd stress_timeout
-export -f run_one kill_tree
+export -f run_one kill_tree tree_pids kill_pids
 
 printf 'stress: %s/%s :: %s x %s (%s parallel, %ss per repetition)\n' \
   "$pkg" "$target" "$name" "$runs" "$parallel" "$stress_timeout"
