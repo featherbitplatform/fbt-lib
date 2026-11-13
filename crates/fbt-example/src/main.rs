@@ -69,7 +69,7 @@ struct NetArgs {
     /// (credentials percent-decoded). SOCKS5 also carries the DHT, uTP and
     /// UDP trackers; an HTTP proxy cannot carry UDP, so the DHT then runs
     /// directly unless `--no-dht` is given.
-    #[arg(long, value_name = "URL", value_parser = parse_proxy)]
+    #[arg(long, value_name = "URL", value_parser = ProxyParser)]
     proxy: Option<ProxyConfig>,
 }
 
@@ -110,9 +110,11 @@ fn parse_rate(s: &str) -> Result<u64, String> {
 /// Parses `socks5://[user:pass@]host:port` or `http://[user:pass@]host:port`
 /// (an IPv6 host in brackets; user and password percent-decoded) into a
 /// [`ProxyConfig`] that proxies peers, trackers and host names.
+/// Error messages never contain the URL's credentials ([`redact_proxy_url`]).
 fn parse_proxy(s: &str) -> Result<ProxyConfig, String> {
     const USAGE: &str = "expected socks5://[user:pass@]host:port or http://[user:pass@]host:port";
-    let bad = |why: &str| format!("invalid proxy URL {s:?}: {why} ({USAGE})");
+    let shown = redact_proxy_url(s);
+    let bad = |why: &str| format!("invalid proxy URL {shown:?}: {why} ({USAGE})");
     let (scheme, rest) = s.split_once("://").ok_or_else(|| bad("no scheme"))?;
     let kind = if scheme.eq_ignore_ascii_case("socks5") {
         ProxyKind::Socks5
@@ -129,15 +131,24 @@ fn parse_proxy(s: &str) -> Result<ProxyConfig, String> {
         Some((c, hp)) => (Some(c), hp),
         None => (None, rest),
     };
-    let (host, port) = host_port
-        .rsplit_once(':')
-        .ok_or_else(|| bad("missing port"))?;
-    let host = match host.strip_prefix('[') {
-        Some(h) => h
-            .strip_suffix(']')
-            .ok_or_else(|| bad("unclosed IPv6 bracket"))?,
-        None if host.contains(':') => return Err(bad("put an IPv6 host in brackets")),
-        None => host,
+    let (host, port) = match host_port.strip_prefix('[') {
+        // `[v6]:port`: split at the bracket, not at a colon inside it.
+        Some(bracketed) => {
+            let (host, after) = bracketed
+                .split_once(']')
+                .ok_or_else(|| bad("unclosed IPv6 bracket"))?;
+            let port = after.strip_prefix(':').ok_or_else(|| bad("missing port"))?;
+            (host, port)
+        }
+        None => {
+            let (host, port) = host_port
+                .rsplit_once(':')
+                .ok_or_else(|| bad("missing port"))?;
+            if host.contains(':') {
+                return Err(bad("put an IPv6 host in brackets"));
+            }
+            (host, port)
+        }
     };
     if host.is_empty() {
         return Err(bad("missing host"));
@@ -166,6 +177,55 @@ fn parse_proxy(s: &str) -> Result<ProxyConfig, String> {
             .transpose()?;
     }
     Ok(config)
+}
+
+/// `s` with everything before the authority's last `@` (the user and
+/// password) replaced, for error messages.
+fn redact_proxy_url(s: &str) -> String {
+    let (scheme, rest) = match s.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, s),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = match authority.rsplit_once('@') {
+        Some((_, host_port)) => format!("<redacted>@{host_port}"),
+        None => authority.to_string(),
+    };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{authority}{tail}"),
+        None => format!("{authority}{tail}"),
+    }
+}
+
+/// clap parser for `--proxy`: [`parse_proxy`], with an error that names
+/// the flag but, unlike a plain `value_parser` function, never repeats the
+/// raw value (it may hold a password).
+#[derive(Clone)]
+struct ProxyParser;
+
+impl clap::builder::TypedValueParser for ProxyParser {
+    type Value = ProxyConfig;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<ProxyConfig, clap::Error> {
+        let flag = arg.map_or_else(|| "--proxy <URL>".to_string(), ToString::to_string);
+        let fail = |why: String| {
+            clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!("invalid value for '{flag}': {why}\n"),
+            )
+            .with_cmd(cmd)
+        };
+        let s = value
+            .to_str()
+            .ok_or_else(|| fail("the proxy URL is not valid UTF-8".to_string()))?;
+        parse_proxy(s).map_err(fail)
+    }
 }
 
 /// Decodes `%XX` escapes; `None` for a broken escape or non-UTF-8 result.
@@ -643,6 +703,19 @@ async fn transfer(
     let params = add_params(source, dir, opts.resume.as_deref())?;
     let session = Session::new(settings).await?;
     println!("listening on {}", session.local_addr());
+    // Whatever happens below, the session shuts down (trackers get their
+    // `stopped`, the disk cache is flushed).
+    let result = run_transfer(&session, params, &opts).await;
+    session.shutdown().await;
+    result
+}
+
+/// The part of [`transfer`] that runs with the session up.
+async fn run_transfer(
+    session: &Session,
+    params: AddTorrent,
+    opts: &TransferOpts,
+) -> Result<ExitCode, Error> {
     let mut events = session
         .subscribe(EventMask::STATUS | EventMask::PEER | EventMask::NAT | EventMask::TRACKER);
     let handle = session.add_torrent(params).await?;
@@ -658,29 +731,70 @@ async fn transfer(
         stop_at: opts.stop_at,
     };
     let mut code = watch(&handle, &mut events, limits).await;
+    let mut paused = true;
     if opts.stop_at.is_some() || opts.resume.is_some() {
         // Nothing may be written after the save, or its stamps would not
         // hold on the next start.
-        handle.pause().await?;
-    }
-    if let Some(path) = &opts.resume {
-        match handle.save_resume_data().await {
-            Ok(bytes) => {
-                if let Err(e) = write_atomically(path, &bytes) {
-                    eprintln!("error: writing {}: {e}", path.display());
-                    code = ExitCode::FAILURE;
-                } else {
-                    println!("resume data saved to {}", path.display());
-                }
-            }
-            Err(e) => {
-                eprintln!("error: saving resume data: {e}");
-                code = ExitCode::FAILURE;
-            }
+        if let Err(e) = handle.pause().await {
+            eprintln!("warning: pausing the torrent failed: {e}");
+            paused = false;
         }
     }
-    session.shutdown().await;
+    if let Some(path) = &opts.resume
+        && !save_resume(&handle, path, paused).await
+    {
+        code = ExitCode::FAILURE;
+    }
     Ok(code)
+}
+
+/// Saves the torrent's resume data to `path` unless it would be worse than
+/// what is there: an errored torrent, a failed pause, or a failed save
+/// keeps the existing file (with a warning), and a magnet without its
+/// metadata has nothing to save yet. Returns false when the save or the
+/// write itself failed.
+async fn save_resume(handle: &TorrentHandle, path: &Path, paused: bool) -> bool {
+    let status = handle.status();
+    let keep = |why: &str| {
+        let what = if path.exists() {
+            format!("keeping {}", path.display())
+        } else {
+            format!("not writing {}", path.display())
+        };
+        eprintln!("warning: resume data not saved ({why}); {what}");
+    };
+    if !status.has_metadata {
+        eprintln!(
+            "resume: not saved: the magnet's metadata has not arrived yet, so there is nothing to resume"
+        );
+        return true;
+    }
+    if matches!(status.state, TorrentState::Error) {
+        keep("the torrent is in error");
+        return true;
+    }
+    if !paused {
+        keep("the torrent could not be paused");
+        return true;
+    }
+    match handle.save_resume_data().await {
+        Ok(bytes) => match write_atomically(path, &bytes) {
+            Ok(()) => {
+                println!("resume data saved to {}", path.display());
+                true
+            }
+            Err(e) => {
+                eprintln!("error: writing {}: {e}", path.display());
+                keep("the write failed");
+                false
+            }
+        },
+        Err(e) => {
+            eprintln!("error: saving resume data: {e}");
+            keep("the save failed");
+            false
+        }
+    }
 }
 
 /// What `stream` reads, and where it goes.
@@ -1422,6 +1536,53 @@ mod tests {
         ] {
             assert!(parse_proxy(bad).is_err(), "{bad:?} should be rejected");
         }
+        for no_port in [
+            "http://[::1]",
+            "http://[::1]/",
+            "socks5://[::1]x",
+            "socks5://proxy.test",
+        ] {
+            let e = parse_proxy(no_port).expect_err(no_port);
+            assert!(e.contains("missing port"), "{no_port:?}: {e}");
+        }
+    }
+
+    /// No rejection repeats the user name or password.
+    #[test]
+    fn proxy_errors_redact_credentials() {
+        for bad in [
+            "socks5://secretuser:hunter2@proxy.test",
+            "http://secretuser:hunter2@[::1]",
+            "ftp://secretuser:hunter2@proxy.test:21",
+            "socks5://secretuser:hunter2@proxy.test:1080/path",
+            "socks5://secretuser:hu%zzter2@proxy.test:1080",
+        ] {
+            let e = parse_proxy(bad).expect_err(bad);
+            assert!(
+                !e.contains("hunter2") && !e.contains("secretuser"),
+                "{bad:?}: {e}"
+            );
+            assert!(e.contains("<redacted>@"), "{bad:?}: {e}");
+        }
+        let cli = Cli::try_parse_from([
+            "fbt-example",
+            "seed",
+            "t.torrent",
+            "--data",
+            "d",
+            "--proxy",
+            "socks5://secretuser:hunter2@proxy.test",
+        ]);
+        let Err(e) = cli else {
+            panic!("a proxy URL without a port parsed");
+        };
+        let text = e.to_string();
+        assert!(text.contains("--proxy"), "{text}");
+        assert!(text.contains("missing port"), "{text}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("secretuser"),
+            "{text}"
+        );
     }
 
     #[test]

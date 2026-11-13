@@ -598,7 +598,8 @@ fn proxy_url_parsing() {
     }
     for bad in [
         "socks5://127.0.0.1",
-        "http://user:pass@proxy.example",
+        "http://user:hunter2@proxy.example",
+        "socks4://user:hunter2@127.0.0.1:1080",
         "socks4://127.0.0.1:1080",
         "127.0.0.1:1080",
         "socks5://:1080",
@@ -609,6 +610,8 @@ fn proxy_url_parsing() {
         assert_eq!(out.status.code(), Some(2), "{bad}: {out:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("--proxy"), "{bad}: {stderr}");
+        // A rejected URL's password never reaches the terminal or CI logs.
+        assert!(!stderr.contains("hunter2"), "{bad}: {stderr}");
     }
 }
 
@@ -618,7 +621,17 @@ fn proxy_url_parsing() {
 #[test]
 fn resume_file_is_written_and_trusted() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (torrent_path, seed_dir, _) = seed_fixture(tmp.path());
+    // 2 MiB at 256 KiB/s: about 4 s to the halfway mark and 12.5 % per 1 s
+    // progress poll, so the stop lands well short of 100 %.
+    let payload: Vec<u8> = (0..2 * 1024 * 1024usize)
+        .map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8)
+        .collect();
+    let (torrent, _) = make_torrent(&[("big.bin", payload.len())], 65536);
+    let torrent_path = tmp.path().join("t.torrent");
+    std::fs::write(&torrent_path, &torrent).expect("write torrent");
+    let seed_dir = tmp.path().join("seed");
+    std::fs::create_dir_all(seed_dir.join("payload")).expect("mkdir");
+    std::fs::write(seed_dir.join("payload/big.bin"), &payload).expect("write");
     let out_dir = tmp.path().join("out");
     let resume = tmp.path().join("r.dat");
     let (_seed, port) = spawn_seed(&torrent_path, &seed_dir, &[]);
@@ -637,12 +650,20 @@ fn resume_file_is_written_and_trusted() {
     ];
 
     let mut first = args.to_vec();
-    // Slow enough that the 1 s progress poll sees the halfway mark.
-    first.extend(["--stop-at", "50", "--download-limit", "32K"]);
+    first.extend(["--stop-at", "50", "--download-limit", "256K"]);
     let out = run_download_output(&first);
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("stop at 50%: "), "{stdout}");
+    let stopped_at: f64 = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("stop at 50%: "))
+        .and_then(|rest| rest.strip_suffix("% done"))
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no stop line in {stdout}"));
+    assert!(
+        (50.0..100.0).contains(&stopped_at),
+        "stopped at {stopped_at}%: {stdout}"
+    );
     assert!(resume.is_file(), "no resume file written");
     let saved = std::fs::read(&resume).expect("resume file");
     assert!(fbt::AddTorrent::from_resume(&saved).is_ok());
@@ -661,8 +682,8 @@ fn resume_file_is_written_and_trusted() {
     assert!(stderr.contains("resume: trusted ("), "{stderr}");
     assert!(!stderr.contains("resume: checking"), "{stderr}");
     assert_eq!(
-        read_tree(&out_dir.join("payload")),
-        read_tree(&seed_dir.join("payload"))
+        std::fs::read(out_dir.join("payload/big.bin")).expect("read"),
+        payload
     );
 }
 
