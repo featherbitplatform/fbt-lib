@@ -172,6 +172,12 @@ pub struct Settings {
     pub rechoke_interval: Duration,
     /// Time between status updates (non-zero).
     pub status_interval: Duration,
+    /// Time between status updates of a torrent that has nothing to do:
+    /// seeding or paused, with no peers, open readers, deadline pieces,
+    /// web seeds in use, jobs running or piece layers pending (5 s). Any
+    /// command, peer event or job result switches back to
+    /// [`status_interval`](Self::status_interval) at once. Non-zero.
+    pub idle_status_interval: Duration,
     /// Capacity of the event queues (1 to [`MAX_EVENT_QUEUE`]).
     pub event_queue: usize,
     /// Peers asked from each tracker announce.
@@ -427,6 +433,7 @@ impl Settings {
             ("request_timeout", self.request_timeout),
             ("rechoke_interval", self.rechoke_interval),
             ("status_interval", self.status_interval),
+            ("idle_status_interval", self.idle_status_interval),
             ("tracker_retry_base", self.tracker_retry_base),
             ("dht_announce_interval", self.dht_announce_interval),
             ("dht_query_timeout", self.dht_query_timeout),
@@ -607,6 +614,7 @@ impl Default for Settings {
             peer_retry_delay: Duration::from_secs(60),
             rechoke_interval: Duration::from_secs(10),
             status_interval: Duration::from_millis(500),
+            idle_status_interval: Duration::from_secs(5),
             event_queue: 4096,
             num_want: 50,
             tracker: TrackerConfig::default(),
@@ -713,6 +721,19 @@ mod tests {
         );
         s.read_ahead = ReadAhead::new(16 << 20, Duration::from_secs(10), Some(1));
         assert!(s.validate().is_ok());
+    }
+
+    /// The idle tick exists and is validated like every other timer.
+    #[test]
+    fn idle_status_interval_defaults_and_validates() {
+        let mut s = Settings::default();
+        assert_eq!(s.idle_status_interval, Duration::from_secs(5));
+        assert!(s.validate().is_ok());
+        s.idle_status_interval = Duration::ZERO;
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "idle_status_interval must be greater than zero"
+        );
     }
 
     #[test]

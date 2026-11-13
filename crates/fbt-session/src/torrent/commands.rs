@@ -170,6 +170,9 @@ impl Actor {
                     .map_or(0, |l| l.meta.piece_layers.len());
                 let _ = tx.send(n);
             }
+            Cmd::StatusTicks(tx) => {
+                let _ = tx.send(self.status_ticks);
+            }
             Cmd::Shutdown(tx) => {
                 let _ = self.stop(None).await;
                 let _ = tx.send(());

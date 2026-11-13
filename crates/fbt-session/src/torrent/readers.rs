@@ -80,6 +80,12 @@ pub(super) struct Readers {
 }
 
 impl Readers {
+    /// No open reader and no read waiting for a piece: the status tick's
+    /// reader work (`readers_tick`) would have nothing to do.
+    pub(super) fn is_idle(&self) -> bool {
+        self.open.is_empty() && self.waiting.is_empty()
+    }
+
     fn remove_waiter(&mut self, id: ReaderId) {
         self.waiting.retain(|_, v| {
             v.retain(|w| w.0 != id);

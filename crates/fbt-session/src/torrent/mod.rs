@@ -93,6 +93,8 @@ pub(crate) enum Cmd {
     PeerTrust(SocketAddr, oneshot::Sender<i32>),
     /// Tests: how many piece layers the actor's metainfo holds.
     PieceLayersKnown(oneshot::Sender<usize>),
+    /// Tests: how many times the actor's status tick has run.
+    StatusTicks(oneshot::Sender<u64>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -761,6 +763,14 @@ impl TorrentHandle {
     #[doc(hidden)]
     pub async fn piece_layers_known(&self) -> usize {
         self.call(Cmd::PieceLayersKnown).await.unwrap_or(0)
+    }
+
+    /// How many times this torrent's status tick has run; tests watch the
+    /// difference over a window to see the tick rate (an idle torrent ticks
+    /// every [`Settings::idle_status_interval`](crate::Settings::idle_status_interval)). For tests.
+    #[doc(hidden)]
+    pub async fn status_ticks(&self) -> u64 {
+        self.call(Cmd::StatusTicks).await.unwrap_or(0)
     }
 
     /// Asks the actor to stop; the receiver completes once it has.

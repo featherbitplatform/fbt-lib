@@ -363,6 +363,10 @@ pub(crate) struct Actor {
     /// What web seed downloads are charged to: the torrent's and the
     /// session's download limits.
     pub(super) web_seed_throttle: Throttle,
+    /// How often the status tick ran; read by
+    /// [`TorrentHandle::status_ticks`](crate::TorrentHandle::status_ticks),
+    /// which tests use to watch the tick rate.
+    pub(super) status_ticks: u64,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -541,6 +545,7 @@ impl Actor {
             smartban: SmartBan::default(),
             web_seeds: WebSeeds::default(),
             web_seed_throttle,
+            status_ticks: 0,
             need_save_resume: resume.is_none(),
             resume_trusted: None,
             last_have: None,
@@ -609,10 +614,15 @@ impl Actor {
         self.peers_found(PeerSource::Magnet, count);
         self.sync_running();
         self.try_connect();
-        let mut tick = tokio::time::interval(self.shared.settings.status_interval);
+        let status_interval = self.shared.settings.status_interval;
+        let idle_interval = self.shared.settings.idle_status_interval;
+        let mut tick = tokio::time::interval(status_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut rechoke = tokio::time::interval(self.shared.settings.rechoke_interval);
         rechoke.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Whether `tick` currently runs at the idle period; the check at the
+        // end of every iteration keeps it in step with [`Actor::is_idle`].
+        let mut tick_idle = false;
         loop {
             if !self.storage_busy {
                 if let Some(queued) = self.queue_pending.take() {
@@ -652,6 +662,7 @@ impl Actor {
                 },
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
+                    self.status_ticks += 1;
                     self.flush(FlushReason::Expired);
                     self.release_stale_partials();
                     self.expire_parole_pieces();
@@ -670,6 +681,20 @@ impl Actor {
                     self.publish();
                 }
                 _ = rechoke.tick() => self.rechoke(),
+            }
+            // End of every iteration: an idle torrent does not need a
+            // sub-second tick, and any event that ends idleness is noticed
+            // here, so leaving idle waits for no more than one
+            // `status_interval`. Re-evaluating is a few field reads;
+            // re-creating the interval restarts its countdown from now,
+            // which is right in both directions (the iteration that flips
+            // idleness has already published whatever it changed).
+            let idle = self.is_idle();
+            if idle != tick_idle {
+                tick_idle = idle;
+                let period = if idle { idle_interval } else { status_interval };
+                tick = tokio::time::interval_at(Instant::now() + period, period);
+                tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             }
         }
     }
@@ -759,6 +784,27 @@ impl Actor {
                     Phase::Checking { .. } | Phase::QueuedForCheck { .. } | Phase::Resuming
                 )
                 && !self.stopped())
+    }
+
+    /// Whether the status tick may run at `idle_status_interval`: the torrent
+    /// is seeding or paused, and nothing the tick drives has work — no peers,
+    /// open readers, deadline pieces, web seeds in use, background jobs,
+    /// layers to fetch, or built layers waiting for a swap. Commands, peer
+    /// events and job results wake the actor whatever the tick does; only
+    /// tick-driven timers slow down, and [`Actor::run`] switches back at the
+    /// end of the first iteration anything above appears in.
+    pub(super) fn is_idle(&self) -> bool {
+        (self.paused || self.state() == TorrentState::Seeding)
+            && self.peers.is_empty()
+            && self.readers.is_idle()
+            && self.deadlines.is_empty()
+            && self.web_seeds.num_active() == 0
+            && self.jobs.is_empty()
+            && self.pending_layers.is_none()
+            && self
+                .loaded
+                .as_ref()
+                .is_none_or(|l| l.built_layers.is_empty())
     }
 
     pub(super) fn state(&self) -> TorrentState {
@@ -1155,6 +1201,82 @@ mod tests {
         // The disconnect removes exactly what was added.
         picker.remove_peer_pieces(peers[&PeerKey(1)].pieces());
         assert_eq!(picker.availability(0), 0);
+    }
+
+    /// A ready actor whose every piece passed: seeding, with nothing else
+    /// going on.
+    fn seeding_actor() -> Actor {
+        let mut a = super::super::swarm::tests::actor_with(&[3 * 16_384], 16_384, 0);
+        let l = a.loaded.as_mut().expect("loaded");
+        let n = l.layout.num_pieces();
+        let picker = l.picker.as_mut().expect("picker");
+        for piece in 0..n {
+            picker.piece_passed(piece);
+        }
+        assert_eq!(a.state(), TorrentState::Seeding);
+        a
+    }
+
+    /// Seeding with no peers and nothing running is idle; a peer ends that
+    /// at once, even one still dialling.
+    #[test]
+    fn seeding_without_peers_or_jobs_is_idle() {
+        use super::super::swarm::tests::addr;
+        use crate::event::PeerSource;
+        use crate::peer::transport::Transport;
+
+        let mut a = seeding_actor();
+        assert!(a.is_idle(), "seeding with nothing going on");
+        let (tx, _rx) = mpsc::channel(1);
+        let generation = a.generation;
+        let key = a.new_key();
+        a.peers.insert(
+            key,
+            Peer::new(
+                addr(1),
+                tx,
+                generation,
+                1,
+                Transport::Tcp,
+                PeerSource::Tracker,
+            ),
+        );
+        assert!(!a.is_idle(), "a peer is connected or dialling");
+        a.peers.remove(&key).expect("peer");
+        assert!(a.is_idle(), "the peer is gone");
+    }
+
+    /// Everything Review Focus 1 lists as ending idleness keeps the fast
+    /// tick: a download, a job in flight, an open reader and a web seed.
+    /// A pause alone does not: only commands can end it.
+    #[tokio::test]
+    async fn anything_pending_keeps_the_fast_tick() {
+        use tokio::sync::oneshot;
+
+        use super::super::swarm::tests::actor_with;
+        use crate::stream::ReadAhead;
+        use crate::stream::reader::ReaderLink;
+
+        let mut a = actor_with(&[3 * 16_384], 16_384, 0);
+        assert!(!a.is_idle(), "downloading");
+        a.paused = true;
+        assert!(a.is_idle(), "paused with nothing running");
+        a.paused = false;
+
+        let mut a = seeding_actor();
+        a.jobs.spawn(std::future::pending::<Job>());
+        assert!(!a.is_idle(), "a job is running");
+
+        let mut b = seeding_actor();
+        let (tx, mut rx) = oneshot::channel();
+        let link = std::sync::Arc::new(ReaderLink::new(0, ReadAhead::default()));
+        b.on_open_reader(0, link, tx);
+        assert!(rx.try_recv().expect("answered").is_ok(), "reader opened");
+        assert!(!b.is_idle(), "an open reader is tick-driven work");
+
+        let mut c = seeding_actor();
+        c.init_web_seeds(vec!["http://127.0.0.1:8080/torrent/".to_owned()]);
+        assert!(!c.is_idle(), "a web seed in use");
     }
 
     #[test]
