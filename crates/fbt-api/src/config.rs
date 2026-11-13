@@ -61,7 +61,10 @@ pub struct ApiConfig {
     /// move targets, creation sources) must be inside. Each must exist.
     /// A path must be absolute, free of `..` and written below a root (as
     /// given here, or in its canonical form); symlinks in it are resolved
-    /// and must stay inside. Default `None`: any path.
+    /// and must stay inside. The check is lexical before it touches the
+    /// filesystem, so a path must be spelled like the root: a different
+    /// letter case on case-insensitive filesystems (macOS, Windows) is
+    /// refused with `403`. Default `None`: any path.
     pub allowed_roots: Option<Vec<PathBuf>>,
     /// The largest request body; larger ones get `413`. Default
     /// [`MAX_BODY_BYTES`].

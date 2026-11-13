@@ -45,7 +45,9 @@ pub(crate) struct Root {
 /// inside a canonical root, compared component-wise; otherwise
 /// `403 path_not_allowed`. A path that reaches a root only through a
 /// symlink alias outside the roots (say `/tmp` for a `/private/tmp` root)
-/// must be given in a root's own form.
+/// must be given in a root's own form, as must the letter case on a
+/// case-insensitive filesystem (macOS, Windows): the lexical check is
+/// case-sensitive and refuses a differently-cased spelling with `403`.
 ///
 /// The returned path is the one to hand to the session, so a symlink
 /// present at check time cannot redirect it; the residual check-to-use

@@ -1,14 +1,68 @@
 //! fbt-api: an HTTP/JSON API over an [`fbt::Session`]: control of every
 //! torrent and session setting, server-sent events and byte-range file
-//! streaming, with an OpenAPI document.
+//! streaming, with an OpenAPI document at `/api/v1/openapi.json`.
 //!
 //! Mount [`router`] in your own axum server, or run [`ApiServer`].
+//!
+//! # Mounting the router
+//!
+//! ```no_run
+//! # async fn demo(session: fbt::Session) -> Result<(), Box<dyn std::error::Error>> {
+//! use fbt_api::{ApiConfig, router};
+//!
+//! let app = router(session, &ApiConfig::new("secret-token"))?;
+//! let listener = tokio::net::TcpListener::bind("127.0.0.1:8090").await?;
+//! axum::serve(listener, app).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Running the standalone server
+//!
+//! ```no_run
+//! # async fn demo(session: fbt::Session) -> Result<(), Box<dyn std::error::Error>> {
+//! use fbt_api::{ApiConfig, ApiServer};
+//!
+//! let server = ApiServer::start(session, ApiConfig::new("secret-token")).await?;
+//! println!("API on http://{}", server.local_addr());
+//! // ... later: stop accepting, end streams, abort stragglers after 5 s.
+//! server.shutdown().await;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Security model
 //!
 //! Every client is untrusted until authenticated: request bodies, query
 //! strings, path parameters and headers never panic the server, and every
 //! body and collection has a size cap. A token holder is fully trusted:
 //! the API is the session's own control surface
 //! ([`ApiConfig::allowed_roots`] limits the paths it may name).
+//!
+//! - **Token.** With [`Auth::Token`] every request but
+//!   `GET /api/v1/openapi.json` and CORS preflights needs
+//!   `Authorization: Bearer <token>`. The file-stream and event URLs also
+//!   take `?token=`, because browser media elements and `EventSource`
+//!   cannot send headers; no other route does.
+//! - **Loopback and no auth.** [`Auth::Disabled`] is allowed only with a
+//!   loopback [`ApiConfig::bind`]. Requests whose `Host` is not
+//!   `localhost`, `127.0.0.1` or `[::1]`, or whose `Origin` is not in
+//!   [`ApiConfig::cors_origins`], get `403`: the guard against CSRF and DNS
+//!   rebinding.
+//! - **CORS.** Off unless [`ApiConfig::cors_origins`] lists origins.
+//! - **`allowed_roots`.** When set, every path a request names (save
+//!   paths, move targets, creation sources) must lie inside a root. The
+//!   check is lexical before it touches the filesystem, so a path must be
+//!   spelled like the configured root: a different letter case on
+//!   case-insensitive filesystems (macOS, Windows), a Windows 8.3 short
+//!   name, or a symlink alias outside the roots (`/tmp` for a
+//!   `/private/tmp` root) is refused with `403`. Symlinks inside a root
+//!   that lead out of it are resolved and refused too.
+//! - **Caps.** Bodies are limited by [`ApiConfig::max_body_bytes`]
+//!   (`413`), file streams by [`ApiConfig::max_streams`] and event
+//!   streams by [`ApiConfig::max_event_streams`] (`503`). A paused client
+//!   keeps its stream slot, so `max_streams` is what bounds the slots idle
+//!   clients can hold.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
