@@ -1,0 +1,42 @@
+[package]
+name = "fbt-api"
+description = "pure-Rust BitTorrent library: HTTP/JSON control API, events and streaming over fbt."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["tls"]
+# HTTPS trackers over rustls with the `ring` provider (needs a C toolchain).
+tls = ["fbt/tls"]
+# HTTPS trackers over rustls with the pure-Rust RustCrypto provider.
+pure-rust = ["fbt/pure-rust"]
+
+[dependencies]
+fbt = { path = "../fbt", default-features = false }
+axum.workspace = true
+utoipa.workspace = true
+utoipa-axum.workspace = true
+tower-http.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["io"] }
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower.workspace = true
+bytes.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+tempfile.workspace = true
