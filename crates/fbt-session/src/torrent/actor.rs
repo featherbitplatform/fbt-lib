@@ -1279,6 +1279,57 @@ mod tests {
         assert!(!c.is_idle(), "a web seed in use");
     }
 
+    /// A paused torrent that starts a recheck is not idle while its check
+    /// job runs, and goes idle again only once the result has been handled.
+    #[tokio::test]
+    async fn paused_during_a_check_is_not_idle_until_it_returns() {
+        let mut a = seeding_actor();
+        a.paused = true;
+        assert!(a.is_idle(), "paused with nothing running");
+
+        a.recheck();
+        assert!(
+            matches!(a.phase, Phase::Checking { .. }),
+            "a free check slot starts the check at once"
+        );
+        assert!(!a.is_idle(), "the recheck is in flight");
+
+        let r = a.jobs.join_next().await.expect("the check result");
+        a.on_job_result(r);
+        assert_eq!(a.jobs.len(), 0, "the handled check spawned nothing");
+        assert!(a.is_idle(), "paused with the check back");
+    }
+
+    /// A paused torrent whose storage is being moved is not idle while the
+    /// move's job runs, and goes idle again only once it has returned and
+    /// the caller has been answered.
+    #[tokio::test]
+    async fn paused_during_a_storage_move_is_not_idle_until_it_finishes() {
+        use std::path::PathBuf;
+
+        use tokio::sync::oneshot;
+
+        use crate::storage::MoveMode;
+
+        let mut a = seeding_actor();
+        a.paused = true;
+        assert!(a.is_idle(), "paused with nothing running");
+
+        let (tx, mut rx) = oneshot::channel();
+        a.on_move_storage(PathBuf::from("elsewhere"), MoveMode::FailIfExists, tx)
+            .await;
+        assert!(a.storage_busy);
+        assert_eq!(a.jobs.len(), 1, "the move job started");
+        assert!(!a.is_idle(), "the move is in flight");
+
+        let r = a.jobs.join_next().await.expect("the move result");
+        a.on_job_result(r);
+        assert!(rx.try_recv().is_ok(), "the caller was answered");
+        assert!(!a.storage_busy, "the storage is free again");
+        assert_eq!(a.jobs.len(), 0, "the handled move spawned nothing");
+        assert!(a.is_idle(), "paused with the move back");
+    }
+
     #[test]
     fn so_selection_is_merged_in_one_pass() {
         use Priority::{Normal as N, Skip as S};

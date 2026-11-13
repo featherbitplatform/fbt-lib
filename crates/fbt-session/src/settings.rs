@@ -174,7 +174,9 @@ pub struct Settings {
     pub status_interval: Duration,
     /// Time between status updates of a torrent that has nothing to do:
     /// seeding or paused, with no peers, open readers, deadline pieces,
-    /// web seeds in use, jobs running or piece layers pending (5 s). Any
+    /// web seeds in use, jobs running or piece layers pending (5 s). While
+    /// a torrent is idle its status snapshot (rates, active and seeding
+    /// time) and its seed-limit checks refresh only at this period. Any
     /// command, peer event or job result switches back to
     /// [`status_interval`](Self::status_interval) at once. Non-zero.
     pub idle_status_interval: Duration,
