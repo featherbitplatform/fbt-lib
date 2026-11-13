@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
-use fbt_dht::{Body, Dht, DhtConfig, MAX_STATE_NODES, Message, Query, QueryMsg};
+use fbt_dht::{Body, Dht, DhtConfig, DhtError, MAX_STATE_NODES, Message, Query, QueryMsg};
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -113,6 +113,11 @@ async fn scrape_round_trip() {
         .await
     );
     let ih = [0x33; 20];
+    // a node that knows nobody cannot scrape: an error, not zeros
+    let lone = Dht::spawn(cfg("127.0.0.1:0")).await.unwrap();
+    assert!(matches!(lone.scrape(ih).await, Err(DhtError::NoNodes)));
+    lone.shutdown().await;
+    assert!(matches!(lone.scrape(ih).await, Err(DhtError::Shutdown)));
     let empty = nodes[2].scrape(ih).await.unwrap();
     assert_eq!((empty.seeds, empty.peers), (0, 0));
     let mut seed = nodes[8].announce(ih, Some(5001), true);

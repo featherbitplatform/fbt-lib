@@ -192,6 +192,10 @@ pub enum DhtError {
     /// A saved state could not be read; names the offending part.
     #[error("invalid DHT state: {0}")]
     InvalidState(&'static str),
+    /// The routing table is empty: no node to start a lookup from (the DHT
+    /// has not bootstrapped yet).
+    #[error("the DHT knows no node yet")]
+    NoNodes,
     /// The queried node did not answer in time (or cannot be reached: no
     /// socket of its address family).
     #[error("the DHT node did not answer")]
@@ -667,12 +671,18 @@ impl Dht {
     /// BEP 33 scrape: a `get_peers` lookup with `scrape` set, one per bound
     /// family, whose `K` closest answers' seed and peer bloom filters are
     /// unioned and estimated. Nodes that do not know the torrent send no
-    /// filters, so an unknown torrent gives zeros. Dropping the future
-    /// cancels the lookups.
+    /// filters, so an unknown torrent gives zeros. Fails with
+    /// [`DhtError::NoNodes`] while the routing tables are empty (zeros then
+    /// would only mean that nobody was asked), and with
+    /// [`DhtError::Shutdown`] once the node has shut down. Dropping the
+    /// future cancels the lookups.
     pub async fn scrape(&self, info_hash: [u8; 20]) -> Result<DhtScrape, DhtError> {
         let link = Link::Strong(self.clone());
         let target = NodeId(info_hash);
         let views = link.closest(Some(target)).await?;
+        if views.iter().all(|v| v.closest.is_empty()) {
+            return Err(DhtError::NoNodes);
+        }
         let mut set = JoinSet::new();
         for v in views {
             set.spawn(lookup::run(

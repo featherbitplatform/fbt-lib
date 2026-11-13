@@ -279,10 +279,10 @@ pub use fbt_session::{
     AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtSamples,
     DhtScrape, DhtStats, DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream,
     ExternalIpSource, FileReader, IpFilter, ListenError, MAX_METADATA_SIZE, MapMethod, MapProtocol,
-    MixedMode, MoveMode, PeerClassLimits, PeerSource, Priority, ProxyConfig, ProxyKind,
-    QueueSettings, RateLimit, ReadAhead, RemoveMode, ResumeError, SeedChokingAlgorithm, Session,
-    SessionError, SessionState, Settings, StorageError, StreamError, TorrentHandle, TorrentSource,
-    TorrentState, TorrentStatus, Transport,
+    MixedMode, MoveMode, NodeId, NodeInfo, PeerClassLimits, PeerSource, Priority, ProxyConfig,
+    ProxyKind, QueueSettings, RateLimit, ReadAhead, RemoveMode, ResumeError, SeedChokingAlgorithm,
+    Session, SessionError, SessionState, Settings, StorageError, StreamError, TorrentHandle,
+    TorrentSource, TorrentState, TorrentStatus, Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

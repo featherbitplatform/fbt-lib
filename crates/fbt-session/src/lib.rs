@@ -90,7 +90,7 @@ pub use bans::BlockReason;
 pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::{SessionError, StreamError};
 pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
-pub use fbt_dht::{DhtSamples, DhtScrape, DhtStats};
+pub use fbt_dht::{DhtSamples, DhtScrape, DhtStats, NodeId, NodeInfo};
 pub use fbt_net::ipfilter::IpFilter;
 pub use fbt_net::proxy::{ProxyConfig, ProxyKind};
 pub use fbt_net::{MapMethod, MapProtocol};

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_core::{InfoHashes, PeerId};
-use fbt_dht::{Dht, DhtConfig, DhtSamples, DhtScrape, DhtState, DhtStats, NodeId};
+use fbt_dht::{Dht, DhtConfig, DhtError, DhtSamples, DhtScrape, DhtState, DhtStats, NodeId};
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::PortMapper;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
@@ -863,13 +863,13 @@ impl Session {
     /// other peers announced for `info_hash` to the nodes closest to it
     /// (bloom filters: estimates count distinct IPs, not ports).
     ///
-    /// Fails with [`SessionError::DhtDisabled`] with the DHT off and
-    /// [`SessionError::Dht`] once the DHT has shut down.
+    /// Fails with [`SessionError::DhtDisabled`] with the DHT off,
+    /// [`SessionError::Dht`] while the DHT knows no node yet (nobody to
+    /// ask: not the same as zero seeds and peers) and
+    /// [`SessionError::Shutdown`] once the session has shut down.
     pub async fn dht_scrape(&self, info_hash: [u8; 20]) -> Result<DhtScrape, SessionError> {
         let dht = self.dht()?;
-        dht.scrape(info_hash)
-            .await
-            .map_err(|e| SessionError::Dht(e.to_string()))
+        dht.scrape(info_hash).await.map_err(dht_error)
     }
 
     /// BEP 51: asks the DHT node at `node` for a sample of the info hashes
@@ -877,9 +877,10 @@ impl Session {
     /// crawling (following [`DhtSamples::nodes`], honouring
     /// [`DhtSamples::interval`]) is the caller's job.
     ///
-    /// Fails with [`SessionError::DhtDisabled`] with the DHT off and
-    /// [`SessionError::Dht`] when the node does not answer, answers with an
-    /// error (`204` if it does not support BEP 51) or the DHT shut down.
+    /// Fails with [`SessionError::DhtDisabled`] with the DHT off,
+    /// [`SessionError::Dht`] when the node does not answer or answers with
+    /// an error (`204` if it does not support BEP 51), and
+    /// [`SessionError::Shutdown`] once the session has shut down.
     pub async fn dht_sample_infohashes(
         &self,
         node: SocketAddr,
@@ -888,7 +889,7 @@ impl Session {
         let dht = self.dht()?;
         dht.sample_infohashes(node, NodeId(target))
             .await
-            .map_err(|e| SessionError::Dht(e.to_string()))
+            .map_err(dht_error)
     }
 
     fn dht(&self) -> Result<&Dht, SessionError> {
@@ -1487,6 +1488,15 @@ async fn start_dht(settings: &Settings, udp: &[SharedUdpSocket]) -> Option<Dht> 
             warn!(error = %e, "cannot start the DHT; running without it");
             None
         }
+    }
+}
+
+/// A DHT failure as a session error: a DHT shut down with the session is
+/// [`SessionError::Shutdown`], as for [`Session::dht_state`].
+fn dht_error(e: DhtError) -> SessionError {
+    match e {
+        DhtError::Shutdown => SessionError::Shutdown,
+        e => SessionError::Dht(e.to_string()),
     }
 }
 

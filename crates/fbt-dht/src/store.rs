@@ -38,6 +38,9 @@ pub(crate) struct PeerStore {
     max_torrents: usize,
     max_peers: usize,
     torrents: HashMap<[u8; 20], Vec<Entry>>,
+    /// The BEP 51 sample served until it is a sample interval old, and
+    /// when it was drawn.
+    sampled: Option<(Instant, Vec<[u8; 20]>)>,
 }
 
 impl PeerStore {
@@ -46,6 +49,7 @@ impl PeerStore {
             max_torrents,
             max_peers,
             torrents: HashMap::new(),
+            sampled: None,
         }
     }
 
@@ -139,6 +143,30 @@ impl PeerStore {
     /// BEP 51: up to `max` distinct stored info hashes, sampled at random.
     pub(crate) fn sample(&self, rng: &mut impl Rng, max: usize) -> Vec<[u8; 20]> {
         self.torrents.keys().copied().sample(rng, max)
+    }
+
+    /// BEP 51: the sample to answer `sample_infohashes` with at `now`. The
+    /// same sample is served until it is `ttl` old (the `interval` we
+    /// advertise), as libtorrent does, so a crawler that ignores `interval`
+    /// cannot enumerate the store by asking again and again. An empty
+    /// sample is redrawn as soon as the store holds something.
+    pub(crate) fn cached_sample(
+        &mut self,
+        rng: &mut impl Rng,
+        max: usize,
+        now: Instant,
+        ttl: Duration,
+    ) -> Vec<[u8; 20]> {
+        let fresh = self.sampled.as_ref().is_some_and(|(at, s)| {
+            now.saturating_duration_since(*at) < ttl && !(s.is_empty() && !self.torrents.is_empty())
+        });
+        if !fresh {
+            self.sampled = Some((now, self.sample(rng, max)));
+        }
+        self.sampled
+            .as_ref()
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default()
     }
 
     /// Number of info hashes stored (BEP 51 `num`).
@@ -320,6 +348,34 @@ mod tests {
                 .all(|h| h[0] < 30 && h.iter().all(|b| *b == h[0]))
         );
         assert_eq!(s.sample(&mut r, 100).len(), 30);
+    }
+
+    #[test]
+    fn sample_is_cached_for_the_interval() {
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(6 * 60 * 60);
+        let mut r = StdRng::seed_from_u64(10);
+        let mut s = PeerStore::new(2000, 10);
+        // empty, then the first announce makes the next query redraw
+        assert!(s.cached_sample(&mut r, 20, t0, ttl).is_empty());
+        s.announce([1; 20], peer("1.0.0.1:6881"), false, t0);
+        assert_eq!(s.cached_sample(&mut r, 20, t0, ttl), vec![[1; 20]]);
+        for k in 0..1000u32 {
+            let mut ih = [0u8; 20];
+            ih[..4].copy_from_slice(&k.to_be_bytes());
+            ih[19] = 0xff;
+            s.announce(ih, peer("1.0.0.1:6881"), false, t0);
+        }
+        // within the interval: the same sample, however often it is asked
+        let first = s.cached_sample(&mut r, 20, t0, ttl);
+        for m in [1, 60, 359] {
+            assert_eq!(s.cached_sample(&mut r, 20, t0 + m * MIN, ttl), first);
+        }
+        // a new draw once the interval has passed
+        let later = s.cached_sample(&mut r, 20, t0 + ttl, ttl);
+        assert_eq!(later.len(), 20);
+        assert_ne!(later, first);
+        assert_eq!(s.cached_sample(&mut r, 20, t0 + ttl + MIN, ttl), later);
     }
 
     #[test]

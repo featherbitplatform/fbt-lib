@@ -375,7 +375,8 @@ async fn session_dht_scrape() {
     let mut ss = dht_settings(vec![addr_of(&boot)]);
     ss.dht_announce_interval = Duration::from_secs(1);
     let seeder = Session::new(ss).await.unwrap();
-    let _sh = seed_in(&seeder, &m, &payload).await;
+    let sh = seed_in(&seeder, &m, &payload).await;
+    assert!(wait_until(|| sh.status().is_seed, T).await);
     let asker = Session::new(dht_settings(vec![addr_of(&boot)]))
         .await
         .unwrap();
@@ -427,7 +428,21 @@ async fn dht_methods_without_dht_are_disabled() {
         on.dht_sample_infohashes(dead_addr, [1; 20]).await,
         Err(SessionError::Dht(_))
     ));
+    // No node known yet: nobody to ask is an error, not zero seeds.
+    assert!(matches!(
+        on.dht_scrape([1; 20]).await,
+        Err(SessionError::Dht(_))
+    ));
     on.shutdown().await;
+    // After shutdown, as `dht_state` does.
+    assert!(matches!(
+        on.dht_scrape([1; 20]).await,
+        Err(SessionError::Shutdown)
+    ));
+    assert!(matches!(
+        on.dht_sample_infohashes(dead_addr, [1; 20]).await,
+        Err(SessionError::Shutdown)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -106,6 +106,11 @@ pub struct TorrentStatus {
     /// without resume data, while the stamps are being compared, and for a
     /// magnet saved before its metadata arrived (it has no pieces to trust).
     pub resume_trusted: Option<bool>,
+    /// Every piece of the torrent is verified, skipped files included
+    /// (libtorrent's `is_seed`). [`TorrentState::Seeding`] only needs the
+    /// wanted pieces; a torrent announces itself to the DHT as a seed
+    /// (BEP 33) only when this is set.
+    pub is_seed: bool,
 }
 
 impl TorrentStatus {
@@ -140,6 +145,7 @@ impl TorrentStatus {
             seeding_time: Duration::ZERO,
             need_save_resume: false,
             resume_trusted: None,
+            is_seed: false,
         }
     }
 }

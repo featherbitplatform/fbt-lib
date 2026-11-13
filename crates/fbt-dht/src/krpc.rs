@@ -967,6 +967,29 @@ mod tests {
             })
         ));
         assert_eq!(Message::decode(q).unwrap().encode(), q);
+        // non-integer `scrape` and `seed` values read as unset
+        let q = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234566:scrape1:1e1:q9:get_peers1:t2:aa1:y1:qe";
+        assert!(matches!(
+            Message::decode(q).unwrap().body,
+            Body::Query(QueryMsg {
+                query: Query::GetPeers { scrape: false, .. },
+                ..
+            })
+        ));
+        for seed in [&b"4:seed1:1"[..], b"4:seedli1ee", b"4:seedde"] {
+            let mut q =
+                b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234564:porti6881e"
+                    .to_vec();
+            q.extend_from_slice(seed);
+            q.extend_from_slice(b"5:token1:xe1:q13:announce_peer1:t2:aa1:y1:qe");
+            assert!(matches!(
+                Message::decode(&q).unwrap().body,
+                Body::Query(QueryMsg {
+                    query: Query::AnnouncePeer { seed: false, .. },
+                    ..
+                })
+            ));
+        }
         // a sample_infohashes query without a target is malformed
         assert!(matches!(
             Message::decode(

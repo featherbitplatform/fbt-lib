@@ -807,6 +807,11 @@ impl Actor {
             seeding_time: self.seeding_time,
             need_save_resume: self.need_save_resume,
             resume_trusted: self.resume_trusted,
+            is_seed: self
+                .loaded
+                .as_ref()
+                .and_then(|l| l.picker.as_ref())
+                .is_some_and(|p| p.have().is_full()),
         }
     }
 

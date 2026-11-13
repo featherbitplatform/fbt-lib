@@ -265,6 +265,7 @@ async fn resume_methods(s: &Session, h: &TorrentHandle, st: &dyn Storage) {
     let _: Result<Vec<u8>, SessionError> = h.save_resume_data().await;
     let _: Result<AddTorrent, ResumeError> = AddTorrent::from_resume(b"");
     let _: (bool, Option<bool>) = (h.status().need_save_resume, h.status().resume_trusted);
+    let _: bool = h.status().is_seed;
     let _: Result<(SessionState, Vec<(InfoHashes, SessionError)>), SessionError> =
         s.save_state().await;
     let (state, _): (SessionState, Vec<(InfoHashes, SessionError)>) = s.shutdown_and_save().await;
@@ -302,4 +303,9 @@ async fn dht_methods(s: &Session, addr: std::net::SocketAddr) {
             d.nodes.iter().map(|n| (n.addr, n.id.0)).collect();
     }
     let _ = [SessionError::DhtDisabled, SessionError::Dht(String::new())];
+    let info: Option<fbt::NodeInfo> = None;
+    if let Some(fbt::NodeInfo { id, addr }) = info {
+        let _: (fbt::NodeId, std::net::SocketAddr) = (id, addr);
+        let _: [u8; 20] = id.0;
+    }
 }

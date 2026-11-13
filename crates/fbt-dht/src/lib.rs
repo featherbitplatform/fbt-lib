@@ -29,7 +29,6 @@ mod store;
 mod table;
 mod token;
 
-pub use bloom::{BloomFilter, MAX_ESTIMATE};
 pub use id::{NODE_ID_LEN, NodeId, bep42_id, is_local};
 pub use krpc::{
     BLOOM_FILTER_LEN, Body, ERR_GENERIC, ERR_METHOD_UNKNOWN, ERR_PROTOCOL, ERR_SERVER, KRPC_LIMITS,

@@ -6,7 +6,7 @@
 //! time. Every answer it builds fits in [`MAX_DATAGRAM`].
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rand::Rng;
 
@@ -123,7 +123,13 @@ impl Server<'_> {
             }
             Query::SampleInfohashes { target } => Body::Response(Response {
                 id: own,
-                samples: self.store.sample(rng, MAX_SAMPLES),
+                // one sample per interval, not one per query
+                samples: self.store.cached_sample(
+                    rng,
+                    MAX_SAMPLES,
+                    now,
+                    Duration::from_secs(u64::from(SAMPLE_INTERVAL_SECS)),
+                ),
                 num: Some(u32::try_from(self.store.len()).unwrap_or(u32::MAX)),
                 interval: Some(SAMPLE_INTERVAL_SECS),
                 ..self.nodes(family, q, target)
@@ -175,8 +181,10 @@ fn empty(id: crate::NodeId) -> Response {
 }
 
 /// Encodes `m`, dropping values, then `nodes6`, then `nodes` entries until
-/// the datagram fits in [`MAX_DATAGRAM`]. (Two filters, 20 samples and
-/// full node lists of both families fit: about 1,150 bytes.)
+/// the datagram fits in [`MAX_DATAGRAM`]. Filters and samples are never
+/// dropped, and no answer carries both: a scrape answer (two filters) or a
+/// sample answer (20 samples) with full node lists of both families comes
+/// to at most about 1,200 bytes.
 pub(crate) fn bounded(mut m: Message) -> Vec<u8> {
     loop {
         let out = m.encode();
@@ -323,6 +331,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sample_infohashes_answer_is_cached_for_the_interval() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let t4 = table(Family::V4, 20, &mut rng);
+        let tokens = Tokens::new(&mut rng);
+        let mut store = PeerStore::new(2000, 10);
+        let t0 = Instant::now();
+        for k in 0..500u32 {
+            let mut ih = [0u8; 20];
+            ih[..4].copy_from_slice(&k.to_be_bytes());
+            store.announce(ih, "1.0.0.1:1".parse().unwrap(), false, t0);
+        }
+        let mut s = Server {
+            table_v4: Some(&t4),
+            table_v6: None,
+            tokens: &tokens,
+            store: &mut store,
+        };
+        let from: SocketAddr = "9.9.9.9:1".parse().unwrap();
+        let mut ask = |s: &mut Server<'_>, at: Instant| {
+            let query = Query::SampleInfohashes {
+                target: NodeId([7; 20]),
+            };
+            let out = s
+                .answer(from, b"t", &q(query, Want::default()), at, &mut rng)
+                .unwrap();
+            let Body::Response(r) = Message::decode(&out).unwrap().body else {
+                panic!()
+            };
+            assert_eq!(r.interval, Some(SAMPLE_INTERVAL_SECS));
+            assert_eq!(r.num, Some(500));
+            r.samples
+        };
+        let interval = Duration::from_secs(u64::from(SAMPLE_INTERVAL_SECS));
+        let first = ask(&mut s, t0);
+        assert_eq!(first.len(), MAX_SAMPLES);
+        for at in [t0, t0 + Duration::from_secs(1), t0 + interval / 2] {
+            assert_eq!(ask(&mut s, at), first, "same sample within the interval");
+        }
+        let next = ask(&mut s, t0 + interval);
+        assert_eq!(next.len(), MAX_SAMPLES);
+        assert_ne!(next, first, "redrawn after the interval");
     }
 
     #[test]

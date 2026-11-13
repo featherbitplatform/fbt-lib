@@ -26,12 +26,12 @@ const M: u32 = (BLOOM_BYTES * 8) as u32;
 /// Hash functions (`k`).
 const K: u32 = 2;
 /// The largest estimate: what a full filter gives.
-pub const MAX_ESTIMATE: u32 = 6000;
+pub(crate) const MAX_ESTIMATE: u32 = 6000;
 
 /// A BEP 33 bloom filter of IP addresses: 256 bytes (`m` = 2048 bits,
 /// `k` = 2).
 #[derive(Clone, PartialEq, Eq)]
-pub struct BloomFilter([u8; BLOOM_BYTES]);
+pub(crate) struct BloomFilter([u8; BLOOM_BYTES]);
 
 impl BloomFilter {
     /// A filter holding `bytes` as received.

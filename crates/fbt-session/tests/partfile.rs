@@ -150,6 +150,8 @@ async fn skipped_neighbour_is_never_created() {
     h.add_peer(seed.local_addr()).await.unwrap();
     finished(&mut ev).await;
     assert_eq!(have(&h).await, vec![1, 2, 3]);
+    // finished its wanted pieces but not a full seed: no BEP 33 `seed`
+    assert!(!h.status().is_seed);
     assert!(!file(dir.path(), "a").exists(), "A created");
     assert!(!file(dir.path(), "c").exists(), "C created");
     assert!(part_path(dir.path(), &m).exists(), "no part file");
