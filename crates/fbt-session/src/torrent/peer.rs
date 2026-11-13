@@ -9,12 +9,114 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::pex::PexPeer;
+use crate::event::PeerSource;
 use crate::peer::DisconnectReason;
 use crate::peer::conn::MAX_ALLOWED_FAST;
 use crate::peer::messages::PeerCommand;
 use crate::peer::transport::Transport;
 use crate::picker::PeerPieces;
 use crate::rate::RateMeter;
+use crate::status::PeerStatus;
+
+/// Most characters of a peer's client name kept in a [`PeerStatus`].
+pub(crate) const MAX_CLIENT_CHARS: usize = 64;
+
+/// Azureus-style client codes (`-XXnnnn-`) we name.
+const AZUREUS_CLIENTS: &[(&[u8; 2], &str)] = &[
+    (b"AZ", "Vuze"),
+    (b"BI", "BiglyBT"),
+    (b"BT", "BitTorrent"),
+    (b"DE", "Deluge"),
+    (b"FB", "fbt"),
+    (b"FD", "Free Download Manager"),
+    (b"KT", "KTorrent"),
+    (b"LT", "libtorrent"),
+    (b"lt", "libTorrent"),
+    (b"PI", "PicoTorrent"),
+    (b"qB", "qBittorrent"),
+    (b"SD", "Thunder"),
+    (b"TR", "Transmission"),
+    (b"UM", "uTorrent Mac"),
+    (b"UT", "uTorrent"),
+    (b"UW", "uTorrent Web"),
+    (b"WW", "WebTorrent"),
+    (b"XL", "Xunlei"),
+];
+
+/// One Azureus version character: `0-9`, then `A-Z` for 10 to 35.
+fn version_digit(c: u8) -> Option<u32> {
+    match c {
+        b'0'..=b'9' => Some(u32::from(c - b'0')),
+        b'A'..=b'Z' => Some(u32::from(c - b'A') + 10),
+        _ => None,
+    }
+}
+
+/// The client an Azureus-style peer id (`-XXnnnn-`, BEP 20) names, as
+/// "name major.minor.patch" (".build" added when not 0); `None` for any
+/// other id and for a client code we do not know.
+pub(crate) fn azureus_client(id: &[u8; 20]) -> Option<String> {
+    let [b'-', c0, c1, v0, v1, v2, v3, b'-', ..] = *id else {
+        return None;
+    };
+    let (_, name) = AZUREUS_CLIENTS.iter().find(|(c, _)| **c == [c0, c1])?;
+    let [a, b, c, d] = [
+        version_digit(v0)?,
+        version_digit(v1)?,
+        version_digit(v2)?,
+        version_digit(v3)?,
+    ];
+    Some(if d == 0 {
+        format!("{name} {a}.{b}.{c}")
+    } else {
+        format!("{name} {a}.{b}.{c}.{d}")
+    })
+}
+
+/// A Unicode format character (general category Cf): soft hyphen, bidi
+/// marks, embeddings, overrides and isolates, zero-width characters, BOM,
+/// interlinear annotation and tag characters, and the rest of Cf.
+fn is_format(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0xAD | 0x600..=0x605
+            | 0x61C
+            | 0x6DD
+            | 0x70F
+            | 0x890..=0x891
+            | 0x8E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// A client name from a peer, safe to show: control and format (bidi,
+/// zero-width) characters dropped,
+/// surrounding whitespace trimmed, at most [`MAX_CLIENT_CHARS`]
+/// characters; `None` when nothing is left.
+pub(crate) fn sanitise_client(raw: &str) -> Option<String> {
+    let clean: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_format(*c))
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_CLIENT_CHARS)
+        .collect();
+    (!clean.is_empty()).then_some(clean)
+}
 
 /// One peer connection, from spawn until its `Disconnected` event.
 #[derive(Debug)]
@@ -100,6 +202,8 @@ pub(super) struct Peer {
     /// A v2 connection (the v2 reserved bit, or the truncated v2 hash): a
     /// source for the layer fetch.
     pub v2: bool,
+    /// Where we learnt of it.
+    pub source: PeerSource,
 }
 
 impl Peer {
@@ -109,6 +213,7 @@ impl Peer {
         generation: u64,
         num_pieces: u32,
         transport: Transport,
+        source: PeerSource,
     ) -> Self {
         Peer {
             addr,
@@ -148,6 +253,42 @@ impl Peer {
             upload_only: false,
             reported: None,
             holepunch: false,
+            source,
+        }
+    }
+
+    /// Its [`PeerStatus`] at `now`.
+    pub(super) fn status(&self, now: Instant) -> PeerStatus {
+        let len = self.bits.len();
+        let progress = if self.seed {
+            1.0
+        } else if len == 0 {
+            0.0
+        } else {
+            f64::from(self.bits.count_ones()) / f64::from(len)
+        };
+        let client = self
+            .ext
+            .as_ref()
+            .and_then(|e| e.client.as_deref())
+            .and_then(sanitise_client)
+            .or_else(|| self.peer_id.and_then(|id| azureus_client(&id.0)));
+        PeerStatus {
+            addr: self.addr,
+            client,
+            transport: self.transport,
+            encrypted: self.encrypted,
+            incoming: !self.outgoing,
+            download_rate: self.from_rate.rate(now),
+            upload_rate: self.to_rate.rate(now),
+            total_downloaded: self.from_rate.total(),
+            total_uploaded: self.to_rate.total(),
+            peer_choking: self.choked_us,
+            peer_interested: self.peer_interested,
+            am_choking: self.am_choking,
+            am_interested: self.am_interested,
+            progress,
+            source: self.source,
         }
     }
 
@@ -209,5 +350,82 @@ impl Peer {
     /// Connected, not closed, and we do not choke it.
     pub(super) fn unchoked(&self) -> bool {
         self.connected && self.tx.is_some() && !self.am_choking
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(prefix: &[u8]) -> [u8; 20] {
+        let mut id = [b'x'; 20];
+        for (d, s) in id.iter_mut().zip(prefix) {
+            *d = *s;
+        }
+        id
+    }
+
+    #[test]
+    fn azureus_client_ids() {
+        assert_eq!(
+            azureus_client(&id(b"-qB4650-")).as_deref(),
+            Some("qBittorrent 4.6.5")
+        );
+        assert_eq!(
+            azureus_client(&id(b"-TR4060-")).as_deref(),
+            Some("Transmission 4.0.6")
+        );
+        assert_eq!(
+            azureus_client(&id(b"-LT20A0-")).as_deref(),
+            Some("libtorrent 2.0.10")
+        );
+        assert_eq!(
+            azureus_client(&id(b"-lt0D80-")).as_deref(),
+            Some("libTorrent 0.13.8")
+        );
+        assert_eq!(
+            azureus_client(&id(b"-DE2112-")).as_deref(),
+            Some("Deluge 2.1.1.2")
+        );
+        assert_eq!(
+            azureus_client(&id(b"-FB0100-")).as_deref(),
+            Some("fbt 0.1.0")
+        );
+        // Not Azureus style: Shad0w style, random bytes, a broken frame.
+        assert_eq!(azureus_client(&id(b"M7-2-2--")), None);
+        assert_eq!(azureus_client(&[0xff; 20]), None);
+        assert_eq!(azureus_client(&id(b"-qB4650x")), None);
+        assert_eq!(azureus_client(&id(b"-qB4\x0050-")), None);
+        // An unknown client code.
+        assert_eq!(azureus_client(&id(b"-ZZ1000-")), None);
+    }
+
+    #[test]
+    fn client_names_are_sanitised() {
+        assert_eq!(
+            sanitise_client("evil\u{1b}[31m\nname\u{7f}").as_deref(),
+            Some("evil[31mname")
+        );
+        assert_eq!(sanitise_client(" \t\r\n "), None);
+        // Bidi overrides and isolates, zero-width characters, BOM.
+        assert_eq!(
+            sanitise_client("a\u{202E}b\u{202A}c\u{2066}d\u{2069}e").as_deref(),
+            Some("abcde")
+        );
+        assert_eq!(
+            sanitise_client("x\u{200B}y\u{200D}z\u{200F}\u{FEFF}").as_deref(),
+            Some("xyz")
+        );
+        assert_eq!(sanitise_client("\u{202E}\u{200B}"), None);
+        // Other non-ASCII text stays.
+        assert_eq!(
+            sanitise_client("Überclient µ").as_deref(),
+            Some("Überclient µ")
+        );
+        let long = "a".repeat(500);
+        assert_eq!(
+            sanitise_client(&long).map(|s| s.chars().count()),
+            Some(MAX_CLIENT_CHARS)
+        );
     }
 }

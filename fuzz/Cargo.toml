@@ -21,6 +21,7 @@ fbt-core = { path = "../crates/fbt-core" }
 fbt-utp = { path = "../crates/fbt-utp" }
 fbt-net = { path = "../crates/fbt-net" }
 fbt-session = { path = "../crates/fbt-session" }
+fbt-api = { path = "../crates/fbt-api", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "io-util"] }
 
 [workspace]
@@ -187,6 +188,13 @@ bench = false
 [[bin]]
 name = "hash_proof"
 path = "fuzz_targets/hash_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_range"
+path = "fuzz_targets/http_range.rs"
 test = false
 doc = false
 bench = false

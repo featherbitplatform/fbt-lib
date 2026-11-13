@@ -1023,7 +1023,14 @@ mod tests {
     ) -> (PeerKey, mpsc::Receiver<PeerCommand>) {
         let n = a.loaded.as_ref().expect("loaded").layout.num_pieces();
         let (tx, rx) = mpsc::channel(1 << 16);
-        let mut p = Peer::new(addr(i), tx, a.generation, n, Transport::Tcp);
+        let mut p = Peer::new(
+            addr(i),
+            tx,
+            a.generation,
+            n,
+            Transport::Tcp,
+            crate::event::PeerSource::Tracker,
+        );
         p.outgoing = true;
         p.connected = true;
         p.choked_us = false;

@@ -13,18 +13,20 @@
 # .torrent and by `btmh`-only magnet; `fbt-example create` must reproduce
 # qBittorrent's v2 info hash for the same payload; and qBittorrent (v2, by
 # .torrent and by magnet) and Transmission (hybrid) download torrents
-# fbt-example created from an fbt-example seed.
+# fbt-example created from an fbt-example seed. Last, `fbt-example download
+# --api` serves fbt-api while it downloads: curl lists the torrent, streams
+# byte ranges, checks 401 and 416 and follows its event stream.
 # Needs Docker with Compose v2. Everything lands in target/interop/.
 #
 #   bash dev/interop/run.sh
 #
 # INTEROP_ONLY=utp (a comma-separated list of download, seed, encryption,
-# magnet, pex, utp, lsd, stream, resume, webseed, proxy, v2, hybrid) runs only those scenarios, after the shared
+# magnet, pex, utp, lsd, stream, resume, webseed, proxy, v2, hybrid, api) runs only those scenarios, after the shared
 # setup; uTP always runs, and an unknown name fails before anything starts. FBT_RUST_LOG sets RUST_LOG for the uTP download (its
 # tracing lands in fbt-download-utp.log), e.g. FBT_RUST_LOG=fbt_utp=debug.
 set -euo pipefail
 
-known_scenarios=(download seed encryption magnet pex utp lsd stream resume webseed proxy v2 hybrid)
+known_scenarios=(download seed encryption magnet pex utp lsd stream resume webseed proxy v2 hybrid api)
 # An unknown name fails at once, before the setup, rather than selecting nothing.
 if [ -n "${INTEROP_ONLY:-}" ]; then
     IFS=, read -ra only_names <<<"$INTEROP_ONLY"
@@ -1027,6 +1029,81 @@ stop_seed
 qbt_remove "$fbt_hyb"
 trc transmission-remote -t "$fbt_hyb_v1" -r >/dev/null
 echo "interop: hybrid OK (qbittorrent, transmission)"
+fi
+
+if want api; then
+# ------------------------------------------------------------ HTTP/JSON API --
+# fbt-example download --api serves fbt-api next to its session. It is held
+# to 2 MiB/s and seeds 30 s after the finish, so the API is up while curl
+# (in the same container) lists the torrent, streams three byte ranges of
+# beta.bin and checks 401 and 416; the event stream starts before the
+# download ends and must carry its torrent_finished.
+echo "interop: fbt-example download --api (port 6908, API 8090), driven over HTTP"
+api_started=$SECONDS
+api_token=interop-api-token
+api_url=http://127.0.0.1:8090/api/v1
+api_auth="Authorization: Bearer $api_token"
+api_log=$logs/fbt-api-download.log
+fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt-api --port 6908 \
+    --no-dht --dht-bootstrap "$dht_bootstrap" --api 0.0.0.0:8090 --api-token "$api_token" \
+    --download-limit 2M --seed-for 30 >"$api_log" 2>&1 &
+api_pid=$!
+api_listening() {
+    kill -0 "$api_pid" 2>/dev/null || fail "fbt-example download --api exited early (see $api_log)"
+    grep -q '^api: listening on ' "$api_log"
+}
+wait_for "fbt-example to serve the API" 60 api_listening
+fbt curl -sN --max-time 120 -H "$api_auth" "$api_url/events" >"$logs/fbt-api-events.log" 2>&1 &
+events_pid=$!
+# api_get <path> [curl args...]: an authenticated GET, failing on an HTTP error.
+api_get() { fbt curl -fsS --max-time 120 -H "$api_auth" "$api_url/$1" "${@:2}"; }
+# api_status <path> [curl args...]: the HTTP status alone.
+api_status() { fbt curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "$api_url/$1" "${@:2}"; }
+
+api_torrents=$(api_get torrents)
+[ "$(echo "$api_torrents" | fbt jq length)" = 1 ] && [ "$(echo "$api_torrents" | fbt jq -r '.[0].id')" = "$hash1" ] ||
+    fail "GET /torrents did not list fixture ($hash1) alone: $api_torrents"
+api_beta=$(api_get "torrents/$hash1/files" | fbt jq -r '.[] | select(.path | endswith("beta.bin")) | "\(.index) \(.len)"')
+read -r api_beta_index api_beta_len <<<"$api_beta"
+[ -n "$api_beta_index" ] && [ "$api_beta_len" = 25000000 ] ||
+    fail "GET /torrents/$hash1/files has no 25000000-byte beta.bin: '$api_beta'"
+api_stream="torrents/$hash1/files/$api_beta_index/stream"
+beta=/interop/payload/fixture/beta.bin
+# api_range <name> <first byte> <length>: stream that range and compare it with beta.bin.
+api_range() {
+    local out=/interop/api-range-$1.bin code
+    code=$(api_get "$api_stream" -H "Range: bytes=$2-$(($2 + $3 - 1))" -o "$out" -w '%{http_code}')
+    [ "$code" = 206 ] || fail "the $1 range answered $code, not 206"
+    fbt sh -c "tail -c +$(($2 + 1)) '$beta' | head -c $3 | cmp - '$out'" ||
+        fail "the $1 range ($2, $3 bytes) differs from beta.bin"
+}
+api_range start 0 65536
+api_range middle 12000000 65536
+api_range end $((api_beta_len - 65536)) 65536
+code=$(api_status torrents)
+[ "$code" = 401 ] || fail "GET /torrents without the token answered $code, not 401"
+code=$(api_status "$api_stream" -H "$api_auth" -H "Range: bytes=$api_beta_len-")
+[ "$code" = 416 ] || fail "a range past the end of beta.bin answered $code, not 416"
+# Still downloading once every check is done: 64 MiB at 2 MiB/s takes about
+# 32 s, the checks about 7 (measured). A missing or non-numeric progress
+# fails too (jq orders null below every number).
+api_progress=$(api_get "torrents/$hash1" | fbt jq -c .progress)
+fbt jq -en --argjson p "$api_progress" '($p | type) == "number" and $p < 1' >/dev/null ||
+    fail "the download had finished (progress $api_progress) before the API checks ended (see $api_log)"
+echo "interop: api: listed, streamed 3 ranges, 401 and 416 in $((SECONDS - api_started))s, at progress $api_progress"
+
+set +e
+wait "$api_pid"
+status=$?
+set -e
+check_download "$api_log" "$status" "fbt-example download --api"
+# The API's shutdown ends the event stream, so curl exits with it.
+wait "$events_pid" || true
+[ "$(hashes /interop/payload fixture)" = "$(hashes /interop/fbt-api fixture)" ] ||
+    fail "data downloaded in the api scenario differs from the payload"
+grep -q '^event: torrent_finished' "$logs/fbt-api-events.log" ||
+    fail "the event stream has no torrent_finished (see $logs/fbt-api-events.log)"
+echo "interop: api OK (list, ranges, 401, 416, events) in $((SECONDS - api_started))s"
 fi
 
 if [ -n "${INTEROP_ONLY:-}" ]; then

@@ -25,6 +25,7 @@ Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 
 - HTTP and HTTPS web seeds (BEP 19)
 - DHT scrape (BEP 33), `sample_infohashes` (BEP 51) and immutable and mutable items (BEP 44); tracker scrape
 - `serde` for the public config structs (the `serde` feature)
+- `fbt-api`: an HTTP/JSON API over a session (axum): torrent control, session settings, server-sent events, byte-range file streaming and an OpenAPI document, with bearer-token auth and allowed roots; mount its router or run `ApiServer`
 - Pure Rust, no `unsafe`; hostile peer, tracker, proxy, web seed, resume and `.torrent` input is bounded
 
 ## Usage
@@ -215,7 +216,7 @@ All three are on by default; set them to `false` to stay off the LAN. Private to
 
 `Settings::encryption` defaults to `EncryptionPolicy::Preferred`: outgoing connections open with an MSE handshake and may fall back to plain text. `Forced` refuses plain text, `Disabled` never encrypts.
 
-`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`, plus `--transport tcp|utp|both`, `--listen ADDR`, `--download-limit` and `--upload-limit`, `--cache-mb`, and `--lsd` and `--nat` (both off in the CLI); `fbt-example stream <torrent> --file N --out DIR` streams file `N` to stdout or a file while it downloads, fetching only what is read plus the read-ahead window, with `--seek`, `--length`, `--bitrate` and `--peer`; `fbt-example dht-node` runs a bare DHT node. `download` also takes `--resume PATH` (loads the resume data when the file exists, and writes it on exit after pausing; it prints `resume: trusted (<n> pieces)` or `resume: checking`), `--stop-at PERCENT` (pause, save, shut down and exit once that much is done) and `--web-seed URL` (repeatable); `download`, `seed` and `stream` take `--proxy socks5://[user:pass@]host:port` or `http://[user:pass@]host:port`. The CLI prints tracker replies and errors.
+`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`, plus `--transport tcp|utp|both`, `--listen ADDR`, `--download-limit` and `--upload-limit`, `--cache-mb`, and `--lsd` and `--nat` (both off in the CLI); `fbt-example stream <torrent> --file N --out DIR` streams file `N` to stdout or a file while it downloads, fetching only what is read plus the read-ahead window, with `--seek`, `--length`, `--bitrate` and `--peer`; `fbt-example dht-node` runs a bare DHT node. `download` also takes `--resume PATH` (loads the resume data when the file exists, and writes it on exit after pausing; it prints `resume: trusted (<n> pieces)` or `resume: checking`), `--stop-at PERCENT` (pause, save, shut down and exit once that much is done) and `--web-seed URL` (repeatable); `download`, `seed` and `stream` take `--proxy socks5://[user:pass@]host:port` or `http://[user:pass@]host:port`. `download` and `seed` also take `--api ADDR --api-token TOKEN` to serve the HTTP API (`fbt-api`) next to the transfer. The CLI prints tracker replies and errors.
 
 ## Feature flags
 
@@ -251,13 +252,13 @@ cargo deny --all-features check
 
 ## Interop and fuzzing
 
-Live interop against qBittorrent-nox and Transmission through opentracker, plus magnet via DHT, forced encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent, LSD between two fbt containers, resume without recheck against qBittorrent, a web seed served by nginx, and a download through a SOCKS5 proxy (Dante) on isolated networks with their own DHT node (no public node and no router is contacted), needs Docker (details in [dev/interop/README.md](dev/interop/README.md)):
+Live interop against qBittorrent-nox and Transmission through opentracker, plus magnet via DHT, forced encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent, LSD between two fbt containers, resume without recheck against qBittorrent, a web seed served by nginx, a download through a SOCKS5 proxy (Dante), and `fbt-example download --api` driven with curl (list, byte ranges, 401, 416, events) on isolated networks with their own DHT node (no public node and no router is contacted), needs Docker (details in [dev/interop/README.md](dev/interop/README.md)):
 
 ```
 bash dev/interop/run.sh
 ```
 
-Fuzzing needs nightly and `cargo install cargo-fuzz --locked`. Targets: `bencode`, `metainfo`, `wire_codec`, `handshake`, `http_announce`, `udp_announce`, `path`, `krpc`, `extension`, `mse`, `magnet`, `utp_packet`, `utp_conn`, `lsd`, `ssdp`, `upnp_xml`, `natpmp`, `resume`, `socks5`, `http_connect`, `scrape`, `web_seed_head`; seeds live in `fuzz/seeds/<target>/`.
+Fuzzing needs nightly and `cargo install cargo-fuzz --locked`. Targets: `bencode`, `metainfo`, `wire_codec`, `handshake`, `http_announce`, `udp_announce`, `path`, `krpc`, `extension`, `mse`, `magnet`, `utp_packet`, `utp_conn`, `lsd`, `ssdp`, `upnp_xml`, `natpmp`, `resume`, `socks5`, `http_connect`, `scrape`, `web_seed_head`, `hash_proof`, `http_range`; seeds live in `fuzz/seeds/<target>/`.
 
 ```
 mkdir -p fuzz/corpus/<target>

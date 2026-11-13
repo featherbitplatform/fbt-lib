@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 fbt = { path = "../fbt" }
+fbt-api = { path = "../fbt-api" }
 fbt-net = { path = "../fbt-net" }
 fbt-bencode = { path = "../fbt-bencode" }
 sha1.workspace = true

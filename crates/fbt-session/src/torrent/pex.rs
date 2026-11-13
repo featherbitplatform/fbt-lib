@@ -273,7 +273,7 @@ impl Actor {
         // (BEP 55), with the `HOLEPUNCH` flag the address came with.
         for (addr, flags) in &added {
             if !self.retries.is_never(addr)
-                && self.remember(*addr)
+                && self.remember(*addr, PeerSource::Pex)
                 && let Some(k) = self.known.get_mut(addr)
             {
                 if flags.contains(PexFlags::UTP) {
@@ -436,7 +436,14 @@ mod tests {
     #[test]
     fn incoming_peer_without_listen_port_is_not_shared() {
         let (tx, _rx) = mpsc::channel(1);
-        let mut p = Peer::new(addr(1), tx, 0, 0, Transport::Tcp);
+        let mut p = Peer::new(
+            addr(1),
+            tx,
+            0,
+            0,
+            Transport::Tcp,
+            crate::event::PeerSource::Tracker,
+        );
         assert_eq!(connectable_addr(&p), None);
         p.listen_port = Some(7000);
         assert_eq!(
@@ -453,7 +460,14 @@ mod tests {
         let mut rxs = Vec::new();
         for i in 0..n {
             let (tx, rx) = mpsc::channel(8);
-            let mut p = Peer::new(addr(i), tx, a.generation, 1, Transport::Tcp);
+            let mut p = Peer::new(
+                addr(i),
+                tx,
+                a.generation,
+                1,
+                Transport::Tcp,
+                crate::event::PeerSource::Tracker,
+            );
             p.outgoing = true;
             p.connected = true;
             p.pex = Some(PexPeer::default());
@@ -503,10 +517,10 @@ mod tests {
             .collect();
         assert_eq!(blocked, vec![(bad, BlockReason::IpFilter)]);
         // Never queued for dialling, even when asked directly.
-        a.queue_addr(bad);
-        a.queue_addr(good);
-        assert!(!a.candidates.contains(&bad));
-        assert!(a.candidates.contains(&good));
+        a.queue_addr(bad, crate::event::PeerSource::Tracker);
+        a.queue_addr(good, crate::event::PeerSource::Tracker);
+        assert!(!a.candidates.iter().any(|(c, _)| *c == bad));
+        assert!(a.candidates.iter().any(|(c, _)| *c == good));
     }
 
     #[tokio::test(start_paused = true)]
@@ -573,7 +587,14 @@ mod tests {
         a.pex_tick();
         assert!(a.next_pex_due.is_some());
         let (tx, mut rx) = mpsc::channel(8);
-        let mut p = Peer::new(addr(50), tx, a.generation, 1, Transport::Tcp);
+        let mut p = Peer::new(
+            addr(50),
+            tx,
+            a.generation,
+            1,
+            Transport::Tcp,
+            crate::event::PeerSource::Tracker,
+        );
         p.outgoing = true;
         p.connected = true;
         p.pex = Some(PexPeer::default());

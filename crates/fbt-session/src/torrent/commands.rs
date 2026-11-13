@@ -1,5 +1,6 @@
 //! Commands the torrent actor accepts, and the actions behind them.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use crate::peer::messages::PeerEvent;
 use crate::picker::PeerKey;
 use crate::resume::{self, ResumeError, ResumeRecord, ResumeState};
 use crate::session::{Priority, RemoveMode, release};
+use crate::status::FileStatus;
 use crate::storage::FileStamp;
 use crate::storage::cache::FlushReason;
 
@@ -97,9 +99,10 @@ impl Actor {
             Cmd::AddPeer(addr, tx) => {
                 if !self.refuse_blocked(addr)
                     && !self.retries.is_never(&addr)
-                    && self.remember(addr)
+                    && self.remember(addr, PeerSource::Manual)
                 {
-                    self.queue_addr(addr);
+                    let source = self.known_source(&addr);
+                    self.queue_addr(addr, source);
                     self.try_connect();
                 }
                 let _ = tx.send(());
@@ -250,6 +253,29 @@ impl Actor {
             }
             Cmd::WebSeeds(tx) => {
                 let _ = tx.send(self.web_seeds.urls());
+            }
+            Cmd::Files(tx) => {
+                let _ = tx.send(self.file_statuses());
+            }
+            Cmd::Peers(tx) => {
+                let now = Instant::now();
+                let peers = self
+                    .peers
+                    .values()
+                    .filter(|p| p.live())
+                    .map(|p| p.status(now))
+                    .collect();
+                let _ = tx.send(peers);
+            }
+            Cmd::Trackers(tx) => {
+                let now = Instant::now();
+                let trackers = self.announcer.as_ref().map_or_else(Vec::new, |a| {
+                    a.table
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .snapshot(now)
+                });
+                let _ = tx.send(trackers);
             }
         }
         Flow::Continue
@@ -676,6 +702,66 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// Every file of the torrent with its verified bytes (none while the
+    /// files are checked or a v2 torrent's layers are fetched);
+    /// [`SessionError::NoMetadata`] before a magnet's metadata.
+    fn file_statuses(&self) -> Result<Vec<FileStatus>, SessionError> {
+        let (meta, prio, renamed, have) = match (&self.loaded, &self.pending_layers) {
+            (Some(l), _) => (
+                &l.meta,
+                &l.file_prio[..],
+                l.renamed
+                    .iter()
+                    .map(|(i, p)| (*i, p))
+                    .collect::<BTreeMap<_, _>>(),
+                l.picker.as_ref().map(|p| p.have()),
+            ),
+            (None, Some(p)) => (
+                &p.meta,
+                &p.file_prio[..],
+                self.resume
+                    .iter()
+                    .flat_map(|r| r.renamed.iter().map(|(i, p)| (*i, p)))
+                    .collect(),
+                None,
+            ),
+            (None, None) => return Err(SessionError::NoMetadata),
+        };
+        let mut downloaded = vec![0u64; meta.info.files.len()];
+        if let Some(have) = have {
+            let layout = meta.piece_layout();
+            let files = meta.file_layout();
+            for piece in have.iter_ones() {
+                let off = layout.piece_offset(piece);
+                let len = u64::from(layout.piece_size(piece));
+                for slice in files.map(off, len) {
+                    if let Some(d) = downloaded.get_mut(slice.file) {
+                        *d = d.saturating_add(slice.len);
+                    }
+                }
+            }
+        }
+        Ok(meta
+            .info
+            .files
+            .iter()
+            .zip(downloaded)
+            .enumerate()
+            .map(|(index, (f, downloaded))| FileStatus {
+                index,
+                path: renamed
+                    .get(&index)
+                    .copied()
+                    .unwrap_or(&f.path)
+                    .to_path_buf(),
+                len: f.len,
+                pad: f.pad,
+                priority: prio.get(index).copied().unwrap_or_default(),
+                downloaded,
+            })
+            .collect())
     }
 }
 

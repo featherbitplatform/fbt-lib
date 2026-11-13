@@ -882,7 +882,7 @@ impl Actor {
             BanTarget::Addr(addr) => {
                 self.retries.never(addr);
                 self.known.remove(&addr);
-                self.candidates.retain(|a| *a != addr);
+                self.candidates.retain(|(a, _)| *a != addr);
             }
             BanTarget::Ip(ip) => self.retries.ban_metadata_ip(ip),
         }

@@ -16,6 +16,7 @@ on:
       - "crates/fbt-utp/**"
       - "crates/fbt-net/**"
       - "crates/fbt-session/**"
+      - "crates/fbt-api/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
@@ -63,6 +64,7 @@ jobs:
           - web_seed_head
           - resume
           - hash_proof
+          - http_range
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

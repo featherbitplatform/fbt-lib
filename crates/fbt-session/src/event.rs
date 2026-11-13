@@ -14,7 +14,7 @@ use crate::bans::BlockReason;
 use crate::peer::{DisconnectReason, Transport};
 use crate::status::TorrentState;
 
-/// Where a batch of peer addresses came from.
+/// Where a batch of peer addresses, or one peer connection, came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PeerSource {
@@ -28,6 +28,14 @@ pub enum PeerSource {
     Magnet,
     /// Local service discovery (BEP 14).
     Lsd,
+    /// The peer connected to us.
+    Incoming,
+    /// [`TorrentHandle::add_peer`](crate::TorrentHandle::add_peer).
+    Manual,
+    /// The resume data's peer list.
+    Resume,
+    /// A relay's BEP 55 `Connect`.
+    Holepunch,
 }
 
 /// Where an external address estimate came from.
