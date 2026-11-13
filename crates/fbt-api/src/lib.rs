@@ -26,6 +26,7 @@ mod auth;
 mod config;
 mod dto;
 mod error;
+mod ids;
 mod routes;
 mod server;
 

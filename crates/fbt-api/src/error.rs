@@ -98,7 +98,6 @@ impl ApiErrorResponse {
     }
 
     /// `404 not_found`.
-    #[allow(dead_code, reason = "used by the torrent routes")]
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
@@ -273,7 +272,6 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequestParts<S> for ApiQuery<T> {
 
 /// [`axum::extract::Path`] whose rejection is an [`ApiErrorResponse`].
 #[derive(Debug)]
-#[allow(dead_code, reason = "the request-taking routes use it")]
 pub(crate) struct ApiPath<T>(pub(crate) T);
 
 impl<T: DeserializeOwned + Send, S: Send + Sync> FromRequestParts<S> for ApiPath<T> {

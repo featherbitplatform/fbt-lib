@@ -37,6 +37,7 @@ use utoipa_axum::routes;
 use crate::config::ApiConfig;
 
 pub(crate) mod session;
+pub(crate) mod torrents;
 
 /// The state every handler gets (`State<AppState>`); cheap to clone.
 #[derive(Clone)]
@@ -101,6 +102,7 @@ event routes also take `?token=<token>`. Errors are \
     security(("bearerAuth" = [])),
     tags(
         (name = "session", description = "The session: status and settings."),
+        (name = "torrents", description = "Torrents: list, status, files, peers, trackers, pieces."),
         (name = "meta", description = "This document."),
     ),
 )]
@@ -127,6 +129,7 @@ impl Modify for BearerAddon {
 pub(crate) fn api_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(session::router())
+        .merge(torrents::router())
         .routes(routes!(openapi_json))
 }
 
