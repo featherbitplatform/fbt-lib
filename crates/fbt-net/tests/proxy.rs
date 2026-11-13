@@ -529,6 +529,61 @@ fn defaults_and_validation() {
     assert!(c.validate().is_err(), "port 0");
 }
 
+#[test]
+fn credential_lengths_are_validated() {
+    let mut c = ProxyConfig::default();
+    c.kind = ProxyKind::Socks5;
+    c.host = "127.0.0.1".into();
+    let long = "u".repeat(256);
+    let max = "u".repeat(255);
+    // SOCKS5 (RFC 1929): a username needs a password, each 1 to 255 bytes.
+    for (user, pass, ok) in [
+        (None, None, true),
+        (Some("a"), Some("b"), true),
+        (Some(max.as_str()), Some(max.as_str()), true),
+        (Some(""), Some("b"), false),
+        (Some("a"), None, false),
+        (Some("a"), Some(""), false),
+        (Some(long.as_str()), Some("b"), false),
+        (Some("a"), Some(long.as_str()), false),
+    ] {
+        c.username = user.map(String::from);
+        c.password = pass.map(String::from);
+        assert_eq!(c.validate().is_ok(), ok, "socks5 {user:?}/{pass:?}");
+    }
+    // HTTP Basic: no `:` in the username; an unset password is empty.
+    c.kind = ProxyKind::Http;
+    for (user, pass, ok) in [
+        (Some("a"), None, true),
+        (Some("a"), Some("b:c"), true),
+        (Some("a:b"), Some("c"), false),
+    ] {
+        c.username = user.map(String::from);
+        c.password = pass.map(String::from);
+        assert_eq!(c.validate().is_ok(), ok, "http {user:?}/{pass:?}");
+    }
+}
+
+#[tokio::test]
+async fn http_interim_responses_are_skipped() {
+    let echo = echo_server().await;
+    let proxy = FakeHttpProxy::start(HttpScript::Interim(2)).await;
+    let c = cfg(ProxyKind::Http, proxy.addr());
+    let mut s = connect_tcp(&c, ProxyTarget::Addr(echo), T).await.unwrap();
+    check_echo(&mut s).await;
+}
+
+#[tokio::test]
+async fn endless_interim_responses_are_capped() {
+    let proxy = FakeHttpProxy::start(HttpScript::Interim(u32::MAX)).await;
+    let c = cfg(ProxyKind::Http, proxy.addr());
+    let target = ProxyTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 9)));
+    let start = Instant::now();
+    let err = connect_tcp(&c, target, T).await.unwrap_err();
+    assert!(matches!(err, ProxyError::Protocol(_)), "{err:?}");
+    assert!(start.elapsed() < T);
+}
+
 #[tokio::test]
 async fn overlong_username_is_a_protocol_error() {
     let proxy = FakeSocks5::start(Script::RequireAuth("a".into(), "b".into())).await;

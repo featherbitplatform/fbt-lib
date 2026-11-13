@@ -24,6 +24,9 @@ pub enum Script {
     /// write, as if the target had already spoken: a client that reads past
     /// the head loses them.
     Trailer(Vec<u8>),
+    /// Tunnels like `Ok`, after this many `100 Continue` interim heads
+    /// (`u32::MAX`: interim heads without end).
+    Interim(u32),
 }
 
 pub struct FakeHttpProxy {
@@ -121,6 +124,11 @@ async fn serve(
                 )
                 .await?;
                 return Ok(());
+            }
+        }
+        Script::Interim(n) => {
+            for _ in 0..*n {
+                s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
             }
         }
         Script::Ok | Script::Trailer(_) => {}

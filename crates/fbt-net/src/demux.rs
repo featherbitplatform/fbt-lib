@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::proxy::{Socks5Udp, decode_udp, encode_udp};
 
@@ -101,7 +101,8 @@ struct Inner {
     handlers: Mutex<Handlers>,
     counters: Counters,
     closed: AtomicBool,
-    relay_lost: AtomicBool,
+    /// True once a relayed socket lost its association.
+    relay_lost: watch::Sender<bool>,
     stop: Arc<Notify>,
     /// Wakes the relay's control task at close (a second waiter, so it
     /// cannot take the receive task's permit).
@@ -117,7 +118,7 @@ impl Inner {
             handlers: Mutex::new(Handlers::default()),
             counters: Counters::default(),
             closed: AtomicBool::new(false),
-            relay_lost: AtomicBool::new(false),
+            relay_lost: watch::Sender::new(false),
             stop: Arc::new(Notify::new()),
             control_stop: Arc::new(Notify::new()),
         }
@@ -260,8 +261,9 @@ impl SharedUdpSocket {
     /// [`encode_udp`], and only datagrams from the relay that
     /// [`decode_udp`] accepts are dispatched, with the source they name;
     /// the rest count as [`DemuxStats::dropped`]. When the proxy closes the
-    /// control connection the socket stops, with a warning, and
-    /// [`DemuxStats::relay_lost`] turns true. Must run inside a tokio
+    /// control connection the socket stops and
+    /// [`DemuxStats::relay_lost`] (and [`relay_lost`](Self::relay_lost))
+    /// turns true. Must run inside a tokio
     /// runtime.
     pub fn bind_relayed(local: SocketAddr, assoc: Socks5Udp) -> io::Result<SharedUdpSocket> {
         let socket = Self::start(local, Some(assoc.relay()))?;
@@ -318,6 +320,14 @@ impl SharedUdpSocket {
         }
     }
 
+    /// Turns true when a relayed socket loses its SOCKS5 association (as
+    /// [`DemuxStats::relay_lost`]), once; never on a direct socket. The
+    /// receiver does not keep the socket alive: its `changed` fails once
+    /// the socket is gone.
+    pub fn relay_lost(&self) -> watch::Receiver<bool> {
+        self.inner.relay_lost.subscribe()
+    }
+
     /// Datagram counts so far.
     pub fn stats(&self) -> DemuxStats {
         let c = &self.inner.counters;
@@ -326,7 +336,7 @@ impl SharedUdpSocket {
             dht: c.dht.load(Ordering::Relaxed),
             tracker: c.tracker.load(Ordering::Relaxed),
             dropped: c.dropped.load(Ordering::Relaxed),
-            relay_lost: self.inner.relay_lost.load(Ordering::SeqCst),
+            relay_lost: *self.inner.relay_lost.borrow(),
         }
     }
 
@@ -383,12 +393,13 @@ async fn watch_relay(mut assoc: Socks5Udp, inner: Weak<Inner>, stop: Arc<Notify>
         () = stop.notified() => {}
         () = assoc.closed() => {
             if let Some(inner) = inner.upgrade() {
-                tracing::warn!(
+                // The session reports it (a warning and an event).
+                tracing::debug!(
                     relay = %assoc.relay(),
                     "the SOCKS5 proxy closed the UDP association; the relayed socket stopped"
                 );
-                inner.relay_lost.store(true, Ordering::SeqCst);
                 inner.stop();
+                inner.relay_lost.send_replace(true);
             }
         }
     }

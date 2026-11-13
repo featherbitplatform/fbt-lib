@@ -7,13 +7,20 @@ use tokio::net::TcpStream;
 
 use super::{ProxyConfig, ProxyError, ProxyTarget, base64};
 
-/// The longest `CONNECT` response head read, terminator included (8 KiB).
+/// The longest `CONNECT` response head read, terminator included (8 KiB);
+/// also the most read for all the heads of one response together, interim
+/// (`1xx`) ones included.
 pub const MAX_CONNECT_HEAD: usize = 8192;
+
+/// The most interim (`1xx`) heads skipped before the final one.
+const MAX_INTERIM: usize = 8;
 
 const TERMINATOR: &[u8] = b"\r\n\r\n";
 
 /// Sends `CONNECT` and reads the response head byte by byte, so no tunnel
-/// byte is consumed. A 2xx status leaves `s` as the tunnel.
+/// byte is consumed. A 2xx status leaves `s` as the tunnel. Interim `1xx`
+/// heads before it (`100 Continue`) are skipped: at most [`MAX_INTERIM`],
+/// all heads together within [`MAX_CONNECT_HEAD`] bytes.
 pub(super) async fn connect(
     s: &mut TcpStream,
     cfg: &ProxyConfig,
@@ -38,6 +45,9 @@ pub(super) async fn connect(
 
     let mut head = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
+    // Bytes of the interim heads already skipped.
+    let mut skipped = 0usize;
+    let mut interim = 0usize;
     loop {
         if s.read(&mut byte).await? == 0 {
             return Err(ProxyError::Io(io::Error::new(
@@ -46,14 +56,26 @@ pub(super) async fn connect(
             )));
         }
         head.extend_from_slice(&byte);
-        if !head.ends_with(TERMINATOR) && head.len() < MAX_CONNECT_HEAD {
+        let full = skipped + head.len() >= MAX_CONNECT_HEAD;
+        if !head.ends_with(TERMINATOR) && !full {
             continue;
         }
-        return match parse_connect_head(&head)? {
-            Some((status, _)) if (200..300).contains(&status) => Ok(()),
-            Some((status, _)) => Err(ProxyError::HttpStatus(status)),
-            None => Err(ProxyError::Protocol("CONNECT response head is incomplete")),
-        };
+        match parse_connect_head(&head)? {
+            Some((status, len)) if (100..200).contains(&status) => {
+                interim += 1;
+                skipped += len;
+                if interim > MAX_INTERIM || skipped >= MAX_CONNECT_HEAD {
+                    return Err(ProxyError::Protocol("too many interim CONNECT responses"));
+                }
+                head.clear();
+            }
+            Some((status, _)) if (200..300).contains(&status) => return Ok(()),
+            Some((status, _)) => return Err(ProxyError::HttpStatus(status)),
+            None if full => {
+                return Err(ProxyError::Protocol("CONNECT response head too long"));
+            }
+            None => return Err(ProxyError::Protocol("CONNECT response head is incomplete")),
+        }
     }
 }
 

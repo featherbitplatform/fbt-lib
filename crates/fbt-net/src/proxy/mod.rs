@@ -52,8 +52,15 @@ pub enum ProxyKind {
 ///   TCP connections only: UDP tracker host names and DHT bootstrap host names
 ///   are resolved locally. Local service discovery (LSD), UPnP and NAT-PMP
 ///   stay direct on the local network and are never proxied.
+/// - **No proxy-only mode.** Whatever the proxy cannot carry goes direct,
+///   from the host's own address: with an HTTP proxy the DHT (which names
+///   every torrent's info hash to other nodes) and incoming uTP (outgoing
+///   too, without `proxy_peers`); with any proxy LSD, UPnP and NAT-PMP. The
+///   session logs a warning for each one enabled; turn them off in its
+///   settings to keep all traffic on the proxy.
 ///
-/// `Debug` prints the password as `"***"`.
+/// `Debug` prints the password as `"***"`; serialising (the `serde`
+/// feature) writes it in clear text.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -112,7 +119,9 @@ impl fmt::Debug for ProxyConfig {
 
 impl ProxyConfig {
     /// Checks the fields a proxy needs: unless `kind` is [`ProxyKind::None`],
-    /// `host` is non-empty and `port` non-zero.
+    /// `host` is non-empty and `port` non-zero, and the credentials can be
+    /// sent: for SOCKS5 a `username` needs a `password`, each of 1 to 255
+    /// bytes (RFC 1929); for HTTP Basic the `username` has no `:`.
     pub fn validate(&self) -> Result<(), String> {
         if self.kind == ProxyKind::None {
             return Ok(());
@@ -123,7 +132,20 @@ impl ProxyConfig {
         if self.port == 0 {
             return Err("proxy port is 0".into());
         }
-        Ok(())
+        let Some(user) = &self.username else {
+            return Ok(());
+        };
+        let pass = self.password.as_deref().unwrap_or("");
+        match self.kind {
+            ProxyKind::Socks5 if !(1..=255).contains(&user.len()) => {
+                Err("SOCKS5 proxy username must be 1 to 255 bytes".into())
+            }
+            ProxyKind::Socks5 if !(1..=255).contains(&pass.len()) => {
+                Err("SOCKS5 proxy password must be 1 to 255 bytes".into())
+            }
+            ProxyKind::Http if user.contains(':') => Err("HTTP proxy username contains ':'".into()),
+            _ => Ok(()),
+        }
     }
 }
 
