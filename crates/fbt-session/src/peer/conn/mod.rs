@@ -398,6 +398,8 @@ pub(crate) fn wire_len(m: &fbt_wire::Message) -> u64 {
         M::Bitfield(b) => b.len(),
         M::Piece { data, .. } => data.len().saturating_add(8),
         M::Extended { payload, .. } => payload.len().saturating_add(1),
+        M::HashRequest(_) | M::HashReject(_) => 48,
+        M::Hashes { hashes, .. } => hashes.len().saturating_add(48),
         M::Unknown { payload, .. } => payload.len(),
     };
     (payload as u64).saturating_add(5)

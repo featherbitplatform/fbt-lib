@@ -36,6 +36,14 @@ impl Reserved {
     pub fn set_dht(&mut self) {
         self.0[7] |= 0x01;
     }
+    /// BEP 52 v2 / hybrid support (`reserved[7] & 0x10`).
+    pub fn supports_v2(&self) -> bool {
+        self.0[7] & 0x10 != 0
+    }
+    /// Advertises BEP 52 support.
+    pub fn set_v2(&mut self) {
+        self.0[7] |= 0x10;
+    }
 }
 
 /// A decoded handshake.

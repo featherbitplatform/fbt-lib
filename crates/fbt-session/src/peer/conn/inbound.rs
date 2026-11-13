@@ -143,6 +143,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
             Message::Extended { id, payload } => self.on_extended(id, &payload).await?,
             Message::KeepAlive | Message::Unknown { .. } => {}
+            // Routed in a later task; ignored until then.
+            Message::HashRequest(_) | Message::Hashes { .. } | Message::HashReject(_) => {}
         }
         Ok(())
     }
