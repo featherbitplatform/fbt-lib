@@ -553,10 +553,10 @@ async fn resume_rejects_garbage_and_mismatches() {
         err(&good[..good.len() / 2]),
         ResumeError::Bencode(_)
     ));
-    let v2 = edit(&good, |d| {
-        d.insert(b"fbt-resume-version".to_vec(), OwnedValue::Int(2));
+    let v3 = edit(&good, |d| {
+        d.insert(b"fbt-resume-version".to_vec(), OwnedValue::Int(3));
     });
-    assert!(matches!(err(&v2), ResumeError::Version(2)));
+    assert!(matches!(err(&v3), ResumeError::Version(3)));
     let (other, _) = make_torrent(&[("x", 1000)], 16_384);
     let swapped = edit(&good, |d| {
         let info = fbt_bencode::decode(other.raw_info())
@@ -922,4 +922,178 @@ async fn seed_limit_pause_needs_a_save() {
     assert!(wait_until(|| h.status().need_save_resume, T).await);
     assert!(!h.status().auto_managed);
     s.shutdown().await;
+}
+
+/// 32 KiB pieces for the v2 and hybrid torrents made by `create_torrent`
+/// over `write_v2_payload` (files of 100 000, 0 and 300 000 bytes: two
+/// piece layers).
+const V2_PIECE: u32 = 32_768;
+
+/// A session seeding `bytes` from the files below `dir`.
+async fn fs_seed(bytes: &[u8], dir: &Path) -> (Session, TorrentHandle) {
+    let m = Metainfo::from_bytes(bytes).unwrap();
+    let s = Session::new(settings()).await.unwrap();
+    let h = s
+        .add_torrent(AddTorrent::new(m, dir.to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    (s, h)
+}
+
+/// `bytes` (a `.torrent`) without its `piece layers`.
+fn without_layers(bytes: &[u8]) -> Vec<u8> {
+    edit(bytes, |d| {
+        assert!(d.remove(&b"piece layers"[..]).is_some());
+    })
+}
+
+/// A v2-only torrent fetched by magnet (its layers fetched from the seed)
+/// comes back from its resume data with them: no metadata or layer fetch,
+/// and its pieces trusted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_magnet_resume_skips_layer_fetch() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(seed_dir.path()),
+        fbt_metainfo::TorrentVersion::V2,
+        V2_PIECE,
+    );
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    assert_eq!(m.piece_layers.len(), 2);
+    let (seed, _sh) = fs_seed(&bytes, seed_dir.path()).await;
+    let s = Session::new(settings()).await.unwrap();
+    let mg = Magnet::from_info_hashes(m.info_hashes);
+    assert!(mg.info_hashes.v1.is_none());
+    let h = s
+        .add_torrent(AddTorrent::magnet(mg, leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    h.add_peer(seed.local_addr()).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    assert_eq!(h.piece_layers_known().await, 2);
+    h.pause().await.unwrap();
+    let data = h.save_resume_data().await.unwrap();
+    s.shutdown().await;
+    seed.shutdown().await;
+
+    // No peers this time: everything has to come from the resume data.
+    let s = Session::new(settings()).await.unwrap();
+    let p = AddTorrent::from_resume(&data).unwrap();
+    let TorrentSource::Metainfo(got) = &p.source else {
+        panic!("metainfo expected");
+    };
+    assert_eq!(got.piece_layers, m.piece_layers);
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(h.status().has_metadata);
+    assert_ne!(h.status().state, TorrentState::DownloadingMetadata);
+    assert!(trusted(&h).await);
+    assert!(h.pieces().await.unwrap().is_full());
+    assert_eq!(h.piece_layers_known().await, 2);
+    h.resume().await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    s.shutdown().await;
+}
+
+/// The layers a hybrid built from its verified data are saved, so a
+/// trusted resume (which verifies nothing) still holds them. Fetched by its
+/// `btmh`-only magnet, it comes back under both of its hashes: the `info`
+/// saved names the v1 hash the metadata revealed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_resume_keeps_built_layers() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(seed_dir.path()),
+        fbt_metainfo::TorrentVersion::Hybrid,
+        V2_PIECE,
+    );
+    let full = Metainfo::from_bytes(&bytes).unwrap();
+    let v1 = full.info_hashes.v1.expect("v1 hash");
+    let v2 = full.info_hashes.v2.expect("v2 hash");
+    let (seed, _sh) = fs_seed(&without_layers(&bytes), seed_dir.path()).await;
+    let s = Session::new(settings()).await.unwrap();
+    let h = s
+        .add_torrent(AddTorrent::magnet(
+            Magnet::from_info_hashes(InfoHashes::from_v2(v2)),
+            leech_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    h.add_peer(seed.local_addr()).await.unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    // The metadata exchange carries no layers: these were built.
+    assert!(h.metainfo().unwrap().piece_layers.is_empty());
+    assert_eq!(h.piece_layers_known().await, 2);
+    h.pause().await.unwrap();
+    let data = h.save_resume_data().await.unwrap();
+    s.shutdown().await;
+    seed.shutdown().await;
+
+    let s = Session::new(settings()).await.unwrap();
+    let p = AddTorrent::from_resume(&data).unwrap();
+    let TorrentSource::Metainfo(got) = &p.source else {
+        panic!("metainfo expected");
+    };
+    assert_eq!(got.piece_layers, full.piece_layers, "the built layers");
+    let h = s.add_torrent(p).await.unwrap();
+    assert!(trusted(&h).await);
+    assert_eq!(h.piece_layers_known().await, 2);
+    assert_eq!(h.info_hashes(), full.info_hashes);
+    for ih in [InfoHashes::from_v1(v1), InfoHashes::from_v2(v2)] {
+        assert!(s.torrent(&ih).is_some(), "{ih}");
+    }
+    s.shutdown().await;
+}
+
+/// A corrupted layer in resume data is dropped, not fatal: the v2-only
+/// torrent waits for it as one added without it, and fetches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bad_layer_in_resume_is_dropped() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(seed_dir.path()),
+        fbt_metainfo::TorrentVersion::V2,
+        V2_PIECE,
+    );
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let (s, h) = fs_seed(&bytes, seed_dir.path()).await;
+    let good = h.save_resume_data().await.unwrap();
+    s.shutdown().await;
+
+    let bad_root = *m.piece_layers.keys().next().unwrap();
+    let data = edit(&good, |d| {
+        let Some(OwnedValue::Dict(layers)) = d.get_mut(&b"piece-layers"[..]) else {
+            panic!("piece-layers expected");
+        };
+        let Some(OwnedValue::Bytes(layer)) = layers.get_mut(&bad_root[..]) else {
+            panic!("layer expected");
+        };
+        layer[0] ^= 1;
+    });
+    let p = AddTorrent::from_resume(&data).unwrap();
+    let TorrentSource::Metainfo(got) = &p.source else {
+        panic!("metainfo expected");
+    };
+    assert!(!got.piece_layers.contains_key(&bad_root));
+    assert_eq!(got.piece_layers.len(), 1);
+
+    let s = Session::new(settings()).await.unwrap();
+    let mut ev = s.subscribe(EventMask::ALL);
+    let h = s.add_torrent(p).await.unwrap();
+    // Held until the dropped layer is in, as one added without it.
+    let st = h.status();
+    assert!(!st.has_metadata);
+    assert_eq!(st.state, TorrentState::DownloadingMetadata);
+    let (seed, _sh) = fs_seed(&bytes, seed_dir.path()).await;
+    h.add_peer(seed.local_addr()).await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::MetadataReceived { .. }), T)
+        .await
+        .expect("MetadataReceived");
+    assert_eq!(h.metainfo().unwrap().piece_layers, m.piece_layers);
+    assert!(trusted(&h).await);
+    assert!(h.pieces().await.unwrap().is_full());
+    s.shutdown().await;
+    seed.shutdown().await;
 }

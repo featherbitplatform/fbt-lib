@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-13
+
+### Added
+
+- BitTorrent v2 and hybrid torrents (BEP 52): `fbt-core` gains Merkle trees (`merkle` module: `MerkleTree`, `piece_root`, `layer_root`, `leaf_hashes`, `file_tree_height`, `verify_hashes`); `fbt-metainfo` parses v2-only and hybrid `.torrent` files with their piece layers (`Metainfo::version`, `TorrentVersion`, `Metainfo::v2_piece`, `V2Piece`, `Metainfo::with_piece_layers`, `validate_layer`, `MetainfoError::InconsistentHybrid`, `MAX_PIECE_LAYER_HASHES`, `MAX_V2_PIECES`); a hybrid is checked for consistency between its halves; `fbt-session` verifies pieces by SHA-1, by Merkle root or by both, and builds the piece layers a hybrid lacks while it downloads ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-metainfo`: torrent creation: `CreateTorrent` (`new`, `version`, `piece_len`, `trackers`, `web_seeds`, `comment`, `created_by`, `creation_date`, `private`, `build` with a progress callback that can cancel), `CreateError`, `auto_piece_len` and `MAX_CREATE_FILES`, for v1, v2 and hybrid torrents; re-exported by `fbt`, with a creation doctest ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-wire`: the BEP 52 messages `HashRequest`, `Hashes` and `HashReject` (`MAX_HASH_REQUEST_LEN`) and `Reserved::supports_v2` and `Reserved::set_v2` ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-session`: a torrent is registered under every wire hash (a hybrid under both its v1 and truncated v2 hash) and a `btmh`-only (v2) magnet is accepted; `Session::torrent` also finds a torrent by any of its wire hashes ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-session`: hash serving: a seed answers hash requests from its piece layers (Merkle trees cached, serving jobs and pending requests capped); a v2-only torrent whose `.torrent` or magnet metadata lacks piece layers fetches them from v2 peers over hash requests, verified against each file's `pieces root` ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-session`: a hybrid torrent announces under both its info hashes: every tracker, the DHT and LSD run once per hash ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-session`: resume data version 2 stores v2 info hashes and piece layers (see Changed) ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-example`: `create PATH --out FILE [--format v1|v2|hybrid] [--piece-size BYTES] [--tracker URL] [--web-seed URL] [--private] [--comment TEXT]` ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- Fuzz target `hash_proof` (Merkle proof verification and hash messages), with seed corpora for the new wire messages ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- Interop scenarios `v2` and `hybrid` against qBittorrent-nox and Transmission: created torrents give the same hashes as qBittorrent's creator, v2 downloads and seeds both ways, a `btmh` magnet fetches its layers over hash requests ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+
+### Changed
+
+- `SessionError::V2OnlyUnsupported` is deprecated and no longer produced: v2 (`btmh`-only) magnets are accepted, `Session::torrent()` also finds a torrent by any of its wire hashes and a hybrid is registered under both hashes ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `MetainfoError::V2OnlyUnsupported` is deprecated and no longer produced ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `FileEntry` gains `pieces_root` (breaking for struct literals), `Metainfo::piece_layers` is new, and `Info.pieces` is empty for a v2-only torrent ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- The v2 reserved bit is set on the handshakes of torrents that have a v2 hash, and a connection made under a truncated v2 hash counts as v2 ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- A v2-only `.torrent` without piece layers starts in `DownloadingMetadata` (`has_metadata` false, `metainfo()` `None`) until its layers are fetched ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `Event::TrackerReply` gains `info_hash`, the hash the announce was made under (breaking for struct patterns without `..`); hybrids announce under both hashes ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt_session::storage::check_pieces` has a new signature: it takes the `Metainfo` and also returns the v2 roots of the pieces that passed ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- Resume data is version 2, which older builds cannot read: `info-hash` is optional, and the new keys are `info-hash2` and `piece-layers`; version 1 is still read ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt_wire::Message` gains three variants (`HashRequest`, `Hashes`, `HashReject`); match with a wildcard arm ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-example info` prints the wire hash (40 hex), `info hash v2:` when there is one, and `version:` ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- Created multi-file hybrids carry a tail pad after their last file, so their hashes match libtorrent 2.0 and qBittorrent 5.3 exactly (a single-file hybrid has no file list to hold one) ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `ResumeError::InfoHashMismatch` reads "the resume data's torrent does not match its info hash": it now covers `info-hash2` too ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- A v2 file tree is single-file only when its one top-level entry is a file whose key equals `name`; any other tree is a directory named `name` ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+- `fbt-metainfo`: a torrent without v1 `pieces` (v2-only) is refused with `MetainfoError::InvalidField` (`length`, "too many pieces") when it has more than `MAX_V2_PIECES` (4,194,304, equal to `MAX_PIECE_LAYER_HASHES`) pieces, both from a `.torrent` and from metadata fetched for a `btmh` magnet; `CreateTorrent::build` refuses such a v2-only torrent with the new `CreateError::TooManyPieces`. Before, a 154-byte v2 `.torrent` could claim 2^32 - 1 pieces and abort the process when the session sized its per-piece state ([#17](https://github.com/featherbitplatform/fbt-lib/pull/17))
+
 ## [0.5.0] - 2026-11-13
 
 ### Added
@@ -211,6 +243,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Security CI: semgrep, cargo-deny, grype and gitleaks (`.github/workflows/security.yml`, `dev/sast.sh`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 - Release workflow: tag check against the workspace version, CycloneDX SBOM and a GitHub release with the changelog section (`.github/workflows/release.yml`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 
+[0.6.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.6.0
 [0.5.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.5.0
 [0.4.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.4.0
 [0.3.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.3.0

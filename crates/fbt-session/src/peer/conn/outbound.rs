@@ -192,6 +192,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 }
             }
             PeerCommand::MetadataReady { layout, ext } => self.metadata_ready(layout, ext).await?,
+            PeerCommand::SendHashes { req, hashes } => {
+                self.send(Message::Hashes { req, hashes }).await?;
+            }
+            PeerCommand::RejectHashes(req) => self.send(Message::HashReject(req)).await?,
+            PeerCommand::RequestHashes(req) => self.send(Message::HashRequest(req)).await?,
             PeerCommand::SendMetadata(msg) => {
                 if let Some(m) = self.remote_ids.metadata(&msg) {
                     self.send(m).await?;

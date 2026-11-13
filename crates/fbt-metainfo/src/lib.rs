@@ -12,11 +12,14 @@
 )]
 
 mod collide;
+mod create;
 mod magnet;
 mod metainfo;
 mod path;
+mod v2;
 
 pub use collide::collides;
+pub use create::{CreateError, CreateTorrent, MAX_CREATE_FILES, auto_piece_len};
 pub use magnet::{
     MAX_MAGNET_LEN, MAX_MAGNET_PEERS, MAX_MAGNET_TRACKERS, MAX_SELECT_ENTRIES, MAX_SELECT_INDEX,
     Magnet, MagnetError,
@@ -27,3 +30,4 @@ pub use metainfo::{
 };
 
 pub use path::{PathError, RelPath, sanitize_component, sanitize_path};
+pub use v2::{MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES, TorrentVersion, V2Piece, validate_layer};

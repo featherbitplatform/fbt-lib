@@ -12,8 +12,10 @@ use fbt_metainfo::MAX_TRACKERS;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
-/// Tracker URLs in tiers with a cursor on the one to try next.
-#[derive(Debug)]
+/// Tracker URLs in tiers with a cursor on the one to try next. Cloned
+/// once per announced hash, so each hash walks the same shuffled order
+/// with its own cursor and failures.
+#[derive(Debug, Clone)]
 pub(crate) struct Tiers {
     tiers: Vec<Vec<String>>,
     tier: usize,

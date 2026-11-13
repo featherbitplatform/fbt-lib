@@ -17,6 +17,10 @@ use fbt::{
     PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
     StorageError, StreamError,
 };
+use fbt::{
+    CreateError, CreateTorrent, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES,
+    TorrentVersion, V2Piece, auto_piece_len, validate_layer,
+};
 
 fn names(
     _: Option<AddTorrent>,
@@ -58,6 +62,10 @@ fn names(
     _: Option<Settings>,
     _: Option<TorrentHandle>,
     _: Option<TorrentState>,
+    _: Option<CreateTorrent>,
+    _: Option<CreateError>,
+    _: Option<TorrentVersion>,
+    _: Option<V2Piece>,
     _: Option<TorrentStatus>,
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
@@ -102,6 +110,10 @@ fn peer_connected(e: &Event) -> Option<(std::net::SocketAddr, Transport, bool)> 
 fn surface_compiles() {
     let _: [&str; 3] = DEFAULT_DHT_BOOTSTRAP;
     let _: usize = MAX_METADATA_SIZE;
+    let _: [usize; 3] = [MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES];
+    let _: u32 = auto_piece_len(1);
+    let _: bool = validate_layer(&[0; 32], 1, 16384, &[]);
+    let _ = CreateTorrent::new("x").version(TorrentVersion::V1);
     let _ = [Transport::Tcp, Transport::Utp];
     let s = Settings::default();
     let _: [bool; 4] = [
@@ -168,6 +180,8 @@ async fn storage_methods(h: &TorrentHandle) {
         .move_storage(std::path::PathBuf::new(), MoveMode::default())
         .await;
     let _: Result<(), SessionError> = h.rename_file(0, "x").await;
+    // Hidden from the docs: a test hook, the piece layers the torrent holds.
+    let _: usize = h.piece_layers_known().await;
     let _: std::path::PathBuf = h.status().save_path;
     let _ = [
         SessionError::InvalidPath(String::new()),

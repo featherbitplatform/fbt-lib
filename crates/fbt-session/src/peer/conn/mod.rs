@@ -50,8 +50,10 @@ use state::Conn;
 const HANDSHAKE_LEN: u64 = 68;
 
 /// Command queue room beyond `max_incoming_requests`: every queued remote
-/// request may be answered by one command, plus control commands.
-const COMMAND_HEADROOM: usize = 64;
+/// request may be answered by one command, plus control commands and the
+/// answers to the torrent's 64 pending `hash request`s at most
+/// (`MAX_PENDING_HASH_REQUESTS`).
+const COMMAND_HEADROOM: usize = 128;
 
 /// Capacity of a peer task's command channel. A full queue closes the peer
 /// as stalled, so it must hold an answer for every request we accept.
@@ -84,7 +86,10 @@ fn max_frame(num_pieces: Option<u32>) -> u32 {
 #[derive(Debug, Clone)]
 pub(crate) struct PeerCtx {
     pub key: PeerKey,
+    /// The hash this connection runs under (v1, or the truncated v2).
     pub info_hash: [u8; 20],
+    /// The torrent's truncated v2 hash, when it has one.
+    pub v2_hash: Option<[u8; 20]>,
     pub our_id: PeerId,
     /// `None` while the metadata is pending.
     pub layout: Option<PieceLayout>,
@@ -269,7 +274,14 @@ async fn run_peer_until<S: AsyncRead + AsyncWrite + Unpin>(
 ) {
     let (reason, outstanding) = match handshake(&mut stream, remote, &ctx, deadline).await {
         Err(reason) => (reason, Vec::new()),
-        Ok(theirs) => {
+        Ok(mut theirs) => {
+            // As libtorrent does (`bt_peer_connection.cpp`), a connection
+            // under the truncated v2 hash speaks v2 whatever its reserved
+            // bit: libtorrent sets the bit only to offer a v1-hash
+            // connection the upgrade.
+            if ctx.v2_hash == Some(ctx.info_hash) {
+                theirs.reserved.set_v2();
+            }
             // Counted for mixed mode while connected (dropped with this
             // scope).
             let throttles = ctx
@@ -323,6 +335,11 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let mut reserved = Reserved::default();
     reserved.set_fast();
     reserved.set_extended();
+    // BEP 52, only for a torrent with a v2 hash: libtorrent drops an
+    // incoming plaintext handshake with the bit for a v1-only torrent.
+    if ctx.v2_hash.is_some() {
+        reserved.set_v2();
+    }
     if ctx.ext.dht_port.is_some() {
         reserved.set_dht();
     }
@@ -398,6 +415,8 @@ pub(crate) fn wire_len(m: &fbt_wire::Message) -> u64 {
         M::Bitfield(b) => b.len(),
         M::Piece { data, .. } => data.len().saturating_add(8),
         M::Extended { payload, .. } => payload.len().saturating_add(1),
+        M::HashRequest(_) | M::HashReject(_) => 48,
+        M::Hashes { hashes, .. } => hashes.len().saturating_add(48),
         M::Unknown { payload, .. } => payload.len(),
     };
     (payload as u64).saturating_add(5)

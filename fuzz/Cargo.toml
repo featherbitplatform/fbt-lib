@@ -183,3 +183,10 @@ path = "fuzz_targets/resume.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "hash_proof"
+path = "fuzz_targets/hash_proof.rs"
+test = false
+doc = false
+bench = false

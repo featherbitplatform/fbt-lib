@@ -1,9 +1,12 @@
 mod support;
 
 use fbt_bencode::{DictBuilder, OwnedValue};
-use fbt_metainfo::{Metainfo, MetainfoError};
+use fbt_core::merkle::piece_root;
+use fbt_core::{InfoHashV2, InfoHashes};
+use fbt_metainfo::{MAX_V2_PIECES, Metainfo, MetainfoError, TorrentVersion};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use support::*;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -86,19 +89,6 @@ fn ubuntu_like_parses() {
     let sha1: [u8; 20] = Sha1::digest(m.raw_info()).into();
     assert_eq!(m.info_hashes.v1.unwrap().0, sha1);
     assert_eq!(m.trackers.len(), 2);
-}
-
-#[test]
-fn v2_only_is_unsupported() {
-    let info = DictBuilder::new()
-        .insert(b"name", "v2")
-        .insert(b"meta version", 2i64)
-        .insert(b"piece length", 16_384i64)
-        .build();
-    assert_eq!(
-        Metainfo::from_bytes(&torrent(info, &[])).unwrap_err(),
-        MetainfoError::V2OnlyUnsupported
-    );
 }
 
 #[test]
@@ -514,6 +504,8 @@ fn regenerate_fixtures() {
         ("single", single_fixture()),
         ("multi", multi_fixture()),
         ("hybrid", hybrid_fixture()),
+        ("v2", v2_fixture()),
+        ("v2-single", v2_single_fixture()),
         ("ubuntu-like", ubuntu_like_fixture()),
     ] {
         std::fs::write(format!("{dir}/{name}.torrent"), bytes).unwrap();
@@ -561,4 +553,402 @@ fn case_variant_flood_ends_up_distinct() {
     keys.sort();
     keys.dedup();
     assert_eq!(keys.len(), 20_000, "every path ends up distinct");
+}
+
+// ---- BEP 52 ----
+
+fn f2_root() -> [u8; 32] {
+    v2_root(&v2_content(2, 70_000))
+}
+
+fn f2_layer() -> Vec<[u8; 32]> {
+    v2_layer(&v2_content(2, 70_000), 32_768)
+}
+
+fn invalid_layers(bytes: &[u8]) -> bool {
+    matches!(
+        Metainfo::from_bytes(bytes),
+        Err(MetainfoError::InvalidField {
+            field: "piece layers",
+            ..
+        })
+    )
+}
+
+#[test]
+fn v2_only_parses_with_synthetic_pads() {
+    let m = Metainfo::from_bytes(&fixture("v2.torrent")).unwrap();
+    assert_eq!(m.version(), TorrentVersion::V2);
+    assert!(m.info_hashes.v1.is_none());
+    let sha256: [u8; 32] = Sha256::digest(m.raw_info()).into();
+    assert_eq!(m.info_hashes.v2.unwrap().0, sha256);
+    let shape: Vec<(u64, bool)> = m.info.files.iter().map(|f| (f.len, f.pad)).collect();
+    assert_eq!(
+        shape,
+        vec![(20_000, false), (0, false), (12_768, true), (70_000, false)]
+    );
+    assert_eq!(m.info.files[2].path.to_string(), "v2t/.pad/12768");
+    assert!(m.info.pieces.is_empty());
+    assert_eq!(m.piece_layout().num_pieces(), 1 + 3);
+    assert_eq!(m.total_len(), 102_768);
+    assert_eq!(m.piece_layers.len(), 1);
+    assert_eq!(m.piece_layers[&f2_root()], f2_layer());
+    assert_eq!(m.piece_layers[&f2_root()].len(), 3);
+}
+
+#[test]
+fn v2_single_file() {
+    let m = Metainfo::from_bytes(&fixture("v2-single.torrent")).unwrap();
+    assert_eq!(m.version(), TorrentVersion::V2);
+    assert!(m.info.single_file);
+    assert_eq!(m.info.files.len(), 1);
+    assert_eq!(m.info.files[0].path.components(), ["v2-single.bin"]);
+    assert_eq!(
+        m.info.files[0].pieces_root,
+        Some(v2_root(&v2_content(0, 50_000)))
+    );
+    assert_eq!(m.piece_layout().num_pieces(), 2);
+    assert_eq!(m.piece_layers.len(), 1);
+}
+
+#[test]
+fn hybrid_parses_both_halves() {
+    let m = Metainfo::from_bytes(&fixture("hybrid.torrent")).unwrap();
+    assert_eq!(m.version(), TorrentVersion::Hybrid);
+    let sha1: [u8; 20] = Sha1::digest(m.raw_info()).into();
+    assert_eq!(m.info_hashes.v1.unwrap().0, sha1);
+    assert!(m.info_hashes.v2.is_some());
+    assert_eq!(m.info.pieces.len(), 4);
+    for f in &m.info.files {
+        assert_eq!(f.pieces_root.is_some(), !f.pad && f.len > 0, "{f:?}");
+    }
+    assert_eq!(m.info.files[3].pieces_root, Some(f2_root()));
+    let layer = f2_layer();
+    for (i, want) in layer.iter().enumerate() {
+        let v = m.v2_piece(1 + i as u32).unwrap();
+        assert_eq!(v.expected, Some(*want));
+    }
+    assert_eq!(m.piece_layers[&f2_root()], layer);
+}
+
+#[test]
+fn v2_piece_geometry() {
+    let m = Metainfo::from_bytes(&fixture("v2.torrent")).unwrap();
+    let p0 = m.v2_piece(0).unwrap();
+    let f0 = v2_content(0, 20_000);
+    assert_eq!(p0.file, 0);
+    assert_eq!(p0.expected, Some(p0.pieces_root));
+    assert_eq!((p0.leaves, p0.len, p0.index_in_file), (2, 20_000, 0));
+    assert_eq!(
+        p0.expected,
+        Some(piece_root(&f0[..p0.len as usize], p0.leaves as usize))
+    );
+
+    let f2 = v2_content(2, 70_000);
+    let lens = [32_768u32, 32_768, 4_464];
+    for (i, want_len) in lens.iter().enumerate() {
+        let v = m.v2_piece(1 + i as u32).unwrap();
+        assert_eq!(v.file, 3);
+        assert_eq!(v.pieces_root, f2_root());
+        assert_eq!((v.index_in_file, v.leaves, v.len), (i as u32, 2, *want_len));
+        let start = i * 32_768;
+        let data = &f2[start..start + *want_len as usize];
+        assert_eq!(v.expected, Some(piece_root(data, v.leaves as usize)));
+    }
+    assert_eq!(m.v2_piece(4), None);
+    for p in 0..m.piece_layout().num_pieces() {
+        let v = m.v2_piece(p).unwrap();
+        assert!(!m.info.files[v.file].pad && m.info.files[v.file].len > 0);
+    }
+}
+
+#[test]
+fn v1_has_no_v2_pieces() {
+    let m = Metainfo::from_bytes(&fixture("single.torrent")).unwrap();
+    assert_eq!(m.version(), TorrentVersion::V1);
+    assert_eq!(m.v2_piece(0), None);
+    assert!(m.info.files.iter().all(|f| f.pieces_root.is_none()));
+}
+
+#[test]
+fn missing_layer_is_allowed() {
+    for hybrid in [false, true] {
+        let m = Metainfo::from_bytes(&build_v2(&V2_FILES, 32_768, hybrid, false)).unwrap();
+        assert!(m.piece_layers.is_empty());
+        assert!(m.v2_piece(0).unwrap().expected.is_some());
+        for p in 1..4 {
+            assert_eq!(m.v2_piece(p).unwrap().expected, None);
+        }
+    }
+}
+
+#[test]
+fn bad_piece_layers_are_rejected() {
+    let (info, _) = v2_info_with(&V2_FILES, 32_768, None);
+    let good: Vec<u8> = f2_layer().concat();
+    let mut flipped = good.clone();
+    flipped[40] ^= 1;
+    let cases = [
+        good[..good.len() - 1].to_vec(),
+        good[..good.len() - 32].to_vec(),
+        flipped,
+    ];
+    for bad in cases {
+        let layers = DictBuilder::new().insert(&f2_root(), bad).build();
+        assert!(invalid_layers(&torrent(
+            info.clone(),
+            &[("piece layers", layers)]
+        )));
+    }
+    let not_dict = torrent(info, &[("piece layers", 1i64.into())]);
+    assert!(invalid_layers(&not_dict));
+}
+
+#[test]
+fn unknown_layers_are_ignored() {
+    let (info, _) = v2_info_with(&V2_FILES, 32_768, None);
+    let layers = DictBuilder::new().insert(&[9u8; 32], vec![0u8; 96]).build();
+    let m = Metainfo::from_bytes(&torrent(info, &[("piece layers", layers)])).unwrap();
+    assert!(m.piece_layers.is_empty());
+}
+
+fn simple_v2(tree: OwnedValue, piece_len: i64) -> Vec<u8> {
+    let info = DictBuilder::new()
+        .insert(b"name", "t")
+        .insert(b"piece length", piece_len)
+        .insert(b"meta version", 2i64)
+        .insert(b"file tree", tree)
+        .build();
+    torrent(info, &[])
+}
+
+fn leaf_node(attrs: OwnedValue) -> OwnedValue {
+    DictBuilder::new().insert(b"", attrs).build()
+}
+
+fn leaf_attrs(len: i64, root: &[u8]) -> OwnedValue {
+    DictBuilder::new()
+        .insert(b"length", len)
+        .insert(b"pieces root", root.to_vec())
+        .build()
+}
+
+fn tree_of(name: &str, node: OwnedValue) -> OwnedValue {
+    DictBuilder::new().insert(name.as_bytes(), node).build()
+}
+
+#[test]
+fn v2_rejects_bad_trees() {
+    let root = [7u8; 32];
+    let ok = || tree_of("a", leaf_node(leaf_attrs(100, &root)));
+    assert!(Metainfo::from_bytes(&simple_v2(ok(), 16_384)).is_ok());
+
+    // Nested past the bencode depth limit.
+    let mut deep = leaf_node(leaf_attrs(100, &root));
+    for _ in 0..80 {
+        deep = tree_of("d", deep);
+    }
+    assert!(matches!(
+        Metainfo::from_bytes(&simple_v2(tree_of("d", deep), 16_384)),
+        Err(MetainfoError::Bencode(_))
+    ));
+
+    let bad: Vec<(&str, OwnedValue, i64)> = vec![
+        (
+            "file with children",
+            tree_of(
+                "a",
+                DictBuilder::new()
+                    .insert(b"", leaf_attrs(100, &root))
+                    .insert(b"x", leaf_node(leaf_attrs(100, &root)))
+                    .build(),
+            ),
+            16_384,
+        ),
+        (
+            "31-byte root",
+            tree_of("a", leaf_node(leaf_attrs(100, &root[..31]))),
+            16_384,
+        ),
+        (
+            "root on an empty file",
+            tree_of("a", leaf_node(leaf_attrs(0, &root))),
+            16_384,
+        ),
+        (
+            "missing root",
+            tree_of(
+                "a",
+                leaf_node(DictBuilder::new().insert(b"length", 100i64).build()),
+            ),
+            16_384,
+        ),
+        ("piece length 16383", ok(), 16_383),
+        ("piece length 48 KiB", ok(), 49_152),
+        ("piece length 8 KiB", ok(), 8_192),
+        ("empty tree", OwnedValue::Dict(BTreeMap::new()), 16_384),
+        (
+            "empty directory",
+            tree_of("a", OwnedValue::Dict(BTreeMap::new())),
+            16_384,
+        ),
+        (
+            "unnamed top-level file",
+            leaf_node(leaf_attrs(100, &root)),
+            16_384,
+        ),
+        (
+            "only empty files",
+            tree_of(
+                "a",
+                leaf_node(DictBuilder::new().insert(b"length", 0i64).build()),
+            ),
+            16_384,
+        ),
+        ("node not a dict", tree_of("a", 5i64.into()), 16_384),
+    ];
+    for (what, tree, pl) in bad {
+        assert!(
+            Metainfo::from_bytes(&simple_v2(tree, pl)).is_err(),
+            "{what} must be rejected"
+        );
+    }
+}
+
+fn zero_pieces(total: u64, piece_len: u64) -> Vec<u8> {
+    vec![0u8; 20 * total.div_ceil(piece_len) as usize]
+}
+
+#[test]
+fn inconsistent_hybrid_is_rejected() {
+    // Swapped files.
+    let aligned: [V2File<'static>; 2] = [(&["a"], 32_768), (&["b"], 65_536)];
+    let pieces = zero_pieces(98_304, 32_768);
+    let ok = vec![file(32_768, &["a"]), file(65_536, &["b"])];
+    let (info, _) = v2_info_with(&aligned, 32_768, Some((ok, pieces.clone())));
+    assert!(Metainfo::from_bytes(&torrent(info, &[])).is_ok());
+
+    let swapped = vec![file(65_536, &["b"]), file(32_768, &["a"])];
+    let changed = vec![file(32_768, &["a"]), file(65_535, &["b"])];
+    for v1 in [swapped, changed] {
+        let (info, _) = v2_info_with(&aligned, 32_768, Some((v1, pieces.clone())));
+        assert_eq!(
+            Metainfo::from_bytes(&torrent(info, &[])).unwrap_err(),
+            MetainfoError::InconsistentHybrid
+        );
+    }
+
+    // A dropped pad leaves `b` unaligned.
+    let files: [V2File<'static>; 2] = [(&["a"], 20_000), (&["b"], 70_000)];
+    let dropped = vec![file(20_000, &["a"]), file(70_000, &["b"])];
+    let (info, _) = v2_info_with(&files, 32_768, Some((dropped, zero_pieces(90_000, 32_768))));
+    assert_eq!(
+        Metainfo::from_bytes(&torrent(info, &[])).unwrap_err(),
+        MetainfoError::InconsistentHybrid
+    );
+
+    // An extra v1 file, and a missing one.
+    let extra = vec![
+        file(32_768, &["a"]),
+        file(65_536, &["b"]),
+        file(32_768, &["c"]),
+    ];
+    let missing = vec![file(32_768, &["a"])];
+    for v1 in [extra, missing] {
+        let (info, _) = v2_info_with(&aligned, 32_768, Some((v1, zero_pieces(98_304, 32_768))));
+        assert_eq!(
+            Metainfo::from_bytes(&torrent(info, &[])).unwrap_err(),
+            MetainfoError::InconsistentHybrid
+        );
+    }
+}
+
+#[test]
+fn libtorrent_style_hybrid_parses() {
+    let (mut v1, _) = v1_padded(&V2_FILES, 32_768);
+    // v1: a, empty, .pad/12768, b, then a tail pad after b.
+    assert_eq!(v1.len(), 4);
+    v1.push(file_attr(28_304, &[".pad", "28304"], "p"));
+    let (info, layers) = v2_info_with(&V2_FILES, 32_768, Some((v1, zero_pieces(131_072, 32_768))));
+    let t = torrent(info, &[("piece layers", layers)]);
+    let m = Metainfo::from_bytes(&t).unwrap();
+    assert_eq!(m.version(), TorrentVersion::Hybrid);
+    assert_eq!(m.info.files.len(), 5);
+    assert!(m.info.files[4].pad);
+    assert_eq!(m.piece_layers.len(), 1);
+}
+
+#[test]
+fn v2_info_from_peers() {
+    let m = Metainfo::from_bytes(&fixture("v2.torrent")).unwrap();
+    let hashes = InfoHashes::from_v2(InfoHashV2(m.info_hashes.v2.unwrap().0));
+    let got = Metainfo::from_info_bytes(m.raw_info(), hashes, vec![]).unwrap();
+    assert_eq!(got.version(), TorrentVersion::V2);
+    assert!(got.piece_layers.is_empty());
+    assert_eq!(got.info.files, m.info.files);
+    assert_eq!(got.v2_piece(1).unwrap().expected, None);
+    assert_eq!(got.piece_layout().num_pieces(), 4);
+}
+
+#[test]
+fn with_piece_layers_keeps_valid_ones() {
+    let m = Metainfo::from_bytes(&build_v2(&V2_FILES, 32_768, false, false)).unwrap();
+    assert!(m.piece_layers.is_empty());
+    let f0_root = v2_root(&v2_content(0, 20_000));
+    let mut layers = BTreeMap::new();
+    layers.insert(f2_root(), f2_layer());
+    layers.insert(f0_root, vec![[1u8; 32]]);
+    layers.insert([9u8; 32], vec![[2u8; 32]; 3]);
+    let m = m.with_piece_layers(layers);
+    assert_eq!(m.piece_layers.len(), 1);
+    assert_eq!(m.piece_layers[&f2_root()], f2_layer());
+    assert_eq!(m.v2_piece(2).unwrap().expected, Some(f2_layer()[1]));
+
+    let m = m.with_piece_layers(BTreeMap::new());
+    assert_eq!(m.piece_layers.len(), 1);
+
+    let mut bad = f2_layer();
+    bad[0][0] ^= 1;
+    let fresh = Metainfo::from_bytes(&build_v2(&V2_FILES, 32_768, true, false)).unwrap();
+    let fresh = fresh.with_piece_layers(BTreeMap::from([(f2_root(), bad)]));
+    assert!(fresh.piece_layers.is_empty());
+}
+
+/// A v2-only torrent of one file of `pieces` 16 KiB pieces.
+fn v2_of_pieces(pieces: u64) -> Vec<u8> {
+    let len = i64::try_from(pieces * 16_384).unwrap();
+    simple_v2(tree_of("a", leaf_node(leaf_attrs(len, &[7u8; 32]))), 16_384)
+}
+
+#[test]
+fn v2_piece_count_is_capped() {
+    let too_many = MetainfoError::InvalidField {
+        field: "length",
+        reason: "too many pieces",
+    };
+    // The hostile torrent: about 150 bytes claiming 2^32 - 1 pieces.
+    let hostile = v2_of_pieces(u64::from(u32::MAX));
+    assert!(hostile.len() < 200, "{}", hostile.len());
+    assert_eq!(Metainfo::from_bytes(&hostile).unwrap_err(), too_many);
+
+    let cap = u64::try_from(MAX_V2_PIECES).unwrap();
+    let at_cap = Metainfo::from_bytes(&v2_of_pieces(cap)).unwrap();
+    assert_eq!(
+        at_cap.piece_layout().num_pieces(),
+        u32::try_from(cap).unwrap()
+    );
+    assert_eq!(
+        Metainfo::from_bytes(&v2_of_pieces(cap + 1)).unwrap_err(),
+        too_many
+    );
+
+    // The same refusal for metadata from peers.
+    let top = fbt_bencode::decode(&hostile).unwrap();
+    let info = top.as_dict().unwrap().get(b"info").unwrap();
+    let raw = fbt_bencode::encode(&info.to_owned_value());
+    let hashes = InfoHashes::from_v2(InfoHashV2::of(&raw));
+    assert_eq!(
+        Metainfo::from_info_bytes(&raw, hashes, vec![]).unwrap_err(),
+        too_many
+    );
 }

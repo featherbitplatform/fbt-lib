@@ -1,5 +1,7 @@
 use super::Storage;
+use fbt_core::merkle::piece_root;
 use fbt_core::{Bitfield, PieceLayout};
+use fbt_metainfo::{Metainfo, TorrentVersion};
 use sha1::{Digest, Sha1};
 use std::io;
 use std::ops::ControlFlow;
@@ -9,7 +11,71 @@ pub fn sha1_piece(data: &[u8]) -> [u8; 20] {
     Sha1::digest(data).into()
 }
 
-/// Reads every piece through `storage` and returns the ones matching `hashes`.
+/// What checking one piece found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PieceCheck {
+    /// Every hash the piece has passed.
+    pub ok: bool,
+    /// The piece's BEP 52 subtree root (v2 and hybrid torrents), computed
+    /// over the file's bytes in the piece only.
+    pub v2_root: Option<[u8; 32]>,
+}
+
+/// Checks `data`, the whole of piece `piece`, against every hash `meta`
+/// has for it.
+///
+/// - v1: SHA-1.
+/// - v2: the subtree root against the piece's expected hash (its layer
+///   entry, or `pieces root` for a one-piece file); a piece whose file's
+///   layer is missing fails.
+/// - Hybrid: SHA-1, and the subtree root as well when the expected hash is
+///   known. A piece failing SHA-1 is not hashed again.
+pub(crate) fn verify_piece(meta: &Metainfo, piece: u32, data: &[u8]) -> PieceCheck {
+    let sha1_ok = || meta.info.pieces.get(piece as usize) == Some(&sha1_piece(data));
+    let v2_root = || {
+        let v2 = meta.v2_piece(piece)?;
+        let bytes = data.get(..v2.len as usize)?;
+        Some((piece_root(bytes, v2.leaves as usize), v2.expected))
+    };
+    let fail = PieceCheck {
+        ok: false,
+        v2_root: None,
+    };
+    match meta.version() {
+        TorrentVersion::V2 => match v2_root() {
+            Some((root, expected)) => PieceCheck {
+                ok: expected == Some(root),
+                v2_root: Some(root),
+            },
+            None => fail,
+        },
+        TorrentVersion::Hybrid => {
+            if !sha1_ok() {
+                return fail;
+            }
+            match v2_root() {
+                Some((root, expected)) => PieceCheck {
+                    ok: expected.is_none_or(|e| e == root),
+                    v2_root: Some(root),
+                },
+                None => PieceCheck {
+                    ok: true,
+                    v2_root: None,
+                },
+            }
+        }
+        _ => PieceCheck {
+            ok: sha1_ok(),
+            v2_root: None,
+        },
+    }
+}
+
+/// Reads every piece through `storage` and returns the ones passing every
+/// hash `meta` has for them (see how pieces are verified for v1, v2 and
+/// hybrid torrents), with the BEP 52 subtree root of each passing piece
+/// of a v2 or hybrid torrent (`None` for the others; empty for a v1
+/// torrent).
 ///
 /// One piece-sized buffer is reused. A `NotFound` piece counts as missing; any
 /// other error propagates. `on_piece(i)` runs after each piece is processed;
@@ -18,19 +84,28 @@ pub fn sha1_piece(data: &[u8]) -> [u8; 20] {
 pub fn check_pieces(
     storage: &dyn Storage,
     layout: &PieceLayout,
-    hashes: &[[u8; 20]],
+    meta: &Metainfo,
     mut on_piece: impl FnMut(u32) -> ControlFlow<()>,
-) -> io::Result<Bitfield> {
+) -> io::Result<(Bitfield, Vec<Option<[u8; 32]>>)> {
     let n = layout.num_pieces();
     let mut have = Bitfield::new(n);
+    let mut roots = if meta.version() == TorrentVersion::V1 {
+        Vec::new()
+    } else {
+        vec![None; n as usize]
+    };
     let mut buf = vec![0u8; layout.piece_len() as usize];
     for i in 0..n {
         let size = layout.piece_size(i) as usize;
         if let Some(slice) = buf.get_mut(..size) {
             match storage.read(layout.piece_offset(i), slice) {
                 Ok(()) => {
-                    if hashes.get(i as usize) == Some(&sha1_piece(slice)) {
+                    let check = verify_piece(meta, i, slice);
+                    if check.ok {
                         have.set(i);
+                        if let Some(slot) = roots.get_mut(i as usize) {
+                            *slot = check.v2_root;
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -44,5 +119,5 @@ pub fn check_pieces(
             ));
         }
     }
-    Ok(have)
+    Ok((have, roots))
 }

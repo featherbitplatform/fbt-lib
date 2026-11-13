@@ -31,6 +31,13 @@
 //!
 //! Private torrents (BEP 27) announce to their trackers as any other; the
 //! actor keeps them off the DHT (see `dht`).
+//!
+//! A hybrid announces under both wire hashes of its registry key (see
+//! [`wire_hashes`]), the v1 hash then the truncated v2 hash, as libtorrent
+//! does: one task per hash, each with its own copy of the tiers, so the
+//! `started`/`stopped` pairs, intervals and backoff above hold per
+//! (tracker, hash). A hash that only the metadata revealed later is not
+//! announced. Scrapes use the torrent's wire hash only.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -47,7 +54,7 @@ use tracing::{debug, warn};
 
 use super::tiers::Tiers;
 use crate::event::Event;
-use crate::session::Shared;
+use crate::session::{Shared, wire_hashes};
 use crate::status::{TorrentState, TorrentStatus};
 
 /// Timeout of a `stopped` announce, and how long shutdown waits for it.
@@ -93,7 +100,8 @@ pub(super) struct Signals {
 /// The actor's side of a running announcer.
 #[derive(Debug)]
 pub(super) struct Announcer {
-    pub task: JoinHandle<()>,
+    /// One task per announced hash.
+    pub tasks: Vec<JoinHandle<()>>,
 }
 
 /// Everything an announcer task needs.
@@ -107,33 +115,41 @@ pub(super) struct Params {
     pub signals: watch::Receiver<Signals>,
 }
 
-/// Starts the announcer for a torrent; `None` if it has no tracker. Peers
+/// Starts the announcer for a torrent, one task per hash of
+/// [`wire_hashes`] of its registry key; `None` if it has no tracker. Peers
 /// from replies arrive on the returned receiver.
 pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAddr>>)> {
-    let client = p.shared.tracker.clone();
     let mut rng = rand::rng();
     let tiers = Tiers::new(p.trackers, &mut rng);
     if tiers.is_empty() {
         return None;
     }
+    let key = rng.random();
     let (peers_tx, peers_rx) = mpsc::channel(PEER_QUEUE);
-    let task = Task {
-        ih: p.ih,
-        info_hash: p.ih.wire_hash(),
-        key: rng.random(),
-        client,
-        tiers,
-        shared: p.shared,
-        status: p.status,
-        signals: p.signals,
-        peers: peers_tx,
-        tracker_ids: HashMap::new(),
-        failed_walks: 0,
-        scrapes_seen: 0,
-        scrape: None,
-    };
-    let task = tokio::spawn(task.run());
-    Some((Announcer { task }, peers_rx))
+    let scrape_hash = p.ih.wire_hash();
+    let tasks = wire_hashes(&p.ih)
+        .into_iter()
+        .map(|info_hash| {
+            let task = Task {
+                ih: p.ih,
+                info_hash,
+                scrapes: info_hash == scrape_hash,
+                key,
+                client: p.shared.tracker.clone(),
+                tiers: tiers.clone(),
+                shared: Arc::clone(&p.shared),
+                status: p.status.clone(),
+                signals: p.signals.clone(),
+                peers: peers_tx.clone(),
+                tracker_ids: HashMap::new(),
+                failed_walks: 0,
+                scrapes_seen: 0,
+                scrape: None,
+            };
+            tokio::spawn(task.run())
+        })
+        .collect();
+    Some((Announcer { tasks }, peers_rx))
 }
 
 /// How a walk through the tiers ended.
@@ -153,9 +169,14 @@ enum Interrupt {
     Closed,
 }
 
+/// The announces of one hash of the torrent.
 struct Task {
     ih: InfoHashes,
+    /// The hash this task announces.
     info_hash: [u8; 20],
+    /// This task serves scrape requests: the one announcing the torrent's
+    /// wire hash.
+    scrapes: bool,
     key: u32,
     client: TrackerClient,
     tiers: Tiers,
@@ -255,7 +276,7 @@ impl Task {
         let mut completed_sent = false;
         loop {
             let sig = self.signals.borrow_and_update().clone();
-            if !sig.exit && sig.scrapes != self.scrapes_seen {
+            if self.scrapes && !sig.exit && sig.scrapes != self.scrapes_seen {
                 self.scrapes_seen = sig.scrapes;
                 let urls = self.tiers.firsts();
                 self.scrape = Some(start_scrape(
@@ -416,7 +437,7 @@ impl Task {
                     if now.exit || now.running != before.running || now.starts != before.starts {
                         return Err(Interrupt::Lifecycle);
                     }
-                    if now.scrapes != self.scrapes_seen {
+                    if self.scrapes && now.scrapes != self.scrapes_seen {
                         self.scrapes_seen = now.scrapes;
                         self.scrape = Some(start_scrape(
                             &self.client,
@@ -494,6 +515,7 @@ impl Task {
             match r {
                 Ok(resp) => self.shared.emit(Event::TrackerReply {
                     torrent: self.ih,
+                    info_hash: self.info_hash,
                     url,
                     peers: resp.peers.len(),
                 }),
@@ -635,6 +657,7 @@ async fn walk(
                 }
                 shared.emit(Event::TrackerReply {
                     torrent: ih,
+                    info_hash: req.info_hash,
                     url: url.clone(),
                     peers: resp.peers.len(),
                 });

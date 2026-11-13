@@ -9,7 +9,9 @@ use fbt_core::InfoHashes;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum TorrentState {
-    /// A magnet torrent is fetching its metadata from peers.
+    /// A magnet torrent is fetching its metadata from peers, or a v2-only
+    /// torrent the piece layers it lacks (BEP 52 `hash request`s to peers
+    /// that set the v2 bit).
     DownloadingMetadata,
     /// Waiting for one of the session's
     /// [`max_active_checks`](crate::Settings::max_active_checks) slots to
@@ -48,7 +50,8 @@ pub struct TorrentStatus {
     /// The torrent's name; for a magnet without metadata, its `dn` (or
     /// empty).
     pub name: String,
-    /// The metadata is known (always for a `.torrent`; for a magnet once
+    /// The metadata is known (for a `.torrent` at once, unless it is a v2
+    /// one lacking piece layers; for a magnet, and such a `.torrent`, once
     /// [`Event::MetadataReceived`](crate::Event::MetadataReceived) is out).
     pub has_metadata: bool,
     /// Current state.

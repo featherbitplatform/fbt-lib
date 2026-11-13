@@ -99,6 +99,56 @@
   http://tracker:6969/announce: ...` line (the CLI prints every
   `Event::TrackerReply`). opentracker is not consulted: its `/stats` modes
   report counts, not peer addresses.
+- **BitTorrent v2:** qBittorrent creates a v2 torrent of a fresh 3-file
+  payload (`payload-v2/v2data`, files chmod 0644) with its WebUI torrent
+  creator: `POST torrentcreator/addTask` with `sourcePath`, `format=v2`,
+  `pieceSize=262144`, `trackers` (split on `|` by the WebUI; one URL here)
+  and `startSeeding=true` returns a `taskID`; `run.sh` polls
+  `torrentcreator/status?taskID=` until `Finished`, saves
+  `torrentcreator/torrentFile?taskID=` and calls `deleteTask`. qBittorrent
+  seeds it from the payload's parent directory. Then:
+  1. `fbt-example download` of qBittorrent's `.torrent` (port 6903) must
+     match the payload and connect to qBittorrent.
+  2. `fbt-example create --format v2 --piece-size 262144` of the same
+     directory must print the `info hash v2` qBittorrent reports as
+     `infohash_v2` in `torrents/info` (a hard check: file tree, ordering and
+     encoding). The payload is mode 0644 and fbt creates from the same
+     directory (its final name is the `name`), because libtorrent records
+     executable and hidden files as `attr` `x`/`h`, which our creator never
+     writes.
+  3. `fbt-example download "magnet:?xt=urn:btmh:1220<infohash_v2>&tr=..."`
+     (port 6904, a `btmh`-only magnet) from qBittorrent's seed: metadata,
+     then the piece layers over BEP 52 hash requests.
+  4. fbt seeds its own v2 torrent of a 12-file payload (`payload-v2own`,
+     port 6905) and qBittorrent downloads it (`torrents/add` plus
+     `addPeers`).
+  5. qBittorrent drops fbt's torrent (keeping the files) and adds it again
+     by `btmh` magnet into a fresh save path; fbt's seed is its only source,
+     so it must fetch the twelve files' piece layers from our hash serving.
+     The seed runs with `RUST_LOG=info,fbt_session::torrent::layers=debug`
+     and `run.sh` logs how many hash requests it rejected over its serving
+     cap (8 per torrent, `hash request over the serving caps`). Measured: 0.
+     libtorrent keeps at most 2 hash requests outstanding per peer, so a
+     single qBittorrent never reaches the cap.
+
+  The magnet download (3) runs before fbt's seed starts, and that seed and
+  the hybrid one run for 1200 s (`--seed-for`; `stop_seed` ends them), more
+  than all the waits of the legs they serve, so a slow runner cannot outlast
+  them.
+- **Hybrid:** qBittorrent creates (`format=hybrid`) and seeds a hybrid of a
+  fresh payload; `fbt-example download` (port 6906) fetches it.
+  `fbt-example create --format hybrid` of the same directory prints both
+  hashes, which must equal qBittorrent's `infohash_v1` and `infohash_v2`
+  (a hard check: the v1 file list with libtorrent's pads, `.pad/<n>` with
+  `attr` `p` before each unaligned file and after the last one, and the v2
+  tree). fbt then seeds its own hybrid (port 6907); qBittorrent and
+  Transmission both download it, and the seed's log must show each
+  connecting. Transmission 4.1 takes the hybrid (as v1) and writes its pad
+  files to disk under `.pad/`; the data comparison leaves `.pad/` out.
+  qBittorrent names a hybrid by its truncated v2 hash (its `hash` in
+  `torrents/info`), Transmission by the v1 hash, so `run.sh` looks each
+  up by its own (`qbt_id`, `info_hash`). Both drop fbt's hybrid at the
+  end.
 
 Every `fbt-example` run passes `--dht-bootstrap dht-node:6881`. On success it
 prints `interop: download OK (qbittorrent, transmission)`,
@@ -108,7 +158,8 @@ prints `interop: download OK (qbittorrent, transmission)`,
 `interop: uTP download OK (qbittorrent)`, `interop: uTP seed OK (qbittorrent)`,
 `interop: stream with seeks OK (qbittorrent)`, `interop: LSD OK`,
 `interop: resume without recheck OK (qbittorrent)`,
-`interop: web seed OK (nginx)` and `interop: SOCKS5 proxy OK (qbittorrent)`,
+`interop: web seed OK (nginx)`, `interop: SOCKS5 proxy OK (qbittorrent)`,
+`interop: v2 OK (qbittorrent)` and `interop: hybrid OK (qbittorrent, transmission)`,
 and exits 0. It also prints how long the DHT took to
 join and the total time. CI runs it as the `interop` job (65-minute timeout).
 
@@ -139,7 +190,7 @@ outcome.
 | `transmission` | Transmission daemon, `transmission/settings.json` | peers 51413, RPC 9091 |
 | `dht-node` | `fbt-example dht-node` (same image as `fbt`): the private DHT's bootstrap node | DHT 6881 UDP |
 | `dht-helper-1` to `dht-helper-11` | the same, bootstrapped from `dht-node:6881`; one container (and address) each | DHT 6881 UDP |
-| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe, then the stream scenario), 6900 (resume), 6901 (web seed), 6902 (SOCKS5 proxy) |
+| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe, then the stream scenario), 6900 (resume), 6901 (web seed), 6902 (SOCKS5 proxy), 6903 (v2 download), 6904 (btmh magnet), 6905 (v2 seed), 6906 (hybrid download), 6907 (hybrid seed) |
 | `fbt-lsd` | the same image, idle like `fbt`; on `swarm` and `lan` | 6897 (LSD seed), 6899 (LSD probe) |
 | `fbt-mcast-route`, `fbt-lsd-mcast-route` | one-shot, in the network namespace of `fbt` / `fbt-lsd`: routes 224.0.0.0/4 out of the `lan` interface | none |
 | `socks5` | Dante (`danted`) built by `socks5/Dockerfile`, `socks5/danted.conf`: no authentication, CONNECT and UDP ASSOCIATE | SOCKS5 1080 |
@@ -266,7 +317,7 @@ example `RUST_LOG=debug`) to raise `fbt-example`'s log level.
 
 To chase one scenario, `INTEROP_ONLY` takes a comma-separated list of
 `download`, `seed`, `encryption`, `magnet`, `pex`, `utp`, `lsd`, `stream`,
-`resume`, `webseed` and `proxy`;
+`resume`, `webseed`, `proxy`, `v2` and `hybrid`;
 an unknown name fails at once with `interop: unknown scenario '<name>' (known:
 ...)`, before the setup. The shared setup and the uTP scenarios always run,
 the others only when named. A partial run ends with `interop: selected

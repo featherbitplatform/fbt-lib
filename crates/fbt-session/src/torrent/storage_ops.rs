@@ -117,7 +117,11 @@ impl Actor {
         if self.loaded.is_none() {
             // A magnet without metadata has no files yet: only the place
             // they will be created at changes.
-            let custom = self.magnet.as_ref().is_some_and(|m| m.storage.is_some());
+            let custom = self.magnet.as_ref().is_some_and(|m| m.storage.is_some())
+                || self
+                    .pending_layers
+                    .as_ref()
+                    .is_some_and(|p| p.storage.is_some());
             if custom {
                 self.move_failed(SessionError::Unsupported, tx);
                 return;

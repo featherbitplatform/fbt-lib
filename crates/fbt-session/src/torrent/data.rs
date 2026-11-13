@@ -7,13 +7,16 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use fbt_core::merkle::MerkleTree;
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef};
 use fbt_metainfo::{Metainfo, MetainfoError};
+use fbt_wire::HashRequest;
 use tokio::time::Instant;
 use tracing::debug;
 
 use super::ReaderId;
 use super::actor::{Actor, Phase};
+use super::layers::ServeError;
 use super::readers::Answer;
 use super::smartban::BlockSource;
 use super::swarm::BanTarget;
@@ -22,7 +25,7 @@ use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
 use crate::storage::cache::FlushReason;
-use crate::storage::sha1_piece;
+use crate::storage::{PieceCheck, sha1_piece, verify_piece};
 
 /// Result of a blocking job, fed back into the actor loop.
 #[derive(Debug)]
@@ -33,10 +36,11 @@ pub(crate) enum Job {
         seq: u64,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     },
-    /// `check_pieces` finished.
+    /// `check_pieces` finished: the pieces found, and the v2 subtree root
+    /// of each passing piece (empty for v1 torrents).
     Checked {
         generation: u64,
-        result: io::Result<Bitfield>,
+        result: io::Result<(Bitfield, Vec<Option<[u8; 32]>>)>,
     },
     /// Resume data's stamps were compared: its pieces when trusted.
     ResumeChecked {
@@ -48,6 +52,8 @@ pub(crate) enum Job {
         generation: u64,
         piece: u32,
         ok: bool,
+        /// The piece's v2 subtree root (v2 and hybrid torrents).
+        v2_root: Option<[u8; 32]>,
         data: Vec<u8>,
         /// The SHA-1 of each block, for smart ban: computed when the piece
         /// fails, or passes while an earlier failure of it is on record.
@@ -96,6 +102,14 @@ pub(crate) enum Job {
         tx: Answer,
         result: io::Result<Vec<u8>>,
     },
+    /// A peer's `hash request` was served from the layers.
+    HashesServed {
+        key: PeerKey,
+        req: HashRequest,
+        result: Result<Vec<u8>, ServeError>,
+        /// The file's tree, when this job built it (for the cache).
+        built: Option<Arc<MerkleTree>>,
+    },
     /// The storage operation (move or rename) returned.
     StorageOp { result: io::Result<()> },
     /// A web seed's request for `blocks`, issued under `generation`,
@@ -115,25 +129,46 @@ impl Actor {
         match job {
             Job::CheckSlot { seq, permit } => self.on_check_slot(seq, permit),
             Job::Checked { generation, result } => {
-                if generation == self.generation {
-                    // What the check found may differ from any saved data.
-                    self.need_save_resume = true;
+                if generation != self.generation {
+                    return;
                 }
+                // What the check found may differ from any saved data.
+                self.need_save_resume = true;
+                let result = result.map(|(have, roots)| {
+                    for (i, root) in (0u32..).zip(roots) {
+                        self.on_piece_root(i, root);
+                    }
+                    have
+                });
                 self.on_checked(generation, result);
+                let finished = self
+                    .loaded
+                    .as_ref()
+                    .and_then(|l| l.picker.as_ref())
+                    .is_some_and(crate::picker::PiecePicker::is_finished);
+                self.swap_layers(finished);
             }
             Job::ResumeChecked {
                 generation,
                 trusted,
             } => self.on_resume_checked(generation, trusted),
+            Job::HashesServed {
+                key,
+                req,
+                result,
+                built,
+            } => self.on_hashes_served(key, req, result, built),
             Job::Hashed {
                 generation,
                 piece,
                 ok,
+                v2_root,
                 data,
                 block_hashes,
             } => {
                 self.hashing = self.hashing.saturating_sub(1);
-                self.on_hashed(generation, piece, ok, data, block_hashes);
+                let check = PieceCheck { ok, v2_root };
+                self.on_hashed(generation, piece, check, data, block_hashes);
             }
             Job::WroteRun {
                 generation,
@@ -286,7 +321,7 @@ impl Actor {
         let wants_blocks = self.smartban.wants_block_hashes(piece);
         self.hashing = self.hashing.saturating_add(1);
         self.jobs.spawn_blocking(move || {
-            let ok = meta.info.pieces.get(piece as usize) == Some(&sha1_piece(&data));
+            let PieceCheck { ok, v2_root } = verify_piece(&meta, piece, &data);
             let block_hashes = (!ok || wants_blocks).then(|| {
                 data.chunks(BLOCK_SIZE as usize)
                     .map(sha1_piece)
@@ -296,6 +331,7 @@ impl Actor {
                 generation,
                 piece,
                 ok,
+                v2_root,
                 data,
                 block_hashes,
             }
@@ -306,7 +342,7 @@ impl Actor {
         &mut self,
         generation: u64,
         piece: u32,
-        ok: bool,
+        check: PieceCheck,
         data: Vec<u8>,
         block_hashes: Option<Vec<[u8; 20]>>,
     ) {
@@ -316,7 +352,7 @@ impl Actor {
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
-        if !ok {
+        if !check.ok {
             debug!(torrent = %l.meta.info.name, piece, "piece failed its hash check");
             if let Some(picker) = l.picker.as_mut() {
                 picker.piece_failed(piece);
@@ -354,6 +390,8 @@ impl Actor {
         picker.piece_passed(piece);
         self.lost_pieces.remove(&piece);
         let finished = picker.is_finished();
+        self.on_piece_root(piece, check.v2_root);
+        self.swap_layers(finished);
         self.emit(Event::PieceFinished {
             torrent: self.ih,
             piece,

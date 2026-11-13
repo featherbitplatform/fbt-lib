@@ -721,3 +721,109 @@ fn web_seed_flag_downloads() {
     );
     drop(server);
 }
+
+/// The value of the first `<key>: ` line of `stdout`.
+fn field<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}: ");
+    stdout.lines().find_map(|l| l.strip_prefix(prefix.as_str()))
+}
+
+#[test]
+fn create_then_info_round_trip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("payload");
+    std::fs::create_dir_all(data.join("sub")).expect("mkdir");
+    std::fs::write(data.join("a.bin"), vec![7u8; 40_000]).expect("write");
+    std::fs::write(data.join("sub/b.bin"), vec![9u8; 70_000]).expect("write");
+    for (format, has_v1, has_v2) in [
+        ("v1", true, false),
+        ("v2", false, true),
+        ("hybrid", true, true),
+    ] {
+        let out_file = tmp.path().join(format!("{format}.torrent"));
+        let created = Command::new(BIN)
+            .arg("create")
+            .arg(&data)
+            .arg("--out")
+            .arg(&out_file)
+            .args(["--format", format, "--piece-size", "32768"])
+            .args(["--tracker", "http://tracker.invalid/announce"])
+            .args(["--comment", "round trip"])
+            .output()
+            .expect("run create");
+        assert!(created.status.success(), "{created:?}");
+        let created_out = String::from_utf8_lossy(&created.stdout);
+        assert_eq!(
+            field(&created_out, "created"),
+            Some(out_file.to_string_lossy().as_ref()),
+            "{created_out}"
+        );
+
+        let m = Metainfo::from_bytes(&std::fs::read(&out_file).expect("read")).expect("parse");
+        assert_eq!(m.info_hashes.v1.is_some(), has_v1, "{format}");
+        assert_eq!(m.info_hashes.v2.is_some(), has_v2, "{format}");
+        assert_eq!(
+            m.trackers,
+            vec![vec!["http://tracker.invalid/announce".to_owned()]]
+        );
+
+        let info = Command::new(BIN)
+            .arg("info")
+            .arg(&out_file)
+            .output()
+            .expect("run info");
+        assert!(info.status.success(), "{info:?}");
+        let stdout = String::from_utf8_lossy(&info.stdout);
+        assert_eq!(field(&stdout, "version"), Some(format), "{stdout}");
+        let wire = field(&stdout, "info hash").expect("info hash line");
+        assert_eq!(wire.len(), 40, "{stdout}");
+        assert!(wire.bytes().all(|b| b.is_ascii_hexdigit()), "{stdout}");
+        if let Some(v1) = m.info_hashes.v1 {
+            assert_eq!(wire, v1.to_string(), "{stdout}");
+        }
+        match m.info_hashes.v2 {
+            Some(v2) => {
+                let v2 = v2.to_string();
+                assert_eq!(
+                    field(&stdout, "info hash v2"),
+                    Some(v2.as_str()),
+                    "{stdout}"
+                );
+                if !has_v1 {
+                    // A v2-only torrent's wire hash is its truncated v2 hash.
+                    assert_eq!(wire, &v2[..40], "{stdout}");
+                }
+            }
+            None => assert_eq!(field(&stdout, "info hash v2"), None, "{stdout}"),
+        }
+        // 110 000 bytes in 32 KiB pieces: 4 pieces for v1 (one stream), 2 + 3
+        // for v2 and hybrid (pieces never span files).
+        let pieces = if has_v2 { 5 } else { 4 };
+        assert!(
+            stdout.contains(&format!("pieces: {pieces} x 32.0 KiB")),
+            "{format}: {stdout}"
+        );
+        // `create` prints the same hash lines as `info`.
+        for key in ["info hash", "info hash v2", "version"] {
+            assert_eq!(field(&created_out, key), field(&stdout, key), "{key}");
+        }
+    }
+}
+
+#[test]
+fn create_bad_piece_size_is_a_clean_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("f.bin"), b"data").expect("write");
+    let out = Command::new(BIN)
+        .arg("create")
+        .arg(tmp.path().join("f.bin"))
+        .arg("--out")
+        .arg(tmp.path().join("f.torrent"))
+        .args(["--piece-size", "1000"])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid piece length 1000"), "{stderr}");
+    assert!(!tmp.path().join("f.torrent").exists());
+}

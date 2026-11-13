@@ -1,6 +1,6 @@
-//! v1 and hybrid `.torrent` parsing. The input is untrusted.
+//! v1, v2 and hybrid `.torrent` parsing. The input is untrusted.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use fbt_bencode::{DecodeError, Dict, Limits, Value, decode_with};
 use fbt_core::{FileLayout, InfoHashV1, InfoHashV2, InfoHashes, PieceLayout};
@@ -8,6 +8,10 @@ use fbt_core::{FileLayout, InfoHashV1, InfoHashV2, InfoHashes, PieceLayout};
 use crate::collide::resolve_collisions;
 use crate::magnet::Magnet;
 use crate::path::{RelPath, sanitize_component, sanitize_path};
+use crate::v2::{
+    MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES, TorrentVersion, V2Piece, layer_ok, layer_targets,
+    locate, merge_hybrid, parse_file_tree, parse_piece_layers, v2_file_starts, valid_v2_piece_len,
+};
 
 /// Most web seed URLs kept (`url-list` here, `ws` in a magnet); later ones are
 /// ignored.
@@ -16,7 +20,7 @@ pub const MAX_WEB_SEEDS: usize = 16;
 pub(crate) const MAX_URL_LEN: usize = 2048;
 /// Deepest accepted file path, in components (including the root name).
 const MAX_PATH_DEPTH: usize = 256;
-const MAX_PIECE_LEN: i64 = 268_435_456;
+pub(crate) const MAX_PIECE_LEN: i64 = 268_435_456;
 /// Most tracker URLs kept across all tiers; later ones are ignored. The
 /// session applies the same cap to trackers set by hand.
 pub const MAX_TRACKERS: usize = 64;
@@ -56,15 +60,23 @@ pub enum MetainfoError {
     #[deprecated(note = "no longer produced: colliding paths are renamed at parse time")]
     #[error("duplicate path `{0}`")]
     DuplicatePath(String),
-    /// A v2-only torrent (no v1 `pieces`); supported from milestone 6.
+    /// A v2-only torrent (no v1 `pieces`).
+    ///
+    /// No longer produced: v2-only torrents are parsed. Kept for
+    /// compatibility; it will be removed in a later breaking release.
+    #[deprecated(note = "no longer produced: v2-only torrents are parsed")]
     #[error("v2-only torrents are not supported yet")]
     V2OnlyUnsupported,
+    /// A hybrid torrent whose v1 and v2 halves describe different files, or
+    /// whose files do not start on piece boundaries.
+    #[error("hybrid torrent: the v1 and v2 file lists disagree")]
+    InconsistentHybrid,
     /// The info dictionary does not hash to the expected info hash.
     #[error("info dictionary does not match the expected info hash")]
     InfoHashMismatch,
 }
 
-fn invalid(field: &'static str, reason: &'static str) -> MetainfoError {
+pub(crate) fn invalid(field: &'static str, reason: &'static str) -> MetainfoError {
     MetainfoError::InvalidField { field, reason }
 }
 
@@ -78,6 +90,10 @@ pub struct FileEntry {
     pub len: u64,
     /// BEP 47 padding file: occupies piece space but is never written to disk.
     pub pad: bool,
+    /// BEP 52 `pieces root` of the file's Merkle tree: set for non-empty
+    /// files of v2 and hybrid torrents, `None` for v1 torrents, pads and
+    /// empty files.
+    pub pieces_root: Option<[u8; 32]>,
 }
 
 /// The v1 `info` dictionary, validated.
@@ -87,7 +103,7 @@ pub struct Info {
     pub name: String,
     /// Piece length in bytes.
     pub piece_len: u32,
-    /// SHA-1 of each piece.
+    /// SHA-1 of each piece (empty for a v2-only torrent).
     pub pieces: Vec<[u8; 20]>,
     /// Files in torrent order (padding files included).
     pub files: Vec<FileEntry>,
@@ -100,7 +116,7 @@ pub struct Info {
 /// A parsed `.torrent` file.
 #[derive(Debug, Clone)]
 pub struct Metainfo {
-    /// Info hashes (v1 always set; v2 set for hybrid torrents).
+    /// Info hashes (v1 set for v1 and hybrid torrents, v2 for v2 and hybrid).
     pub info_hashes: InfoHashes,
     /// The validated info dictionary.
     pub info: Info,
@@ -116,8 +132,12 @@ pub struct Metainfo {
     pub created_by: Option<String>,
     /// Creation time, seconds since the Unix epoch.
     pub creation_date: Option<i64>,
+    /// Validated BEP 52 piece layers, keyed by `pieces root`. Empty for v1
+    /// torrents and when the `.torrent` carried none.
+    pub piece_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
     raw_info: Vec<u8>,
     layout: PieceLayout,
+    v2_starts: Vec<(u64, usize)>,
 }
 
 impl Metainfo {
@@ -131,6 +151,12 @@ impl Metainfo {
             .get(b"info")
             .ok_or(MetainfoError::MissingField("info"))?;
         let parsed = parse_info(info_val)?;
+        let piece_layers = match root.get(b"piece layers") {
+            Some(v) if !parsed.v2_starts.is_empty() => {
+                parse_piece_layers(v, &parsed.info.files, parsed.info.piece_len)?
+            }
+            _ => BTreeMap::new(),
+        };
 
         Ok(Metainfo {
             info_hashes: parsed.info_hashes,
@@ -140,8 +166,10 @@ impl Metainfo {
             comment: lossy(root, b"comment"),
             created_by: lossy(root, b"created by"),
             creation_date: root.get(b"creation date").and_then(Value::as_int),
+            piece_layers,
             raw_info: parsed.raw_info,
             layout: parsed.layout,
+            v2_starts: parsed.v2_starts,
         })
     }
 
@@ -183,8 +211,10 @@ impl Metainfo {
             comment: None,
             created_by: None,
             creation_date: None,
+            piece_layers: BTreeMap::new(),
             raw_info: parsed.raw_info,
             layout: parsed.layout,
+            v2_starts: parsed.v2_starts,
         })
     }
 
@@ -200,6 +230,48 @@ impl Metainfo {
             .collect();
         m.web_seeds = self.web_seeds.clone();
         m
+    }
+
+    /// Which metainfo versions this torrent carries.
+    pub fn version(&self) -> TorrentVersion {
+        match (self.info_hashes.v1.is_some(), self.info_hashes.v2.is_some()) {
+            (true, true) => TorrentVersion::Hybrid,
+            (false, true) => TorrentVersion::V2,
+            _ => TorrentVersion::V1,
+        }
+    }
+
+    /// How global piece `piece` is checked under BEP 52: its file, root,
+    /// expected hash and geometry. `None` for v1 torrents, out-of-range
+    /// pieces and pieces that hold no file bytes.
+    pub fn v2_piece(&self, piece: u32) -> Option<V2Piece> {
+        locate(
+            &self.v2_starts,
+            &self.info.files,
+            &self.piece_layers,
+            self.info.piece_len,
+            piece,
+        )
+    }
+
+    /// Merges `layers` into the piece layers held, keeping only those that
+    /// validate for a file of this torrent (and fit [`MAX_PIECE_LAYER_HASHES`]).
+    /// A layer already held is kept.
+    #[must_use]
+    pub fn with_piece_layers(mut self, layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>) -> Metainfo {
+        let targets = layer_targets(&self.info.files, self.info.piece_len);
+        let mut total: usize = self.piece_layers.values().map(Vec::len).sum();
+        for (root, layer) in layers {
+            if self.piece_layers.contains_key(&root)
+                || !layer_ok(&targets, self.info.piece_len, &root, &layer)
+                || total.saturating_add(layer.len()) > MAX_PIECE_LAYER_HASHES
+            {
+                continue;
+            }
+            total += layer.len();
+            self.piece_layers.insert(root, layer);
+        }
+        self
     }
 
     /// The exact bencoded `info` dictionary bytes (what the hashes cover).
@@ -228,6 +300,7 @@ struct ParsedInfo {
     info: Info,
     raw_info: Vec<u8>,
     layout: PieceLayout,
+    v2_starts: Vec<(u64, usize)>,
 }
 
 /// Validates an `info` value; shared by `from_bytes` and `from_info_bytes`.
@@ -246,18 +319,18 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
         }
     };
     let pieces_raw = match info_dict.get(b"pieces") {
-        Some(p) => p
-            .as_bytes()
-            .ok_or_else(|| invalid("pieces", "not a byte string"))?,
-        None if v2 => return Err(MetainfoError::V2OnlyUnsupported),
+        Some(p) => Some(
+            p.as_bytes()
+                .ok_or_else(|| invalid("pieces", "not a byte string"))?,
+        ),
+        None if v2 => None,
         None => return Err(MetainfoError::MissingField("pieces")),
     };
 
-    let v1 = InfoHashV1::of(&raw_info);
-    let info_hashes = if v2 {
-        InfoHashes::hybrid(v1, InfoHashV2::of(&raw_info))
-    } else {
-        InfoHashes::from_v1(v1)
+    let info_hashes = match (v2, pieces_raw.is_some()) {
+        (true, true) => InfoHashes::hybrid(InfoHashV1::of(&raw_info), InfoHashV2::of(&raw_info)),
+        (true, false) => InfoHashes::from_v2(InfoHashV2::of(&raw_info)),
+        _ => InfoHashes::from_v1(InfoHashV1::of(&raw_info)),
     };
 
     let piece_len = int_field(info_dict, b"piece length", "piece length")?;
@@ -266,7 +339,13 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
     }
     let piece_len =
         u32::try_from(piece_len).map_err(|_| invalid("piece length", "out of range"))?;
-    if pieces_raw.len() % 20 != 0 {
+    if v2 && !valid_v2_piece_len(piece_len) {
+        return Err(invalid(
+            "piece length",
+            "not a power of two of at least 16 KiB",
+        ));
+    }
+    if pieces_raw.is_some_and(|p| p.len() % 20 != 0) {
         return Err(invalid("pieces", "length is not a multiple of 20"));
     }
 
@@ -275,10 +354,28 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
         .ok_or(MetainfoError::MissingField("name"))?
         .as_bytes()
         .ok_or_else(|| invalid("name", "not a byte string"))?;
-    let name = sanitize_component(name_bytes).unwrap_or_else(|| v1.to_string());
+    let name = sanitize_component(name_bytes).unwrap_or_else(|| info_hashes.to_string());
 
     let private = matches!(info_dict.get(b"private").and_then(Value::as_int), Some(1));
-    let (mut files, single_file) = parse_files(info_dict, &name)?;
+    let v2_files = if v2 {
+        let tree = info_dict
+            .get(b"file tree")
+            .ok_or(MetainfoError::MissingField("file tree"))?
+            .as_dict()
+            .ok_or_else(|| invalid("file tree", "not a dictionary"))?;
+        Some(parse_file_tree(tree, &name, name_bytes, piece_len)?)
+    } else {
+        None
+    };
+    let (mut files, single_file) = match (pieces_raw, v2_files) {
+        (Some(_), None) => parse_files(info_dict, &name)?,
+        (Some(_), Some((tree_files, _))) => {
+            let (v1_files, single) = parse_files(info_dict, &name)?;
+            (merge_hybrid(v1_files, &tree_files, piece_len)?, single)
+        }
+        (None, Some(parsed)) => parsed,
+        (None, None) => return Err(MetainfoError::MissingField("pieces")),
+    };
 
     let mut total: u64 = 0;
     for f in &files {
@@ -288,12 +385,24 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
     }
     let layout = PieceLayout::new(total, piece_len)
         .map_err(|_| invalid("length", "total length is zero or too large"))?;
-    if usize::try_from(layout.num_pieces()).ok() != Some(pieces_raw.len() / 20) {
+    if let Some(p) = pieces_raw
+        && usize::try_from(layout.num_pieces()).ok() != Some(p.len() / 20)
+    {
         return Err(invalid("pieces", "count does not match total length"));
+    }
+    // Without `pieces` nothing else bounds the count: every per-piece
+    // vector of the session is sized from it.
+    if pieces_raw.is_none()
+        && usize::try_from(layout.num_pieces()).map_or(true, |n| n > MAX_V2_PIECES)
+    {
+        return Err(invalid("length", "too many pieces"));
     }
     resolve_collisions(&mut files);
 
-    let pieces: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
+    let pieces: Vec<[u8; 20]> = pieces_raw
+        .map(|p| p.as_chunks::<20>().0.to_vec())
+        .unwrap_or_default();
+    let v2_starts = v2_file_starts(&files);
 
     Ok(ParsedInfo {
         info_hashes,
@@ -307,6 +416,7 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
         },
         raw_info,
         layout,
+        v2_starts,
     })
 }
 
@@ -328,6 +438,7 @@ fn parse_files(info: &Dict<'_>, name: &str) -> Result<(Vec<FileEntry>, bool), Me
             path: RelPath::single(name.to_string()),
             len,
             pad: false,
+            pieces_root: None,
         };
         return Ok((vec![file], true));
     };
@@ -376,6 +487,7 @@ fn parse_files(info: &Dict<'_>, name: &str) -> Result<(Vec<FileEntry>, bool), Me
             path,
             len,
             pad: !symlink && attr.contains(&b'p'),
+            pieces_root: None,
         });
     }
     Ok((out, false))

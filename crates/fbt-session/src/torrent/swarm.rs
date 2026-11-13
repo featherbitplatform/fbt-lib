@@ -5,7 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fbt_core::{Bitfield, PeerId};
+use fbt_core::{Bitfield, InfoHashes, PeerId};
 use fbt_wire::{CryptoMethods, HolepunchMsg};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
@@ -84,6 +84,12 @@ impl Actor {
         PeerCtx {
             key,
             info_hash: self.ih.wire_hash(),
+            // The key's v2 hash, else the one the metadata revealed.
+            v2_hash: self
+                .ih
+                .v2
+                .or_else(|| self.known_meta().and_then(|m| m.info_hashes.v2))
+                .map(|v2| InfoHashes::from_v2(v2).wire_hash()),
             our_id: self.shared.peer_id,
             layout: l.map(|l| l.layout),
             have,
@@ -102,7 +108,8 @@ impl Actor {
     /// may be private; until it is known, PEX is advertised (the magnet
     /// exception) when `pex_enabled`.
     pub(super) fn ext_config(&self, addr: &SocketAddr) -> ExtConfig {
-        let meta = self.loaded.as_ref().map(|l| &l.meta);
+        // Known metadata, a v2-only torrent's waiting for layers included.
+        let meta = self.known_meta();
         ExtConfig {
             listen_port: self.shared.listen_port_for(addr),
             metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),
@@ -426,6 +433,9 @@ impl Actor {
         }
         let key = self.new_key();
         let mut ctx = self.ctx(key, &addr);
+        // The hash the peer named (v1 or truncated v2: the listener found
+        // this torrent by it) is the one we answer with.
+        ctx.info_hash = hs.info_hash;
         ctx.encrypted = stream.is_encrypted();
         ctx.transport = stream.get_ref().kind();
         let transport = ctx.transport;

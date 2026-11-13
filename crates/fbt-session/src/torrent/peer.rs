@@ -80,6 +80,9 @@ pub(super) struct Peer {
     /// `ut_metadata` requests it sent (served up to
     /// [`MAX_METADATA_REQUESTS_PER_PEER`](super::metadata::MAX_METADATA_REQUESTS_PER_PEER)).
     pub metadata_requests: u32,
+    /// Its `hash request`s being served (at most
+    /// [`MAX_PENDING_HASH_REQUESTS`](super::layers::MAX_PENDING_HASH_REQUESTS)).
+    pub hash_requests: usize,
     /// PEX state; `Some` while PEX runs with this peer (it advertised
     /// `ut_pex`, the setting is on and the torrent is not private).
     pub pex: Option<PexPeer>,
@@ -94,6 +97,9 @@ pub(super) struct Peer {
     /// to TCP nor asks for a rendezvous, and is retried only for an address
     /// we knew already.
     pub holepunch: bool,
+    /// A v2 connection (the v2 reserved bit, or the truncated v2 hash): a
+    /// source for the layer fetch.
+    pub v2: bool,
 }
 
 impl Peer {
@@ -115,6 +121,7 @@ impl Peer {
             peer_id: None,
             seed: false,
             bits: Bitfield::new(num_pieces),
+            v2: false,
             choked_us: true,
             am_interested: false,
             peer_interested: false,
@@ -136,6 +143,7 @@ impl Peer {
             transport,
             connected_at: None,
             metadata_requests: 0,
+            hash_requests: 0,
             pex: None,
             upload_only: false,
             reported: None,

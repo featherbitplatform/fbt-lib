@@ -3,17 +3,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use fbt_core::Bitfield;
+use fbt_core::{Bitfield, InfoHashes};
 use fbt_metainfo::{Magnet, Metainfo, MetainfoError};
 use tokio::time::Instant;
 
 use super::actor::{Actor, Loaded, Phase};
 use super::commands::selected_priorities;
+use super::layers::{LayerFetch, PendingLayers};
 use super::metadata::MetadataFetch;
 use super::swarm::BanTarget;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
+use crate::session::{Priority, wire_hashes};
 use crate::storage::{FsStorage, Storage};
 
 /// A magnet torrent until its metadata arrives.
@@ -67,25 +69,55 @@ impl Actor {
         }
     }
 
-    /// The verified metadata: build `Loaded` and the storage, tell the
-    /// handle and every peer, then check the existing data as for a
-    /// `.torrent`.
+    /// The verified metadata: a v2-only torrent lacking layers waits for
+    /// them (see [`Actor::await_layers`]); otherwise it is installed.
     pub(super) fn install_metadata(&mut self, meta: Metainfo) {
         let Some(m) = self.magnet.take() else {
             return;
         };
         let m = *m;
         let file_prio = selected_priorities(meta.info.files.len(), m.magnet.select_only.as_deref());
+        self.register_revealed_hashes(&meta.info_hashes);
+        match LayerFetch::new(&meta) {
+            Some(fetch) => {
+                self.await_layers(PendingLayers {
+                    meta: Arc::new(meta),
+                    fetch,
+                    storage: m.storage,
+                    file_prio,
+                    sequential: m.sequential,
+                });
+                // Off the DHT and PEX at once if it says private.
+                self.leave_public_discovery();
+            }
+            None => self.install_loaded(meta, m.storage, file_prio, m.sequential),
+        }
+    }
+
+    /// The metadata, complete: build `Loaded` and the storage, tell the
+    /// handle and every peer, then check the existing data as for a
+    /// `.torrent`. `MetadataReceived` is emitted here, once.
+    pub(super) fn install_loaded(
+        &mut self,
+        meta: Metainfo,
+        storage: Option<Arc<dyn Storage>>,
+        file_prio: Vec<Priority>,
+        sequential: bool,
+    ) {
         // Resume data of a magnet saved before its metadata names no
         // renamed file (it is refused otherwise), but the storage is built
         // the same way as at add.
         let renamed = self.resume.as_ref().map_or(&[][..], |r| &r.renamed[..]);
-        let storage: Arc<dyn Storage> = match m.storage {
+        let storage: Arc<dyn Storage> = match storage {
             Some(s) => s,
-            None => Arc::new(FsStorage::with_paths(m.save_path, &meta, renamed)),
+            None => Arc::new(FsStorage::with_paths(
+                self.save_path.clone(),
+                &meta,
+                renamed,
+            )),
         };
         let meta = Arc::new(meta);
-        let mut loaded = Loaded::new(Arc::clone(&meta), file_prio, m.sequential);
+        let mut loaded = Loaded::new(Arc::clone(&meta), file_prio, sequential);
         loaded.renamed = renamed.iter().cloned().collect();
         let layout = loaded.layout;
         let total_wanted = loaded.total_wanted;
@@ -96,12 +128,7 @@ impl Actor {
         self.emit(Event::MetadataReceived { torrent: self.ih });
         // Peers were set up with no pieces; they get the layout now.
         let n = layout.num_pieces();
-        if self.is_private() {
-            // The magnet exception ends here: off the DHT and PEX at once.
-            self.dht_announcer = None;
-            self.dht_rx = None;
-            self.drop_pex_peers();
-        }
+        self.leave_public_discovery();
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
             let Some(addr) = self.peers.get(&key).map(|p| p.addr) else {
@@ -126,6 +153,31 @@ impl Actor {
         self.metadata_check = true;
         self.start_check();
         self.refresh_state();
+    }
+
+    /// A torrent whose metadata says private: the magnet exception ends
+    /// here, off the DHT and PEX at once.
+    fn leave_public_discovery(&mut self) {
+        if self.is_private() {
+            self.dht_announcer = None;
+            self.dht_rx = None;
+            self.drop_pex_peers();
+        }
+    }
+
+    /// Registers each wire hash of the verified metadata that the magnet's
+    /// own hashes lacked (a hybrid's other hash) as an alias of this torrent,
+    /// so peers naming it reach us. Not announced.
+    fn register_revealed_hashes(&self, revealed: &InfoHashes) {
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        let known = wire_hashes(&self.ih);
+        for w in wire_hashes(revealed) {
+            if !known.contains(&w) {
+                session.add_alias(&self.ih, w);
+            }
+        }
     }
 
     /// Advances the metadata fetch's timers.

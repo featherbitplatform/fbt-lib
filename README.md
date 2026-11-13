@@ -2,11 +2,12 @@
 
 A from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent, and an idiomatic async Rust API. It is the engine for featherbittorrent, a future client with a terminal UI, a web UI and media streaming while downloading. It has no UI of its own and runs on macOS, Linux and Windows.
 
-Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 added the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange (v0.2.0). Milestone 3 added uTP, local and NAT reach, rate limits and a write-back cache (v0.3.0). Milestone 4 added streaming while downloading, with a seekable reader over a torrent that is still downloading (v0.4.0). Milestone 5 adds persistence and operations (resume data, queueing, proxies, IP filtering, web seeds and more DHT) and is heading for v0.5.0. Nothing is published to crates.io and the API will change.
+Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 added the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange (v0.2.0). Milestone 3 added uTP, local and NAT reach, rate limits and a write-back cache (v0.3.0). Milestone 4 added streaming while downloading, with a seekable reader over a torrent that is still downloading (v0.4.0). Milestone 5 added persistence and operations (resume data, queueing, proxies, IP filtering, web seeds and more DHT) (v0.5.0). Milestone 6 adds BitTorrent v2 and hybrid torrents (BEP 52) and torrent creation, and is heading for v0.6.0. Nothing is published to crates.io and the API will change.
 
 ## Features
 
-- Metainfo v1 and hybrid, HTTP(S) and UDP trackers, verified storage, piece picking and a tokio session with an event stream
+- BitTorrent v1, v2 and hybrid torrents (BEP 52): Merkle-tree verification, hash requests and serving, piece layers fetched from peers, hybrids announced under both info hashes, `btmh` magnets; creating v1, v2 and hybrid `.torrent` files (`CreateTorrent`)
+- HTTP(S) and UDP trackers, verified storage, piece picking and a tokio session with an event stream
 - Mainline DHT (BEP 5, BEP 42 node ids) in its own crate, `fbt-dht`
 - Magnet links with metadata exchange from peers (BEP 9, BEP 10)
 - MSE/PE message stream encryption: forced, preferred (the default) or disabled

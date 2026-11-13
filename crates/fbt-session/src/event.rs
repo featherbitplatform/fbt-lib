@@ -79,7 +79,9 @@ pub enum Event {
         /// Piece index.
         piece: u32,
     },
-    /// A magnet torrent received and verified its metadata.
+    /// A magnet torrent received and verified its metadata; for a v2-only
+    /// torrent, once the piece layers it lacked are fetched too (a v2
+    /// `.torrent` without them included).
     MetadataReceived {
         /// The torrent.
         torrent: InfoHashes,
@@ -101,6 +103,9 @@ pub enum Event {
     TrackerReply {
         /// The torrent.
         torrent: InfoHashes,
+        /// The hash announced: the v1 hash or the truncated v2 hash (a
+        /// hybrid announces under both).
+        info_hash: [u8; 20],
         /// Tracker URL.
         url: String,
         /// Peers in the reply.

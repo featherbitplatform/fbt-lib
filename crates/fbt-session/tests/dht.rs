@@ -642,3 +642,58 @@ async fn dht_remote_error_code_reaches_the_caller() {
     }
     s.shutdown().await;
 }
+
+/// A leech that only knows a hybrid's `btmh` finds its seed over the DHT:
+/// the seed announces under the truncated v2 hash too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn btmh_peer_finds_hybrid_seed_over_dht() {
+    use fbt_metainfo::TorrentVersion;
+    let boot = loopback_dht(Vec::new()).await;
+    let seed_dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(seed_dir.path()),
+        TorrentVersion::Hybrid,
+        32_768,
+    );
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    assert!(m.trackers.is_empty());
+    let v2_only = InfoHashes::from_v2(m.info_hashes.v2.expect("v2 hash"));
+    let mut ss = dht_settings(vec![addr_of(&boot)]);
+    ss.dht_announce_interval = Duration::from_secs(1);
+    let seeder = Session::new(ss).await.unwrap();
+    let sh = seeder
+        .add_torrent(AddTorrent::new(m.clone(), seed_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&sh, |s| *s == TorrentState::Seeding, T).await);
+    // Both hashes reached the bootstrap node.
+    assert!(wait_until(|| stored(&boot) >= 2, T).await);
+
+    let leecher = Session::new(dht_settings(vec![addr_of(&boot)]))
+        .await
+        .unwrap();
+    let mut ev = leecher.subscribe(EventMask::ALL);
+    let leech_dir = tempfile::tempdir().unwrap();
+    let mg = Magnet::from_info_hashes(v2_only);
+    assert!(mg.info_hashes.v1.is_none());
+    assert!(mg.trackers.is_empty() && mg.peers.is_empty());
+    let h = leecher
+        .add_torrent(AddTorrent::magnet(mg, leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::TorrentFinished { .. }),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("TorrentFinished");
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    assert!(
+        payload_of(&m, leech_dir.path()) == payload_of(&m, seed_dir.path()),
+        "data differs"
+    );
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+    boot.shutdown().await;
+}

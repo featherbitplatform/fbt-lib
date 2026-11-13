@@ -54,13 +54,14 @@ bash dev/bench.sh
 
 # Live interop vs qBittorrent-nox and Transmission via opentracker, plus magnet via DHT, forced
 # encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent, LSD between two
-# fbt-example containers, resume without recheck, a web seed (nginx) and a SOCKS5 proxy (Dante), on
-# isolated networks with our own dht-node (Docker; see dev/interop/README.md)
+# fbt-example containers, resume without recheck, a web seed (nginx), a SOCKS5 proxy (Dante),
+# and v2 and hybrid torrents (creation hashes, hash requests, `btmh` magnets), on isolated
+# networks with our own dht-node (Docker; see dev/interop/README.md)
 bash dev/interop/run.sh
 
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec
 # handshake http_announce udp_announce path krpc extension mse magnet utp_packet utp_conn lsd ssdp
-# upnp_xml natpmp resume socks5 http_connect scrape web_seed_head. Seeds live in fuzz/seeds/<target>/.
+# upnp_xml natpmp resume socks5 http_connect scrape web_seed_head hash_proof. Seeds live in fuzz/seeds/<target>/.
 mkdir -p fuzz/corpus/<target>
 cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 ```
