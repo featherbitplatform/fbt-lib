@@ -2,7 +2,7 @@
 //! subtree roots of its verified pieces, and answering peers' `hash
 //! request`s from the layers we hold.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -312,7 +312,7 @@ struct FetchFile {
 }
 
 /// One request's worth of a file's layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Span {
     file: usize,
     index: u32,
@@ -351,9 +351,17 @@ pub(super) struct LayerFetch {
     sources: BTreeMap<PeerKey, Vec<(Span, Instant)>>,
     /// v2 peers waiting for a source slot.
     candidates: VecDeque<PeerKey>,
-    /// Sources retired by a timeout or a reject, until when: their late
-    /// answers are ignored, and they become candidates again after.
+    /// Sources retired by a timeout or a reject, until when: they become
+    /// candidates again after.
     retired: BTreeMap<PeerKey, Instant>,
+    /// File index of each `pieces root` fetched.
+    by_root: HashMap<[u8; 32], usize>,
+    /// Every span asked of each connected peer during this fetch (at most
+    /// the fetch's span count per peer; dropped with the peer): an answer
+    /// to one of them no longer in flight is late, not unrequested.
+    asked: HashMap<PeerKey, HashSet<Span>>,
+    /// Spans received (at most the fetch's span count).
+    done: HashSet<Span>,
 }
 
 impl LayerFetch {
@@ -406,9 +414,13 @@ impl LayerFetch {
                 layer: vec![[0; 32]; count],
             });
         }
+        let by_root = files.iter().enumerate().map(|(i, f)| (f.root, i)).collect();
         (!todo.is_empty()).then(|| LayerFetch {
             piece_height,
             files,
+            by_root,
+            asked: HashMap::new(),
+            done: HashSet::new(),
             spans_left: todo.len(),
             todo,
             sources: BTreeMap::new(),
@@ -441,7 +453,11 @@ impl LayerFetch {
         self.fill(now)
     }
 
-    /// `hashes` from `key` answering `req`.
+    /// `hashes` from `key` answering `req`. An answer to a span asked of
+    /// `key` earlier but no longer in flight there (it timed out, say) is
+    /// late: kept if the span is still wanted and it verifies, ignored
+    /// otherwise. Only an answer to a span never asked of `key`, or an
+    /// in-flight answer failing its proof, is `Bad`.
     pub(super) fn on_hashes(
         &mut self,
         key: PeerKey,
@@ -449,21 +465,45 @@ impl LayerFetch {
         hashes: &[u8],
         now: Instant,
     ) -> LayerStep {
-        if self.retired.contains_key(&key) {
-            // Late, from a source retired without blame.
-            return LayerStep::Send(Vec::new());
-        }
-        let Some(span) = self.take_in_flight(key, req) else {
-            self.drop_source(key);
-            return LayerStep::Bad(key);
+        let (span, in_flight) = match self.take_in_flight(key, req) {
+            Some(span) => (span, true),
+            None => match self.asked_span(key, req) {
+                Some(span) => (span, false),
+                None => {
+                    self.drop_source(key);
+                    return LayerStep::Bad(key);
+                }
+            },
         };
+        if self.done.contains(&span) {
+            return LayerStep::Send(self.fill(now));
+        }
         if !self.accept(span, hashes) {
+            if !in_flight {
+                return LayerStep::Send(Vec::new());
+            }
             self.todo.push_front(span);
             self.drop_source(key);
             return LayerStep::Bad(key);
         }
+        self.done.insert(span);
         self.spans_left = self.spans_left.saturating_sub(1);
+        // A late answer may beat the span's new request: drop that one.
+        self.todo.retain(|s| *s != span);
+        for spans in self.sources.values_mut() {
+            spans.retain(|(s, _)| *s != span);
+        }
         LayerStep::Send(self.fill(now))
+    }
+
+    /// The span `req` names, if it was ever asked of `key`.
+    fn asked_span(&self, key: PeerKey, req: &HashRequest) -> Option<Span> {
+        let span = Span {
+            file: *self.by_root.get(&req.pieces_root)?,
+            index: req.index,
+        };
+        (self.asked.get(&key)?.contains(&span) && self.request(span).as_ref() == Some(req))
+            .then_some(span)
     }
 
     /// `hash reject` from `key` for `req`: the source is retired (no ban)
@@ -491,6 +531,7 @@ impl LayerFetch {
         self.drop_source(key);
         self.candidates.retain(|k| *k != key);
         self.retired.remove(&key);
+        self.asked.remove(&key);
         self.fill(now)
     }
 
@@ -623,6 +664,9 @@ impl LayerFetch {
             if !gave || self.todo.is_empty() {
                 break;
             }
+        }
+        for (key, span) in &out {
+            self.asked.entry(*key).or_default().insert(*span);
         }
         out.into_iter()
             .filter_map(|(key, span)| Some((key, self.request(span)?)))
@@ -1302,5 +1346,67 @@ mod tests {
         let again = f.tick(later + LAYER_REQUEST_TIMEOUT);
         assert!(!again.is_empty());
         assert!(again.iter().all(|(k, _)| *k == A), "{again:?}");
+    }
+
+    #[test]
+    fn late_answer_after_timeout_is_not_bad() {
+        // Five files of two pieces: five spans, one more than a source holds.
+        let names = ["f0", "f1", "f2", "f3", "f4"];
+        let files: Vec<(&str, usize)> = names.iter().map(|n| (*n, 40_000)).collect();
+        let (full, stripped) = v2_meta(&files);
+        let mut f = LayerFetch::new(&stripped).unwrap();
+        let now = Instant::now();
+        let first = f.add_source(A, now);
+        assert_eq!(first.len(), SPANS_PER_SOURCE);
+        assert_eq!(f.add_source(B, now).len(), 1);
+        // Both time out; back as long after, they share the spans anew.
+        f.tick(now + LAYER_REQUEST_TIMEOUT);
+        let again = f.tick(now + 2 * LAYER_REQUEST_TIMEOUT);
+        let at_b: Vec<HashRequest> = again
+            .iter()
+            .filter(|(k, _)| *k == B)
+            .map(|(_, r)| *r)
+            .collect();
+        // A's first ask of a span now in flight at B: late, kept.
+        let late = *first
+            .iter()
+            .map(|(_, r)| r)
+            .find(|r| at_b.contains(r))
+            .expect("a span moved to B");
+        let later = now + 2 * LAYER_REQUEST_TIMEOUT;
+        assert!(matches!(
+            f.on_hashes(A, &late, &serve(&full, &late), later),
+            LayerStep::Send(_)
+        ));
+        assert_eq!(f.spans_left, names.len() - 1);
+        // B's answer to that span is now late too: ignored.
+        assert!(matches!(
+            f.on_hashes(B, &late, &serve(&full, &late), later),
+            LayerStep::Send(_)
+        ));
+        // A late answer failing its proof is ignored, not judged.
+        let other = *first
+            .iter()
+            .map(|(_, r)| r)
+            .find(|r| at_b.contains(r) && **r != late)
+            .expect("another span moved to B");
+        let mut bad = serve(&full, &other);
+        bad[0] ^= 1;
+        assert_eq!(
+            f.on_hashes(A, &other, &bad, later),
+            LayerStep::Send(Vec::new())
+        );
+        assert_eq!(f.spans_left, names.len() - 1);
+        // A span never asked of B is still bad.
+        let never = first
+            .iter()
+            .map(|(_, r)| *r)
+            .find(|r| !at_b.contains(r) && *r != late)
+            .expect("a span B was never asked");
+        assert!(!again.contains(&(B, never)));
+        assert_eq!(
+            f.on_hashes(B, &never, &serve(&full, &never), later),
+            LayerStep::Bad(B)
+        );
     }
 }

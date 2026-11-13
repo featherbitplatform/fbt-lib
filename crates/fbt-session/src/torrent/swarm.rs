@@ -102,7 +102,8 @@ impl Actor {
     /// may be private; until it is known, PEX is advertised (the magnet
     /// exception) when `pex_enabled`.
     pub(super) fn ext_config(&self, addr: &SocketAddr) -> ExtConfig {
-        let meta = self.loaded.as_ref().map(|l| &l.meta);
+        // Known metadata, a v2-only torrent's waiting for layers included.
+        let meta = self.known_meta();
         ExtConfig {
             listen_port: self.shared.listen_port_for(addr),
             metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),

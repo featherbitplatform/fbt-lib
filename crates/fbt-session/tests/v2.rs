@@ -605,3 +605,37 @@ async fn seed_without_v2_peers_stays_in_metadata() {
     assert!(!st.has_metadata);
     leecher.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_torrent_waiting_for_layers_keeps_its_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = fbt_metainfo::CreateTorrent::new(write_v2_payload(dir.path()))
+        .version(TorrentVersion::V2)
+        .piece_len(PIECE)
+        .private(true)
+        .build(&mut |_, _| ControlFlow::Continue(()))
+        .unwrap();
+    let m = Metainfo::from_bytes(&strip_layers(&bytes)).unwrap();
+    assert!(m.info.private);
+    let s = Session::new(test_settings()).await.unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert_eq!(h.status().state, TorrentState::DownloadingMetadata);
+    let mut reserved = v2_reserved();
+    reserved.set_extended();
+    let mut peer =
+        ScriptedPeer::connect_with(s.local_addr(), m.info_hashes.wire_hash(), reserved).await;
+    let payload = peer.next_ext(0).await.expect("our extension handshake");
+    let hs = fbt_wire::ExtHandshake::decode(&payload).expect("valid handshake");
+    assert_eq!(
+        hs.id_of(fbt_wire::UT_PEX),
+        None,
+        "no ut_pex for a private torrent"
+    );
+    assert_eq!(hs.metadata_size, Some(m.raw_info().len() as u32));
+    assert!(!h.status().has_metadata);
+    s.shutdown().await;
+}
