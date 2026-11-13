@@ -15,6 +15,7 @@ use fbt::{
     ProxyKind, RateLimit, ReadAhead, Session, SessionError, Settings, TorrentHandle, TorrentSource,
     TorrentState, TorrentStatus, TorrentVersion, Transport,
 };
+use fbt_api::{ApiConfig, ApiServer};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
@@ -23,6 +24,28 @@ use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// The HTTP/JSON API (`fbt-api`) next to `download` and `seed`.
+#[derive(Args)]
+struct ApiArgs {
+    /// Serve the HTTP/JSON API on this address (port 0 picks a free one);
+    /// needs `--api-token`.
+    #[arg(long, value_name = "ADDR", requires = "api_token")]
+    api: Option<SocketAddr>,
+    /// Bearer token the API requires on every request.
+    #[arg(long, value_name = "TOKEN", requires = "api")]
+    api_token: Option<String>,
+}
+
+impl ApiArgs {
+    /// The API config, when `--api` is given.
+    fn config(&self) -> Option<ApiConfig> {
+        let (bind, token) = (self.api?, self.api_token.clone()?);
+        let mut config = ApiConfig::new(token);
+        config.bind = bind;
+        Some(config)
+    }
 }
 
 /// Connection policy shared by `download` and `seed`.
@@ -329,6 +352,8 @@ enum Command {
         web_seed: Vec<String>,
         #[command(flatten)]
         net: NetArgs,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// Read one file of a torrent while it downloads, fetching only what is
     /// read plus the read-ahead window.
@@ -378,6 +403,8 @@ enum Command {
         seed_for: Option<u64>,
         #[command(flatten)]
         net: NetArgs,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// Run a bare DHT node: no torrents, no default bootstrap nodes.
     DhtNode {
@@ -536,6 +563,7 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             stop_at,
             web_seed,
             net,
+            api,
         } => {
             let source = if torrent
                 .get(..7)
@@ -553,6 +581,7 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
                 resume,
                 stop_at,
                 web_seeds: web_seed,
+                api: api.config(),
             };
             transfer(source, out, opts, &net).await
         }
@@ -562,12 +591,14 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             port,
             seed_for,
             net,
+            api,
         } => {
             let source = Source::File(load(&torrent)?);
             let opts = TransferOpts {
                 port,
                 seed_for,
                 download: false,
+                api: api.config(),
                 ..TransferOpts::default()
             };
             transfer(source, data, opts, &net).await
@@ -725,6 +756,8 @@ struct TransferOpts {
     /// Stop at this percentage done.
     stop_at: Option<u8>,
     web_seeds: Vec<String>,
+    /// Serve the HTTP/JSON API next to the session.
+    api: Option<ApiConfig>,
 }
 
 /// The add parameters: from the resume file when it exists (it must be for
@@ -792,9 +825,25 @@ async fn transfer(
     let params = add_params(source, dir, opts.resume.as_deref())?;
     let session = Session::new(settings).await?;
     println!("listening on {}", session.local_addr());
-    // Whatever happens below, the session shuts down (trackers get their
-    // `stopped`, the disk cache is flushed).
+    let api = match opts.api.clone() {
+        Some(config) => match ApiServer::start(session.clone(), config).await {
+            Ok(api) => {
+                println!("api: listening on {}", api.local_addr());
+                Some(api)
+            }
+            Err(e) => {
+                session.shutdown().await;
+                return Err(format!("api: {e}").into());
+            }
+        },
+        None => None,
+    };
+    // Whatever happens below, the API stops and the session shuts down
+    // (trackers get their `stopped`, the disk cache is flushed).
     let result = run_transfer(&session, params, &opts).await;
+    if let Some(api) = api {
+        api.shutdown().await;
+    }
     session.shutdown().await;
     result
 }

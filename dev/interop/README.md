@@ -149,6 +149,22 @@
   `torrents/info`), Transmission by the v1 hash, so `run.sh` looks each
   up by its own (`qbt_id`, `info_hash`). Both drop fbt's hybrid at the
   end.
+- **HTTP/JSON API:** `fbt-example download --api 0.0.0.0:8090 --api-token
+  <token> --download-limit 4M --seed-for 30` (port 6908) fetches the first
+  torrent and serves `fbt-api` next to its session. The limit and the 30 s
+  of seeding keep the process, and so the API, up while `curl` (in the `fbt`
+  container, on `127.0.0.1:8090`) drives it; a plain download would exit
+  once done and take the API with it. As soon as the log shows `api:
+  listening on`, `curl -sN --max-time 120` follows `GET /api/v1/events` in
+  the background (`logs/fbt-api-events.log`). Then, while the download
+  runs: `GET /api/v1/torrents` must list the torrent alone, by its 40-hex
+  wire hash; `GET /api/v1/torrents/<id>/files` gives `beta.bin`'s index;
+  three `Range` requests on `/api/v1/torrents/<id>/files/<index>/stream`
+  (the first, a middle and the last 64 KiB) must answer `206` and equal
+  those bytes of `beta.bin` (`cmp`); a request without the token must get
+  `401`, and `Range: bytes=25000000-` (past the end) `416`. The download
+  must exit 0 with matching data, and the event stream, which the API's
+  shutdown ends, must hold an `event: torrent_finished` line.
 
 Every `fbt-example` run passes `--dht-bootstrap dht-node:6881`. On success it
 prints `interop: download OK (qbittorrent, transmission)`,
@@ -159,7 +175,8 @@ prints `interop: download OK (qbittorrent, transmission)`,
 `interop: stream with seeks OK (qbittorrent)`, `interop: LSD OK`,
 `interop: resume without recheck OK (qbittorrent)`,
 `interop: web seed OK (nginx)`, `interop: SOCKS5 proxy OK (qbittorrent)`,
-`interop: v2 OK (qbittorrent)` and `interop: hybrid OK (qbittorrent, transmission)`,
+`interop: v2 OK (qbittorrent)`, `interop: hybrid OK (qbittorrent, transmission)` and
+`interop: api OK (list, ranges, 401, 416, events)`,
 and exits 0. It also prints how long the DHT took to
 join and the total time. CI runs it as the `interop` job (65-minute timeout).
 
@@ -190,7 +207,7 @@ outcome.
 | `transmission` | Transmission daemon, `transmission/settings.json` | peers 51413, RPC 9091 |
 | `dht-node` | `fbt-example dht-node` (same image as `fbt`): the private DHT's bootstrap node | DHT 6881 UDP |
 | `dht-helper-1` to `dht-helper-11` | the same, bootstrapped from `dht-node:6881`; one container (and address) each | DHT 6881 UDP |
-| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe, then the stream scenario), 6900 (resume), 6901 (web seed), 6902 (SOCKS5 proxy), 6903 (v2 download), 6904 (btmh magnet), 6905 (v2 seed), 6906 (hybrid download), 6907 (hybrid seed) |
+| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe, then the stream scenario), 6900 (resume), 6901 (web seed), 6902 (SOCKS5 proxy), 6903 (v2 download), 6904 (btmh magnet), 6905 (v2 seed), 6906 (hybrid download), 6907 (hybrid seed), 6908 (API download; its API on 8090) |
 | `fbt-lsd` | the same image, idle like `fbt`; on `swarm` and `lan` | 6897 (LSD seed), 6899 (LSD probe) |
 | `fbt-mcast-route`, `fbt-lsd-mcast-route` | one-shot, in the network namespace of `fbt` / `fbt-lsd`: routes 224.0.0.0/4 out of the `lan` interface | none |
 | `socks5` | Dante (`danted`) built by `socks5/Dockerfile`, `socks5/danted.conf`: no authentication, CONNECT and UDP ASSOCIATE | SOCKS5 1080 |
@@ -317,7 +334,7 @@ example `RUST_LOG=debug`) to raise `fbt-example`'s log level.
 
 To chase one scenario, `INTEROP_ONLY` takes a comma-separated list of
 `download`, `seed`, `encryption`, `magnet`, `pex`, `utp`, `lsd`, `stream`,
-`resume`, `webseed`, `proxy`, `v2` and `hybrid`;
+`resume`, `webseed`, `proxy`, `v2`, `hybrid` and `api`;
 an unknown name fails at once with `interop: unknown scenario '<name>' (known:
 ...)`, before the setup. The shared setup and the uTP scenarios always run,
 the others only when named. A partial run ends with `interop: selected

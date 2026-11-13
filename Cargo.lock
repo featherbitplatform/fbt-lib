@@ -639,6 +639,7 @@ version = "0.6.0"
 dependencies = [
  "clap",
  "fbt",
+ "fbt-api",
  "fbt-bencode",
  "fbt-net",
  "sha1",
