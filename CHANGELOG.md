@@ -32,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resume data is version 2, which older builds cannot read: `info-hash` is optional, and the new keys are `info-hash2` and `piece-layers`; version 1 is still read
 - `fbt_wire::Message` gains three variants (`HashRequest`, `Hashes`, `HashReject`); match with a wildcard arm
 - `fbt-example info` prints the wire hash (40 hex), `info hash v2:` when there is one, and `version:`
-- Created hybrids carry a tail pad, so their hashes match libtorrent 2.0 and qBittorrent 5.3 exactly
+- Created multi-file hybrids carry a tail pad after their last file, so their hashes match libtorrent 2.0 and qBittorrent 5.3 exactly (a single-file hybrid has no file list to hold one)
+- `ResumeError::InfoHashMismatch` reads "the resume data's torrent does not match its info hash": it now covers `info-hash2` too
+- A v2 file tree is single-file only when its one top-level entry is a file whose key equals `name`; any other tree is a directory named `name`
 - `fbt-metainfo`: a torrent without v1 `pieces` (v2-only) is refused with `MetainfoError::InvalidField` (`length`, "too many pieces") when it has more than `MAX_V2_PIECES` (4,194,304, equal to `MAX_PIECE_LAYER_HASHES`) pieces, both from a `.torrent` and from metadata fetched for a `btmh` magnet; `CreateTorrent::build` refuses such a v2-only torrent with the new `CreateError::TooManyPieces`. Before, a 154-byte v2 `.torrent` could claim 2^32 - 1 pieces and abort the process when the session sized its per-piece state
 
 ## [0.5.0] - 2026-11-13

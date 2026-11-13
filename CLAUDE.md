@@ -54,8 +54,9 @@ bash dev/bench.sh
 
 # Live interop vs qBittorrent-nox and Transmission via opentracker, plus magnet via DHT, forced
 # encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent, LSD between two
-# fbt-example containers, resume without recheck, a web seed (nginx), a SOCKS5 proxy (Dante), and v2 and hybrid torrents (creation hashes, hash requests, `btmh` magnets), on
-# isolated networks with our own dht-node (Docker; see dev/interop/README.md)
+# fbt-example containers, resume without recheck, a web seed (nginx), a SOCKS5 proxy (Dante),
+# and v2 and hybrid torrents (creation hashes, hash requests, `btmh` magnets), on isolated
+# networks with our own dht-node (Docker; see dev/interop/README.md)
 bash dev/interop/run.sh
 
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec
