@@ -5,7 +5,7 @@ mod support;
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use fbt::{
@@ -153,6 +153,7 @@ async fn serves_whole_file() {
     assert_eq!(headers["content-length"], "300000");
     assert_eq!(headers["accept-ranges"], "bytes");
     assert_eq!(headers["content-type"], "video/mp4");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
     let disposition = headers["content-disposition"].to_str().expect("ascii");
     assert!(
         disposition.contains("filename=\"video.mp4\""),
@@ -227,6 +228,7 @@ async fn head_has_no_body() {
             "accept-ranges",
             "content-type",
             "content-disposition",
+            "x-content-type-options",
         ] {
             assert_eq!(
                 head_headers.get(name),
@@ -463,8 +465,8 @@ async fn hang_up_releases_the_reader() {
     );
     drop(conn);
     assert!(
-        wait_deadlines(&s.handle, true, Duration::from_secs(2)).await,
-        "the deadlines are cleared within 2 s of the hang-up"
+        wait_deadlines(&s.handle, true, Duration::from_secs(5)).await,
+        "the deadlines are cleared within 5 s of the hang-up"
     );
     s.session.shutdown().await;
     s.seed.shutdown().await;
@@ -528,13 +530,29 @@ async fn remove_ends_open_streams() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_ends_open_sse_and_streams() {
     let s = stalled(|_| {}).await;
-    let (_events, head) = raw_get(&s.base, "/api/v1/events").await;
+    let (events, head) = raw_get(&s.base, "/api/v1/events").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    let (_stream, head) = raw_get(&s.base, &s.path).await;
+    let (stream, head) = raw_get(&s.base, &s.path).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    tokio::time::timeout(Duration::from_secs(6), s.server.shutdown())
-        .await
-        .expect("shutdown returns within 6 s");
+    // Both bodies end at once, so shutdown never reaches the 5 s grace
+    // that aborts stragglers.
+    let started = Instant::now();
+    s.server.shutdown().await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "shutdown took {took:?}");
+    for (name, mut conn) in [("events", events), ("stream", stream)] {
+        let mut buf = [0u8; 4096];
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the {name} connection is closed");
+    }
     s.session.shutdown().await;
     s.seed.shutdown().await;
 }

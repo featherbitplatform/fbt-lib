@@ -85,6 +85,12 @@ fn plan(
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(header::CONTENT_TYPE, content_type(file));
     headers.insert(header::CONTENT_DISPOSITION, content_disposition(file));
+    // The body is torrent content: never let a browser sniff it into an
+    // active type.
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
 
     let mut ranges = request.get_all(header::RANGE).iter();
     let outcome = match (ranges.next(), ranges.next()) {
@@ -164,7 +170,8 @@ fn respond(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
         (status = 404, description = "Unknown torrent or file (`not_found`).", body = ErrorBody),
         (status = 409, description = "No metadata yet (`no_metadata`).", body = ErrorBody),
         (status = 416, description = "The range starts past the end (`range_not_satisfiable`), with `Content-Range: bytes */<len>`.", body = ErrorBody),
-        (status = 503, description = "Too many open streams (`too_many_streams`), with `Retry-After: 1`.", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "Too many open streams (`too_many_streams`), with `Retry-After: 1`, or the session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn stream_file(
