@@ -1046,6 +1046,33 @@ impl Session {
         Ok(())
     }
 
+    /// The queue's limits: [`Settings::queue`], or the last
+    /// [`set_queue_settings`](Self::set_queue_settings).
+    pub fn queue_settings(&self) -> QueueSettings {
+        self.inner.shared.queue_settings()
+    }
+
+    /// The session-wide rate limit: [`Settings::rate_limit`], or the last
+    /// [`set_rate_limit`](Self::set_rate_limit).
+    pub fn rate_limit(&self) -> RateLimit {
+        self.inner.shared.bandwidth.global_limit()
+    }
+
+    /// The peer class limits: [`Settings::peer_class_limits`], or the last
+    /// [`set_peer_class_limits`](Self::set_peer_class_limits).
+    pub fn peer_class_limits(&self) -> PeerClassLimits {
+        self.inner.shared.bandwidth.class_limits()
+    }
+
+    /// True once [`shutdown`](Self::shutdown) or
+    /// [`shutdown_and_save`](Self::shutdown_and_save) has begun on this
+    /// session or any clone of it; every command then returns
+    /// [`SessionError::Shutdown`]. For a long-lived consumer holding a
+    /// clone (an event stream adapter, say) to notice the end.
+    pub fn is_shut_down(&self) -> bool {
+        self.inner.shared.is_shutdown()
+    }
+
     /// Sets the session-wide rate limit ([`Settings::rate_limit`]); it
     /// applies at once, and to waiting connections within a second.
     pub fn set_rate_limit(&self, limit: RateLimit) {

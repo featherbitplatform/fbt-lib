@@ -113,7 +113,7 @@ pub use session::{AddTorrent, Priority, RemoveMode, Session, TorrentSource};
 pub use settings::{
     DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, Settings,
 };
-pub use status::{TorrentState, TorrentStatus};
+pub use status::{FileStatus, TorrentState, TorrentStatus, TrackerStatus};
 pub use storage::{CacheStats, FileStamp, MoveMode, StorageError};
 pub use stream::{FileReader, ReadAhead};
 pub use torrent::TorrentHandle;

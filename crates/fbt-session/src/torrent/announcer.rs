@@ -38,11 +38,16 @@
 //! `started`/`stopped` pairs, intervals and backoff above hold per
 //! (tracker, hash). A hash that only the metadata revealed later is not
 //! announced. Scrapes use the torrent's wire hash only.
+//!
+//! Each task records what its trackers answered in the announcer's
+//! [`TrackerTable`], one entry per (tracker, hash), which the actor reads
+//! for `TorrentHandle::trackers`; a lock held for a few field writes or one
+//! copy of the table.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use fbt_core::InfoHashes;
 use fbt_tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerClient, TrackerError};
@@ -55,7 +60,7 @@ use tracing::{debug, warn};
 use super::tiers::Tiers;
 use crate::event::Event;
 use crate::session::{Shared, wire_hashes};
-use crate::status::{TorrentState, TorrentStatus};
+use crate::status::{TorrentState, TorrentStatus, TrackerStatus};
 
 /// Timeout of a `stopped` announce, and how long shutdown waits for it.
 pub(super) const STOPPED_TIMEOUT: Duration = Duration::from_secs(5);
@@ -102,6 +107,130 @@ pub(super) struct Signals {
 pub(super) struct Announcer {
     /// One task per announced hash.
     pub tasks: Vec<JoinHandle<()>>,
+    /// What each (tracker, hash) last answered.
+    pub table: Arc<Mutex<TrackerTable>>,
+}
+
+/// What one tracker last answered under one hash.
+#[derive(Debug, Clone)]
+struct TrackerEntry {
+    url: String,
+    tier: usize,
+    info_hash: [u8; 20],
+    last_error: Option<String>,
+    last_reply: Option<SystemTime>,
+    /// When the next walk starting with this tracker is due.
+    next_announce: Option<Instant>,
+    seeders: Option<u32>,
+    leechers: Option<u32>,
+    peers_returned: Option<u32>,
+}
+
+/// One entry per (tracker, hash) the announcer announces to, in tier
+/// order then hash order; at most [`MAX_TRACKERS`](fbt_metainfo::MAX_TRACKERS)
+/// URLs per hash, as [`Tiers`] keeps. Entries are never removed: a tracker
+/// dropped as unusable keeps its error.
+#[derive(Debug, Default)]
+pub(super) struct TrackerTable {
+    entries: Vec<TrackerEntry>,
+}
+
+impl TrackerTable {
+    /// Entries for every URL of `tiers` under each of `hashes`.
+    fn new(tiers: &Tiers, hashes: &[[u8; 20]]) -> Self {
+        let mut entries = Vec::new();
+        for (tier, urls) in tiers.tiers().iter().enumerate() {
+            for url in urls {
+                for &info_hash in hashes {
+                    if entries
+                        .iter()
+                        .any(|e: &TrackerEntry| e.url == *url && e.info_hash == info_hash)
+                    {
+                        continue;
+                    }
+                    entries.push(TrackerEntry {
+                        url: url.clone(),
+                        tier,
+                        info_hash,
+                        last_error: None,
+                        last_reply: None,
+                        next_announce: None,
+                        seeders: None,
+                        leechers: None,
+                        peers_returned: None,
+                    });
+                }
+            }
+        }
+        TrackerTable { entries }
+    }
+
+    fn entry(&mut self, url: &str, info_hash: [u8; 20]) -> Option<&mut TrackerEntry> {
+        self.entries
+            .iter_mut()
+            .find(|e| e.url == url && e.info_hash == info_hash)
+    }
+
+    /// The next announce under `info_hash` goes to `url` at `due`; none
+    /// for its other trackers (or for all of them with `None`).
+    fn set_next(&mut self, info_hash: [u8; 20], next: Option<(&str, Instant)>) {
+        for e in self.entries.iter_mut().filter(|e| e.info_hash == info_hash) {
+            e.next_announce = match next {
+                Some((url, due)) if e.url == url => Some(due),
+                _ => None,
+            };
+        }
+    }
+
+    /// The entries as public snapshots, `next_announce` counted from `now`.
+    pub(super) fn snapshot(&self, now: Instant) -> Vec<TrackerStatus> {
+        self.entries
+            .iter()
+            .map(|e| TrackerStatus {
+                url: e.url.clone(),
+                tier: e.tier,
+                info_hash: e.info_hash,
+                last_error: e.last_error.clone(),
+                last_reply: e.last_reply,
+                next_announce: e.next_announce.map(|t| t.saturating_duration_since(now)),
+                seeders: e.seeders,
+                leechers: e.leechers,
+                peers_returned: e.peers_returned,
+            })
+            .collect()
+    }
+}
+
+/// Runs `f` on the table, under its lock.
+fn with_table<R>(table: &Mutex<TrackerTable>, f: impl FnOnce(&mut TrackerTable) -> R) -> R {
+    f(&mut table.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Records a reply from `url` under `info_hash`.
+fn record_reply(
+    table: &Mutex<TrackerTable>,
+    url: &str,
+    info_hash: [u8; 20],
+    resp: &AnnounceResponse,
+) {
+    with_table(table, |t| {
+        if let Some(e) = t.entry(url, info_hash) {
+            e.last_error = None;
+            e.last_reply = Some(SystemTime::now());
+            e.seeders = resp.complete;
+            e.leechers = resp.incomplete;
+            e.peers_returned = Some(u32::try_from(resp.peers.len()).unwrap_or(u32::MAX));
+        }
+    });
+}
+
+/// Records an announce error from `url` under `info_hash`.
+fn record_error(table: &Mutex<TrackerTable>, url: &str, info_hash: [u8; 20], e: &TrackerError) {
+    with_table(table, |t| {
+        if let Some(entry) = t.entry(url, info_hash) {
+            entry.last_error = Some(e.to_string());
+        }
+    });
 }
 
 /// Everything an announcer task needs.
@@ -127,7 +256,9 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
     let key = rng.random();
     let (peers_tx, peers_rx) = mpsc::channel(PEER_QUEUE);
     let scrape_hash = p.ih.wire_hash();
-    let tasks = wire_hashes(&p.ih)
+    let hashes = wire_hashes(&p.ih);
+    let table = Arc::new(Mutex::new(TrackerTable::new(&tiers, &hashes)));
+    let tasks = hashes
         .into_iter()
         .map(|info_hash| {
             let task = Task {
@@ -141,6 +272,7 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
                 status: p.status.clone(),
                 signals: p.signals.clone(),
                 peers: peers_tx.clone(),
+                table: Arc::clone(&table),
                 tracker_ids: HashMap::new(),
                 failed_walks: 0,
                 scrapes_seen: 0,
@@ -149,7 +281,7 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
             tokio::spawn(task.run())
         })
         .collect();
-    Some((Announcer { tasks }, peers_rx))
+    Some((Announcer { tasks, table }, peers_rx))
 }
 
 /// How a walk through the tiers ended.
@@ -184,6 +316,8 @@ struct Task {
     status: watch::Receiver<TorrentStatus>,
     signals: watch::Receiver<Signals>,
     peers: mpsc::Sender<Vec<SocketAddr>>,
+    /// Shared with the other tasks and the actor.
+    table: Arc<Mutex<TrackerTable>>,
     /// `tracker id` per URL, echoed back.
     tracker_ids: HashMap<String, Vec<u8>>,
     failed_walks: u32,
@@ -288,6 +422,7 @@ impl Task {
                 ));
             }
             if sig.exit || !sig.running {
+                self.publish_next(None);
                 if !run.started_urls.is_empty() {
                     self.stopped(&run.started_urls, sig.left).await;
                 }
@@ -309,6 +444,7 @@ impl Task {
             }
             let now = Instant::now();
             let (event, due) = plan(&run, &sig, completed_sent, now);
+            self.publish_next(Some(due));
             if due > now {
                 match self.wait_lifecycle(Some(due)).await {
                     Interrupt::Closed => return,
@@ -327,6 +463,7 @@ impl Task {
                 Err(Interrupt::Closed) => return,
                 Err(Interrupt::Lifecycle) => continue,
                 Ok(Walk::NoTrackers) => {
+                    self.publish_next(None);
                     // Nothing left to announce to; wait for the end.
                     let _ = self.signals.wait_for(|s| s.exit).await;
                     return;
@@ -364,6 +501,15 @@ impl Task {
                 }
             }
         }
+    }
+
+    /// Records when the next walk is due, on the tracker it starts with
+    /// (none without `due`).
+    fn publish_next(&mut self, due: Option<Instant>) {
+        // Every walk starts over from the first URL; so may this.
+        self.tiers.restart();
+        let next = due.and_then(|due| self.tiers.current().map(|url| (url, due)));
+        with_table(&self.table, |t| t.set_next(self.info_hash, next));
     }
 
     fn backoff(&self) -> Duration {
@@ -407,8 +553,11 @@ impl Task {
             &mut self.tiers,
             req,
             started_urls,
-            &self.shared,
-            self.ih,
+            Report {
+                shared: &self.shared,
+                table: &self.table,
+                ih: self.ih,
+            },
             &mut self.tracker_ids,
         );
         tokio::pin!(walk);
@@ -513,12 +662,15 @@ impl Task {
             };
             pending.remove(&url);
             match r {
-                Ok(resp) => self.shared.emit(Event::TrackerReply {
-                    torrent: self.ih,
-                    info_hash: self.info_hash,
-                    url,
-                    peers: resp.peers.len(),
-                }),
+                Ok(resp) => {
+                    record_reply(&self.table, &url, self.info_hash, &resp);
+                    self.shared.emit(Event::TrackerReply {
+                        torrent: self.ih,
+                        info_hash: self.info_hash,
+                        url,
+                        peers: resp.peers.len(),
+                    });
+                }
                 Err(e) => self.error(url, &e),
             }
         }
@@ -529,6 +681,7 @@ impl Task {
     }
 
     fn error(&self, url: String, e: &TrackerError) {
+        record_error(&self.table, &url, self.info_hash, e);
         emit_error(&self.shared, self.ih, url, e);
     }
 }
@@ -631,6 +784,15 @@ fn event_for(url: &str, event: AnnounceEvent, started_urls: &HashSet<String>) ->
     }
 }
 
+/// Where a walk reports its outcomes: the session's events and the
+/// tracker table.
+#[derive(Clone, Copy)]
+struct Report<'a> {
+    shared: &'a Shared,
+    table: &'a Mutex<TrackerTable>,
+    ih: InfoHashes,
+}
+
 /// One walk through the tiers from the first URL until a tracker answers or
 /// every one has failed. Each tracker is sent [`event_for`] it.
 async fn walk(
@@ -638,10 +800,10 @@ async fn walk(
     tiers: &mut Tiers,
     req: AnnounceRequest,
     started_urls: &HashSet<String>,
-    shared: &Shared,
-    ih: InfoHashes,
+    report: Report<'_>,
     tracker_ids: &mut HashMap<String, Vec<u8>>,
 ) -> Walk {
+    let Report { shared, table, ih } = report;
     tiers.restart();
     loop {
         let Some(url) = tiers.current().map(str::to_owned) else {
@@ -655,6 +817,7 @@ async fn walk(
                 if let Some(id) = &resp.tracker_id {
                     tracker_ids.insert(url.clone(), id.clone());
                 }
+                record_reply(table, &url, req.info_hash, &resp);
                 shared.emit(Event::TrackerReply {
                     torrent: ih,
                     info_hash: req.info_hash,
@@ -665,6 +828,7 @@ async fn walk(
             }
             Err(e) => {
                 let drop_it = unusable(&e);
+                record_error(table, &url, req.info_hash, &e);
                 emit_error(shared, ih, url, &e);
                 if drop_it {
                     tiers.remove_current();

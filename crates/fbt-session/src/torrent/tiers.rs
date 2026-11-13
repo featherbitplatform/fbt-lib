@@ -52,6 +52,11 @@ impl Tiers {
         }
     }
 
+    /// The URLs kept, by tier.
+    pub(crate) fn tiers(&self) -> &[Vec<String>] {
+        &self.tiers
+    }
+
     /// No URL left.
     pub(crate) fn is_empty(&self) -> bool {
         self.tiers.is_empty()

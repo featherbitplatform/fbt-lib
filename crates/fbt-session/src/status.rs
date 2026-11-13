@@ -1,9 +1,11 @@
 //! Plain-data torrent status snapshots.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use fbt_core::InfoHashes;
+
+use crate::session::Priority;
 
 /// What a torrent is doing.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -151,4 +153,55 @@ impl TorrentStatus {
             is_seed: false,
         }
     }
+}
+
+/// One file of a torrent, from
+/// [`TorrentHandle::files`](crate::TorrentHandle::files).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct FileStatus {
+    /// Its index in the metadata's file list (pad files included).
+    pub index: usize,
+    /// Its path relative to the save path (for a multi-file torrent it
+    /// starts with the torrent's directory); a path given by
+    /// [`rename_file`](crate::TorrentHandle::rename_file) replaces the
+    /// metadata's.
+    pub path: PathBuf,
+    /// Its length in bytes.
+    pub len: u64,
+    /// A BEP 47 pad file: never written to disk.
+    pub pad: bool,
+    /// Its download priority.
+    pub priority: Priority,
+    /// Bytes of the file inside verified pieces.
+    pub downloaded: u64,
+}
+
+/// One tracker of a torrent under one announced hash, from
+/// [`TorrentHandle::trackers`](crate::TorrentHandle::trackers).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TrackerStatus {
+    /// The tracker's announce URL.
+    pub url: String,
+    /// Its tier (BEP 12), from 0.
+    pub tier: usize,
+    /// The hash announced to it: the v1 hash or the truncated v2 hash.
+    pub info_hash: [u8; 20],
+    /// The last announce's error, cleared by the next reply. A tracker
+    /// dropped as unusable (unsupported scheme, invalid URL, HTTPS without
+    /// TLS) keeps it.
+    pub last_error: Option<String>,
+    /// When it last answered an announce.
+    pub last_reply: Option<SystemTime>,
+    /// Time left until the next announce goes to it: set on the tracker the
+    /// next walk through the tiers starts with while the torrent is
+    /// announced, `None` on the others and while it is stopped.
+    pub next_announce: Option<Duration>,
+    /// Seeders in its last reply, if it said.
+    pub seeders: Option<u32>,
+    /// Leechers in its last reply, if it said.
+    pub leechers: Option<u32>,
+    /// Peers its last reply carried.
+    pub peers_returned: Option<u32>,
 }

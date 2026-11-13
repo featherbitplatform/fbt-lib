@@ -511,6 +511,16 @@ impl Bandwidth {
         }
     }
 
+    /// The global limit set.
+    pub(crate) fn global_limit(&self) -> RateLimit {
+        self.limits().global
+    }
+
+    /// The class limits set.
+    pub(crate) fn class_limits(&self) -> PeerClassLimits {
+        self.limits().classes
+    }
+
     /// Sets the global limit, at once.
     pub(crate) fn set_global(&self, limit: RateLimit) {
         let mut l = self.limits();
