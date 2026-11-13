@@ -6,6 +6,7 @@ mod bitfield;
 pub mod compact;
 mod info_hash;
 mod layout;
+pub mod merkle;
 mod peer_id;
 pub mod rate;
 pub mod udp;
