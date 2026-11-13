@@ -929,7 +929,8 @@ impl Session {
     /// with the highest sequence number whose signature verifies, or `None`
     /// when no node close to it has one.
     ///
-    /// Fails like [`dht_get_immutable`](Self::dht_get_immutable).
+    /// Fails like [`dht_get_immutable`](Self::dht_get_immutable), and with
+    /// [`SessionError::Dht`] for a salt over 64 bytes.
     pub async fn dht_get_mutable(
         &self,
         public_key: [u8; 32],

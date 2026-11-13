@@ -774,8 +774,9 @@ impl Dht {
     /// `get` lookup for its target collects write tokens from the `K`
     /// closest nodes of each bound family, then each gets a `put`. Returns
     /// the target (SHA-1 of `value`) and the number of nodes that stored
-    /// it; with none, the first node's KRPC error if any
-    /// ([`DhtError::Remote`]). Fails like [`get_immutable`](Dht::get_immutable)
+    /// it; with none, the most specific KRPC refusal if any
+    /// ([`DhtError::Remote`]; `302`, then `301`, `206`, `205`, `207`, then
+    /// the lowest other code). Fails like [`get_immutable`](Dht::get_immutable)
     /// otherwise.
     pub async fn put_immutable(&self, value: Vec<u8>) -> Result<([u8; 20], usize), DhtError> {
         if !is_item_value(&value) {
@@ -805,15 +806,15 @@ impl Dht {
     /// BEP 44: the mutable item of `public_key` and `salt` (empty for none)
     /// with the highest `seq` any node close to its target returned, among
     /// those whose signature verifies; forged answers are ignored. `None`
-    /// when no node has it. Fails like
-    /// [`get_immutable`](Dht::get_immutable).
+    /// when no node has it. Fails with [`DhtError::InvalidValue`] for a salt
+    /// over 64 bytes, otherwise like [`get_immutable`](Dht::get_immutable).
     pub async fn get_mutable(
         &self,
         public_key: [u8; 32],
         salt: &[u8],
     ) -> Result<Option<MutableItem>, DhtError> {
         if salt.len() > MAX_SALT {
-            return Ok(None);
+            return Err(DhtError::InvalidValue);
         }
         let target = items::mutable_target(&public_key, salt);
         let goal = Goal::Get {
@@ -841,9 +842,9 @@ impl Dht {
     /// 32-byte seed, never sent) under `salt` and `seq` and stores it as a
     /// mutable item, like [`put_immutable`](Dht::put_immutable). With
     /// `cas`, nodes store it only over an item of exactly that `seq`.
-    /// Returns the number of nodes that stored it; when none did, the first
-    /// node's KRPC error if any ([`DhtError::Remote`]: `301` for a `cas`
-    /// mismatch, `302` for a `seq` not above the stored one). Fails with
+    /// Returns the number of nodes that stored it; when none did, the most
+    /// specific refusal as for `put_immutable` ([`DhtError::Remote`]: `302`
+    /// for a `seq` not above the stored one, `301` for a `cas` mismatch). Fails with
     /// [`DhtError::InvalidValue`] for an invalid value, a salt over 64
     /// bytes or a negative `seq`.
     pub async fn put_mutable(
@@ -911,7 +912,8 @@ impl Dht {
     }
 
     /// Sends `put(token)` to every responder of `outcomes` with its token:
-    /// the number that stored it, or with none, the first KRPC error.
+    /// the number that stored it, or with none, the most specific refusal
+    /// ([`most_specific`]).
     async fn put_to(
         &self,
         outcomes: &[Outcome],
@@ -929,7 +931,7 @@ impl Dht {
             match joined {
                 Ok(Ok(_)) => stored += 1,
                 Ok(Err(QueryError::Remote { code })) => {
-                    refused.get_or_insert(code);
+                    refused = Some(refused.map_or(code, |r| most_specific(r, code)));
                 }
                 Ok(Err(QueryError::Shutdown)) => return Err(DhtError::Shutdown),
                 _ => {}
@@ -951,6 +953,22 @@ impl Dht {
             .map_err(|_| DhtError::Shutdown)?;
         rx.await.map_err(|_| DhtError::Shutdown)
     }
+}
+
+/// Of two put refusals, the one to report: `302` (`seq` too low), then
+/// `301` (`cas` mismatch), `206` (bad signature), `205`/`207` (too big),
+/// then any other code (lowest first, such as `203` from a node whose token
+/// expired), so mixed answers always give the same error.
+fn most_specific(a: i64, b: i64) -> i64 {
+    let rank = |c: i64| match c {
+        crate::krpc::ERR_SEQ_TOO_LOW => 0,
+        crate::krpc::ERR_CAS_MISMATCH => 1,
+        crate::krpc::ERR_INVALID_SIGNATURE => 2,
+        crate::krpc::ERR_VALUE_TOO_BIG => 3,
+        crate::krpc::ERR_SALT_TOO_BIG => 4,
+        _ => 5,
+    };
+    std::cmp::min_by_key(a, b, |&c| (rank(c), c))
 }
 
 #[derive(Debug)]
@@ -2515,6 +2533,17 @@ mod tests {
         let new = regenerate_for(own, ext, &mut rng).expect("new id");
         assert!(new.is_valid_for(ext));
         assert_eq!(regenerate_for(new, ext, &mut rng), None, "already valid");
+    }
+
+    #[test]
+    fn put_refusals_report_the_most_specific_code() {
+        let pick = |codes: &[i64]| codes.iter().copied().reduce(most_specific);
+        assert_eq!(pick(&[203, 301, 302, 206]), Some(302));
+        assert_eq!(pick(&[302, 203, 301]), Some(302));
+        assert_eq!(pick(&[203, 301, 206]), Some(301));
+        assert_eq!(pick(&[203, 206]), Some(206));
+        assert_eq!(pick(&[207, 205, 203]), Some(205));
+        assert_eq!(pick(&[204, 203, 202]), Some(202));
     }
 
     #[test]

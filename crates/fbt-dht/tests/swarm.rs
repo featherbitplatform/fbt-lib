@@ -464,12 +464,37 @@ fn ed25519_public_key(seed: [u8; 32]) -> [u8; 32] {
 
 /// A swarm of `n` loopback nodes whose tables hold at least `min` nodes.
 async fn ready_swarm(n: usize, min: usize) -> Vec<Dht> {
-    let nodes = swarm(n, "127.0.0.1:0").await;
+    ready_swarm_with(n, min, Duration::from_millis(500)).await
+}
+
+/// [`ready_swarm`] with each node's query timeout.
+async fn ready_swarm_with(n: usize, min: usize, query_timeout: Duration) -> Vec<Dht> {
+    let mut c = cfg("127.0.0.1:0");
+    c.query_timeout = query_timeout;
+    let first = Dht::spawn(c.clone()).await.unwrap();
+    let seed = first.local_addrs()[0].to_string();
+    let mut nodes = vec![first];
+    for _ in 1..n {
+        let mut c = c.clone();
+        c.bootstrap = vec![seed.clone()];
+        nodes.push(Dht::spawn(c).await.unwrap());
+    }
+    // introduce every pair directly (a ping each way), so a full mesh does
+    // not wait on discovery
+    let addrs: Vec<SocketAddr> = nodes.iter().map(|d| d.local_addrs()[0]).collect();
+    for (d, own) in nodes.iter().zip(&addrs) {
+        for a in addrs.iter().filter(|a| *a != own) {
+            d.add_node(*a);
+        }
+    }
+    let counts = || nodes.iter().map(|d| d.stats().nodes_v4).collect::<Vec<_>>();
     assert!(
-        wait_until(Duration::from_secs(10), || nodes
+        wait_until(Duration::from_secs(20), || nodes
             .iter()
             .all(|d| d.stats().nodes_v4 >= min))
-        .await
+        .await,
+        "tables: {:?}",
+        counts()
     );
     nodes
 }
@@ -523,11 +548,13 @@ async fn immutable_put_then_get() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mutable_put_then_get_highest_seq() {
-    // 9 nodes: each put reaches the K = 8 others, so after two puts from
-    // different nodes every node holds the item, and the refusals below
-    // (which BEP 44 only applies over a stored item) come from all of them
-    let nodes = ready_swarm(9, 5).await;
+    // 9 nodes that all know each other: a put reaches the K = 8 others. The
+    // refusals below (which BEP 44 only applies over a stored item) need
+    // every node but the writer, node 5, to hold the item; that is checked
+    // node by node first, so a slow reply cannot make the test flaky.
+    let nodes = ready_swarm_with(9, 8, Duration::from_secs(2)).await;
     let seed = [0x21u8; 32];
+    let public_key = ed25519_public_key(seed);
     assert!(
         nodes[2]
             .put_mutable(seed, Vec::new(), b"3:one".to_vec(), 1, None)
@@ -542,7 +569,42 @@ async fn mutable_put_then_get_highest_seq() {
             .unwrap()
             >= 1
     );
-    let public_key = ed25519_public_key(seed);
+    // node 3 stores only node 2's put (seq 1), every other node seq 2; a
+    // node a put missed gets it again
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = fbt_dht::NodeId(sha1(&public_key));
+    let expected = |k: usize| if k == 3 { 1 } else { 2 };
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.clear();
+        for (k, n) in nodes.iter().enumerate() {
+            let Body::Response(r) =
+                ask_raw(&sock, n.local_addrs()[0], Query::Get { target, seq: None }).await
+            else {
+                panic!("node {k} refused a get")
+            };
+            held.push(r.seq);
+        }
+        let missing: Vec<usize> = (0..nodes.len())
+            .filter(|&k| k != 5 && held[k] != Some(expected(k)))
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        if missing.contains(&3) {
+            let _ = nodes[2]
+                .put_mutable(seed, Vec::new(), b"3:one".to_vec(), 1, None)
+                .await;
+        }
+        if missing.iter().any(|&k| k != 3) {
+            let _ = nodes[3]
+                .put_mutable(seed, Vec::new(), b"3:two".to_vec(), 2, None)
+                .await;
+        }
+    }
+    for (k, seq) in held.iter().enumerate().filter(|(k, _)| *k != 5) {
+        assert_eq!(*seq, Some(expected(k)), "node {k}: {held:?}");
+    }
     assert_eq!(nodes[8].get_mutable([0; 32], b"").await.unwrap(), None);
     // a salted item under the same key
     assert!(
@@ -576,8 +638,8 @@ async fn mutable_put_then_get_highest_seq() {
             .await,
         Err(DhtError::Remote { code: 302 })
     ));
-    // a stale cas: 301 (node 3 holds seq 1 from node 2's put, the others
-    // seq 2: cas 0 matches neither)
+    // a stale cas: 301 (node 3 holds seq 1, the others seq 2: cas 0
+    // matches neither)
     assert!(matches!(
         nodes[5]
             .put_mutable(seed, Vec::new(), b"5:three".to_vec(), 3, Some(0))
@@ -590,6 +652,10 @@ async fn mutable_put_then_get_highest_seq() {
         None
     );
     // invalid arguments never leave the node
+    assert!(matches!(
+        nodes[5].get_mutable(public_key, &[0; 65]).await,
+        Err(DhtError::InvalidValue)
+    ));
     assert!(matches!(
         nodes[5]
             .put_mutable(seed, vec![0; 65], b"i1e".to_vec(), 9, None)

@@ -4,6 +4,11 @@
 //!
 //! [`Message::decode`] parses hostile UDP datagrams: it never panics, decodes
 //! with [`KRPC_LIMITS`], and cuts every list to a named cap before allocating.
+//!
+//! A BEP 44 item value must be canonical bencode (sorted keys, see
+//! `is_item_value`): signatures and targets cover its exact bytes. A `put`
+//! whose `v` is not is malformed, so the node drops it without a reply,
+//! like any malformed query; in a response such a `v` is dropped.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

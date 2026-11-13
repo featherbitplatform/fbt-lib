@@ -507,6 +507,32 @@ mod tests {
             panic!()
         };
         assert_eq!((r.v, r.k, r.sig, r.seq), (None, None, None, Some(7)));
+        // a value or salt the decoder cut, with a valid token: 205 and 207,
+        // nothing changes
+        let token = tokens.issue(from.ip());
+        for code in [
+            crate::krpc::ERR_VALUE_TOO_BIG,
+            crate::krpc::ERR_SALT_TOO_BIG,
+        ] {
+            let cut = Query::Put {
+                token: token.clone(),
+                v: Vec::new(),
+                k: Some(k),
+                sig: Some(sig),
+                seq: Some(8),
+                salt: None,
+                cas: None,
+                reject: Some(code),
+            };
+            assert!(
+                matches!(ask(&mut s, cut), Body::Error { code: c, .. } if c == code),
+                "{code}"
+            );
+        }
+        let Body::Response(r) = ask(&mut s, get(None)) else {
+            panic!()
+        };
+        assert_eq!(r.seq, Some(7));
     }
 
     #[test]

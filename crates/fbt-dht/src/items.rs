@@ -310,8 +310,7 @@ mod tests {
         assert!(!verify(&k, &hex(BEP44_SIG), b"foobar", 1, HELLO));
         assert!(!verify(&k, &hex(BEP44_SIG), b"", 2, HELLO));
         assert!(!verify(&k, &hex(BEP44_SIG), b"", 1, b"12:Hello World?"));
-        // immutable: SHA-1 of the bencoded value (computed with Python's
-        // hashlib, not copied from the BEP)
+        // test 3 (immutable): the target is the SHA-1 of the bencoded value
         assert_eq!(
             immutable_target(HELLO),
             hex::<20>("e5f96f6f38320f0f33959cb4d3d656452117aadb")
