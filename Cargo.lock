@@ -563,7 +563,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fbt"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-api"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "bytes",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-bencode"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proptest",
  "rand",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-dht"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ed25519-dalek",
  "fbt-bencode",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-example"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "fbt",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-metainfo"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-net"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-session"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bitflags",
  "bytes",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-tracker"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "fbt-bencode",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-utp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-wire"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bitflags",
  "bytes",
