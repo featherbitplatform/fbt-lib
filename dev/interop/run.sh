@@ -5,19 +5,21 @@
 # magnet through the private DHT (bootstrapped from the `dht-node` service
 # only) with BEP 9 metadata exchange, finds a peer through PEX alone, moves
 # a torrent each way with qBittorrent over uTP only, streams a file from
-# qBittorrent with seeks, and finds a second fbt-example (the `fbt-lsd`
-# service) through LSD alone.
+# qBittorrent with seeks, finds a second fbt-example (the `fbt-lsd`
+# service) through LSD alone, resumes a half-done download from its resume
+# file without a recheck, downloads from an nginx web seed alone and through
+# a Dante SOCKS5 proxy.
 # Needs Docker with Compose v2. Everything lands in target/interop/.
 #
 #   bash dev/interop/run.sh
 #
 # INTEROP_ONLY=utp (a comma-separated list of download, seed, encryption,
-# magnet, pex, utp, lsd, stream) runs only those scenarios, after the shared
+# magnet, pex, utp, lsd, stream, resume, webseed, proxy) runs only those scenarios, after the shared
 # setup; uTP always runs, and an unknown name fails before anything starts. FBT_RUST_LOG sets RUST_LOG for the uTP download (its
 # tracing lands in fbt-download-utp.log), e.g. FBT_RUST_LOG=fbt_utp=debug.
 set -euo pipefail
 
-known_scenarios=(download seed encryption magnet pex utp lsd stream)
+known_scenarios=(download seed encryption magnet pex utp lsd stream resume webseed proxy)
 # An unknown name fails at once, before the setup, rather than selecting nothing.
 if [ -n "${INTEROP_ONLY:-}" ]; then
     IFS=, read -ra only_names <<<"$INTEROP_ONLY"
@@ -307,7 +309,7 @@ echo "interop: preparing $INTEROP_DIR"
 dc down -v --remove-orphans >/dev/null 2>&1 || true
 rm -rf "$INTEROP_DIR"
 mkdir -p "$logs" "$INTEROP_DIR/qbt-config/qBittorrent/config" "$INTEROP_DIR/tr-config" \
-    "$INTEROP_DIR/tr-dl" "$INTEROP_DIR/fbt"
+    "$INTEROP_DIR/tr-dl" "$INTEROP_DIR/fbt" "$INTEROP_DIR/payload6"
 cp "$here/qbittorrent/qBittorrent.conf" "$INTEROP_DIR/qbt-config/qBittorrent/config/"
 cp "$here/transmission/settings.json" "$here/transmission/dht.bootstrap" "$INTEROP_DIR/tr-config/"
 
@@ -672,6 +674,115 @@ stop_seed
 seed_service=fbt
 echo "interop: LSD OK"
 fi
+if want resume; then
+# ------------------------------------------------- resume without recheck --
+# qBittorrent is the only source: Transmission's copy of fixture 1 stops. The
+# first run stops at 50 % (pause, save the resume file, exit 0); the second
+# loads it, must trust its pieces without checking the files, and finishes.
+echo "interop: fbt-example download --resume --stop-at 50, then again from the resume file"
+trc transmission-remote -t "$hash1" -S >/dev/null
+resume_file=/interop/fbt-resume/r.dat
+mkdir -p "$INTEROP_DIR/fbt-resume"
+qbt_up_before=$(qbt_field "$hash1" .uploaded)
+# resume_run <step> [extra args...]: one download into /interop/fbt-resume.
+resume_run() {
+    local log="$logs/fbt-resume-$1.log"
+    shift
+    set +e
+    fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt-resume --port 6900 \
+        --no-dht --dht-bootstrap "$dht_bootstrap" --resume "$resume_file" "$@" >"$log" 2>&1
+    status=$?
+    set -e
+    check_download "$log" "$status" "fbt-example download --resume ($(basename "$log"))"
+}
+resume_run stop --stop-at 50
+fbt test -s "$resume_file" || fail "the first run wrote no resume file (see $logs/fbt-resume-stop.log)"
+stopped_at=$(sed -n 's/^stop at 50%: \([0-9.]*\)% done$/\1/p' "$logs/fbt-resume-stop.log")
+[ -n "$stopped_at" ] && awk -v p="$stopped_at" 'BEGIN {exit !(p >= 50 && p < 100)}' ||
+    fail "the first run did not stop part-way (at '${stopped_at}'%; see $logs/fbt-resume-stop.log)"
+wait_for "qBittorrent's uploaded to grow in the first run" 30 qbt_uploaded_more_than "$hash1" "$qbt_up_before"
+qbt_up_mid=$(qbt_field "$hash1" .uploaded)
+resume_run again
+[ "$(hashes /interop/payload fixture)" = "$(hashes /interop/fbt-resume fixture)" ] ||
+    fail "data downloaded in the resume scenario differs from the payload"
+grep -Eq '^resume: trusted \([0-9]+ pieces\)$' "$logs/fbt-resume-again.log" ||
+    fail "the second run did not trust its resume data (see $logs/fbt-resume-again.log)"
+# Neither a full check (`resume: checking`) nor a progress line in the
+# checking state.
+! grep -Eq '^resume: checking$| checking$' "$logs/fbt-resume-again.log" ||
+    fail "the second run checked its files (see $logs/fbt-resume-again.log)"
+wait_for "qBittorrent's uploaded to grow in the second run" 30 qbt_uploaded_more_than "$hash1" "$qbt_up_mid"
+echo "interop: resume: stopped at ${stopped_at}%, qBittorrent uploaded $qbt_up_before -> $qbt_up_mid -> $(qbt_field "$hash1" .uploaded) bytes"
+trc transmission-remote -t "$hash1" -s >/dev/null
+echo "interop: resume without recheck OK (qbittorrent)"
+fi
+
+if want webseed; then
+# ---------------------------------------------------------------- web seed --
+# A trackerless torrent whose only source is its url-list: the `webseed`
+# service (nginx) serving payload6 read-only.
+echo "interop: creating payload and web-seeded fixture6.torrent"
+fbt test -d /interop/payload6/fixture6 || make_payload /interop/payload6/fixture6
+trc transmission-create -o /interop/fixture6.torrent -w http://webseed/ -s 256 /interop/payload6/fixture6 >/dev/null
+hash6=$(info_hash /interop/fixture6.torrent)
+[ -n "$hash6" ] || fail "could not read the info hash of fixture6.torrent"
+echo "interop: fbt-example download from the web seed alone (timeout 300s)"
+webseed_log="$logs/fbt-webseed.log"
+set +e
+fbt timeout 300 fbt-example download /interop/fixture6.torrent --no-dht --dht-bootstrap "$dht_bootstrap" \
+    --out /interop/fbt-webseed --port 6901 >"$webseed_log" 2>&1
+status=$?
+set -e
+check_download "$webseed_log" "$status" "fbt-example download (web seed)"
+[ "$(hashes /interop/payload6 fixture6)" = "$(hashes /interop/fbt-webseed fixture6)" ] ||
+    fail "data downloaded from the web seed differs from the payload"
+! grep -q '^peer connected ' "$webseed_log" || fail "the web seed download connected to a peer (see $webseed_log)"
+dc logs --no-color --no-log-prefix webseed >"$logs/webseed-nginx.log" 2>&1
+grep -Eq '"GET /fixture6/[^ ]+ HTTP/1\.1" 206 ' "$logs/webseed-nginx.log" ||
+    fail "nginx served no 206 range response (see $logs/webseed-nginx.log)"
+echo "interop: web seed: nginx answered $(grep -Ec '"GET /fixture6/[^ ]+ HTTP/1\.1" 206 ' "$logs/webseed-nginx.log") range requests"
+echo "interop: web seed OK (nginx)"
+fi
+
+if want proxy; then
+# ------------------------------------------------------------ SOCKS5 proxy --
+# qBittorrent is the only source again. Every connection of ours goes through
+# Dante, so qBittorrent sees the socks5 container's address, never fbt's.
+echo "interop: fbt-example download through the SOCKS5 proxy (timeout 300s)"
+trc transmission-remote -t "$hash1" -S >/dev/null
+socks5_ip=$(container_ip socks5)
+[ -n "$socks5_ip" ] || fail "could not resolve the socks5 address"
+qbt_up_before=$(qbt_field "$hash1" .uploaded)
+proxy_log="$logs/fbt-proxy.log"
+fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt-proxy --port 6902 \
+    --dht-bootstrap "$dht_bootstrap" --proxy socks5://socks5:1080 >"$proxy_log" 2>&1 &
+proxy_pid=$!
+# qBittorrent lists only connected peers, so sample them while it runs.
+seen_socks5=false
+seen_fbt=false
+while kill -0 "$proxy_pid" 2>/dev/null; do
+    peer_ips=$(qbt_api "sync/torrentPeers?hash=$hash1" | fbt jq -r '(.peers // {})[] | .ip' 2>/dev/null || true)
+    if echo "$peer_ips" | grep -qxF "$socks5_ip"; then seen_socks5=true; fi
+    if echo "$peer_ips" | grep -qxF "$fbt_ip"; then seen_fbt=true; fi
+    sleep 1
+done
+set +e
+wait "$proxy_pid"
+status=$?
+set -e
+check_download "$proxy_log" "$status" "fbt-example download --proxy"
+[ "$(hashes /interop/payload fixture)" = "$(hashes /interop/fbt-proxy fixture)" ] ||
+    fail "data downloaded through the proxy differs from the payload"
+[ "$seen_fbt" = false ] || fail "qBittorrent saw fbt's own address $fbt_ip: a connection bypassed the proxy"
+[ "$seen_socks5" = true ] || fail "qBittorrent never listed the proxy's address $socks5_ip as a peer"
+grep -q '^tracker reply http://tracker:6969/announce: ' "$proxy_log" ||
+    fail "no tracker reply came through the proxy (see $proxy_log)"
+wait_for "qBittorrent's uploaded to grow through the proxy" 30 qbt_uploaded_more_than "$hash1" "$qbt_up_before"
+echo "interop: proxy: qBittorrent saw $socks5_ip (socks5), uploaded $qbt_up_before -> $(qbt_field "$hash1" .uploaded) bytes"
+trc transmission-remote -t "$hash1" -s >/dev/null
+echo "interop: SOCKS5 proxy OK (qbittorrent)"
+fi
+
 if [ -n "${INTEROP_ONLY:-}" ]; then
     echo "interop: selected scenarios passed ($INTEROP_ONLY) in $((SECONDS - setup_secs))s (setup ${setup_secs}s, total ${SECONDS}s)"
 else

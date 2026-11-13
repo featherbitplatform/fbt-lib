@@ -17,7 +17,7 @@ Binding design: `docs/superpowers/specs/2026-11-10-fbt-lib-design.md`. Read it b
 - **Naming other clients is allowed.** libtorrent, qBittorrent, Transmission and opentracker may be named in code, docs and commits.
 - **Logging and errors:** `tracing` for logs (the library never installs a subscriber), `thiserror` for errors. Public enums and config structs of `fbt-session` and `fbt` are `#[non_exhaustive]`; config structs implement `Default`.
 - **Dependencies** are declared once in the root `[workspace.dependencies]`; crates inherit them, never pin their own versions. All crates are `publish = false` for now.
-- **Tests never contact the public internet, the public DHT or a real router.** `test_settings()` disables the DHT, LSD, UPnP and NAT-PMP; tests that need a DHT run their own nodes on loopback, and NAT tests use the fakes in `crates/fbt-net/tests/support/`. `Settings::default()` bootstraps from the public routers and turns LSD, UPnP and NAT-PMP on, so never build a session from it in a test.
+- **Tests never contact the public internet, the public DHT, a real router or a real proxy.** `test_settings()` disables the DHT, LSD, UPnP and NAT-PMP; tests that need a DHT run their own nodes on loopback, NAT tests use the fakes in `crates/fbt-net/tests/support/`, proxy tests use the SOCKS5 and HTTP proxy fakes there (`fake_socks5.rs`, `fake_http_proxy.rs`), and web seed tests use the in-repo HTTP server `crates/fbt-session/tests/support/web_seed.rs`. `Settings::default()` bootstraps from the public routers and turns LSD, UPnP and NAT-PMP on, so never build a session from it in a test.
 - **Cross-platform.** Builds and tests must pass on macOS, Linux and Windows.
 
 ## Conventions
@@ -53,13 +53,14 @@ bash dev/sast.sh semgrep      # one tool
 bash dev/bench.sh
 
 # Live interop vs qBittorrent-nox and Transmission via opentracker, plus magnet via DHT, forced
-# encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent and LSD between two
-# fbt-example containers, on isolated networks with our own dht-node (Docker; see dev/interop/README.md)
+# encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent, LSD between two
+# fbt-example containers, resume without recheck, a web seed (nginx) and a SOCKS5 proxy (Dante), on
+# isolated networks with our own dht-node (Docker; see dev/interop/README.md)
 bash dev/interop/run.sh
 
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec
 # handshake http_announce udp_announce path krpc extension mse magnet utp_packet utp_conn lsd ssdp
-# upnp_xml natpmp. Seeds live in fuzz/seeds/<target>/.
+# upnp_xml natpmp resume socks5 http_connect scrape web_seed_head. Seeds live in fuzz/seeds/<target>/.
 mkdir -p fuzz/corpus/<target>
 cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 ```

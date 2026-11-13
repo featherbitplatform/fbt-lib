@@ -1,6 +1,6 @@
 [package]
 name = "fbt-net"
-description = "Shared UDP socket demultiplexed by packet shape (uTP, DHT, UDP trackers)."
+description = "Shared UDP socket demultiplexed by packet shape (uTP, DHT, UDP trackers), port mapping and proxy clients."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# serde support for `ProxyKind`, `ProxyConfig` and `IpFilter`.
+serde = ["dep:serde"]
+
 [dependencies]
 fbt-core = { path = "../fbt-core" }
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "io-util"] }
@@ -19,7 +23,9 @@ bytes.workspace = true
 rand.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "rt-multi-thread", "macros", "test-util"] }

@@ -65,10 +65,12 @@ pub(crate) struct Endpoint {
 
 /// Binds every address of `settings.listen_addrs`, in order. An address
 /// whose TCP bind fails is skipped; one whose UDP bind fails keeps TCP only.
-/// Both are reported as [`ListenError`]s. Fails with the first error when
+/// Both are reported as [`ListenError`]s. Without `udp` (a SOCKS5 relay
+/// carries all UDP) only TCP is bound. Fails with the first error when
 /// nothing binds.
 pub(crate) async fn bind_all(
     settings: &Settings,
+    udp: bool,
 ) -> Result<(Vec<Endpoint>, Vec<ListenError>), SessionError> {
     let mut endpoints = Vec::new();
     let mut errors = Vec::new();
@@ -76,7 +78,12 @@ pub(crate) async fn bind_all(
     for &addr in &settings.listen_addrs {
         // NAT emulation refuses incoming TCP as `enable_incoming_tcp` off does.
         let listen = settings.enable_incoming_tcp && !settings.nat_emulation;
-        match bind_one(addr, listen) {
+        let bound = if udp {
+            bind_one(addr, listen)
+        } else {
+            bind_tcp_only(addr, listen)
+        };
+        match bound {
             Ok((ep, udp_err)) => {
                 if let Some(e) = udp_err {
                     warn!(%addr, error = %e, "cannot bind the UDP socket; TCP only on this address");
@@ -136,6 +143,17 @@ fn bind_one(addr: SocketAddr, listen: bool) -> io::Result<(Endpoint, Option<io::
             }
         }
     }
+}
+
+/// Binds TCP on `addr` alone: the endpoint has no UDP socket.
+fn bind_tcp_only(addr: SocketAddr, listen: bool) -> io::Result<(Endpoint, Option<io::Error>)> {
+    let tcp = bind_tcp(addr, listen)?;
+    let ep = Endpoint {
+        addr: tcp.local_addr()?,
+        tcp: listen.then_some(tcp),
+        udp: None,
+    };
+    Ok((ep, None))
 }
 
 /// A TCP listener on `addr`; IPv6 binds IPv6-only, so `[::]:p` does not

@@ -145,3 +145,30 @@ proptest! {
         let _ = Magnet::parse(&format!("magnet:?{s}"));
     }
 }
+
+#[test]
+fn ws_round_trips() {
+    let uri = format!(
+        "magnet:?xt=urn:btih:{HEX}&ws=http%3A%2F%2Fa.example%2Ff%20x&ws=https%3A%2F%2Fb.example%2F&ws=ftp%3A%2F%2Fc.example%2F&ws=http%3A%2F%2Fa.example%2Ff%20x"
+    );
+    let m = Magnet::parse(&uri).unwrap();
+    assert_eq!(m.web_seeds, ["http://a.example/f x", "https://b.example/"]);
+    assert_eq!(Magnet::parse(&m.to_uri()).unwrap(), m);
+    // Capped like a torrent's list.
+    let many: String = (0..30)
+        .map(|i| format!("&ws=http%3A%2F%2Fs{i}.example%2F"))
+        .collect();
+    let m = Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}{many}")).unwrap();
+    assert_eq!(m.web_seeds.len(), fbt_metainfo::MAX_WEB_SEEDS);
+}
+
+#[test]
+fn malformed_ws_is_dropped_not_fatal() {
+    let m = Magnet::parse(&format!(
+        "magnet:?xt=urn:btih:{HEX}&ws=http%3A%2F%2F%ZZ&ws=http%3A%2F%2F%FF&ws=http%3A%2F%2Fok.example%2F"
+    ))
+    .unwrap();
+    assert_eq!(m.web_seeds, ["http://ok.example/"]);
+    // `tr` still fails the magnet.
+    assert!(Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}&tr=%ZZ")).is_err());
+}

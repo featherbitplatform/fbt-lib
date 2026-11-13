@@ -76,12 +76,17 @@ impl Actor {
         };
         let m = *m;
         let file_prio = selected_priorities(meta.info.files.len(), m.magnet.select_only.as_deref());
+        // Resume data of a magnet saved before its metadata names no
+        // renamed file (it is refused otherwise), but the storage is built
+        // the same way as at add.
+        let renamed = self.resume.as_ref().map_or(&[][..], |r| &r.renamed[..]);
         let storage: Arc<dyn Storage> = match m.storage {
             Some(s) => s,
-            None => Arc::new(FsStorage::new(m.save_path, &meta)),
+            None => Arc::new(FsStorage::with_paths(m.save_path, &meta, renamed)),
         };
         let meta = Arc::new(meta);
-        let loaded = Loaded::new(Arc::clone(&meta), file_prio, m.sequential);
+        let mut loaded = Loaded::new(Arc::clone(&meta), file_prio, m.sequential);
+        loaded.renamed = renamed.iter().cloned().collect();
         let layout = loaded.layout;
         let total_wanted = loaded.total_wanted;
         self.install(loaded, storage);

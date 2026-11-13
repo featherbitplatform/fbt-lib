@@ -5,11 +5,13 @@ use std::time::Duration;
 
 use fbt_net::lsd::{LSD_V4, LSD_V6};
 use fbt_net::natpmp::NATPMP_PORT;
+use fbt_net::proxy::{ProxyConfig, ProxyKind};
 use fbt_net::upnp::SSDP_V4;
 use fbt_tracker::TrackerConfig;
 
 use crate::bandwidth::{MixedMode, PeerClassLimits, RateLimit};
 use crate::choker::{ChokingAlgorithm, SeedChokingAlgorithm};
+use crate::queue::QueueSettings;
 use crate::stream::ReadAhead;
 
 /// Largest accepted [`Settings::event_queue`]; the queue is allocated up
@@ -37,6 +39,7 @@ pub const DEFAULT_DHT_BOOTSTRAP: [&str; 3] = [
 
 /// Whether peer connections use MSE/PE (message stream encryption).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum EncryptionPolicy {
     /// Encrypted (RC4) connections only, in both directions.
@@ -60,9 +63,12 @@ pub enum EncryptionPolicy {
 /// 16 KiB..=[`MAX_METADATA_SIZE`], a DHT bootstrap entry that is not
 /// `host:port`, an empty or duplicated `listen_addrs`, every transport
 /// switched off, `disk_threads` or `max_active_checks` outside 1..=64, a zero
-/// `read_ahead.time` or `read_ahead.bitrate`) with
+/// `max_peers_per_ip`, a zero `read_ahead.time` or `read_ahead.bitrate`, a
+/// zero `queue.interval`, a negative or non-finite `seed_ratio_limit`) with
 /// [`SessionError::InvalidSettings`](crate::SessionError::InvalidSettings).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Settings {
     /// Addresses the session listens on (non-empty, no duplicates). Each
@@ -78,6 +84,25 @@ pub struct Settings {
     pub max_peers_per_torrent: usize,
     /// Connected peers across all torrents.
     pub max_peers_global: usize,
+    /// Connections a torrent accepts from one IP address (non-zero; an
+    /// IPv4-mapped address counts as its IPv4 address). Further ones are
+    /// closed with [`BlockReason::PerIpLimit`](crate::BlockReason::PerIpLimit).
+    /// 1 by default, as libtorrent's `allow_multiple_connections_per_ip`
+    /// off.
+    pub max_peers_per_ip: usize,
+    /// Loopback peers are exempt from `max_peers_per_ip`, so clients on the
+    /// same host (and test suites) can connect to each other.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub per_ip_exempt_loopback: bool,
+    /// Bans name one endpoint (address and port) instead of the whole IP,
+    /// so loopback tests can ban one of several peers on `127.0.0.1`. An
+    /// incoming peer's endpoint is its source port, so a banned incoming
+    /// peer gets back in by reconnecting from another port: endpoint bans
+    /// hold only against peers we dial.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub ban_endpoints: bool,
     /// Outgoing connections still connecting or handshaking.
     pub max_half_open: usize,
     /// Upload slots per torrent (regular plus optimistic). With
@@ -344,6 +369,52 @@ pub struct Settings {
     /// at the stream's bitrate when that is more). Its `time` and a known
     /// `bitrate` must be non-zero.
     pub read_ahead: ReadAhead,
+    /// The proxy peer connections, web seeds and trackers go through (none
+    /// by default). See [`ProxyConfig`] for what each kind can carry:
+    ///
+    /// - SOCKS5 with `proxy_peers` or `proxy_trackers` relays all UDP
+    ///   (outgoing uTP, the DHT, UDP trackers) through one UDP ASSOCIATE.
+    ///   The session then binds TCP listeners only, plus one relayed UDP
+    ///   socket on a free port; the DHT runs over the relay's address
+    ///   family only (IPv4 in practice). If the
+    ///   association cannot be made, [`Session::new`](crate::Session::new)
+    ///   fails with [`SessionError::Proxy`](crate::SessionError::Proxy).
+    /// - An HTTP proxy with `proxy_peers` dials peers over TCP only
+    ///   (`enable_outgoing_utp` is treated as off); the DHT still runs
+    ///   directly unless `dht_enabled` is off. With `enable_outgoing_tcp`
+    ///   off as well, the session cannot dial peers at all;
+    ///   [`Session::new`](crate::Session::new) logs a warning.
+    /// - UDP tracker and DHT bootstrap host names are resolved locally
+    ///   whatever `proxy_hostnames` says, and LSD, UPnP and NAT-PMP stay
+    ///   direct on the local network.
+    ///
+    /// Listening is unchanged: incoming connections never use the proxy.
+    /// [`Session::new`](crate::Session::new) logs a warning for each
+    /// enabled feature that bypasses the proxy (with an HTTP proxy the
+    /// DHT, which names every torrent's info hash, and uTP; with any proxy
+    /// LSD, UPnP and NAT-PMP): turn them off for a session whose traffic
+    /// should all go through the proxy. There is no single proxy-only
+    /// switch yet.
+    ///
+    /// Serialising the settings (the `serde` feature) writes the proxy
+    /// password in clear text.
+    pub proxy: ProxyConfig,
+    /// How many auto-managed torrents run at once; the rest wait as
+    /// [`TorrentState::Queued`](crate::TorrentState::Queued). Changed at
+    /// runtime with
+    /// [`Session::set_queue_settings`](crate::Session::set_queue_settings).
+    pub queue: QueueSettings,
+    /// An auto-managed seed whose share ratio reaches this pauses, stops
+    /// being auto-managed and emits
+    /// [`Event::SeedLimitReached`](crate::Event::SeedLimitReached) (`None`,
+    /// the default: no limit). The ratio is `total_uploaded / max(
+    /// total_downloaded, total_wanted)`, so a torrent added complete counts
+    /// its whole size as downloaded. Finite and not negative.
+    pub seed_ratio_limit: Option<f64>,
+    /// An auto-managed seed that has seeded this long in all
+    /// ([`TorrentStatus::seeding_time`](crate::TorrentStatus::seeding_time))
+    /// stops likewise (`None`, the default: no limit).
+    pub seed_time_limit: Option<Duration>,
 }
 
 impl Settings {
@@ -425,6 +496,9 @@ impl Settings {
         {
             return Err(format!("listen_addrs has {dup} twice"));
         }
+        if self.max_peers_per_ip == 0 {
+            return Err("max_peers_per_ip must be greater than zero".to_owned());
+        }
         if self.dht_query_rate_per_ip == 0 {
             return Err("dht_query_rate_per_ip must be greater than zero".to_owned());
         }
@@ -433,7 +507,52 @@ impl Settings {
                 "dht_bootstrap_nodes entries must be host:port, got {bad:?}"
             ));
         }
+        if self
+            .seed_ratio_limit
+            .is_some_and(|r| !r.is_finite() || r < 0.0)
+        {
+            return Err("seed_ratio_limit must be finite and not negative".to_owned());
+        }
+        self.queue.validate()?;
+        self.proxy.validate().map_err(|e| format!("proxy: {e}"))?;
         self.read_ahead.validate()
+    }
+
+    /// The enabled features that send from the real address whatever
+    /// [`proxy`](Self::proxy) says; empty without a proxy. Under an HTTP
+    /// proxy (or a SOCKS5 one that carries neither peers nor trackers, so
+    /// relays no UDP): the DHT, outgoing uTP (unless `proxy_peers` turns
+    /// it off) and incoming uTP. Under any proxy: LSD, UPnP and NAT-PMP.
+    /// [`Session::new`](crate::Session::new) logs a warning for each.
+    pub(crate) fn proxy_bypasses(&self) -> Vec<&'static str> {
+        let p = &self.proxy;
+        let mut out = Vec::new();
+        if p.kind == ProxyKind::None {
+            return out;
+        }
+        let relays_udp = p.kind == ProxyKind::Socks5 && (p.proxy_peers || p.proxy_trackers);
+        if !relays_udp {
+            if self.dht_enabled {
+                out.push("the DHT");
+            }
+            // An HTTP proxy carrying peers turns outgoing uTP off.
+            if self.enable_outgoing_utp && !(p.kind == ProxyKind::Http && p.proxy_peers) {
+                out.push("outgoing uTP");
+            }
+            if self.enable_incoming_utp {
+                out.push("incoming uTP");
+            }
+        }
+        for (on, name) in [
+            (self.enable_lsd, "LSD"),
+            (self.enable_upnp, "UPnP"),
+            (self.enable_natpmp, "NAT-PMP"),
+        ] {
+            if on {
+                out.push(name);
+            }
+        }
+        out
     }
 }
 
@@ -465,6 +584,9 @@ impl Default for Settings {
             ],
             max_peers_per_torrent: 50,
             max_peers_global: 200,
+            max_peers_per_ip: 1,
+            per_ip_exempt_loopback: true,
+            ban_endpoints: false,
             max_half_open: 10,
             unchoke_slots: 4,
             choking_algorithm: ChokingAlgorithm::default(),
@@ -526,6 +648,10 @@ impl Default for Settings {
             rate_limit_local_peers: false,
             mixed_mode: MixedMode::default(),
             read_ahead: ReadAhead::default(),
+            proxy: ProxyConfig::default(),
+            queue: QueueSettings::default(),
+            seed_ratio_limit: None,
+            seed_time_limit: None,
         }
     }
 }
@@ -533,6 +659,42 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn features_bypassing_the_proxy_are_listed() {
+        let mut s = Settings::default();
+        assert!(s.proxy_bypasses().is_empty(), "no proxy");
+        s.proxy.kind = ProxyKind::Http;
+        s.proxy.host = "proxy.example".to_owned();
+        assert_eq!(
+            s.proxy_bypasses(),
+            ["the DHT", "incoming uTP", "LSD", "UPnP", "NAT-PMP"]
+        );
+        s.proxy.proxy_peers = false;
+        assert_eq!(
+            s.proxy_bypasses(),
+            [
+                "the DHT",
+                "outgoing uTP",
+                "incoming uTP",
+                "LSD",
+                "UPnP",
+                "NAT-PMP"
+            ]
+        );
+        // SOCKS5 relays every UDP packet: only the local-network ones stay.
+        s.proxy.kind = ProxyKind::Socks5;
+        assert_eq!(s.proxy_bypasses(), ["LSD", "UPnP", "NAT-PMP"]);
+        s.enable_lsd = false;
+        s.enable_upnp = false;
+        s.enable_natpmp = false;
+        assert!(s.proxy_bypasses().is_empty());
+        // SOCKS5 carrying neither peers nor trackers relays no UDP.
+        s.proxy.proxy_trackers = false;
+        s.dht_enabled = false;
+        s.enable_incoming_utp = false;
+        assert_eq!(s.proxy_bypasses(), ["outgoing uTP"]);
+    }
 
     #[test]
     fn zero_read_ahead_time_is_invalid() {
@@ -550,6 +712,28 @@ mod tests {
             "read_ahead.bitrate must be greater than zero"
         );
         s.read_ahead = ReadAhead::new(16 << 20, Duration::from_secs(10), Some(1));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn queue_and_seed_limits_are_validated() {
+        let mut s = Settings::default();
+        assert_eq!(s.queue, QueueSettings::default());
+        assert_eq!(s.queue.active_downloads, Some(3));
+        assert_eq!(s.queue.active_seeds, Some(5));
+        assert_eq!(s.queue.active_limit, Some(500));
+        assert_eq!((s.seed_ratio_limit, s.seed_time_limit), (None, None));
+        s.queue.interval = Duration::ZERO;
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "queue.interval must be greater than zero"
+        );
+        s.queue = QueueSettings::default();
+        for bad in [-0.1, f64::NAN, f64::INFINITY] {
+            s.seed_ratio_limit = Some(bad);
+            assert!(s.validate().is_err(), "{bad}");
+        }
+        s.seed_ratio_limit = Some(0.0);
         assert!(s.validate().is_ok());
     }
 }

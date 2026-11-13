@@ -513,7 +513,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fbt"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-bencode"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rand",
  "sha1",
@@ -543,8 +543,9 @@ dependencies = [
 
 [[package]]
 name = "fbt-dht"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "ed25519-dalek",
  "fbt-bencode",
  "fbt-core",
  "proptest",
@@ -558,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-example"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "fbt",
@@ -572,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-metainfo"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fbt-bencode",
  "fbt-core",
@@ -580,16 +581,19 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "fbt-net"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "fbt-core",
  "proptest",
  "rand",
+ "serde",
+ "serde_json",
  "socket2",
  "thiserror",
  "tokio",
@@ -598,10 +602,11 @@ dependencies = [
 
 [[package]]
 name = "fbt-session"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bitflags",
  "bytes",
+ "ed25519-dalek",
  "fbt-bencode",
  "fbt-core",
  "fbt-dht",
@@ -612,7 +617,10 @@ dependencies = [
  "fbt-wire",
  "futures-core",
  "futures-util",
+ "proptest",
  "rand",
+ "serde",
+ "serde_json",
  "sha1",
  "socket2",
  "tempfile",
@@ -624,11 +632,12 @@ dependencies = [
 
 [[package]]
 name = "fbt-tracker"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "fbt-bencode",
  "fbt-core",
+ "fbt-net",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -636,14 +645,16 @@ dependencies = [
  "rand",
  "rustls",
  "rustls-rustcrypto",
+ "serde",
  "thiserror",
  "tokio",
+ "tower-service",
  "webpki-roots",
 ]
 
 [[package]]
 name = "fbt-utp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "fbt-core",
@@ -658,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "fbt-wire"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bitflags",
  "bytes",
@@ -1443,6 +1454,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
 name = "serdect"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1612,6 +1636,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1756,6 +1786,15 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "universal-hash"
@@ -1937,3 +1976,9 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

@@ -1,26 +1,82 @@
 //! HTTP(S) announce: request building, redirect handling, capped body read
-//! and untrusted-response parsing.
+//! and untrusted-response parsing; byte-range fetches for web seeds.
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::Range;
+use std::pin::Pin;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use fbt_bencode::{Value, ValueKind, decode};
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, Uri, header};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
+use fbt_net::proxy::{ProxyConfig, ProxyError, ProxyKind};
+
+use crate::connector::ProxyConnector;
 use crate::tls::{self, Connector};
 use crate::types::{MAX_TRACKER_ID_BYTES, MIN_INTERVAL, bounded_text};
 use crate::urlencode::url_encode_bytes;
-use crate::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerConfig, TrackerError};
+use crate::{
+    AnnounceEvent, AnnounceRequest, AnnounceResponse, ScrapeInfo, TrackerConfig, TrackerError,
+};
 
 const MAX_REDIRECTS: usize = 3;
 const MIN_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// Most bytes reserved up front for a range body; it grows past this only
+/// as bytes arrive.
+const MAX_RANGE_PREALLOC: usize = 1 << 20;
+
+/// The slowest a range body may arrive, on average, once
+/// [`RANGE_RATE_GRACE`] has passed (time spent waiting on the caller's
+/// [`RangePace`] excluded): a server trickling bytes would otherwise hold
+/// the request for ever, each byte arriving within the per-frame timeout.
+pub(crate) const MIN_RANGE_RATE: u64 = 4 * 1024;
+/// How long a range request runs before [`MIN_RANGE_RATE`] applies.
+pub(crate) const RANGE_RATE_GRACE: Duration = Duration::from_secs(30);
+
+/// Paces the body of a range fetch, as a download rate limit does for a
+/// peer connection: before each read the fetch waits for
+/// [`ready`](Self::ready), and after it reports the bytes read to
+/// [`charge`](Self::charge). TCP backpressure then holds the server to
+/// the limit.
+#[doc(hidden)]
+pub trait RangePace: Send + Sync {
+    /// Completes once the next bytes may be read.
+    fn ready(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// `n` bytes of the body were read.
+    fn charge(&self, n: u64);
+}
+
+/// No pacing.
+struct Unpaced;
+
+impl RangePace for Unpaced {
+    fn ready(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn charge(&self, _: u64) {}
+}
+
+/// Whether `bytes` read in `active` time is below [`MIN_RANGE_RATE`], once
+/// past [`RANGE_RATE_GRACE`].
+pub(crate) fn too_slow(bytes: u64, active: Duration) -> bool {
+    active > RANGE_RATE_GRACE
+        && u128::from(bytes) * 1000 < u128::from(MIN_RANGE_RATE) * active.as_millis()
+}
+
+/// An HTTP client with its pooled connections.
+type HttpPool = Client<Connector, Empty<Bytes>>;
 
 pub(crate) struct HttpClient {
-    client: Client<Connector, Empty<Bytes>>,
+    /// For announces: through the proxy with `proxy_trackers`.
+    trackers: HttpPool,
+    /// For web seeds: through the proxy with `proxy_peers`.
+    web_seeds: HttpPool,
     user_agent: String,
     timeout: Duration,
     max_bytes: usize,
@@ -33,10 +89,21 @@ impl std::fmt::Debug for HttpClient {
 }
 
 impl HttpClient {
-    pub(crate) fn new(cfg: &TrackerConfig) -> Result<HttpClient, TrackerError> {
-        let client = Client::builder(TokioExecutor::new()).build(tls::build_connector()?);
+    /// Two clients over the same TLS setup: announces go through `proxy`
+    /// when it sets `proxy_trackers`, web seeds when it sets `proxy_peers`.
+    /// Proxy round trips are bounded by `cfg.http_timeout`.
+    pub(crate) fn new(
+        cfg: &TrackerConfig,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<HttpClient, TrackerError> {
+        let active = proxy.filter(|p| p.kind != ProxyKind::None);
+        let client = |use_proxy: bool| -> Result<_, TrackerError> {
+            let c = ProxyConnector::new(active.filter(|_| use_proxy), cfg.http_timeout);
+            Ok(Client::builder(TokioExecutor::new()).build(tls::build_connector(c)?))
+        };
         Ok(HttpClient {
-            client,
+            trackers: client(active.is_some_and(|p| p.proxy_trackers))?,
+            web_seeds: client(active.is_some_and(|p| p.proxy_peers))?,
             user_agent: cfg.user_agent.clone(),
             timeout: cfg.http_timeout,
             max_bytes: cfg.max_response_bytes,
@@ -55,42 +122,174 @@ impl HttpClient {
         }
     }
 
-    async fn fetch(&self, mut url: String) -> Result<Vec<u8>, TrackerError> {
+    /// Scrapes `scrape` (a scrape URL) for `hashes`.
+    pub(crate) async fn scrape(
+        &self,
+        scrape: &str,
+        hashes: &[[u8; 20]],
+    ) -> Result<Vec<ScrapeInfo>, TrackerError> {
+        let full = crate::scrape::with_hashes(scrape, hashes);
+        match tokio::time::timeout(self.timeout, self.fetch(full)).await {
+            Ok(body) => crate::scrape::parse_http_scrape_for(&body?, Some(hashes)),
+            Err(_) => Err(TrackerError::Timeout),
+        }
+    }
+
+    async fn fetch(&self, url: String) -> Result<Vec<u8>, TrackerError> {
+        let resp = self.follow(&self.trackers, url, None).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(TrackerError::HttpStatus(status.as_u16()));
+        }
+        self.read_capped(resp.into_body()).await
+    }
+
+    /// GETs `url` through `client` (with `range` as its `Range` header),
+    /// following at most [`MAX_REDIRECTS`] redirects (never from `https`
+    /// to `http`), and returns the final response, whatever its status.
+    /// Each request waits at most the configured timeout for its response
+    /// head.
+    async fn follow(
+        &self,
+        client: &HttpPool,
+        mut url: String,
+        range: Option<&str>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, TrackerError> {
         let mut redirects = 0;
         loop {
             let uri = check_uri(&url)?;
-            let request = Request::get(uri.clone())
-                .header(header::USER_AGENT, &self.user_agent)
+            let mut builder =
+                Request::get(uri.clone()).header(header::USER_AGENT, &self.user_agent);
+            if let Some(r) = range {
+                builder = builder.header(header::RANGE, r);
+            }
+            let request = builder
                 .body(Empty::<Bytes>::new())
                 .map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
-            let resp = self
-                .client
-                .request(request)
+            let resp = tokio::time::timeout(self.timeout, client.request(request))
                 .await
-                .map_err(|e| TrackerError::Io(std::io::Error::other(e)))?;
-            let status = resp.status();
-            if status.is_redirection() {
-                redirects += 1;
-                if redirects > MAX_REDIRECTS {
-                    return Err(TrackerError::TooManyRedirects);
-                }
-                let location = resp
-                    .headers()
-                    .get(header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or(TrackerError::InvalidResponse("redirect without location"))?;
-                let next = resolve_location(&uri, location)?;
-                if uri.scheme_str() == Some("https") && next.starts_with("http://") {
-                    return Err(TrackerError::InvalidResponse("insecure redirect"));
-                }
-                url = next;
-                continue;
+                .map_err(|_| TrackerError::Timeout)?
+                .map_err(request_error)?;
+            if !resp.status().is_redirection() {
+                return Ok(resp);
             }
-            if !status.is_success() {
-                return Err(TrackerError::HttpStatus(status.as_u16()));
+            redirects += 1;
+            if redirects > MAX_REDIRECTS {
+                return Err(TrackerError::TooManyRedirects);
             }
-            return self.read_capped(resp.into_body()).await;
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or(TrackerError::InvalidResponse("redirect without location"))?;
+            let next = resolve_location(&uri, location)?;
+            if uri.scheme_str() == Some("https") && next.starts_with("http://") {
+                return Err(TrackerError::InvalidResponse("insecure redirect"));
+            }
+            url = next;
         }
+    }
+
+    /// The bytes `range` of `url` (a web seed's file), through the web
+    /// seed client. See [`TrackerClient::fetch_range`](crate::TrackerClient::fetch_range).
+    pub(crate) async fn fetch_range(
+        &self,
+        url: &str,
+        range: Range<u64>,
+        pace: Option<&dyn RangePace>,
+    ) -> Result<Bytes, TrackerError> {
+        let pace = pace.unwrap_or(&Unpaced);
+        let started = tokio::time::Instant::now();
+        let len = range.end.saturating_sub(range.start);
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+        let last = range.end - 1;
+        let header = format!("bytes={}-{last}", range.start);
+        let resp = self
+            .follow(&self.web_seeds, url.to_owned(), Some(&header))
+            .await?;
+        let status = resp.status();
+        match status.as_u16() {
+            206 => {
+                let got = resp
+                    .headers()
+                    .get(header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_content_range)
+                    .ok_or(TrackerError::InvalidResponse(
+                        "206 without a valid Content-Range",
+                    ))?;
+                if (got.0, got.1) != (range.start, last) {
+                    return Err(TrackerError::InvalidResponse(
+                        "Content-Range does not match the request",
+                    ));
+                }
+            }
+            200 => {
+                // The whole file: our range only if it is the whole file.
+                let whole = resp
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                if range.start != 0 || whole != Some(len) {
+                    return Err(TrackerError::InvalidResponse(
+                        "the server ignored the range",
+                    ));
+                }
+            }
+            code if !status.is_success() => return Err(TrackerError::HttpStatus(code)),
+            _ => {
+                return Err(TrackerError::InvalidResponse(
+                    "unexpected status for a range request",
+                ));
+            }
+        }
+        self.read_exact(resp.into_body(), len, pace, started).await
+    }
+
+    /// Reads a body that must be exactly `len` bytes: at most `len` bytes
+    /// are kept, and the first byte past them fails the request (the
+    /// frame that carries it is dropped). No wait for the next frame may
+    /// exceed the configured timeout, so a slow but live server is not
+    /// cut, but past [`RANGE_RATE_GRACE`] since `started` the average rate,
+    /// waits on `pace` excluded, must stay at [`MIN_RANGE_RATE`] or more.
+    async fn read_exact(
+        &self,
+        mut body: hyper::body::Incoming,
+        len: u64,
+        pace: &dyn RangePace,
+        started: tokio::time::Instant,
+    ) -> Result<Bytes, TrackerError> {
+        let cap = usize::try_from(len).map_err(|_| TrackerError::ResponseTooLarge)?;
+        let mut out = BytesMut::with_capacity(cap.min(MAX_RANGE_PREALLOC));
+        let mut paced = Duration::ZERO;
+        loop {
+            let before = tokio::time::Instant::now();
+            pace.ready().await;
+            paced = paced.saturating_add(before.elapsed());
+            let frame = match tokio::time::timeout(self.timeout, body.frame()).await {
+                Err(_) => return Err(TrackerError::Timeout),
+                Ok(None) => break,
+                Ok(Some(frame)) => frame.map_err(|e| TrackerError::Io(std::io::Error::other(e)))?,
+            };
+            if let Some(data) = frame.data_ref() {
+                if out.len().saturating_add(data.len()) > cap {
+                    return Err(TrackerError::ResponseTooLarge);
+                }
+                out.extend_from_slice(data);
+                pace.charge(data.len() as u64);
+            }
+            let active = started.elapsed().saturating_sub(paced);
+            if out.len() < cap && too_slow(out.len() as u64, active) {
+                return Err(TrackerError::TooSlow);
+            }
+        }
+        if out.len() != cap {
+            return Err(TrackerError::InvalidResponse("body shorter than the range"));
+        }
+        Ok(out.freeze())
     }
 
     async fn read_capped(&self, mut body: hyper::body::Incoming) -> Result<Vec<u8>, TrackerError> {
@@ -106,6 +305,50 @@ impl HttpClient {
         }
         Ok(out)
     }
+}
+
+/// Parses a `Content-Range` header value, `bytes a-b/total` or
+/// `bytes a-b/*`, into `(a, b, total)`: `a <= b`, and `b < total` when the
+/// total is known. Anything else (an unsatisfied `*/total`, signs, spaces
+/// inside numbers, overflow) is `None`. Input is untrusted.
+#[doc(hidden)]
+pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let (unit, rest) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim_start().split_once('/')?;
+    let (a, b) = range.split_once('-')?;
+    let (a, b) = (decimal(a)?, decimal(b)?);
+    let total = match total {
+        "*" => None,
+        t => Some(decimal(t)?),
+    };
+    if a > b || total.is_some_and(|t| b >= t) {
+        return None;
+    }
+    Some((a, b, total))
+}
+
+/// A non-empty run of ASCII digits that fits a `u64`.
+fn decimal(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// A failed request: [`TrackerError::Proxy`] when the proxy failed (a
+/// [`ProxyError`] in the source chain), else [`TrackerError::Io`].
+fn request_error(e: hyper_util::client::legacy::Error) -> TrackerError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    while let Some(s) = source {
+        if let Some(p) = s.downcast_ref::<ProxyError>() {
+            return TrackerError::Proxy(p.to_string());
+        }
+        source = s.source();
+    }
+    TrackerError::Io(std::io::Error::other(e))
 }
 
 /// Parses and scheme-checks `url`.

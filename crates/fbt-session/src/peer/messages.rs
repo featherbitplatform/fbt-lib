@@ -8,6 +8,7 @@ use fbt_wire::{ExtHandshake, HolepunchMsg, MetadataMsg, PexMsg, Reserved};
 
 use super::ext::ExtConfig;
 use super::transport::Transport;
+use crate::bans::BlockReason;
 use crate::picker::PeerKey;
 
 /// Why a peer connection ended.
@@ -43,6 +44,9 @@ pub enum DisconnectReason {
     /// We are finished and the peer is a seed or upload-only (BEP 21):
     /// neither side has anything to gain.
     UploadOnly,
+    /// We closed it: the IP filter blocks it (set while it was connected),
+    /// it is banned, or its IP has too many connections to the torrent.
+    Blocked(BlockReason),
 }
 
 /// The pieces a remote announced, owned.

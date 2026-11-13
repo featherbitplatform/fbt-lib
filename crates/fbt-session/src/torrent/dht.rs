@@ -5,7 +5,11 @@
 //! while `running` is set and exits at `exit` (or when the actor is gone).
 //! A run announces once the DHT knows a node, then every
 //! `Settings::dht_announce_interval`; while the torrent fetches its metadata,
-//! every [`METADATA_INTERVAL`] instead, never more often. Found peers reach
+//! every [`METADATA_INTERVAL`] instead, never more often. A torrent with
+//! every piece ([`TorrentStatus::is_seed`], libtorrent's `is_seed`)
+//! announces with the BEP 33 `seed` flag; one that only finished its wanted
+//! pieces does not, though the tracker announcer reports `left` = 0 for it
+//! (`left` counts wanted bytes, as libtorrent's does). Found peers reach
 //! the actor through a bounded channel it polls; the actor never waits.
 //!
 //! Private torrents get no announcer. A magnet's privacy is unknown until
@@ -107,7 +111,8 @@ async fn run(mut p: DhtParams, peers: mpsc::Sender<Vec<SocketAddr>>) {
             },
         }
         last = Some(Instant::now());
-        let mut lookup = p.dht.announce(p.info_hash, Some(p.port));
+        let seed = p.status.borrow().is_seed;
+        let mut lookup = p.dht.announce(p.info_hash, Some(p.port), seed);
         loop {
             tokio::select! {
                 batch = lookup.next() => match batch {

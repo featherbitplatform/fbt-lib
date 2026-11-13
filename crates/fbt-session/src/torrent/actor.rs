@@ -3,16 +3,16 @@
 //! coming back as [`Job`]s, and commands to peers use `try_send` (a peer whose queue is full is
 //! closed as stalled).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use fbt_core::{InfoHashes, PieceLayout};
-use fbt_metainfo::Metainfo;
+use fbt_core::{Bitfield, InfoHashes, PieceLayout};
+use fbt_metainfo::{Metainfo, RelPath};
 use fbt_wire::PexFlags;
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, watch};
@@ -31,14 +31,18 @@ use super::peer::Peer;
 use super::readers::Readers;
 use super::retries::Retries;
 use super::serve::PieceReads;
+use super::smartban::SmartBan;
+use super::storage_ops::StorageOp;
+use super::webseed::WebSeeds;
 use super::{Cmd, piece_priorities, same_state};
-use crate::bandwidth::BucketPair;
+use crate::bandwidth::{BucketPair, Throttle};
 use crate::choker::{Choker, ChokerConfig};
 use crate::error::StreamError;
 use crate::event::{Event, PeerSource};
 use crate::peer::messages::PeerEvent;
 use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
+use crate::resume::ResumeState;
 use crate::session::{AddTorrent, Priority, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::cache::{FlushReason, PieceCache};
@@ -72,6 +76,10 @@ pub(super) enum Phase {
         done: Arc<AtomicU32>,
         cancel: Arc<AtomicBool>,
     },
+    /// Resume data's stamps are compared with the files' on the disk pool
+    /// (`Job::ResumeChecked`): its pieces are trusted, or a full check
+    /// follows. Shown as `QueuedForChecking`.
+    Resuming,
     /// Checked; downloading or seeding (unless paused).
     Ready,
     /// Stopped by a storage error or invalid metadata.
@@ -108,6 +116,46 @@ pub(super) struct Loaded {
     pub sequential: bool,
     /// Partially downloaded pieces, by index.
     pub bufs: HashMap<u32, Vec<u8>>,
+    /// Which files the storage is told are wanted; follows `file_prio`.
+    pub wanted: Arc<WantedFiles>,
+    /// Files given a new path by `rename_file`, relative to the save path.
+    pub renamed: BTreeMap<usize, RelPath>,
+}
+
+/// The wanted flag of each file, for
+/// [`Storage::set_file_priorities`]. The check and the priority jobs both
+/// apply it on their disk thread; the last one to run reads the latest
+/// flags, so an older job never undoes a newer change.
+#[derive(Debug)]
+pub(super) struct WantedFiles {
+    flags: Mutex<Vec<bool>>,
+    /// Held by a job from reading `flags` until the storage has them.
+    turn: Mutex<()>,
+}
+
+impl WantedFiles {
+    fn new(file_prio: &[Priority]) -> Self {
+        WantedFiles {
+            flags: Mutex::new(wanted_flags(file_prio)),
+            turn: Mutex::new(()),
+        }
+    }
+
+    /// Records new priorities; the next `apply` passes them on.
+    pub(super) fn set(&self, file_prio: &[Priority]) {
+        *self.flags.lock().unwrap_or_else(|e| e.into_inner()) = wanted_flags(file_prio);
+    }
+
+    /// Tells `storage` the latest flags. Blocking: disk threads only.
+    pub(super) fn apply(&self, storage: &dyn Storage) -> io::Result<()> {
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        let flags = self.flags.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        storage.set_file_priorities(&flags)
+    }
+}
+
+fn wanted_flags(file_prio: &[Priority]) -> Vec<bool> {
+    file_prio.iter().map(|p| *p != Priority::Skip).collect()
 }
 
 impl Loaded {
@@ -115,6 +163,7 @@ impl Loaded {
         let layout = meta.piece_layout();
         let piece_prio = piece_priorities(&meta, &file_prio);
         let total_wanted = wanted_bytes(&layout, &piece_prio);
+        let wanted = Arc::new(WantedFiles::new(&file_prio));
         Loaded {
             meta,
             layout,
@@ -124,6 +173,8 @@ impl Loaded {
             file_prio,
             sequential,
             bufs: HashMap::new(),
+            wanted,
+            renamed: BTreeMap::new(),
         }
     }
 }
@@ -158,7 +209,23 @@ pub(crate) struct Actor {
     /// Bumped on recheck; jobs and peers of older generations are stale.
     pub(super) generation: u64,
     pub(super) phase: Phase,
+    /// Paused by the user.
     pub(super) paused: bool,
+    /// Held back by the session's queue (see [`Actor::stopped`]).
+    pub(super) queued: bool,
+    /// A `SetQueued` that arrived while the storage moved: applied once it
+    /// is done, the last one winning.
+    pub(super) queue_pending: Option<bool>,
+    /// The torrent's place in the session's queue, as the scheduler last
+    /// said.
+    pub(super) queue_position: usize,
+    /// Under the queue's control; seed limits apply only then.
+    pub(super) auto_managed: bool,
+    /// Time spent running, and seeding, up to `time_mark`.
+    pub(super) active_time: Duration,
+    pub(super) seeding_time: Duration,
+    /// When `active_time` and `seeding_time` were last brought up to date.
+    pub(super) time_mark: Instant,
     pub(super) peers: HashMap<PeerKey, Peer>,
     pub(super) next_key: u64,
     /// Addresses waiting for a connection slot.
@@ -217,6 +284,22 @@ pub(crate) struct Actor {
     pub(super) cache: PieceCache,
     /// Hash jobs running; pause waits for them, as for writes.
     pub(super) hashing: usize,
+    /// Storage reads running (`Job::Read`, `ReadPiece`, `ReadChunk`): a
+    /// storage operation waits for them.
+    pub(super) reads_in_flight: usize,
+    /// A storage operation holds the storage: no write is issued and reads
+    /// that miss the cache wait.
+    pub(super) storage_busy: bool,
+    /// The storage operation under way.
+    pub(super) storage_op: Option<StorageOp>,
+    /// Commands that wait for the storage operation, in arrival order; at
+    /// most `MAX_DEFERRED_CMDS` (plus the session's one `Shutdown`).
+    pub(super) deferred: VecDeque<Cmd>,
+    /// A `KeepExisting` move is done: its recheck runs, then this answers.
+    pub(super) recheck_after_move:
+        Option<tokio::sync::oneshot::Sender<Result<(), crate::error::SessionError>>>,
+    /// Where the files are (the save path given at add, changed by moves).
+    pub(super) save_path: PathBuf,
     /// The torrent finished: `TorrentFinished` follows once every piece is
     /// written and the storage flushed.
     pub(super) finish_pending: bool,
@@ -237,6 +320,30 @@ pub(crate) struct Actor {
     pub(super) readers: Readers,
     /// The readers' windows: the missing pieces they wait for, and when.
     pub(super) deadlines: Deadlines,
+    /// Who sent the blocks of pieces in progress and of failed pieces,
+    /// and each sender's trust.
+    pub(super) smartban: SmartBan,
+    /// The torrent's web seeds (BEP 19).
+    pub(super) web_seeds: WebSeeds,
+    /// Resume data not yet applied: its pieces wait for the stamp
+    /// comparison (taken by the first check).
+    pub(super) resume: Option<Box<ResumeState>>,
+    /// The pieces verified before the running check started, for resume
+    /// data saved meanwhile.
+    pub(super) last_have: Option<Bitfield>,
+    /// See [`TorrentStatus::need_save_resume`].
+    pub(super) need_save_resume: bool,
+    /// See [`TorrentStatus::resume_trusted`].
+    pub(super) resume_trusted: Option<bool>,
+    /// The torrent's own rate limit, as last set.
+    pub(super) rate_limit: crate::bandwidth::RateLimit,
+    /// When the torrent was first added, seconds since the Unix epoch.
+    pub(super) added_time: i64,
+    /// When it first finished, likewise.
+    pub(super) completed_time: Option<i64>,
+    /// What web seed downloads are charged to: the torrent's and the
+    /// session's download limits.
+    pub(super) web_seed_throttle: Throttle,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -256,17 +363,26 @@ impl Actor {
     ) -> Self {
         let ih = params.source.info_hashes();
         let rate = BucketPair::new(params.rate_limit);
-        let (loaded, magnet, trackers) = match params.source {
+        let rate_limit = params.rate_limit;
+        let resume = params.resume;
+        let save_path = params.save_path.clone();
+        let web_seed_throttle = shared.bandwidth.web_seed(&rate);
+        let (loaded, magnet, trackers, web_seed_urls) = match params.source {
             TorrentSource::Metainfo(m) => {
                 let trackers = m.trackers.clone();
+                let urls = m.web_seeds.clone();
                 let meta = Arc::new(*m);
                 let _ = metainfo_cell.set(Arc::clone(&meta));
-                let loaded = Loaded::new(meta, params.file_priorities, params.sequential);
-                (Some(loaded), None, trackers)
+                let mut loaded = Loaded::new(meta, params.file_priorities, params.sequential);
+                if let Some(r) = &resume {
+                    loaded.renamed = r.renamed.iter().cloned().collect();
+                }
+                (Some(loaded), None, trackers, urls)
             }
             TorrentSource::Magnet(magnet) => {
                 // One tier per `tr`, in order.
                 let trackers = magnet.trackers.iter().map(|t| vec![t.clone()]).collect();
+                let urls = magnet.web_seeds.clone();
                 let fetch =
                     MetadataFetch::new(magnet.info_hashes, shared.settings.max_metadata_size)
                         .deferred();
@@ -277,7 +393,7 @@ impl Actor {
                     storage: params.storage,
                     sequential: params.sequential,
                 };
-                (None, Some(Box::new(state)), trackers)
+                (None, Some(Box::new(state)), trackers, urls)
             }
         };
         let phase = if loaded.is_some() {
@@ -340,6 +456,13 @@ impl Actor {
             generation: 0,
             phase,
             paused: params.paused,
+            queued: false,
+            queue_pending: None,
+            queue_position: 0,
+            auto_managed: params.auto_managed,
+            active_time: Duration::ZERO,
+            seeding_time: Duration::ZERO,
+            time_mark: Instant::now(),
             peers: HashMap::new(),
             next_key: 0,
             candidates: VecDeque::new(),
@@ -366,6 +489,12 @@ impl Actor {
             next_pex_due: None,
             cache,
             hashing: 0,
+            reads_in_flight: 0,
+            storage_busy: false,
+            storage_op: None,
+            deferred: VecDeque::new(),
+            recheck_after_move: None,
+            save_path,
             finish_pending: false,
             finish_flush: false,
             piece_reads,
@@ -373,11 +502,31 @@ impl Actor {
             rate,
             readers: Readers::default(),
             deadlines: Deadlines::default(),
+            smartban: SmartBan::default(),
+            web_seeds: WebSeeds::default(),
+            web_seed_throttle,
+            need_save_resume: resume.is_none(),
+            resume_trusted: None,
+            last_have: None,
+            rate_limit,
+            added_time: resume.as_ref().map_or_else(unix_now, |r| r.added),
+            completed_time: resume.as_ref().and_then(|r| r.completed),
+            resume: None,
             #[cfg(test)]
             pex_live_builds: 0,
             #[cfg(test)]
             pex_scans: 0,
         };
+        actor.init_web_seeds(web_seed_urls);
+        if let Some(r) = resume {
+            actor.counters.uploaded = r.uploaded;
+            actor.counters.downloaded = r.downloaded;
+            actor.active_time = r.active_time;
+            actor.seeding_time = r.seeding_time;
+            // The current set: seeds added by hand included.
+            actor.init_web_seeds(r.web_seeds.clone());
+            actor.resume = Some(r);
+        }
         if actor.magnet.is_some() {
             actor.last_state = actor.state();
         }
@@ -385,6 +534,18 @@ impl Actor {
     }
 
     pub(super) async fn run(mut self) {
+        // Resume data's peers are known addresses, dialled once the torrent
+        // runs.
+        let saved = self
+            .resume
+            .as_ref()
+            .map(|r| r.peers.clone())
+            .unwrap_or_default();
+        for addr in saved {
+            if dialable(&addr) && self.shared.blocked(addr).is_none() {
+                self.remember(addr);
+            }
+        }
         self.start_check();
         // Checking, queued for it, or fetching the metadata.
         self.last_state = self.state();
@@ -401,7 +562,7 @@ impl Actor {
             .unwrap_or_default();
         let mut count = 0usize;
         for addr in hints {
-            if dialable(&addr) {
+            if dialable(&addr) && !self.refuse_blocked(addr) {
                 count = count.saturating_add(1);
                 if self.remember(addr) {
                     self.queue_addr(addr);
@@ -416,6 +577,22 @@ impl Actor {
         let mut rechoke = tokio::time::interval(self.shared.settings.rechoke_interval);
         rechoke.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
+            if !self.storage_busy {
+                if let Some(queued) = self.queue_pending.take() {
+                    self.set_queued(queued).await;
+                    continue;
+                }
+                if self.recheck_after_move.is_some() {
+                    self.finish_keep_existing().await;
+                    continue;
+                }
+                if let Some(cmd) = self.deferred.pop_front() {
+                    if let Flow::Exit = self.on_cmd(cmd).await {
+                        return;
+                    }
+                    continue;
+                }
+            }
             tokio::select! {
                 cmd = self.cmds.recv() => {
                     let Some(cmd) = cmd else {
@@ -440,13 +617,17 @@ impl Actor {
                 _ = tick.tick() => {
                     self.flush(FlushReason::Expired);
                     self.release_stale_partials();
+                    self.expire_parole_pieces();
                     self.readers_tick();
                     self.top_up_all(None);
+                    self.web_seed_tick();
                     self.metadata_tick();
                     self.pex_tick();
                     self.lsd_tick();
                     self.queue_retries();
                     self.try_connect();
+                    self.account_time();
+                    self.check_seed_limits();
                     self.publish();
                 }
                 _ = rechoke.tick() => self.rechoke(),
@@ -473,11 +654,13 @@ impl Actor {
         self.storage = Some(storage);
     }
 
-    /// Drops every partially downloaded piece and its budget reservation.
+    /// Drops every partially downloaded piece and its budget reservation,
+    /// and what smart ban recorded of pieces (trust stays).
     pub(super) fn clear_bufs(&mut self) {
         if let Some(l) = self.loaded.as_mut() {
             l.bufs.clear();
         }
+        self.smartban.forget_all();
         self.cache.release_partials();
         self.drop_piece_reads();
     }
@@ -501,15 +684,21 @@ impl Actor {
         self.shared.emit(ev);
     }
 
-    /// Ready and not paused: data may flow.
+    /// Paused by the user or held back by the queue: both stop the torrent
+    /// the same way (no peers, `stopped` announced).
+    pub(super) fn stopped(&self) -> bool {
+        self.paused || self.queued
+    }
+
+    /// Ready and not stopped: data may flow.
     pub(super) fn active(&self) -> bool {
-        matches!(self.phase, Phase::Ready) && !self.paused
+        matches!(self.phase, Phase::Ready) && !self.stopped()
     }
 
     /// Peers may connect: ready, or a magnet fetching its metadata, and not
-    /// paused.
+    /// stopped.
     pub(super) fn connectable(&self) -> bool {
-        matches!(self.phase, Phase::Ready | Phase::Metadata) && !self.paused
+        matches!(self.phase, Phase::Ready | Phase::Metadata) && !self.stopped()
     }
 
     /// What the announcer is told: announcing while peers may connect, and
@@ -520,17 +709,18 @@ impl Actor {
             || (self.metadata_check
                 && matches!(
                     self.phase,
-                    Phase::Checking { .. } | Phase::QueuedForCheck { .. }
+                    Phase::Checking { .. } | Phase::QueuedForCheck { .. } | Phase::Resuming
                 )
-                && !self.paused)
+                && !self.stopped())
     }
 
     pub(super) fn state(&self) -> TorrentState {
         match &self.phase {
             Phase::Error(_) => TorrentState::Error,
-            Phase::Metadata if self.paused => TorrentState::Paused,
+            Phase::Metadata | Phase::Ready if self.paused => TorrentState::Paused,
+            Phase::Metadata | Phase::Ready if self.queued => TorrentState::Queued,
             Phase::Metadata => TorrentState::DownloadingMetadata,
-            Phase::QueuedForCheck { .. } => TorrentState::QueuedForChecking,
+            Phase::QueuedForCheck { .. } | Phase::Resuming => TorrentState::QueuedForChecking,
             Phase::Checking { done, .. } => {
                 let n = self.loaded.as_ref().map_or(0, |l| l.layout.num_pieces());
                 let progress = if n == 0 {
@@ -540,7 +730,6 @@ impl Actor {
                 };
                 TorrentState::CheckingFiles { progress }
             }
-            Phase::Ready if self.paused => TorrentState::Paused,
             Phase::Ready => {
                 if self
                     .loaded
@@ -606,11 +795,87 @@ impl Actor {
             upload_rate: self.counters.ul.rate(now),
             num_peers,
             num_seeds,
+            num_web_seeds: self.web_seeds.num_active(),
             error: match &self.phase {
                 Phase::Error(e) => Some(e.clone()),
                 _ => None,
             },
+            save_path: self.save_path.clone(),
+            queue_position: self.queue_position,
+            auto_managed: self.auto_managed,
+            active_time: self.active_time,
+            seeding_time: self.seeding_time,
+            need_save_resume: self.need_save_resume,
+            resume_trusted: self.resume_trusted,
+            is_seed: self
+                .loaded
+                .as_ref()
+                .and_then(|l| l.picker.as_ref())
+                .is_some_and(|p| p.have().is_full()),
         }
+    }
+
+    /// Adds the time since the last call to `active_time` (while running)
+    /// and `seeding_time` (while seeding).
+    pub(super) fn account_time(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.time_mark);
+        self.time_mark = now;
+        if self.running() {
+            self.active_time = self.active_time.saturating_add(elapsed);
+        }
+        if self.state() == TorrentState::Seeding {
+            self.seeding_time = self.seeding_time.saturating_add(elapsed);
+        }
+    }
+
+    /// An auto-managed seed past [`Settings::seed_ratio_limit`] or
+    /// [`Settings::seed_time_limit`] pauses, leaves the queue's control
+    /// (so resuming it seeds on) and emits `SeedLimitReached`. Ratio:
+    /// uploaded over the larger of downloaded and wanted bytes.
+    ///
+    /// [`Settings::seed_ratio_limit`]: crate::Settings::seed_ratio_limit
+    /// [`Settings::seed_time_limit`]: crate::Settings::seed_time_limit
+    fn check_seed_limits(&mut self) {
+        // During a storage move the pause could not flush: the check
+        // waits for the tick after the move, when the verdict is the same.
+        if !self.auto_managed
+            || self.stopped()
+            || self.storage_busy
+            || self.state() != TorrentState::Seeding
+        {
+            return;
+        }
+        let s = &self.shared.settings;
+        let base = self
+            .counters
+            .downloaded
+            .max(self.loaded.as_ref().map_or(0, |l| l.total_wanted));
+        let ratio_hit = s
+            .seed_ratio_limit
+            .is_some_and(|limit| base > 0 && self.counters.uploaded as f64 / base as f64 >= limit);
+        let time_hit = s
+            .seed_time_limit
+            .is_some_and(|limit| self.seeding_time >= limit);
+        if !(ratio_hit || time_hit) {
+            return;
+        }
+        debug!(torrent = %self.name(), ratio_hit, time_hit, "seed limit reached");
+        self.auto_managed = false;
+        // Paused and out of the queue's control: both are in resume data.
+        self.need_save_resume = true;
+        if let Some(session) = self.session.upgrade() {
+            session.set_auto_managed(&self.ih, false);
+        }
+        // The pause path; nobody waits for the flush.
+        self.paused = true;
+        self.record_user_pause();
+        self.metadata_check = false;
+        self.close_all();
+        self.flush(FlushReason::All);
+        self.emit(Event::SeedLimitReached { torrent: self.ih });
+        self.refresh_state();
+        self.publish();
     }
 
     /// Publishes the status if it changed.
@@ -630,10 +895,14 @@ impl Actor {
     /// changed; other changes wait for the next status tick. The announcer
     /// learns whether to run.
     pub(super) fn refresh_state(&mut self) {
+        self.account_time();
         let state = self.state();
         if !same_state(&state, &self.last_state) {
             self.publish();
             self.last_state = state;
+            // Pauses, resumes, finishes and errors change what the queue
+            // counts.
+            self.shared.queue_dirty.notify_one();
             self.emit(Event::StateChanged {
                 torrent: self.ih,
                 state,
@@ -668,11 +937,12 @@ impl Actor {
 
     /// Peers from a tracker reply, a DHT lookup or PEX join the known addresses,
     /// as `add_peer` does (bounded, oldest unused evicted); addresses nobody
-    /// can dial (port 0, unspecified, multicast) are dropped.
+    /// can dial (port 0, unspecified, multicast) are dropped, and blocked
+    /// ones are reported and dropped.
     pub(super) fn on_found_peers(&mut self, source: PeerSource, peers: Vec<SocketAddr>) {
         let mut count = 0usize;
         for addr in peers {
-            if !dialable(&addr) {
+            if !dialable(&addr) || self.refuse_blocked(addr) {
                 continue;
             }
             count = count.saturating_add(1);
@@ -723,6 +993,8 @@ impl Actor {
             return;
         }
         warn!(torrent = %self.name(), error = %e, "storage error while {during}");
+        // What the files hold is unknown now: no check is skipped.
+        self.resume = None;
         let message = format!("{during}: {e}");
         let reader_error = StreamError::TorrentError(message.clone());
         self.cancel_check();
@@ -775,6 +1047,13 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Now, in seconds since the Unix epoch.
+pub(super) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Bytes of the pieces with a non-zero priority.

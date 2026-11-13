@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 default = []
+serde = ["dep:serde"]
 tls-ring = [
     "dep:rustls",
     "rustls/ring",
@@ -30,13 +31,16 @@ tls-rustcrypto = [
 [dependencies]
 fbt-bencode = { path = "../fbt-bencode" }
 fbt-core = { path = "../fbt-core" }
+fbt-net = { path = "../fbt-net" }
 thiserror.workspace = true
+serde = { workspace = true, optional = true }
 bytes.workspace = true
 tokio = { workspace = true, features = ["time", "net", "sync", "rt"] }
 rand.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+tower-service.workspace = true
 hyper-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-rustcrypto = { workspace = true, optional = true }

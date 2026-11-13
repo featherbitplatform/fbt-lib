@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
-use fbt_dht::{Body, Dht, DhtConfig, MAX_STATE_NODES, Message, Query, QueryMsg};
+use fbt_dht::{Body, Dht, DhtConfig, DhtError, MAX_STATE_NODES, Message, Query, QueryMsg};
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -93,11 +93,81 @@ async fn announce_then_get_peers_finds_the_peer() {
         .await
     );
     let ih = [0x42; 20];
-    let mut announce = nodes[19].announce(ih, Some(4242));
+    let mut announce = nodes[19].announce(ih, Some(4242), false);
     while announce.next().await.is_some() {}
     let want: SocketAddr = "127.0.0.1:4242".parse().unwrap();
     let found = timeout(Duration::from_secs(5), find(&nodes[3], ih, want)).await;
     assert_eq!(found, Ok(true));
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scrape_round_trip() {
+    // every node is 127.0.0.1, so each filter holds at most one address
+    // (synthetic IPs are counted in the store's unit tests)
+    let nodes = swarm(10, "127.0.0.1:0").await;
+    assert!(
+        wait_until(Duration::from_secs(10), || nodes
+            .iter()
+            .all(|n| n.stats().nodes_v4 >= 5))
+        .await
+    );
+    let ih = [0x33; 20];
+    // a node that knows nobody cannot scrape: an error, not zeros
+    let lone = Dht::spawn(cfg("127.0.0.1:0")).await.unwrap();
+    assert!(matches!(lone.scrape(ih).await, Err(DhtError::NoNodes)));
+    lone.shutdown().await;
+    assert!(matches!(lone.scrape(ih).await, Err(DhtError::Shutdown)));
+    let empty = nodes[2].scrape(ih).await.unwrap();
+    assert_eq!((empty.seeds, empty.peers), (0, 0));
+    let mut seed = nodes[8].announce(ih, Some(5001), true);
+    while seed.next().await.is_some() {}
+    let mut leech = nodes[9].announce(ih, Some(5002), false);
+    while leech.next().await.is_some() {}
+    let got = timeout(Duration::from_secs(10), nodes[2].scrape(ih))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((got.seeds, got.peers), (1, 1));
+    // only a seed: no leecher counted
+    let other = [0x34; 20];
+    let mut seed = nodes[8].announce(other, Some(5001), true);
+    while seed.next().await.is_some() {}
+    let got = nodes[3].scrape(other).await.unwrap();
+    assert_eq!((got.seeds, got.peers), (1, 0));
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sample_infohashes_returns_stored_hashes() {
+    let nodes = swarm(4, "127.0.0.1:0").await;
+    assert!(
+        wait_until(Duration::from_secs(10), || nodes
+            .iter()
+            .all(|n| n.stats().nodes_v4 >= 3))
+        .await
+    );
+    // with 4 nodes every announce reaches node 0 (one of the K closest)
+    let hashes: Vec<[u8; 20]> = (1..=3u8).map(|k| [k; 20]).collect();
+    for ih in &hashes {
+        let mut a = nodes[1].announce(*ih, Some(6000), false);
+        while a.next().await.is_some() {}
+    }
+    let target = fbt_dht::NodeId([0x55; 20]);
+    let addr = nodes[0].local_addrs()[0];
+    let got = nodes[3].sample_infohashes(addr, target).await.unwrap();
+    assert_eq!(got.interval, Duration::from_secs(21600));
+    assert_eq!(got.num, 3);
+    let mut samples = got.samples.clone();
+    samples.sort();
+    assert_eq!(samples, hashes);
+    assert!(!got.nodes.is_empty());
+    assert!(got.nodes.iter().all(|n| n.addr.ip().is_loopback()));
+    // an address nothing listens on times out
+    let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    assert!(nodes[3].sample_infohashes(dead_addr, target).await.is_err());
     shutdown(&nodes).await;
 }
 
@@ -116,7 +186,7 @@ async fn ipv6_swarm_converges_when_available() {
     );
     assert!(nodes.iter().all(|n| n.stats().nodes_v4 == 0));
     let ih = [0x66; 20];
-    let mut announce = nodes[9].announce(ih, Some(4242));
+    let mut announce = nodes[9].announce(ih, Some(4242), false);
     while announce.next().await.is_some() {}
     let want: SocketAddr = "[::1]:4242".parse().unwrap();
     let found = timeout(Duration::from_secs(5), find(&nodes[2], ih, want)).await;
@@ -317,7 +387,7 @@ async fn mixed_standalone_and_shared_nodes_converge() {
     );
     let ih = [7u8; 20];
     // node 4 is on a shared socket, node 9 on a standalone one
-    let mut announce = nodes[4].announce(ih, Some(4242));
+    let mut announce = nodes[4].announce(ih, Some(4242), false);
     while announce.next().await.is_some() {}
     let want: SocketAddr = "127.0.0.1:4242".parse().unwrap();
     let found = timeout(Duration::from_secs(5), find(&nodes[9], ih, want)).await;
@@ -378,4 +448,300 @@ async fn long_bootstrap_attempts_are_spaced_from_their_end() {
         );
     }
     dht.shutdown().await;
+}
+
+fn sha1(b: &[u8]) -> [u8; 20] {
+    use sha1::Digest as _;
+    sha1::Sha1::digest(b).into()
+}
+
+/// The ed25519 public key of a 32-byte secret seed.
+fn ed25519_public_key(seed: [u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+        .verifying_key()
+        .to_bytes()
+}
+
+/// A swarm of `n` loopback nodes whose tables hold at least `min` nodes.
+async fn ready_swarm(n: usize, min: usize) -> Vec<Dht> {
+    ready_swarm_with(n, min, Duration::from_millis(500)).await
+}
+
+/// [`ready_swarm`] with each node's query timeout.
+async fn ready_swarm_with(n: usize, min: usize, query_timeout: Duration) -> Vec<Dht> {
+    let mut c = cfg("127.0.0.1:0");
+    c.query_timeout = query_timeout;
+    let first = Dht::spawn(c.clone()).await.unwrap();
+    let seed = first.local_addrs()[0].to_string();
+    let mut nodes = vec![first];
+    for _ in 1..n {
+        let mut c = c.clone();
+        c.bootstrap = vec![seed.clone()];
+        nodes.push(Dht::spawn(c).await.unwrap());
+    }
+    // introduce every pair directly (a ping each way), so a full mesh does
+    // not wait on discovery
+    let addrs: Vec<SocketAddr> = nodes.iter().map(|d| d.local_addrs()[0]).collect();
+    for (d, own) in nodes.iter().zip(&addrs) {
+        for a in addrs.iter().filter(|a| *a != own) {
+            d.add_node(*a);
+        }
+    }
+    let counts = || nodes.iter().map(|d| d.stats().nodes_v4).collect::<Vec<_>>();
+    assert!(
+        wait_until(Duration::from_secs(20), || nodes
+            .iter()
+            .all(|d| d.stats().nodes_v4 >= min))
+        .await,
+        "tables: {:?}",
+        counts()
+    );
+    nodes
+}
+
+/// Sends `query` from `sock` to `to` and returns the answer's body.
+async fn ask_raw(sock: &UdpSocket, to: SocketAddr, query: Query) -> Body {
+    let m = Message {
+        tid: b"bq".to_vec(),
+        ip: None,
+        version: None,
+        body: Body::Query(QueryMsg {
+            id: fbt_dht::NodeId([0x77; 20]),
+            query,
+            want: Default::default(),
+            read_only: true,
+        }),
+    };
+    sock.send_to(&m.encode(), to).await.unwrap();
+    let mut buf = [0u8; 1500];
+    let (n, _) = timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    Message::decode(&buf[..n]).unwrap().body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immutable_put_then_get() {
+    let nodes = ready_swarm(10, 5).await;
+    let value = b"d4:name5:hello4:sizei42ee".to_vec();
+    let (target, stored) = nodes[1].put_immutable(value.clone()).await.unwrap();
+    assert_eq!(target, sha1(&value));
+    assert!(stored >= 1, "stored on {stored} nodes");
+    let got = nodes[7].get_immutable(target).await.unwrap();
+    assert_eq!(got, Some(value));
+    // nobody stores this one
+    assert_eq!(nodes[7].get_immutable([0xab; 20]).await.unwrap(), None);
+    // values must be canonical bencode of at most 1000 bytes
+    for bad in [
+        b"not bencode".to_vec(),
+        b"d1:bi1e1:ai2ee".to_vec(),
+        [b"998:".as_slice(), &[b'x'; 998]].concat(),
+    ] {
+        assert!(matches!(
+            nodes[1].put_immutable(bad).await,
+            Err(DhtError::InvalidValue)
+        ));
+    }
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutable_put_then_get_highest_seq() {
+    // 9 nodes that all know each other: a put reaches the K = 8 others. The
+    // refusals below (which BEP 44 only applies over a stored item) need
+    // every node but the writer, node 5, to hold the item; that is checked
+    // node by node first, so a slow reply cannot make the test flaky.
+    let nodes = ready_swarm_with(9, 8, Duration::from_secs(2)).await;
+    let seed = [0x21u8; 32];
+    let public_key = ed25519_public_key(seed);
+    assert!(
+        nodes[2]
+            .put_mutable(seed, Vec::new(), b"3:one".to_vec(), 1, None)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        nodes[3]
+            .put_mutable(seed, Vec::new(), b"3:two".to_vec(), 2, Some(1))
+            .await
+            .unwrap()
+            >= 1
+    );
+    // node 3 stores only node 2's put (seq 1), every other node seq 2; a
+    // node a put missed gets it again
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = fbt_dht::NodeId(sha1(&public_key));
+    let expected = |k: usize| if k == 3 { 1 } else { 2 };
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.clear();
+        for (k, n) in nodes.iter().enumerate() {
+            let Body::Response(r) =
+                ask_raw(&sock, n.local_addrs()[0], Query::Get { target, seq: None }).await
+            else {
+                panic!("node {k} refused a get")
+            };
+            held.push(r.seq);
+        }
+        let missing: Vec<usize> = (0..nodes.len())
+            .filter(|&k| k != 5 && held[k] != Some(expected(k)))
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        if missing.contains(&3) {
+            let _ = nodes[2]
+                .put_mutable(seed, Vec::new(), b"3:one".to_vec(), 1, None)
+                .await;
+        }
+        if missing.iter().any(|&k| k != 3) {
+            let _ = nodes[3]
+                .put_mutable(seed, Vec::new(), b"3:two".to_vec(), 2, None)
+                .await;
+        }
+    }
+    for (k, seq) in held.iter().enumerate().filter(|(k, _)| *k != 5) {
+        assert_eq!(*seq, Some(expected(k)), "node {k}: {held:?}");
+    }
+    assert_eq!(nodes[8].get_mutable([0; 32], b"").await.unwrap(), None);
+    // a salted item under the same key
+    assert!(
+        nodes[4]
+            .put_mutable(seed, b"foobar".to_vec(), b"i5e".to_vec(), 5, None)
+            .await
+            .unwrap()
+            >= 1
+    );
+    let salted = nodes[8]
+        .get_mutable(public_key, b"foobar")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (salted.seq, salted.value.as_slice(), salted.salt.as_slice()),
+        (5, &b"i5e"[..], &b"foobar"[..])
+    );
+    let item = nodes[8]
+        .get_mutable(public_key, b"")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((item.seq, item.value.as_slice()), (2, &b"3:two"[..]));
+    assert_eq!(item.public_key, public_key);
+    assert!(item.salt.is_empty());
+    // a lower seq is refused by every node: 302
+    assert!(matches!(
+        nodes[5]
+            .put_mutable(seed, Vec::new(), b"3:old".to_vec(), 1, None)
+            .await,
+        Err(DhtError::Remote { code: 302 })
+    ));
+    // a stale cas: 301 (node 3 holds seq 1, the others seq 2: cas 0
+    // matches neither)
+    assert!(matches!(
+        nodes[5]
+            .put_mutable(seed, Vec::new(), b"5:three".to_vec(), 3, Some(0))
+            .await,
+        Err(DhtError::Remote { code: 301 })
+    ));
+    // another salt is another item
+    assert_eq!(
+        nodes[8].get_mutable(public_key, b"other").await.unwrap(),
+        None
+    );
+    // invalid arguments never leave the node
+    assert!(matches!(
+        nodes[5].get_mutable(public_key, &[0; 65]).await,
+        Err(DhtError::InvalidValue)
+    ));
+    assert!(matches!(
+        nodes[5]
+            .put_mutable(seed, vec![0; 65], b"i1e".to_vec(), 9, None)
+            .await,
+        Err(DhtError::InvalidValue)
+    ));
+    assert!(matches!(
+        nodes[5]
+            .put_mutable(seed, Vec::new(), b"i1e".to_vec(), -1, None)
+            .await,
+        Err(DhtError::InvalidValue)
+    ));
+    let item = nodes[0]
+        .get_mutable(public_key, b"")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.seq, 2);
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_signature_is_refused() {
+    let nodes = ready_swarm(4, 3).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let to = nodes[0].local_addrs()[0];
+    let seed = [0x42u8; 32];
+    let key = ed25519_public_key(seed);
+    let Body::Response(r) = ask_raw(
+        &sock,
+        to,
+        Query::Get {
+            target: fbt_dht::NodeId(sha1(&key)),
+            seq: None,
+        },
+    )
+    .await
+    else {
+        panic!("no answer to get")
+    };
+    let token = r.token.expect("get answers carry a write token");
+    let put = Query::Put {
+        token,
+        v: b"6:forged".to_vec(),
+        k: Some(key),
+        sig: Some([0x11; 64]),
+        seq: Some(1),
+        salt: None,
+        cas: None,
+        reject: None,
+    };
+    assert!(matches!(
+        ask_raw(&sock, to, put).await,
+        Body::Error { code: 206, .. }
+    ));
+    for n in &nodes[1..] {
+        assert_eq!(n.get_mutable(key, b"").await.unwrap(), None);
+    }
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_without_a_token_is_refused() {
+    let nodes = ready_swarm(4, 3).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let to = nodes[0].local_addrs()[0];
+    for token in [Vec::new(), b"12345678".to_vec()] {
+        let put = Query::Put {
+            token,
+            v: b"5:hello".to_vec(),
+            k: None,
+            sig: None,
+            seq: None,
+            salt: None,
+            cas: None,
+            reject: None,
+        };
+        assert!(matches!(
+            ask_raw(&sock, to, put).await,
+            Body::Error { code: 203, .. }
+        ));
+    }
+    // nothing was stored
+    assert_eq!(
+        nodes[1].get_immutable(sha1(b"5:hello")).await.unwrap(),
+        None
+    );
+    shutdown(&nodes).await;
 }

@@ -10,6 +10,7 @@ use fbt_net::{MapMethod, MapProtocol};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::sync::ReusableBoxFuture;
 
+use crate::bans::BlockReason;
 use crate::peer::{DisconnectReason, Transport};
 use crate::status::TorrentState;
 
@@ -88,6 +89,14 @@ pub enum Event {
         /// The torrent.
         torrent: InfoHashes,
     },
+    /// An auto-managed seed reached
+    /// [`Settings::seed_ratio_limit`](crate::Settings::seed_ratio_limit) or
+    /// [`Settings::seed_time_limit`](crate::Settings::seed_time_limit): it
+    /// is paused and no longer auto-managed.
+    SeedLimitReached {
+        /// The torrent.
+        torrent: InfoHashes,
+    },
     /// A tracker answered an announce.
     TrackerReply {
         /// The torrent.
@@ -105,6 +114,47 @@ pub enum Event {
         url: String,
         /// What went wrong.
         message: String,
+    },
+    /// A tracker answered a scrape
+    /// ([`TorrentHandle::scrape_trackers`](crate::TorrentHandle::scrape_trackers)).
+    ScrapeReply {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// Tracker URL (the announce URL).
+        url: String,
+        /// Seeds.
+        complete: u32,
+        /// Leechers.
+        incomplete: u32,
+        /// Completed downloads the tracker has seen.
+        downloaded: u32,
+    },
+    /// A scrape failed, or the reply left the torrent out. The tracker
+    /// stays in use for announces.
+    ScrapeFailed {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// Tracker URL (the announce URL).
+        url: String,
+        /// What went wrong.
+        message: String,
+    },
+    /// A web seed (BEP 19) request failed. With `retired` false the seed
+    /// backs off (30 s, doubling per failure in a row, up to 30 minutes)
+    /// and is tried again; with `retired` true (a 4xx status other than
+    /// 408 and 429, a URL that cannot work, or data that failed a hash
+    /// check, found by smart ban) it is never asked again, until
+    /// [`TorrentHandle::add_web_seed`](crate::TorrentHandle::add_web_seed)
+    /// adds it back.
+    WebSeedError {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The web seed's URL, as added.
+        url: String,
+        /// What went wrong.
+        message: String,
+        /// The seed is retired.
+        retired: bool,
     },
     /// A batch of peer addresses arrived for a torrent.
     PeersFound {
@@ -149,6 +199,20 @@ pub enum Event {
         /// Why.
         reason: DisconnectReason,
     },
+    /// A peer was refused: not dialled, or its connection closed (an
+    /// incoming one before its handshake is read when the session-wide
+    /// checks refuse it). A connection that was reported connected also
+    /// gets its [`PeerDisconnected`](Event::PeerDisconnected) with
+    /// [`DisconnectReason::Blocked`].
+    PeerBlocked {
+        /// The torrent; `None` for an incoming connection refused before
+        /// its handshake named one.
+        torrent: Option<InfoHashes>,
+        /// The peer's address.
+        addr: SocketAddr,
+        /// Why.
+        reason: BlockReason,
+    },
     /// Reading or writing torrent data failed; the torrent stopped, except
     /// for a piece found missing on disk while serving a peer: that piece
     /// is downloaded again and the torrent keeps running.
@@ -162,6 +226,43 @@ pub enum Event {
         path: Option<PathBuf>,
         /// The torrent.
         torrent: InfoHashes,
+        /// The error.
+        message: String,
+    },
+    /// [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage)
+    /// finished: the torrent's files are below `path` now.
+    StorageMoved {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The new save path.
+        path: PathBuf,
+    },
+    /// [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage)
+    /// failed; whatever it moved was moved back, and the torrent keeps
+    /// running from the old save path.
+    StorageMoveFailed {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The error.
+        message: String,
+    },
+    /// [`TorrentHandle::rename_file`](crate::TorrentHandle::rename_file)
+    /// finished.
+    FileRenamed {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The file's index.
+        index: usize,
+        /// Its new path, relative to the save path, `/`-separated.
+        path: String,
+    },
+    /// [`TorrentHandle::rename_file`](crate::TorrentHandle::rename_file)
+    /// failed; the file keeps its path.
+    FileRenameFailed {
+        /// The torrent.
+        torrent: InfoHashes,
+        /// The file's index.
+        index: usize,
         /// The error.
         message: String,
     },
@@ -196,6 +297,15 @@ pub enum Event {
         /// Who reported it.
         source: ExternalIpSource,
     },
+    /// The proxy ([`Settings::proxy`](crate::Settings::proxy)) failed in a
+    /// way that affects the whole session. Emitted once when the SOCKS5
+    /// proxy closes the UDP association: the relayed UDP socket stops, so
+    /// the DHT, uTP and UDP trackers fail (closed, never direct) until the
+    /// session is restarted.
+    ProxyError {
+        /// What happened.
+        message: String,
+    },
     /// The subscriber fell behind and `missed` events were dropped.
     Lagged {
         /// Number of events dropped.
@@ -208,15 +318,16 @@ bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct EventMask: u32 {
         /// Torrent added/removed, state changes, metadata received, torrent
-        /// finished.
+        /// finished, seed limit reached, session-wide proxy failures.
         const STATUS = 1;
         /// Piece finished, hash failed.
         const PIECE = 1 << 1;
-        /// Tracker replies and errors.
+        /// Tracker replies and errors, scrapes included.
         const TRACKER = 1 << 2;
-        /// Peer connects and disconnects, peers found.
+        /// Peer connects and disconnects, peers found, peers blocked, web
+        /// seed errors.
         const PEER = 1 << 3;
-        /// Storage errors.
+        /// Storage errors, storage moves and file renames.
         const STORAGE = 1 << 4;
         /// The session's DHT node.
         const DHT = 1 << 5;
@@ -241,14 +352,25 @@ impl Event {
             | Event::TorrentRemoved { .. }
             | Event::StateChanged { .. }
             | Event::MetadataReceived { .. }
-            | Event::TorrentFinished { .. } => EventMask::STATUS,
+            | Event::TorrentFinished { .. }
+            | Event::SeedLimitReached { .. }
+            | Event::ProxyError { .. } => EventMask::STATUS,
             Event::PieceFinished { .. } | Event::HashFailed { .. } => EventMask::PIECE,
-            Event::TrackerReply { .. } | Event::TrackerError { .. } => EventMask::TRACKER,
+            Event::TrackerReply { .. }
+            | Event::TrackerError { .. }
+            | Event::ScrapeReply { .. }
+            | Event::ScrapeFailed { .. } => EventMask::TRACKER,
             Event::PeerConnected { .. }
             | Event::PeerDisconnected { .. }
-            | Event::PeersFound { .. } => EventMask::PEER,
+            | Event::PeersFound { .. }
+            | Event::PeerBlocked { .. }
+            | Event::WebSeedError { .. } => EventMask::PEER,
             Event::DhtBootstrapped { .. } => EventMask::DHT,
-            Event::FileError { .. } => EventMask::STORAGE,
+            Event::FileError { .. }
+            | Event::StorageMoved { .. }
+            | Event::StorageMoveFailed { .. }
+            | Event::FileRenamed { .. }
+            | Event::FileRenameFailed { .. } => EventMask::STORAGE,
             Event::PortMapped { .. }
             | Event::PortMappingFailed { .. }
             | Event::ExternalIpChanged { .. } => EventMask::NAT,

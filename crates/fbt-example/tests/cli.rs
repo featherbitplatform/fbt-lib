@@ -535,3 +535,189 @@ fn stream_bad_file_index_is_a_clean_error() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("file 9"), "{stderr}");
 }
+
+#[path = "../../fbt-session/tests/support/web_seed.rs"]
+mod web_seed;
+
+/// Runs `download` (60 s limit) with stdout and stderr captured.
+fn run_download_output(args: &[&str]) -> std::process::Output {
+    let child = Command::new(BIN)
+        .arg("download")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn download");
+    let mut child = Kill(child);
+    let mut stdout = child.0.stdout.take().expect("stdout");
+    let mut stderr = child.0.stderr.take().expect("stderr");
+    let out_thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut v);
+        v
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut v);
+        v
+    });
+    let status = wait_exit(&mut child.0, Duration::from_secs(60));
+    std::process::Output {
+        status,
+        stdout: out_thread.join().expect("stdout reader"),
+        stderr: err_thread.join().expect("stderr reader"),
+    }
+}
+
+/// `--proxy` takes `socks5://` and `http://` URLs with optional
+/// credentials (the bad magnet then fails after parsing, exit 1); a URL
+/// without a port, with another scheme or with no host is a usage error
+/// (exit 2) naming the flag.
+#[test]
+fn proxy_url_parsing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let run = |proxy: &str| {
+        Command::new(BIN)
+            .args(["download", "magnet:?dn=nothing", "--port", "0", "--no-dht"])
+            .args(["--proxy", proxy, "--out"])
+            .arg(tmp.path())
+            .output()
+            .expect("run")
+    };
+    for good in [
+        "socks5://127.0.0.1:1080",
+        "socks5://user:pass@proxy.example:1080",
+        "http://127.0.0.1:3128",
+        "http://user:p%40ss@[::1]:8080",
+        "http://user@proxy.example:8080",
+    ] {
+        let out = run(good);
+        assert_eq!(out.status.code(), Some(1), "{good}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.starts_with("error:"), "{good}: {stderr}");
+    }
+    for bad in [
+        "socks5://127.0.0.1",
+        "http://user:hunter2@proxy.example",
+        "socks4://user:hunter2@127.0.0.1:1080",
+        "socks4://127.0.0.1:1080",
+        "127.0.0.1:1080",
+        "socks5://:1080",
+        "socks5://127.0.0.1:99999",
+        "http://127.0.0.1:3128/path",
+    ] {
+        let out = run(bad);
+        assert_eq!(out.status.code(), Some(2), "{bad}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--proxy"), "{bad}: {stderr}");
+        // A rejected URL's password never reaches the terminal or CI logs.
+        assert!(!stderr.contains("hunter2"), "{bad}: {stderr}");
+    }
+}
+
+/// `--stop-at 50 --resume` pauses at half, saves the resume file and exits
+/// 0; a second run from that file trusts the saved pieces (no check) and
+/// finishes.
+#[test]
+fn resume_file_is_written_and_trusted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // 2 MiB at 256 KiB/s: about 4 s to the halfway mark and 12.5 % per 1 s
+    // progress poll, so the stop lands well short of 100 %.
+    let payload: Vec<u8> = (0..2 * 1024 * 1024usize)
+        .map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8)
+        .collect();
+    let (torrent, _) = make_torrent(&[("big.bin", payload.len())], 65536);
+    let torrent_path = tmp.path().join("t.torrent");
+    std::fs::write(&torrent_path, &torrent).expect("write torrent");
+    let seed_dir = tmp.path().join("seed");
+    std::fs::create_dir_all(seed_dir.join("payload")).expect("mkdir");
+    std::fs::write(seed_dir.join("payload/big.bin"), &payload).expect("write");
+    let out_dir = tmp.path().join("out");
+    let resume = tmp.path().join("r.dat");
+    let (_seed, port) = spawn_seed(&torrent_path, &seed_dir, &[]);
+    let peer = format!("127.0.0.1:{port}");
+    let args = [
+        torrent_path.to_str().expect("utf8"),
+        "--port",
+        "0",
+        "--no-dht",
+        "--peer",
+        &peer,
+        "--out",
+        out_dir.to_str().expect("utf8"),
+        "--resume",
+        resume.to_str().expect("utf8"),
+    ];
+
+    let mut first = args.to_vec();
+    first.extend(["--stop-at", "50", "--download-limit", "256K"]);
+    let out = run_download_output(&first);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stopped_at: f64 = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("stop at 50%: "))
+        .and_then(|rest| rest.strip_suffix("% done"))
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no stop line in {stdout}"));
+    assert!(
+        (50.0..100.0).contains(&stopped_at),
+        "stopped at {stopped_at}%: {stdout}"
+    );
+    assert!(resume.is_file(), "no resume file written");
+    let saved = std::fs::read(&resume).expect("resume file");
+    assert!(fbt::AddTorrent::from_resume(&saved).is_ok());
+    // The temp file is renamed into place, not left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("r.dat") && n != "r.dat")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    let out = run_download_output(&args);
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("resume: trusted ("), "{stderr}");
+    assert!(!stderr.contains("resume: checking"), "{stderr}");
+    assert_eq!(
+        std::fs::read(out_dir.join("payload/big.bin")).expect("read"),
+        payload
+    );
+}
+
+/// `--web-seed` alone (no peer, no tracker, no DHT) downloads the torrent
+/// from a loopback HTTP server.
+#[test]
+fn web_seed_flag_downloads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (torrent_path, seed_dir, _) = seed_fixture(tmp.path());
+    let out_dir = tmp.path().join("out");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let server = rt.block_on(web_seed::WebSeedServer::start(
+        seed_dir.clone(),
+        web_seed::Behaviour::Normal,
+    ));
+    let url = server.url();
+    let out = run_download_output(&[
+        torrent_path.to_str().expect("utf8"),
+        "--port",
+        "0",
+        "--no-dht",
+        "--web-seed",
+        &url,
+        "--out",
+        out_dir.to_str().expect("utf8"),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        read_tree(&out_dir.join("payload")),
+        read_tree(&seed_dir.join("payload"))
+    );
+    assert!(
+        server.requests().iter().any(|(_, range)| range.is_some()),
+        "no ranged request reached the web seed"
+    );
+    drop(server);
+}

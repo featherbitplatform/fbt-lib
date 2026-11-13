@@ -13,6 +13,8 @@ workspace = true
 
 [features]
 default = ["tls"]
+# serde support for the public config structs and enums.
+serde = ["fbt-session/serde"]
 # HTTPS trackers over rustls with the `ring` provider (needs a C toolchain).
 tls = ["fbt-session/tls-ring"]
 # HTTPS trackers over rustls with the pure-Rust RustCrypto provider.

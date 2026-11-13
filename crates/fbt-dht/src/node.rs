@@ -1,6 +1,6 @@
 //! The DHT node runtime: one actor task owns the UDP sockets (one per
-//! address family), the routing tables, tokens, peer store and rate
-//! limiters. [`Dht`] is a cheap handle that talks to it over a channel.
+//! address family), the routing tables, tokens, peer and item stores and
+//! rate limiters. [`Dht`] is a cheap handle that talks to it over a channel.
 //!
 //! Every datagram is hostile and its source may be spoofed: undecodable or
 //! oversized datagrams and malformed queries are dropped without a reply,
@@ -23,14 +23,18 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
+use crate::bloom::BloomFilter;
 use crate::id::{NodeId, bep42_id, canonical, canonical_addr, is_local};
-use crate::krpc::{Body, MAX_DATAGRAM, Message, NodeInfo, Query, QueryMsg, Response, Want};
-use crate::lookup::{self, Goal, PeerLookup};
+use crate::items::{self, ItemStore, ItemWant, MutableItem};
+use crate::krpc::{
+    Body, MAX_DATAGRAM, MAX_SALT, Message, NodeInfo, Query, QueryMsg, Response, Want, is_item_value,
+};
+use crate::lookup::{self, Goal, Outcome, PeerLookup};
 use crate::rate::{IpRateLimiter, MAX_IPS, query_limiter};
-use crate::server::{Server, version};
+use crate::server::{SAMPLE_INTERVAL_SECS, Server, version};
 use crate::state::{DhtState, MAX_STATE_NODES};
 use crate::store::PeerStore;
-use crate::table::{Family, Insert, K, RoutingTable};
+use crate::table::{Family, Insert, K, RoutingTable, dialable};
 use crate::token::Tokens;
 
 /// External-address votes kept (one per reporter IP).
@@ -96,6 +100,9 @@ pub struct DhtConfig {
     pub max_stored_torrents: usize,
     /// Peers kept per info hash.
     pub max_peers_per_torrent: usize,
+    /// BEP 44 items kept for other nodes (each up to 1000 bytes; the least
+    /// recently put goes first).
+    pub max_items: usize,
     /// Our queries in flight at once; more give `Busy`.
     pub max_pending_queries: usize,
     /// First bootstrap retry delay (doubles per attempt).
@@ -119,6 +126,7 @@ impl Default for DhtConfig {
             enforce_node_id: false,
             max_stored_torrents: 2000,
             max_peers_per_torrent: 500,
+            max_items: 700,
             max_pending_queries: 1024,
             bootstrap_retry_base: Duration::from_secs(30),
             bootstrap_retry_max: Duration::from_secs(15 * 60),
@@ -145,8 +153,36 @@ pub struct DhtStats {
     pub external_ip: Option<IpAddr>,
 }
 
+/// BEP 33 scrape result: estimated seeds and other peers of a torrent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DhtScrape {
+    /// Estimated distinct seed IPs.
+    pub seeds: u32,
+    /// Estimated distinct IPs of peers that are not seeds.
+    pub peers: u32,
+}
+
+/// One node's BEP 51 `sample_infohashes` answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DhtSamples {
+    /// How long before the node's samples change: its `interval`, at most
+    /// 6 hours (BEP 51's bound), zero when it sent none.
+    pub interval: Duration,
+    /// Info hashes the node stores (`num`; the sample count when it sent
+    /// none).
+    pub num: u32,
+    /// Sampled info hashes, at most [`MAX_SAMPLES`](crate::MAX_SAMPLES).
+    pub samples: Vec<[u8; 20]>,
+    /// Nodes close to the target, to crawl next: dialable ones only, and no
+    /// local addresses from a remote node.
+    pub nodes: Vec<NodeInfo>,
+}
+
 /// DHT failures.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DhtError {
     /// The IPv4 socket could not be bound.
     #[error("cannot bind the DHT socket: {0}")]
@@ -163,6 +199,40 @@ pub enum DhtError {
     /// A saved state could not be read; names the offending part.
     #[error("invalid DHT state: {0}")]
     InvalidState(&'static str),
+    /// The routing table is empty: no node to start a lookup from (the DHT
+    /// has not bootstrapped yet).
+    #[error("the DHT knows no node yet")]
+    NoNodes,
+    /// The queried node did not answer in time (or cannot be reached: no
+    /// socket of its address family).
+    #[error("the DHT node did not answer")]
+    Timeout,
+    /// Too many of our queries are in flight.
+    #[error("too many DHT queries in flight")]
+    Busy,
+    /// The queried node answered with a KRPC error.
+    #[error("the DHT node answered with error {code}")]
+    Remote {
+        /// The KRPC error code (`204`: it does not know the method; for a
+        /// BEP 44 put `301`: `cas` mismatch, `302`: `seq` too low).
+        code: i64,
+    },
+    /// A BEP 44 item that cannot be stored: the value is not one canonical
+    /// bencoded value of at most 1000 bytes, the salt is longer than 64
+    /// bytes or the sequence number is negative.
+    #[error("invalid DHT item")]
+    InvalidValue,
+}
+
+impl From<QueryError> for DhtError {
+    fn from(e: QueryError) -> Self {
+        match e {
+            QueryError::Timeout => DhtError::Timeout,
+            QueryError::Busy => DhtError::Busy,
+            QueryError::Remote { code } => DhtError::Remote { code },
+            QueryError::Shutdown => DhtError::Shutdown,
+        }
+    }
 }
 
 /// Why a query got no answer.
@@ -190,7 +260,8 @@ pub(crate) struct FamilyView {
 pub(crate) enum Cmd {
     Query {
         addr: SocketAddr,
-        query: Query,
+        /// Boxed: a BEP 44 `put` carries a key and a signature inline.
+        query: Box<Query>,
         reply: oneshot::Sender<Result<Response, QueryError>>,
     },
     AddNode(SocketAddr),
@@ -230,6 +301,7 @@ impl Link {
             Link::Strong(d) => d.query(addr, query).await,
             Link::Weak(_) => {
                 let (reply, rx) = oneshot::channel();
+                let query = Box::new(query);
                 self.send(Cmd::Query { addr, query, reply }).await?;
                 rx.await.unwrap_or(Err(QueryError::Shutdown))
             }
@@ -586,7 +658,7 @@ impl Dht {
         self.tx
             .send(Cmd::Query {
                 addr,
-                query: q,
+                query: Box::new(q),
                 reply,
             })
             .await
@@ -601,9 +673,274 @@ impl Dht {
 
     /// Looks up peers for `info_hash` like [`get_peers`](Dht::get_peers),
     /// then announces us on `port` (`None`: the DHT socket's port, BEP 5
-    /// `implied_port`) to the `K` closest nodes that gave a token.
-    pub fn announce(&self, info_hash: [u8; 20], port: Option<u16>) -> PeerLookup {
-        PeerLookup::start(Link::Strong(self.clone()), Goal::Announce(port), info_hash)
+    /// `implied_port`) to the `K` closest nodes that gave a token, as a
+    /// seed (BEP 33 `seed`) if `seed`.
+    pub fn announce(&self, info_hash: [u8; 20], port: Option<u16>, seed: bool) -> PeerLookup {
+        PeerLookup::start(
+            Link::Strong(self.clone()),
+            Goal::Announce(port, seed),
+            info_hash,
+        )
+    }
+
+    /// BEP 33 scrape: a `get_peers` lookup with `scrape` set, one per bound
+    /// family, whose `K` closest answers' seed and peer bloom filters are
+    /// unioned and estimated. Nodes that do not know the torrent send no
+    /// filters, so an unknown torrent gives zeros. Fails with
+    /// [`DhtError::NoNodes`] while the routing tables are empty (zeros then
+    /// would only mean that nobody was asked), and with
+    /// [`DhtError::Shutdown`] once the node has shut down. Dropping the
+    /// future cancels the lookups.
+    pub async fn scrape(&self, info_hash: [u8; 20]) -> Result<DhtScrape, DhtError> {
+        let link = Link::Strong(self.clone());
+        let target = NodeId(info_hash);
+        let views = link.closest(Some(target)).await?;
+        if views.iter().all(|v| v.closest.is_empty()) {
+            return Err(DhtError::NoNodes);
+        }
+        let mut set = JoinSet::new();
+        for v in views {
+            set.spawn(lookup::run(
+                link.clone(),
+                v.family,
+                v.own,
+                target,
+                v.closest,
+                Goal::Scrape,
+                None,
+            ));
+        }
+        let (mut seeds, mut peers) = (BloomFilter::default(), BloomFilter::default());
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Outcome {
+                filters: (s, p), ..
+            }) = joined
+            {
+                seeds.union(&s);
+                peers.union(&p);
+            }
+        }
+        Ok(DhtScrape {
+            seeds: seeds.estimate(),
+            peers: peers.estimate(),
+        })
+    }
+
+    /// BEP 51: asks `node` for a sample of the info hashes it stores and
+    /// for the nodes it knows closest to `target`. One query; crawling the
+    /// DHT (following `nodes`, honouring `interval`) is the caller's job.
+    pub async fn sample_infohashes(
+        &self,
+        node: SocketAddr,
+        target: NodeId,
+    ) -> Result<DhtSamples, DhtError> {
+        let r = self.query(node, Query::SampleInfohashes { target }).await?;
+        let remote = !is_local(node.ip());
+        let nodes = r
+            .nodes
+            .iter()
+            .chain(r.nodes6.iter())
+            .filter(|n| dialable(&n.addr) && !(remote && is_local(n.addr.ip())))
+            .copied()
+            .collect();
+        let num = r
+            .num
+            .unwrap_or_else(|| u32::try_from(r.samples.len()).unwrap_or(u32::MAX));
+        let interval = r.interval.unwrap_or(0).min(SAMPLE_INTERVAL_SECS);
+        Ok(DhtSamples {
+            interval: Duration::from_secs(u64::from(interval)),
+            num,
+            samples: r.samples,
+            nodes,
+        })
+    }
+
+    /// BEP 44: the immutable item stored under `target` (the SHA-1 of its
+    /// value), from a `get` lookup per bound family; only a value that
+    /// hashes to `target` is accepted. `None` when no node close to it has
+    /// it. Fails with [`DhtError::NoNodes`] while the routing tables are
+    /// empty and with [`DhtError::Shutdown`] once the node has shut down.
+    pub async fn get_immutable(&self, target: [u8; 20]) -> Result<Option<Vec<u8>>, DhtError> {
+        let goal = Goal::Get {
+            want: ItemWant::Immutable,
+            seq: None,
+        };
+        let outcomes = self.item_lookup(NodeId(target), goal).await?;
+        Ok(outcomes.into_iter().find_map(|o| o.item).map(|f| f.v))
+    }
+
+    /// BEP 44: stores `value` (one canonical bencoded value of at most 1000
+    /// bytes, else [`DhtError::InvalidValue`]) as an immutable item: a
+    /// `get` lookup for its target collects write tokens from the `K`
+    /// closest nodes of each bound family, then each gets a `put`. Returns
+    /// the target (SHA-1 of `value`) and the number of nodes that stored
+    /// it; with none, the most specific KRPC refusal if any
+    /// ([`DhtError::Remote`]; `302`, then `301`, `206`, `205`, `207`, then
+    /// the lowest other code). Fails like [`get_immutable`](Dht::get_immutable)
+    /// otherwise.
+    pub async fn put_immutable(&self, value: Vec<u8>) -> Result<([u8; 20], usize), DhtError> {
+        if !is_item_value(&value) {
+            return Err(DhtError::InvalidValue);
+        }
+        let target = items::immutable_target(&value);
+        let goal = Goal::Get {
+            want: ItemWant::Immutable,
+            seq: None,
+        };
+        let outcomes = self.item_lookup(NodeId(target), goal).await?;
+        let stored = self
+            .put_to(&outcomes, |token| Query::Put {
+                token,
+                v: value.clone(),
+                k: None,
+                sig: None,
+                seq: None,
+                salt: None,
+                cas: None,
+                reject: None,
+            })
+            .await?;
+        Ok((target, stored))
+    }
+
+    /// BEP 44: the mutable item of `public_key` and `salt` (empty for none)
+    /// with the highest `seq` any node close to its target returned, among
+    /// those whose signature verifies; forged answers are ignored. `None`
+    /// when no node has it. Fails with [`DhtError::InvalidValue`] for a salt
+    /// over 64 bytes, otherwise like [`get_immutable`](Dht::get_immutable).
+    pub async fn get_mutable(
+        &self,
+        public_key: [u8; 32],
+        salt: &[u8],
+    ) -> Result<Option<MutableItem>, DhtError> {
+        if salt.len() > MAX_SALT {
+            return Err(DhtError::InvalidValue);
+        }
+        let target = items::mutable_target(&public_key, salt);
+        let goal = Goal::Get {
+            want: ItemWant::Mutable {
+                key: public_key,
+                salt: salt.to_vec(),
+            },
+            seq: None,
+        };
+        let outcomes = self.item_lookup(NodeId(target), goal).await?;
+        let best = outcomes
+            .into_iter()
+            .filter_map(|o| o.item)
+            .filter_map(|f| Some((f.seq?, f.v)))
+            .max_by_key(|(seq, _)| *seq);
+        Ok(best.map(|(seq, value)| MutableItem {
+            public_key,
+            salt: salt.to_vec(),
+            seq,
+            value,
+        }))
+    }
+
+    /// BEP 44: signs `value` with the ed25519 key of `secret_seed` (a
+    /// 32-byte seed, never sent) under `salt` and `seq` and stores it as a
+    /// mutable item, like [`put_immutable`](Dht::put_immutable). With
+    /// `cas`, nodes store it only over an item of exactly that `seq`.
+    /// Returns the number of nodes that stored it; when none did, the most
+    /// specific refusal as for `put_immutable` ([`DhtError::Remote`]: `302`
+    /// for a `seq` not above the stored one, `301` for a `cas` mismatch). Fails with
+    /// [`DhtError::InvalidValue`] for an invalid value, a salt over 64
+    /// bytes or a negative `seq`.
+    pub async fn put_mutable(
+        &self,
+        secret_seed: [u8; 32],
+        salt: Vec<u8>,
+        value: Vec<u8>,
+        seq: i64,
+        cas: Option<i64>,
+    ) -> Result<usize, DhtError> {
+        if !is_item_value(&value) || salt.len() > MAX_SALT || seq < 0 {
+            return Err(DhtError::InvalidValue);
+        }
+        let (k, sig) = items::sign(&secret_seed, &salt, seq, &value);
+        let target = items::mutable_target(&k, &salt);
+        let goal = Goal::Get {
+            want: ItemWant::Mutable {
+                key: k,
+                salt: salt.clone(),
+            },
+            // nodes holding this seq or a newer one need not send the value
+            seq: Some(seq),
+        };
+        let outcomes = self.item_lookup(NodeId(target), goal).await?;
+        let salt = (!salt.is_empty()).then_some(salt);
+        self.put_to(&outcomes, |token| Query::Put {
+            token,
+            v: value.clone(),
+            k: Some(k),
+            sig: Some(sig),
+            seq: Some(seq),
+            salt: salt.clone(),
+            cas,
+            reject: None,
+        })
+        .await
+    }
+
+    /// One `get` lookup per bound family towards `target`.
+    async fn item_lookup(&self, target: NodeId, goal: Goal) -> Result<Vec<Outcome>, DhtError> {
+        let link = Link::Strong(self.clone());
+        let views = link.closest(Some(target)).await?;
+        if views.iter().all(|v| v.closest.is_empty()) {
+            return Err(DhtError::NoNodes);
+        }
+        let mut set = JoinSet::new();
+        for v in views {
+            set.spawn(lookup::run(
+                link.clone(),
+                v.family,
+                v.own,
+                target,
+                v.closest,
+                goal.clone(),
+                None,
+            ));
+        }
+        let mut out = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(o) = joined {
+                out.push(o);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Sends `put(token)` to every responder of `outcomes` with its token:
+    /// the number that stored it, or with none, the most specific refusal
+    /// ([`most_specific`]).
+    async fn put_to(
+        &self,
+        outcomes: &[Outcome],
+        put: impl Fn(Vec<u8>) -> Query,
+    ) -> Result<usize, DhtError> {
+        let mut set = JoinSet::new();
+        for (n, token) in outcomes.iter().flat_map(|o| o.responders.iter()) {
+            let dht = self.clone();
+            let q = put(token.clone());
+            let addr = n.addr;
+            set.spawn(async move { dht.query(addr, q).await });
+        }
+        let (mut stored, mut refused) = (0usize, None);
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Ok(_)) => stored += 1,
+                Ok(Err(QueryError::Remote { code })) => {
+                    refused = Some(refused.map_or(code, |r| most_specific(r, code)));
+                }
+                Ok(Err(QueryError::Shutdown)) => return Err(DhtError::Shutdown),
+                _ => {}
+            }
+        }
+        match refused {
+            Some(code) if stored == 0 => Err(DhtError::Remote { code }),
+            _ => Ok(stored),
+        }
     }
 
     /// Our ids and the nodes in our tables, to restore with
@@ -616,6 +953,22 @@ impl Dht {
             .map_err(|_| DhtError::Shutdown)?;
         rx.await.map_err(|_| DhtError::Shutdown)
     }
+}
+
+/// Of two put refusals, the one to report: `302` (`seq` too low), then
+/// `301` (`cas` mismatch), `206` (bad signature), `205`/`207` (too big),
+/// then any other code (lowest first, such as `203` from a node whose token
+/// expired), so mixed answers always give the same error.
+fn most_specific(a: i64, b: i64) -> i64 {
+    let rank = |c: i64| match c {
+        crate::krpc::ERR_SEQ_TOO_LOW => 0,
+        crate::krpc::ERR_CAS_MISMATCH => 1,
+        crate::krpc::ERR_INVALID_SIGNATURE => 2,
+        crate::krpc::ERR_VALUE_TOO_BIG => 3,
+        crate::krpc::ERR_SALT_TOO_BIG => 4,
+        _ => 5,
+    };
+    std::cmp::min_by_key(a, b, |&c| (rank(c), c))
 }
 
 #[derive(Debug)]
@@ -660,6 +1013,7 @@ struct Actor {
     table_v6: Option<RoutingTable>,
     tokens: Tokens,
     store: PeerStore,
+    items: ItemStore,
     rate: IpRateLimiter,
     global_rate: IpRateLimiter,
     ext_v4: ExternalIpVotes,
@@ -778,6 +1132,7 @@ impl Actor {
             table_v6,
             tokens: Tokens::new(&mut rng),
             store: PeerStore::new(cfg.max_stored_torrents, cfg.max_peers_per_torrent),
+            items: ItemStore::new(cfg.max_items),
             rate: query_limiter(cfg.query_rate_per_ip, MAX_IPS),
             global_rate: query_limiter(GLOBAL_QUERY_RATE.max(cfg.query_rate_per_ip), 1),
             ext_v4: ExternalIpVotes::new(),
@@ -1001,6 +1356,7 @@ impl Actor {
             table_v6: self.table_v6.as_ref(),
             tokens: &self.tokens,
             store: &mut self.store,
+            items: &mut self.items,
         };
         let Some(out) = server.answer(from, tid, q, now, &mut self.rng) else {
             return;
@@ -1186,7 +1542,7 @@ impl Actor {
         match cmd {
             Cmd::Query { addr, query, reply } => match self.can_send(addr) {
                 Ok(()) => {
-                    let _ = self.send_query(addr, query, Some(reply), None, now);
+                    let _ = self.send_query(addr, *query, Some(reply), None, now);
                 }
                 Err(e) => {
                     let _ = reply.send(Err(e));
@@ -1233,6 +1589,7 @@ impl Actor {
         if now >= self.next_housekeeping {
             self.next_housekeeping = after(now, HOUSEKEEPING);
             self.store.expire(now);
+            self.items.expire(now);
             self.refresh(now);
         }
         if now >= self.next_rotation {
@@ -1357,7 +1714,7 @@ impl Actor {
         DhtStats {
             nodes_v4: len(&self.table_v4),
             nodes_v6: len(&self.table_v6),
-            stored_info_hashes: self.store.torrents(),
+            stored_info_hashes: self.store.len(),
             bootstrapped: self.tables().any(|t| t.len() >= K),
             local_addrs: self.local.clone(),
             external_ip: self.ext_v4.current().or(self.ext_v6.current()),
@@ -1563,6 +1920,7 @@ mod tests {
                 nodes6: vec![],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         sock.send_to(&r.encode(), from).await.unwrap();
@@ -1585,6 +1943,7 @@ mod tests {
                             nodes6: vec![],
                             values: vec![],
                             token: None,
+                            ..Response::default()
                         }),
                     };
                     let _ = sock.send_to(&r.encode(), from).await;
@@ -1622,9 +1981,16 @@ mod tests {
 
     async fn token_for(sock: &UdpSocket, addr: SocketAddr, ih: [u8; 20]) -> Vec<u8> {
         let r = response(
-            ask(sock, addr, Query::GetPeers { info_hash: ih })
-                .await
-                .unwrap(),
+            ask(
+                sock,
+                addr,
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+            )
+            .await
+            .unwrap(),
         );
         assert!(r.values.is_empty());
         r.token.expect("token")
@@ -1644,15 +2010,23 @@ mod tests {
                 port: 4000,
                 implied_port: false,
                 token,
+                seed: false,
             },
         )
         .await
         .unwrap();
         response(m);
         let r = response(
-            ask(&sock, addr, Query::GetPeers { info_hash: ih })
-                .await
-                .unwrap(),
+            ask(
+                &sock,
+                addr,
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(r.values, vec!["127.0.0.1:4000".parse().unwrap()]);
         assert!(r.token.is_some());
@@ -1673,15 +2047,23 @@ mod tests {
                     port: 4000,
                     implied_port: true,
                     token,
+                    seed: false,
                 },
             )
             .await
             .unwrap(),
         );
         let r = response(
-            ask(&sock, addr, Query::GetPeers { info_hash: ih })
-                .await
-                .unwrap(),
+            ask(
+                &sock,
+                addr,
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(r.values, vec![sock.local_addr().unwrap()]);
         // the store size reaches the stats
@@ -1710,15 +2092,23 @@ mod tests {
                 port: 4000,
                 implied_port: false,
                 token,
+                seed: false,
             },
         )
         .await
         .unwrap();
         assert!(matches!(m.body, Body::Error { code: 203, .. }), "{m:?}");
         let r = response(
-            ask(&sock, addr, Query::GetPeers { info_hash: ih })
-                .await
-                .unwrap(),
+            ask(
+                &sock,
+                addr,
+                Query::GetPeers {
+                    info_hash: ih,
+                    scrape: false,
+                },
+            )
+            .await
+            .unwrap(),
         );
         assert!(r.values.is_empty());
     }
@@ -1834,6 +2224,7 @@ mod tests {
                 nodes6: vec![],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         b.send_to(&fake.encode(), addr).await.unwrap();
@@ -2145,6 +2536,17 @@ mod tests {
     }
 
     #[test]
+    fn put_refusals_report_the_most_specific_code() {
+        let pick = |codes: &[i64]| codes.iter().copied().reduce(most_specific);
+        assert_eq!(pick(&[203, 301, 302, 206]), Some(302));
+        assert_eq!(pick(&[302, 203, 301]), Some(302));
+        assert_eq!(pick(&[203, 301, 206]), Some(301));
+        assert_eq!(pick(&[203, 206]), Some(206));
+        assert_eq!(pick(&[207, 205, 203]), Some(205));
+        assert_eq!(pick(&[204, 203, 202]), Some(202));
+    }
+
+    #[test]
     fn backoff_doubles_to_the_cap() {
         let base = Duration::from_secs(30);
         let max = Duration::from_secs(15 * 60);
@@ -2447,6 +2849,7 @@ mod tests {
                 nodes6: vec![],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         a.on_datagram(&answer.encode(), me, now);
@@ -2593,6 +2996,7 @@ mod tests {
                 nodes6: vec![],
                 values: vec![],
                 token: None,
+                ..Response::default()
             }),
         };
         a.on_datagram(&answer.encode(), mapped, now);

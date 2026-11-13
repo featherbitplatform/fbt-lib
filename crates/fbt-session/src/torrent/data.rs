@@ -7,7 +7,7 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use fbt_core::{Bitfield, BlockRef};
+use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef};
 use fbt_metainfo::{Metainfo, MetainfoError};
 use tokio::time::Instant;
 use tracing::debug;
@@ -15,7 +15,9 @@ use tracing::debug;
 use super::ReaderId;
 use super::actor::{Actor, Phase};
 use super::readers::Answer;
+use super::smartban::BlockSource;
 use super::swarm::BanTarget;
+use super::webseed::FetchError;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
@@ -36,12 +38,20 @@ pub(crate) enum Job {
         generation: u64,
         result: io::Result<Bitfield>,
     },
+    /// Resume data's stamps were compared: its pieces when trusted.
+    ResumeChecked {
+        generation: u64,
+        trusted: Option<Bitfield>,
+    },
     /// A downloaded piece was hashed; `data` comes back for the write.
     Hashed {
         generation: u64,
         piece: u32,
         ok: bool,
         data: Vec<u8>,
+        /// The SHA-1 of each block, for smart ban: computed when the piece
+        /// fails, or passes while an earlier failure of it is on record.
+        block_hashes: Option<Vec<[u8; 20]>>,
     },
     /// A run of `count` verified pieces from `first` was written.
     WroteRun {
@@ -86,21 +96,44 @@ pub(crate) enum Job {
         tx: Answer,
         result: io::Result<Vec<u8>>,
     },
+    /// The storage operation (move or rename) returned.
+    StorageOp { result: io::Result<()> },
+    /// A web seed's request for `blocks`, issued under `generation`,
+    /// returned their data (one buffer per block) or failed.
+    WebSeed {
+        key: PeerKey,
+        /// The seed's request id, to tell a superseded request.
+        request: u64,
+        generation: u64,
+        blocks: Vec<BlockRef>,
+        result: Result<Vec<Bytes>, FetchError>,
+    },
 }
 
 impl Actor {
     pub(super) fn on_job(&mut self, job: Job) {
         match job {
             Job::CheckSlot { seq, permit } => self.on_check_slot(seq, permit),
-            Job::Checked { generation, result } => self.on_checked(generation, result),
+            Job::Checked { generation, result } => {
+                if generation == self.generation {
+                    // What the check found may differ from any saved data.
+                    self.need_save_resume = true;
+                }
+                self.on_checked(generation, result);
+            }
+            Job::ResumeChecked {
+                generation,
+                trusted,
+            } => self.on_resume_checked(generation, trusted),
             Job::Hashed {
                 generation,
                 piece,
                 ok,
                 data,
+                block_hashes,
             } => {
                 self.hashing = self.hashing.saturating_sub(1);
-                self.on_hashed(generation, piece, ok, data);
+                self.on_hashed(generation, piece, ok, data, block_hashes);
             }
             Job::WroteRun {
                 generation,
@@ -112,13 +145,19 @@ impl Actor {
                 generation,
                 piece,
                 result,
-            } => self.on_read_piece(generation, piece, result),
+            } => {
+                self.reads_in_flight = self.reads_in_flight.saturating_sub(1);
+                self.on_read_piece(generation, piece, result);
+            }
             Job::Read {
                 generation,
                 key,
                 block,
                 result,
-            } => self.on_read_block(generation, key, block, result),
+            } => {
+                self.reads_in_flight = self.reads_in_flight.saturating_sub(1);
+                self.on_read_block(generation, key, block, result);
+            }
             Job::ReadChunk {
                 generation,
                 reader,
@@ -126,7 +165,11 @@ impl Actor {
                 len,
                 tx,
                 result,
-            } => self.on_read_chunk(generation, (reader, offset, len, tx), result),
+            } => {
+                self.reads_in_flight = self.reads_in_flight.saturating_sub(1);
+                self.on_read_chunk(generation, (reader, offset, len, tx), result);
+            }
+            Job::StorageOp { result } => self.on_storage_done(result),
             Job::Flushed { generation, result } => {
                 // A check since then starts its own finish.
                 if generation == self.generation {
@@ -134,26 +177,60 @@ impl Actor {
                 }
             }
             Job::Metadata { key, ban, result } => self.on_metadata_job(key, ban, result),
+            Job::WebSeed {
+                key,
+                request,
+                generation,
+                blocks,
+                result,
+            } => self.on_web_seed_job(key, request, generation, blocks, result),
+        }
+        // Whatever returned may have been the last thing a storage
+        // operation waited for.
+        self.try_start_storage_job();
+    }
+
+    /// A block we requested arrived from peer `key`: accepted (see
+    /// [`accept_block`](Self::accept_block)) only from a connection of the
+    /// current generation that is still open.
+    pub(super) fn on_block(&mut self, key: PeerKey, block: BlockRef, data: Bytes) {
+        let len = data.len() as u64;
+        let source = self.block_source(key);
+        let generation = self.generation;
+        let current = match self.peers.get_mut(&key) {
+            Some(p) => {
+                p.requested.remove(&block);
+                p.generation == generation && p.tx.is_some()
+            }
+            None => false,
+        };
+        match source {
+            Some(source) if current => self.accept_block(key, block, data, source, generation),
+            _ => self.counters.wasted = self.counters.wasted.saturating_add(len),
         }
     }
 
-    /// A block we requested arrived from `key`.
-    pub(super) fn on_block(&mut self, key: PeerKey, block: BlockRef, data: Bytes) {
+    /// `block`, requested from `key` under `generation`, arrived from
+    /// `source` (a peer or a web seed): kept if the picker accepts it
+    /// (outstanding from `key`, not received before) while the torrent is
+    /// ready and still in that generation, else counted as wasted. The last
+    /// block of a piece sends it to its hash check.
+    pub(super) fn accept_block(
+        &mut self,
+        key: PeerKey,
+        block: BlockRef,
+        data: Bytes,
+        source: BlockSource,
+        generation: u64,
+    ) {
         let len = data.len() as u64;
-        let generation = self.generation;
-        let Some(p) = self.peers.get_mut(&key) else {
-            self.counters.wasted = self.counters.wasted.saturating_add(len);
-            return;
-        };
-        p.requested.remove(&block);
-        let current = p.generation == generation && p.tx.is_some();
-        let ready = matches!(self.phase, Phase::Ready);
+        let current = generation == self.generation && matches!(self.phase, Phase::Ready);
         let Some(l) = self.loaded.as_mut() else {
             self.counters.wasted = self.counters.wasted.saturating_add(len);
             return;
         };
         let picker = match l.picker.as_mut() {
-            Some(pk) if current && ready => pk,
+            Some(pk) if current => pk,
             _ => {
                 self.counters.wasted = self.counters.wasted.saturating_add(len);
                 return;
@@ -176,6 +253,8 @@ impl Actor {
             return;
         };
         dst.copy_from_slice(&data);
+        self.smartban
+            .record_block(block.piece, block.offset / BLOCK_SIZE, source);
         self.counters.downloaded = self.counters.downloaded.saturating_add(len);
         self.counters.dl.record(len);
         if let Some(p) = self.peers.get_mut(&key) {
@@ -204,19 +283,33 @@ impl Actor {
         };
         let meta = Arc::clone(&l.meta);
         let generation = self.generation;
+        let wants_blocks = self.smartban.wants_block_hashes(piece);
         self.hashing = self.hashing.saturating_add(1);
         self.jobs.spawn_blocking(move || {
             let ok = meta.info.pieces.get(piece as usize) == Some(&sha1_piece(&data));
+            let block_hashes = (!ok || wants_blocks).then(|| {
+                data.chunks(BLOCK_SIZE as usize)
+                    .map(sha1_piece)
+                    .collect::<Vec<_>>()
+            });
             Job::Hashed {
                 generation,
                 piece,
                 ok,
                 data,
+                block_hashes,
             }
         });
     }
 
-    fn on_hashed(&mut self, generation: u64, piece: u32, ok: bool, data: Vec<u8>) {
+    fn on_hashed(
+        &mut self,
+        generation: u64,
+        piece: u32,
+        ok: bool,
+        data: Vec<u8>,
+        block_hashes: Option<Vec<[u8; 20]>>,
+    ) {
         if generation != self.generation || !matches!(self.phase, Phase::Ready) {
             return;
         }
@@ -235,6 +328,12 @@ impl Actor {
                 torrent: self.ih,
                 piece,
             });
+            let distrusted = self
+                .smartban
+                .piece_failed(piece, block_hashes.unwrap_or_default());
+            for s in distrusted {
+                self.smart_ban(s);
+            }
             self.top_up_all(None);
             return;
         }
@@ -259,6 +358,11 @@ impl Actor {
             torrent: self.ih,
             piece,
         });
+        // Whoever sent a block that differs from the good one when this
+        // piece failed earlier is banned.
+        for s in self.smartban.piece_passed(piece, block_hashes) {
+            self.smart_ban(s);
+        }
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         for key in keys {
             let Some(p) = self.peers.get(&key) else {
@@ -296,6 +400,11 @@ impl Actor {
 
     /// Hands the dirty pieces `reason` selects to writes on the disk pool.
     pub(super) fn flush(&mut self, reason: FlushReason) {
+        // The files are moving: verified pieces stay dirty until they are
+        // in place.
+        if self.storage_busy {
+            return;
+        }
         let (Some(storage), Some(l)) = (self.storage.as_ref(), self.loaded.as_ref()) else {
             return;
         };
@@ -333,6 +442,7 @@ impl Actor {
             return;
         }
         self.cache.written(first, count);
+        self.need_save_resume = true;
         self.maybe_finish();
         self.refresh_state();
         // A landed write may make room for new pieces.
@@ -342,7 +452,7 @@ impl Actor {
     /// Once a finished torrent's pieces are all written, the storage is
     /// flushed; `TorrentFinished` follows the flush.
     pub(super) fn maybe_finish(&mut self) {
-        if !self.finish_pending || !self.cache.is_idle() {
+        if !self.finish_pending || !self.cache.is_idle() || self.storage_busy {
             return;
         }
         self.finish_pending = false;
@@ -390,6 +500,8 @@ impl Actor {
         if !finished {
             return;
         }
+        self.completed_time
+            .get_or_insert_with(super::actor::unix_now);
         // Whoever reacts to the event reads the final counters and state.
         self.publish();
         self.emit(Event::TorrentFinished { torrent: self.ih });
@@ -416,7 +528,7 @@ impl Actor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -437,7 +549,11 @@ mod tests {
     /// An actor for `meta` over `storage`, checked with nothing on disk,
     /// with a session cache of `cache_size` bytes whose dirty pieces expire
     /// after ten minutes.
-    fn test_actor(meta: Metainfo, storage: Arc<dyn Storage>, cache_size: u64) -> Actor {
+    pub(in crate::torrent) fn test_actor(
+        meta: Metainfo,
+        storage: Arc<dyn Storage>,
+        cache_size: u64,
+    ) -> Actor {
         let pieces = meta.info.pieces.len();
         let settings = Settings {
             dht_enabled: false,
@@ -468,6 +584,10 @@ mod tests {
             lsd: crate::net::LsdHub::disabled(),
             portmap: None,
             external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
+            ip_filter: Default::default(),
+            bans: Default::default(),
+            queue: Default::default(),
+            queue_dirty: Default::default(),
         });
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
         add.storage = Some(Arc::clone(&storage));
@@ -654,5 +774,256 @@ mod tests {
             .expect("TorrentFinished");
         assert_eq!(seen.state, TorrentState::Seeding);
         assert_eq!(actor.state(), TorrentState::Seeding);
+    }
+
+    /// The liar of the parole tests.
+    const LIAR: PeerKey = PeerKey(1);
+    /// The honest seed of the parole tests.
+    const HONEST: PeerKey = PeerKey(2);
+    const LIAR_ADDR: ([u8; 4], u16) = ([10, 0, 0, 1], 6881);
+    const HONEST_ADDR: ([u8; 4], u16) = ([10, 0, 0, 2], 6881);
+
+    /// Two unchoking seeds of a single-file torrent of `pieces` pieces of
+    /// `blocks` blocks: [`LIAR`] and [`HONEST`]. Returns the actor, the
+    /// payload and the seeds' command receivers.
+    fn liar_and_honest(
+        pieces: usize,
+        blocks: usize,
+    ) -> (Actor, Vec<u8>, Vec<mpsc::Receiver<PeerCommand>>) {
+        let piece_len = blocks * BLOCK_SIZE as usize;
+        let len = pieces * piece_len;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut bytes = format!(
+            "d4:infod6:lengthi{len}e4:name1:a12:piece lengthi{piece_len}e6:pieces{}:",
+            20 * pieces
+        )
+        .into_bytes();
+        for chunk in payload.chunks(piece_len) {
+            bytes.extend_from_slice(&sha1_piece(chunk));
+        }
+        bytes.extend_from_slice(b"ee");
+        let meta = Metainfo::from_bytes(&bytes).expect("metainfo");
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::new(len as u64));
+        let mut actor = test_actor(meta, storage, 64 << 20);
+        let n = u32::try_from(pieces).expect("piece count");
+        let mut rxs = Vec::new();
+        for (key, addr) in [(LIAR, LIAR_ADDR), (HONEST, HONEST_ADDR)] {
+            let (mut peer, rx) = seed_peer(&actor, n);
+            peer.addr = SocketAddr::from(addr);
+            peer.choked_us = false;
+            rxs.push(rx);
+            actor
+                .loaded
+                .as_mut()
+                .and_then(|l| l.picker.as_mut())
+                .expect("picker")
+                .add_peer_pieces(peer.pieces());
+            actor.peers.insert(key, peer);
+        }
+        EMITTED.take();
+        (actor, payload, rxs)
+    }
+
+    /// Gives `key` (if still connected) a demand of `n` blocks.
+    fn want_blocks(actor: &mut Actor, key: PeerKey, n: usize) {
+        if let Some(p) = actor.peers.get_mut(&key) {
+            p.demand = n;
+        }
+        actor.fill(key);
+    }
+
+    /// Both seeds answer every block requested from them, the liar with
+    /// every byte flipped; then every hash job lands.
+    async fn answer_all(
+        actor: &mut Actor,
+        payload: &[u8],
+        rxs: &mut [mpsc::Receiver<PeerCommand>],
+    ) {
+        let piece_len = actor
+            .loaded
+            .as_ref()
+            .map_or(0, |l| l.layout.piece_len() as usize);
+        for key in [LIAR, HONEST] {
+            let Some(p) = actor.peers.get(&key) else {
+                continue;
+            };
+            let mut asked: Vec<BlockRef> = p.requested.iter().copied().collect();
+            asked.sort_unstable();
+            for blk in asked {
+                let start = blk.piece as usize * piece_len + blk.offset as usize;
+                let mut data = payload[start..start + blk.len as usize].to_vec();
+                if key == LIAR {
+                    data.iter_mut().for_each(|x| *x ^= 0xff);
+                }
+                actor.on_block(key, blk, Bytes::from(data));
+            }
+        }
+        while let Some(r) = actor.jobs.join_next().await {
+            actor.on_job_result(r);
+        }
+        for rx in rxs {
+            while rx.try_recv().is_ok() {}
+        }
+    }
+
+    fn all_passed(actor: &Actor) -> bool {
+        actor
+            .loaded
+            .as_ref()
+            .and_then(|l| l.picker.as_ref())
+            .is_some_and(crate::picker::PiecePicker::is_finished)
+    }
+
+    /// Rounds of: the liar, then the honest seed, ask for `n` blocks each,
+    /// and both answer; until every piece passed (at most 64 rounds).
+    async fn rounds_until_done(
+        actor: &mut Actor,
+        payload: &[u8],
+        rxs: &mut [mpsc::Receiver<PeerCommand>],
+        n: usize,
+    ) {
+        for _ in 0..64 {
+            if all_passed(actor) {
+                return;
+            }
+            want_blocks(actor, LIAR, n);
+            want_blocks(actor, HONEST, n);
+            answer_all(actor, payload, rxs).await;
+        }
+    }
+
+    /// The emitted events so far: the addresses banned and the number of
+    /// hash failures.
+    fn bans_and_failures() -> (Vec<SocketAddr>, usize) {
+        let log = EMITTED.take();
+        let banned = log
+            .iter()
+            .filter_map(|(e, _)| match e {
+                Event::PeerBlocked { addr, .. } => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        let failures = log
+            .iter()
+            .filter(|(e, _)| matches!(e, Event::HashFailed { .. }))
+            .count();
+        (banned, failures)
+    }
+
+    /// A liar (every block corrupt) and an honest seed share a piece:
+    /// each round both ask for two of its four blocks, the liar first,
+    /// and every requested block is answered at once. The first attempt
+    /// mixes their blocks and fails, which puts both on parole; from then
+    /// on each attempt is one peer's alone, so only the liar loses trust
+    /// for its failures. The piece passes from the honest seed, the liar
+    /// is banned and the honest seed never is. Without parole every
+    /// attempt mixes their blocks, and the honest seed's trust falls with
+    /// the liar's until both are banned together.
+    #[tokio::test]
+    async fn honest_co_contributor_of_a_failed_piece_is_not_banned() {
+        let (mut actor, payload, mut rxs) = liar_and_honest(1, 4);
+        rounds_until_done(&mut actor, &payload, &mut rxs, 2).await;
+        let (banned, failures) = bans_and_failures();
+        let honest = SocketAddr::from(HONEST_ADDR);
+        assert!(!banned.contains(&honest), "B was banned: {banned:?}");
+        assert_eq!(banned, vec![SocketAddr::from(LIAR_ADDR)], "A is banned");
+        assert!(all_passed(&actor), "the piece passes ({failures} failures)");
+        // B lost 2 for the mixed failure, got them back when the piece
+        // passed, and 1 for the pass.
+        let b_trust = actor.smartban.trust_of(actor.peer_block_source(honest));
+        assert_eq!(b_trust, 1);
+        // The first, mixed attempt and at least one of A's alone.
+        assert!(failures >= 2, "{failures} failures");
+    }
+
+    /// Four pieces are in flight, each shared by the liar and the honest
+    /// seed, when the first of them fails: the other three fail mixed too,
+    /// after both are on parole. Only the first charges them, so the
+    /// honest seed is never banned, the liar is, and every piece passes.
+    /// Charging every mixed failure would take both to -8 together.
+    #[tokio::test]
+    async fn mixed_pieces_in_flight_do_not_ban_the_honest_seed() {
+        let (mut actor, payload, mut rxs) = liar_and_honest(6, 2);
+        // One block each, in turn: each new piece is shared.
+        for _ in 0..4 {
+            want_blocks(&mut actor, LIAR, 1);
+            want_blocks(&mut actor, HONEST, 1);
+        }
+        let shared: std::collections::HashSet<u32> = [LIAR, HONEST]
+            .iter()
+            .flat_map(|k| actor.peers[k].requested.iter().map(|b| b.piece))
+            .collect();
+        assert_eq!(shared.len(), 4, "four pieces in flight: {shared:?}");
+        answer_all(&mut actor, &payload, &mut rxs).await;
+        let honest = SocketAddr::from(HONEST_ADDR);
+        let b_trust = actor.smartban.trust_of(actor.peer_block_source(honest));
+        assert_eq!(b_trust, -2, "only the first mixed failure charges B");
+        let failed = EMITTED.with(|log| {
+            log.borrow()
+                .iter()
+                .filter(|(e, _)| matches!(e, Event::HashFailed { .. }))
+                .count()
+        });
+        assert_eq!(failed, 4);
+        rounds_until_done(&mut actor, &payload, &mut rxs, 2).await;
+        let (banned, failures) = bans_and_failures();
+        assert!(!banned.contains(&honest), "B was banned: {banned:?}");
+        assert_eq!(banned, vec![SocketAddr::from(LIAR_ADDR)], "A is banned");
+        assert!(
+            all_passed(&actor),
+            "every piece passes ({failures} failures)"
+        );
+    }
+
+    /// The honest seed, on parole, downloads the whole piece alone and
+    /// leaves while it is being hashed. The piece is not reopened (the
+    /// liar gets nothing of it), the hash result is applied as usual, and
+    /// no buffer or budget reservation is left behind.
+    #[tokio::test]
+    async fn owner_leaving_while_its_piece_is_hashed_does_not_reopen_it() {
+        let (mut actor, payload, mut rxs) = liar_and_honest(1, 4);
+        // A mixed attempt fails: both are on parole.
+        want_blocks(&mut actor, LIAR, 2);
+        want_blocks(&mut actor, HONEST, 2);
+        answer_all(&mut actor, &payload, &mut rxs).await;
+        let (_, failures) = bans_and_failures();
+        assert_eq!(failures, 1);
+        // B takes the whole piece and sends it; the hash job is in flight.
+        want_blocks(&mut actor, HONEST, 4);
+        let mut asked: Vec<BlockRef> = actor.peers[&HONEST].requested.iter().copied().collect();
+        asked.sort_unstable();
+        assert_eq!(asked.len(), 4, "B alone has the piece");
+        for blk in asked {
+            let start = blk.offset as usize;
+            let data = Bytes::copy_from_slice(&payload[start..start + blk.len as usize]);
+            actor.on_block(HONEST, blk, data);
+        }
+        assert_eq!(actor.hashing, 1);
+        actor.close_peer(HONEST);
+        let picker = |actor: &Actor| {
+            actor
+                .loaded
+                .as_ref()
+                .and_then(|l| l.picker.as_ref())
+                .map(|p| p.is_in_progress(0))
+        };
+        assert_eq!(picker(&actor), Some(true), "still pending its hash");
+        want_blocks(&mut actor, LIAR, 4);
+        assert!(
+            actor.peers[&LIAR].requested.is_empty(),
+            "the piece was reopened"
+        );
+        while let Some(r) = actor.jobs.join_next().await {
+            actor.on_job_result(r);
+        }
+        let log = EMITTED.take();
+        assert!(
+            log.iter()
+                .any(|(e, _)| matches!(e, Event::PieceFinished { piece: 0, .. })),
+            "the hash result is applied"
+        );
+        assert!(all_passed(&actor));
+        assert!(actor.loaded.as_ref().is_some_and(|l| l.bufs.is_empty()));
+        assert!(!actor.cache.has_partial(0), "a reservation leaked");
     }
 }

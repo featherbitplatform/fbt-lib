@@ -222,26 +222,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         Ok(())
     }
 
-    /// Writes queued blocks while the upload throttle allows, each
-    /// charged as it is written, then reports each one sent once flushed.
+    /// Writes queued blocks while the upload throttle allows, then reports
+    /// each one sent once flushed. Each block first reserves its bytes
+    /// ([`Throttle::reserve`](crate::bandwidth::Throttle::reserve)) and is
+    /// written when that reservation is due, so connections sharing a
+    /// bucket take turns instead of racing for it. A reservation whose
+    /// block went away (cancelled, choked away) pays for the next block.
     pub(super) async fn drain_uploads(&mut self) -> Flow {
         let mut sent = Vec::new();
-        while !self.uploads.is_empty() && self.up.ready_at(Instant::now()).is_none() {
-            let Some((block, data)) = self.uploads.pop_front() else {
+        while let Some((block, data)) = self.uploads.front() {
+            let len = wire_len(&Message::Piece {
+                piece: block.piece,
+                offset: block.offset,
+                data: data.clone(),
+            });
+            let turn = match self.upload_turn.take() {
+                Some(t) => t,
+                None => (self.up.reserve(len), len),
+            };
+            if turn.0.due_at(Instant::now()).is_some() {
+                self.upload_turn = Some(turn);
+                break;
+            }
+            // The first block not cancelled, rejected or choked away while
+            // queued.
+            let mut next = None;
+            while let Some((block, data)) = self.uploads.pop_front() {
+                self.queued.remove(&block);
+                if self.incoming.remove(&block) {
+                    next = Some((block, data));
+                    break;
+                }
+            }
+            let Some((block, data)) = next else {
+                self.upload_turn = Some(turn);
                 break;
             };
-            self.queued.remove(&block);
-            // Cancelled, rejected or choked away while queued.
-            if !self.incoming.remove(&block) {
-                continue;
-            }
             let len = data.len() as u64;
-            self.feed(Message::Piece {
+            let m = Message::Piece {
                 piece: block.piece,
                 offset: block.offset,
                 data,
-            })
-            .await?;
+            };
+            // A block bigger than the one reserved for pays the rest.
+            self.up.charge(wire_len(&m).saturating_sub(turn.1));
+            let r = timeout(self.settings.peer_idle_timeout, self.framed.feed(m)).await;
+            self.write_done(r)?;
             sent.push((block, len));
         }
         if sent.is_empty() {

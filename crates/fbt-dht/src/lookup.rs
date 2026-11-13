@@ -8,7 +8,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::bloom::BloomFilter;
 use crate::id::{NodeId, is_local};
+use crate::items::{self, Found, ItemWant};
 use crate::krpc::{NodeInfo, Query, Response};
 use crate::node::{Link, QueryError};
 use crate::table::{Family, K, dialable};
@@ -34,11 +36,16 @@ enum State {
     Failed,
 }
 
+/// One scrape answer's BEP 33 filters: seeds, then other peers.
+type Filters = (BloomFilter, BloomFilter);
+
 #[derive(Debug)]
 struct Candidate {
     info: NodeInfo,
     dist: [u8; 20],
     state: State,
+    /// The filters of its scrape answer (boxed: most candidates have none).
+    filters: Option<Box<Filters>>,
 }
 
 /// One iterative lookup towards `target`. It is done when the [`K`] closest
@@ -88,6 +95,7 @@ impl Lookup {
                     info: *n,
                     dist,
                     state: State::Fresh,
+                    filters: None,
                 },
             );
             // forget the farthest candidate that is not awaiting an answer
@@ -155,6 +163,45 @@ impl Lookup {
         }
     }
 
+    /// `from`, which has answered, sent BEP 33 filters (either may be
+    /// missing: it counts as empty).
+    pub(crate) fn on_filters(
+        &mut self,
+        from: &NodeId,
+        seeds: Option<Box<[u8; 256]>>,
+        peers: Option<Box<[u8; 256]>>,
+    ) {
+        if seeds.is_none() && peers.is_none() {
+            return;
+        }
+        let filter =
+            |b: Option<Box<[u8; 256]>>| b.map(|b| BloomFilter::from_bytes(*b)).unwrap_or_default();
+        if let Some(c) = self
+            .cands
+            .iter_mut()
+            .find(|c| c.info.id == *from && matches!(c.state, State::Answered(_)))
+        {
+            c.filters = Some(Box::new((filter(seeds), filter(peers))));
+        }
+    }
+
+    /// The union of the filters of the `K` closest candidates that answered.
+    pub(crate) fn filters(&self) -> Filters {
+        let mut out = Filters::default();
+        for c in self
+            .cands
+            .iter()
+            .filter(|c| matches!(c.state, State::Answered(_)))
+            .take(K)
+        {
+            if let Some(f) = &c.filters {
+                out.0.union(&f.0);
+                out.1.union(&f.1);
+            }
+        }
+        out
+    }
+
     /// The query to `from` failed.
     pub(crate) fn on_failure(&mut self, from: &NodeId) {
         self.settle(from, State::Failed);
@@ -192,15 +239,51 @@ impl Lookup {
 }
 
 /// What a lookup is for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum Goal {
     /// `find_node`: fills the routing table (bootstrap, refresh).
     FindNode,
     /// `get_peers`, yielding peers.
     GetPeers,
     /// `get_peers`, then `announce_peer` to the closest responders
-    /// (`None`: `implied_port`).
-    Announce(Option<u16>),
+    /// (`None`: `implied_port`; `true`: BEP 33 `seed`).
+    Announce(Option<u16>, bool),
+    /// BEP 33 `get_peers` with `scrape`: the closest answers' filters.
+    Scrape,
+    /// BEP 44 `get` (with `seq`): the best item that is `want`ed (the
+    /// first immutable one, the mutable one of the highest `seq`), and
+    /// the closest responders' write tokens.
+    Get { want: ItemWant, seq: Option<i64> },
+}
+
+/// What a finished lookup found.
+#[derive(Debug, Default)]
+pub(crate) struct Outcome {
+    /// The union of the `K` closest answers' BEP 33 filters (empty unless
+    /// the goal is [`Goal::Scrape`]).
+    pub(crate) filters: Filters,
+    /// The best checked item (only for [`Goal::Get`]).
+    pub(crate) item: Option<Found>,
+    /// The `K` closest responders that gave a write token, closest first.
+    pub(crate) responders: Vec<(NodeInfo, Vec<u8>)>,
+}
+
+impl Outcome {
+    fn of(lookup: &Lookup, item: Option<Found>) -> Outcome {
+        Outcome {
+            filters: lookup.filters(),
+            item,
+            responders: lookup.responders(),
+        }
+    }
+}
+
+/// Keeps the better of two items: a higher `seq` wins, the first otherwise.
+fn better(best: Option<Found>, new: Found) -> Option<Found> {
+    match best {
+        Some(b) if b.seq >= new.seq => Some(b),
+        _ => Some(new),
+    }
 }
 
 /// Keeps `nodes` of `family` that can be dialed; a non-local responder
@@ -230,7 +313,8 @@ fn peers_from(responder: SocketAddr, values: &[SocketAddr]) -> Vec<SocketAddr> {
 }
 
 /// Runs one lookup on `family` towards `target` from `seeds`. Peers found
-/// go to `peers` (de-duplicated across batches). Returns when done.
+/// go to `peers` (de-duplicated across batches). Returns when done, with
+/// what it found.
 pub(crate) async fn run(
     link: Link,
     family: Family,
@@ -239,14 +323,21 @@ pub(crate) async fn run(
     seeds: Vec<NodeInfo>,
     goal: Goal,
     peers: Option<mpsc::Sender<Vec<SocketAddr>>>,
-) {
+) -> Outcome {
     let mut lookup = Lookup::new(target, seeds);
     let mut seen: HashSet<SocketAddr> = HashSet::new();
-    let query = match goal {
+    let mut item: Option<Found> = None;
+    let query = match &goal {
         Goal::FindNode => Query::FindNode { target },
-        Goal::GetPeers | Goal::Announce(_) => Query::GetPeers {
+        Goal::GetPeers | Goal::Announce(..) => Query::GetPeers {
             info_hash: target.0,
+            scrape: false,
         },
+        Goal::Scrape => Query::GetPeers {
+            info_hash: target.0,
+            scrape: true,
+        },
+        Goal::Get { seq, .. } => Query::Get { target, seq: *seq },
     };
     let mut set: JoinSet<(NodeInfo, Result<Response, QueryError>)> = JoinSet::new();
     loop {
@@ -283,16 +374,25 @@ pub(crate) async fn run(
                     && let Some(tx) = &peers
                     && tx.send(fresh).await.is_err()
                 {
-                    return;
+                    return Outcome::of(&lookup, item);
+                }
+                if let Goal::Get { want, .. } = &goal
+                    && let Some(found) = items::accept(want, &target.0, &r)
+                {
+                    item = better(item, found);
                 }
                 lookup.on_response(&n.id, &usable(n.addr, family, own, nodes), r.token);
+                if let Goal::Scrape = &goal {
+                    lookup.on_filters(&n.id, r.bf_seeds, r.bf_peers);
+                }
             }
-            Err(QueryError::Shutdown) => return,
+            Err(QueryError::Shutdown) => return Outcome::of(&lookup, item),
             Err(QueryError::Busy) => lookup.on_busy(&n.id),
             Err(_) => lookup.on_failure(&n.id),
         }
     }
-    if let Goal::Announce(port) = goal {
+    if let Goal::Announce(port, seed) = &goal {
+        let (port, seed) = (*port, *seed);
         let mut set = JoinSet::new();
         for (n, token) in lookup.responders() {
             let link = link.clone();
@@ -301,11 +401,13 @@ pub(crate) async fn run(
                 port: port.unwrap_or(0),
                 implied_port: port.is_none(),
                 token,
+                seed,
             };
             set.spawn(async move { link.query(n.addr, q).await });
         }
         while set.join_next().await.is_some() {}
     }
+    Outcome::of(&lookup, item)
 }
 
 /// Peers found by [`crate::Dht::get_peers`] or [`crate::Dht::announce`],
@@ -332,7 +434,7 @@ impl PeerLookup {
                     v.own,
                     target,
                     v.closest,
-                    goal,
+                    goal.clone(),
                     Some(tx.clone()),
                 ));
             }
@@ -448,6 +550,35 @@ mod tests {
             rounds += 1;
             assert!(rounds <= MAX_LOOKUP_QUERIES);
         }
+    }
+
+    #[test]
+    fn filters_union_the_k_closest_answers() {
+        let mut l = Lookup::new(TARGET, (1..=12).map(at).collect());
+        let bloom = |d: u32| {
+            let mut b = BloomFilter::default();
+            b.insert(std::net::IpAddr::from([10, 9, 0, d as u8]));
+            Some(Box::new(*b.bytes()))
+        };
+        while !l.is_done() {
+            for n in l.next_queries() {
+                let d = u32::from_be_bytes(n.id.0[16..].try_into().unwrap());
+                // node 1 fails; node 3 sends only a seed filter
+                if d == 1 {
+                    l.on_failure(&n.id);
+                    continue;
+                }
+                l.on_response(&n.id, &[], None);
+                let peers = if d == 3 { None } else { bloom(d + 100) };
+                l.on_filters(&n.id, bloom(d), peers);
+            }
+        }
+        // a filter from a node that has not answered is ignored
+        l.on_filters(&at(1).id, bloom(1), bloom(1));
+        let (seeds, peers) = l.filters();
+        // the K closest answers are 2..=9
+        assert_eq!(seeds.estimate(), K as u32);
+        assert_eq!(peers.estimate(), K as u32 - 1);
     }
 
     #[test]

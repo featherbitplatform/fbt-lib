@@ -243,7 +243,8 @@ impl Actor {
 
     /// A `ut_pex` message from a peer: dropped unless PEX runs with it and
     /// the gap since its last accepted one has passed; otherwise the first
-    /// [`MAX_PEX_ADDED`] dialable `added` addresses join the known ones.
+    /// [`MAX_PEX_ADDED`] dialable `added` addresses join the known ones;
+    /// blocked ones (IP filter or ban) are reported and never do.
     /// `dropped` is ignored: known peers stay known until connecting fails.
     /// An address listed with the `UTP` flag is dialled over uTP first,
     /// even if it turned out TCP-only before; each address remembers the
@@ -265,6 +266,7 @@ impl Actor {
             .into_iter()
             .filter(|(a, _)| dialable(a))
             .take(MAX_PEX_ADDED)
+            .filter(|(a, _)| !self.refuse_blocked(*a))
             .collect();
         // Flags first, so the dials `on_found_peers` starts see them. The
         // sender is the relay a failed connection asks for a rendezvous
@@ -461,6 +463,50 @@ mod tests {
         }
         a.on_peer_set_changed();
         (a, rxs)
+    }
+
+    /// A blocked address in a PEX message is reported and never joins
+    /// the known addresses (so it cannot evict a usable one), nor the
+    /// dial queue; the others in the message do.
+    #[tokio::test]
+    async fn blocked_pex_address_never_becomes_known() {
+        use crate::bans::BlockReason;
+        use crate::event::Event;
+        use crate::torrent::actor::EMITTED;
+
+        let (mut a, _rxs) = actor_with_peers(1);
+        let key = *a.peers.keys().next().expect("a peer");
+        let (bad, good) = (addr(500), addr(501));
+        let mut filter = fbt_net::ipfilter::IpFilter::default();
+        filter.block(bad.ip()..=bad.ip());
+        *a.shared.ip_filter.write().expect("lock") = std::sync::Arc::new(filter);
+        EMITTED.take();
+        a.on_pex(
+            key,
+            PexMsg {
+                added: vec![(bad, PexFlags::CONNECTABLE), (good, PexFlags::UTP)],
+                dropped: Vec::new(),
+            },
+        );
+        assert!(
+            a.known.get(&bad).is_none(),
+            "a blocked address is not known"
+        );
+        assert!(a.known.get(&good).is_some_and(|k| k.utp));
+        let blocked: Vec<_> = EMITTED
+            .take()
+            .into_iter()
+            .filter_map(|(e, _)| match e {
+                Event::PeerBlocked { addr, reason, .. } => Some((addr, reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocked, vec![(bad, BlockReason::IpFilter)]);
+        // Never queued for dialling, even when asked directly.
+        a.queue_addr(bad);
+        a.queue_addr(good);
+        assert!(!a.candidates.contains(&bad));
+        assert!(a.candidates.contains(&good));
     }
 
     #[tokio::test(start_paused = true)]

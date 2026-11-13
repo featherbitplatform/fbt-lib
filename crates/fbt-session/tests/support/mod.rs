@@ -2,6 +2,7 @@
 
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Range;
@@ -31,7 +32,10 @@ pub const T: Duration = Duration::from_secs(30);
 /// updates, and no DHT, LSD, UPnP or NAT-PMP (so no test ever contacts a public DHT node
 /// or a real router; the DHT
 /// tests bootstrap from a loopback node). Transports as by default: uTP
-/// first, TCP fallback.
+/// first, TCP fallback. Smart bans name one endpoint, not the whole IP:
+/// every test peer shares `127.0.0.1`, so banning a corrupt seeder's IP
+/// would ban the honest ones too. No queue limits, so every torrent a test
+/// adds runs (the queue tests set their own).
 pub fn test_settings() -> Settings {
     let mut s = Settings::default();
     s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
@@ -41,6 +45,10 @@ pub fn test_settings() -> Settings {
     s.enable_lsd = false;
     s.enable_upnp = false;
     s.enable_natpmp = false;
+    s.ban_endpoints = true;
+    s.queue.active_downloads = None;
+    s.queue.active_seeds = None;
+    s.queue.active_limit = None;
     s
 }
 
@@ -437,6 +445,57 @@ impl ScriptedPeer {
     }
 }
 
+impl ScriptedPeer {
+    /// Answers every request with the matching bytes of `payload`, except
+    /// that each block in `bad_blocks` is corrupted (every byte flipped)
+    /// the first time it is served; logs every block served into `log`.
+    /// Runs until the connection closes.
+    pub async fn serve_corrupt(
+        &mut self,
+        payload: &[u8],
+        piece_len: u32,
+        mut bad_blocks: HashSet<BlockRef>,
+        log: Arc<Mutex<Vec<BlockRef>>>,
+    ) {
+        while let Some(Ok(m)) = self.framed.next().await {
+            if let Message::Request(b) = m
+                && !self
+                    .answer_corrupt(b, payload, piece_len, &mut bad_blocks, &log)
+                    .await
+            {
+                return;
+            }
+        }
+    }
+
+    /// Answers one request as [`serve_corrupt`](Self::serve_corrupt) does
+    /// (a block of `bad_blocks` is corrupted and removed from it), logging
+    /// it into `log`. False if the connection is gone.
+    pub async fn answer_corrupt(
+        &mut self,
+        b: BlockRef,
+        payload: &[u8],
+        piece_len: u32,
+        bad_blocks: &mut HashSet<BlockRef>,
+        log: &Mutex<Vec<BlockRef>>,
+    ) -> bool {
+        let start = b.piece as usize * piece_len as usize + b.offset as usize;
+        let mut data = payload[start..start + b.len as usize].to_vec();
+        if bad_blocks.remove(&b) {
+            for x in &mut data {
+                *x = !*x;
+            }
+        }
+        log.lock().unwrap().push(b);
+        let piece = Message::Piece {
+            piece: b.piece,
+            offset: b.offset,
+            data: Bytes::from(data),
+        };
+        self.framed.send(piece).await.is_ok()
+    }
+}
+
 fn random_id() -> PeerId {
     let mut id = [0u8; 20];
     rand::rng().fill(&mut id[..]);
@@ -599,14 +658,15 @@ pub struct Announce {
     pub source: SocketAddr,
 }
 
-/// How a fake tracker answers.
+/// How a fake tracker answers; scrapes too, except that a peers reply
+/// scrapes the swarm counts.
 #[derive(Debug, Clone)]
 pub enum Reply {
     /// Peers from its swarm.
     Peers,
     /// A bencoded `failure reason` (HTTP) or an error action (UDP).
     Failure(String),
-    /// HTTP 500 (HTTP only).
+    /// HTTP 500 (HTTP); no answer at all (UDP).
     ServerError,
     /// Peers, but a `completed` announce is answered only after the delay
     /// (HTTP only). The announce is recorded at once.
@@ -618,8 +678,9 @@ pub enum Reply {
 
 #[derive(Debug, Default)]
 struct TrackerState {
-    /// Peers per info hash; every peer is on 127.0.0.1.
-    swarms: std::collections::HashMap<[u8; 20], Vec<SocketAddr>>,
+    /// Peers per info hash with the `left` each last reported; every peer
+    /// is on 127.0.0.1.
+    swarms: std::collections::HashMap<[u8; 20], Vec<(SocketAddr, u64)>>,
     announces: Vec<Announce>,
 }
 
@@ -628,14 +689,26 @@ impl TrackerState {
     fn announce(&mut self, a: Announce) -> Vec<SocketAddr> {
         let me = SocketAddr::from(([127, 0, 0, 1], a.port));
         let swarm = self.swarms.entry(a.info_hash).or_default();
-        if a.event == "stopped" {
-            swarm.retain(|p| *p != me);
-        } else if !swarm.contains(&me) {
-            swarm.push(me);
+        swarm.retain(|(p, _)| *p != me);
+        if a.event != "stopped" {
+            swarm.push((me, a.left));
         }
-        let others = swarm.iter().copied().filter(|p| *p != me).collect();
+        let others = swarm.iter().map(|(p, _)| *p).filter(|p| *p != me).collect();
         self.announces.push(a);
         others
+    }
+
+    /// `(complete, downloaded, incomplete)` of a swarm: seeds, `completed`
+    /// announces and leechers.
+    fn counts(&self, info_hash: &[u8; 20]) -> (u32, u32, u32) {
+        let swarm = self.swarms.get(info_hash).map_or(&[][..], Vec::as_slice);
+        let seeds = swarm.iter().filter(|(_, left)| *left == 0).count() as u32;
+        let downloaded = self
+            .announces
+            .iter()
+            .filter(|a| a.info_hash == *info_hash && a.event == "completed")
+            .count() as u32;
+        (seeds, downloaded, swarm.len() as u32 - seeds)
     }
 }
 
@@ -656,6 +729,7 @@ fn compact(peers: &[SocketAddr]) -> Vec<u8> {
 pub struct FakeTracker {
     pub url: String,
     state: std::sync::Arc<Mutex<TrackerState>>,
+    reply: std::sync::Arc<Mutex<Reply>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -666,36 +740,47 @@ impl Drop for FakeTracker {
 }
 
 impl FakeTracker {
-    /// An HTTP tracker answering every announce with `reply`.
+    /// An HTTP tracker answering every announce with `reply` (until
+    /// [`set_reply`](Self::set_reply)); it scrapes on `/scrape`.
     pub async fn http(reply: Reply) -> FakeTracker {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let state = std::sync::Arc::new(Mutex::new(TrackerState::default()));
-        let st = state.clone();
+        let reply = std::sync::Arc::new(Mutex::new(reply));
+        let (st, rp) = (state.clone(), reply.clone());
         let task = tokio::spawn(async move {
             while let Ok((stream, from)) = listener.accept().await {
-                tokio::spawn(http_conn(stream, from, st.clone(), reply.clone()));
+                let reply = rp.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                tokio::spawn(http_conn(stream, from, st.clone(), reply));
             }
         });
         FakeTracker {
             url: format!("http://{addr}/announce"),
             state,
+            reply,
             task,
         }
     }
 
-    /// A UDP (BEP 15) tracker answering every announce with `reply`.
+    /// A UDP (BEP 15) tracker answering every announce with `reply` (until
+    /// [`set_reply`](Self::set_reply)); it scrapes on action 2.
     pub async fn udp(reply: Reply) -> FakeTracker {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         let state = std::sync::Arc::new(Mutex::new(TrackerState::default()));
-        let st = state.clone();
-        let task = tokio::spawn(udp_loop(sock, st, reply));
+        let reply = std::sync::Arc::new(Mutex::new(reply));
+        let task = tokio::spawn(udp_loop(sock, state.clone(), reply.clone()));
         FakeTracker {
             url: format!("udp://{addr}"),
             state,
+            reply,
             task,
         }
+    }
+
+    /// Answers every request from now on with `reply`.
+    pub fn set_reply(&self, reply: Reply) {
+        *self.reply.lock().unwrap_or_else(|e| e.into_inner()) = reply;
     }
 
     /// Every announce so far.
@@ -752,6 +837,46 @@ async fn http_conn(
     let head = String::from_utf8_lossy(&buf).into_owned();
     let target = head.split_whitespace().nth(1).unwrap_or("").to_owned();
     let query = target.split_once('?').map_or("", |(_, q)| q);
+    if target.starts_with("/scrape") {
+        let hashes: Vec<[u8; 20]> = query
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("info_hash="))
+            .map(|v| percent_decode(v).try_into().unwrap())
+            .collect();
+        let (status, body) = match reply {
+            Reply::ServerError => ("500 Internal Server Error", Vec::new()),
+            Reply::Failure(msg) => (
+                "200 OK",
+                format!("d14:failure reason{}:{}e", msg.len(), msg).into_bytes(),
+            ),
+            _ => {
+                let mut body = b"d5:filesd".to_vec();
+                let mut sorted = hashes.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                for h in sorted {
+                    let (c, d, i) = st.counts(&h);
+                    body.extend_from_slice(b"20:");
+                    body.extend_from_slice(&h);
+                    body.extend_from_slice(
+                        format!("d8:completei{c}e10:downloadedi{d}e10:incompletei{i}ee").as_bytes(),
+                    );
+                }
+                body.extend_from_slice(b"ee");
+                ("200 OK", body)
+            }
+        };
+        let mut resp = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(&body);
+        let _ = stream.write_all(&resp).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
     let mut info_hash = [0u8; 20];
     let mut port = 0u16;
     let mut event = "none".to_owned();
@@ -820,7 +945,7 @@ async fn http_conn(
 async fn udp_loop(
     sock: tokio::net::UdpSocket,
     state: std::sync::Arc<Mutex<TrackerState>>,
-    reply: Reply,
+    reply: std::sync::Arc<Mutex<Reply>>,
 ) {
     const CID: u64 = 0x0102_0304_0506_0708;
     let be32 = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
@@ -835,8 +960,28 @@ async fn udp_loop(
         }
         let action = be32(b, 8);
         let tid = &b[12..16];
+        let reply = reply.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if matches!(reply, Reply::ServerError) {
+            continue;
+        }
         let mut out = Vec::new();
-        if action == 0 && b[..8] == 0x0417_2710_1980u64.to_be_bytes() {
+        if action == 2 && b[..8] == CID.to_be_bytes() {
+            if let Reply::Failure(msg) = &reply {
+                out.extend_from_slice(&3u32.to_be_bytes());
+                out.extend_from_slice(tid);
+                out.extend_from_slice(msg.as_bytes());
+            } else {
+                out.extend_from_slice(&2u32.to_be_bytes());
+                out.extend_from_slice(tid);
+                let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                for h in b[16..].as_chunks::<20>().0 {
+                    let (c, d, i) = st.counts(h);
+                    for n in [c, d, i] {
+                        out.extend_from_slice(&n.to_be_bytes());
+                    }
+                }
+            }
+        } else if action == 0 && b[..8] == 0x0417_2710_1980u64.to_be_bytes() {
             out.extend_from_slice(&0u32.to_be_bytes());
             out.extend_from_slice(tid);
             out.extend_from_slice(&CID.to_be_bytes());

@@ -6,6 +6,8 @@
 //!   and fallbacks, and one connection's state.
 //! - `peers`: peer events, interest, choking and block requests.
 //! - `data`: block buffering, piece verification and writes.
+//! - `smartban`: who sent the blocks of a piece that failed its hash
+//!   check, and which senders to ban.
 //! - `serve`: answering block requests from peers.
 //! - `metadata`: fetching a magnet's metadata from peers and serving ours
 //!   (BEP 9).
@@ -14,6 +16,8 @@
 //! - `pex`: peer exchange (BEP 11) with connected peers.
 //! - `deadline`: the pieces open file readers wait for, and when.
 //! - `readers`: open file readers, their reads and read-ahead.
+//! - `storage_ops`: moving the storage and renaming files.
+//! - `webseed`: web seeds (BEP 19), fetched from as pseudo-peers.
 
 mod actor;
 mod announcer;
@@ -32,18 +36,22 @@ mod pex;
 mod readers;
 mod retries;
 mod serve;
+mod smartban;
+mod storage_ops;
 mod swarm;
 mod tiers;
+mod webseed;
 
 pub(crate) use deadline::ReaderId;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
 use fbt_core::{Bitfield, InfoHashes};
-use fbt_metainfo::Metainfo;
+use fbt_metainfo::{Metainfo, RelPath, sanitize_path};
 use fbt_wire::Handshake;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -53,7 +61,7 @@ use crate::event::PeerSource;
 use crate::peer::conn::PeerStream;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource};
 use crate::status::{TorrentState, TorrentStatus};
-use crate::storage::Storage;
+use crate::storage::{MoveMode, Storage};
 use crate::stream::reader::ReaderLink;
 use crate::stream::{FileReader, ReadAhead};
 
@@ -63,17 +71,25 @@ const COMMAND_QUEUE: usize = 64;
 /// Handle to the actor, from the public handle and the listener.
 #[derive(Debug)]
 pub(crate) enum Cmd {
-    Pause(oneshot::Sender<()>),
-    Resume(oneshot::Sender<()>),
+    Pause(oneshot::Sender<Result<(), SessionError>>),
+    Resume(oneshot::Sender<Result<(), SessionError>>),
     Remove(RemoveMode, oneshot::Sender<Result<(), SessionError>>),
-    Recheck(oneshot::Sender<()>),
+    Recheck(oneshot::Sender<Result<(), SessionError>>),
     Reannounce(oneshot::Sender<()>),
-    SetPriorities(Vec<Priority>, oneshot::Sender<()>),
+    Scrape(oneshot::Sender<()>),
+    SetPriorities(Vec<Priority>, oneshot::Sender<Result<(), SessionError>>),
     AddPeer(SocketAddr, oneshot::Sender<()>),
     Pieces(oneshot::Sender<Bitfield>),
     SetRateLimit(RateLimit, oneshot::Sender<()>),
     /// Peers discovered outside the torrent (local service discovery).
     FoundPeers(PeerSource, Vec<SocketAddr>),
+    /// The session's IP filter changed: close the peers it blocks now.
+    FilterChanged(oneshot::Sender<()>),
+    /// Another torrent smart-banned a peer: close the peers the session's
+    /// bans now block. Sent without waiting for an answer.
+    BansChanged,
+    /// Tests: the smart-ban trust points of the peer at this address.
+    PeerTrust(SocketAddr, oneshot::Sender<i32>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -82,6 +98,10 @@ pub(crate) enum Cmd {
         addr: SocketAddr,
     },
     Shutdown(oneshot::Sender<()>),
+    /// Stops as `Shutdown` does, then answers with the resume data.
+    ShutdownSave(oneshot::Sender<Result<Vec<u8>, SessionError>>),
+    /// Every verified piece written, then the resume data.
+    SaveResume(oneshot::Sender<Result<Vec<u8>, SessionError>>),
     /// A [`FileReader`] opens on file `file`, sharing `link`.
     OpenReader {
         file: usize,
@@ -102,6 +122,45 @@ pub(crate) enum Cmd {
     },
     /// Tests: the merged deadlines.
     DebugDeadlines(oneshot::Sender<Vec<(u32, Duration)>>),
+    /// Moves the storage below `path`.
+    MoveStorage {
+        path: PathBuf,
+        mode: MoveMode,
+        tx: oneshot::Sender<Result<(), SessionError>>,
+    },
+    /// Renames file `index` to `path` (relative to the save path, already
+    /// sanitised; the actor checks collisions).
+    RenameFile {
+        index: usize,
+        path: RelPath,
+        tx: oneshot::Sender<Result<(), SessionError>>,
+    },
+    /// The queue scheduler: stay stopped (`true`, the pause path) or run
+    /// (`false`, the resume path). Held while the storage moves, the last
+    /// one winning.
+    SetQueued(bool),
+    /// The queue scheduler: the torrent's queue position.
+    SetQueuePosition(usize),
+    /// Puts the torrent under the queue's control or takes it out (which
+    /// unqueues it).
+    SetAutoManaged(bool, oneshot::Sender<()>),
+    /// Answers once every earlier command is applied, with the status
+    /// published.
+    Sync(oneshot::Sender<()>),
+    /// Adds a web seed (or revives a retired one).
+    AddWebSeed(String, oneshot::Sender<Result<(), SessionError>>),
+    /// Removes a web seed.
+    RemoveWebSeed(String, oneshot::Sender<()>),
+    /// Every web seed's URL.
+    WebSeeds(oneshot::Sender<Vec<String>>),
+}
+
+/// Where an added torrent starts in the session's queue.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueueStart {
+    /// The queue's first pass keeps it stopped.
+    pub queued: bool,
+    pub position: usize,
 }
 
 #[derive(Debug)]
@@ -113,6 +172,8 @@ struct HandleInner {
     cmds: mpsc::Sender<Cmd>,
     status: watch::Receiver<TorrentStatus>,
     shared: Arc<Shared>,
+    /// The session's registry, which holds the queue.
+    session: Weak<SessionInner>,
 }
 
 /// A torrent in a [`Session`](crate::Session).
@@ -129,17 +190,23 @@ pub struct TorrentHandle {
 pub(crate) fn spawn(
     params: AddTorrent,
     storage: Option<Arc<dyn Storage>>,
+    queue: QueueStart,
     shared: Arc<Shared>,
     session: Weak<SessionInner>,
 ) -> TorrentHandle {
     let ih = params.source.info_hashes();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
-    let initial = match &params.source {
+    let mut initial = match &params.source {
         TorrentSource::Metainfo(m) => TorrentStatus::initial(ih, m.info.name.clone(), true),
         TorrentSource::Magnet(m) => {
             TorrentStatus::initial(ih, m.display_name.clone().unwrap_or_default(), false)
         }
     };
+    initial.save_path = params.save_path.clone();
+    initial.queue_position = queue.position;
+    initial.auto_managed = params.auto_managed;
+    // Nothing saved yet; resume data is up to date until something changes.
+    initial.need_save_resume = params.resume.is_none();
     let (status_tx, status_rx) = watch::channel(initial);
     let metainfo = Arc::new(OnceLock::new());
     let handle = TorrentHandle {
@@ -149,11 +216,14 @@ pub(crate) fn spawn(
             cmds: cmd_tx,
             status: status_rx,
             shared: Arc::clone(&shared),
+            session: session.clone(),
         }),
     };
-    let actor = actor::Actor::new(
+    let mut actor = actor::Actor::new(
         params, storage, metainfo, shared, session, cmd_rx, status_tx,
     );
+    actor.queued = queue.queued;
+    actor.queue_position = queue.position;
     tokio::spawn(actor.run());
     handle
 }
@@ -202,14 +272,53 @@ impl TorrentHandle {
         self.inner.status.borrow().clone()
     }
 
-    /// Disconnects every peer and stops announcing.
-    pub async fn pause(&self) -> Result<(), SessionError> {
-        self.call(Cmd::Pause).await
+    /// The torrent's resume data, for
+    /// [`AddTorrent::from_resume`](crate::AddTorrent::from_resume) in a
+    /// later session: every verified piece is written and the storage
+    /// flushed first, then the files' stamps
+    /// ([`Storage::stamps`](crate::storage::Storage::stamps)) are taken
+    /// with the rest of its state. Clears
+    /// [`TorrentStatus::need_save_resume`]. The library never writes it
+    /// anywhere.
+    ///
+    /// The saved pieces are trusted on restart (no check) only if nothing
+    /// is written to the files after this: save after
+    /// [`pause`](Self::pause), or use
+    /// [`Session::shutdown_and_save`](crate::Session::shutdown_and_save).
+    /// Data saved from a running torrent is still valid, but a file written
+    /// after the save makes the next add check the torrent in full. While
+    /// the torrent is checking, the pieces saved are those before the
+    /// check (or its resume data's, or none) without stamps, so the next
+    /// add checks again. Waits for a storage move, as
+    /// [`move_storage`](Self::move_storage) describes.
+    ///
+    /// The data is decoded again before it is returned, so whatever this
+    /// returns [`AddTorrent::from_resume`](crate::AddTorrent::from_resume)
+    /// accepts; data it would refuse (an `info` dictionary over
+    /// [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES), or more values than
+    /// [`MAX_RESUME_ITEMS`](crate::MAX_RESUME_ITEMS)) fails here with
+    /// [`SessionError::Resume`] instead.
+    pub async fn save_resume_data(&self) -> Result<Vec<u8>, SessionError> {
+        self.call(Cmd::SaveResume).await?
     }
 
-    /// Undoes [`pause`](Self::pause); also clears a storage error.
+    /// Disconnects every peer and stops announcing.
+    pub async fn pause(&self) -> Result<(), SessionError> {
+        self.call(Cmd::Pause).await?
+    }
+
+    /// Undoes [`pause`](Self::pause); also clears a storage error. An
+    /// auto-managed torrent returns to the session's queue: with no free
+    /// slot for its position it resumes as
+    /// [`TorrentState::Queued`](crate::TorrentState::Queued) without
+    /// announcing.
     pub async fn resume(&self) -> Result<(), SessionError> {
-        self.call(Cmd::Resume).await
+        if let Ok(session) = self.session()
+            && session.queue_on_resume(&self.inner.info_hashes)
+        {
+            self.send(Cmd::SetQueued(true)).await?;
+        }
+        self.call(Cmd::Resume).await?
     }
 
     /// Removes the torrent from the session, optionally deleting its files.
@@ -228,12 +337,23 @@ impl TorrentHandle {
         if self.metainfo().is_none() {
             return Err(SessionError::NoMetadata);
         }
-        self.call(Cmd::Recheck).await
+        self.call(Cmd::Recheck).await?
     }
 
     /// Announces to the trackers now.
     pub async fn force_reannounce(&self) -> Result<(), SessionError> {
         self.call(Cmd::Reannounce).await
+    }
+
+    /// Scrapes the first working tracker of each tier for this torrent's
+    /// counts. Returns once the scrape is asked for; each tracker reports
+    /// through [`Event::ScrapeReply`](crate::Event::ScrapeReply) or
+    /// [`Event::ScrapeFailed`](crate::Event::ScrapeFailed)
+    /// ([`EventMask::TRACKER`](crate::EventMask::TRACKER)). A torrent
+    /// without trackers reports nothing. A scrape asked for while one is
+    /// running replaces it.
+    pub async fn scrape_trackers(&self) -> Result<(), SessionError> {
+        self.call(Cmd::Scrape).await
     }
 
     /// Sets one priority per file (pad files included).
@@ -253,7 +373,7 @@ impl TorrentHandle {
                 got: p.len(),
             });
         }
-        self.call(|tx| Cmd::SetPriorities(p, tx)).await
+        self.call(|tx| Cmd::SetPriorities(p, tx)).await?
     }
 
     /// Connects to a peer.
@@ -322,6 +442,173 @@ impl TorrentHandle {
         ))
     }
 
+    /// Moves the torrent's files below `path` (libtorrent's
+    /// `move_storage`). Every verified piece is written first; reads wait
+    /// while the files move and then continue from the new place. `mode`
+    /// says what happens to files already at the target;
+    /// [`MoveMode::KeepExisting`] rechecks the torrent afterwards. Returns
+    /// once the move is done, with
+    /// [`Event::StorageMoved`](crate::Event::StorageMoved) or
+    /// [`Event::StorageMoveFailed`](crate::Event::StorageMoveFailed)
+    /// ([`EventMask::STORAGE`](crate::EventMask::STORAGE)) emitted. A
+    /// failed move puts back what it moved and the torrent keeps running
+    /// from the old path. Moving to the current path does nothing. Before a
+    /// magnet's metadata arrives only the save path changes.
+    ///
+    /// Fails with [`SessionError::Storage`] when the move fails (an
+    /// [`io::ErrorKind::AlreadyExists`](std::io::ErrorKind::AlreadyExists)
+    /// error for [`MoveMode::FailIfExists`] with a file at the target),
+    /// [`SessionError::Unsupported`] for a custom storage that cannot move,
+    /// and [`SessionError::Busy`] at once while the torrent checks its
+    /// data or waits to ([`TorrentState::CheckingFiles`] or
+    /// [`TorrentState::QueuedForChecking`]): the move would wait for the
+    /// whole check. Ask again once the check is over (a
+    /// [`StateChanged`](crate::Event::StateChanged) event, or
+    /// [`TorrentFinished`](crate::Event::TorrentFinished)).
+    ///
+    /// While the files move, [`pause`](Self::pause),
+    /// [`resume`](Self::resume), [`remove`](Self::remove),
+    /// [`force_recheck`](Self::force_recheck),
+    /// [`set_file_priorities`](Self::set_file_priorities),
+    /// [`save_resume_data`](Self::save_resume_data), another
+    /// `move_storage` or [`rename_file`](Self::rename_file), and the
+    /// session's shutdown wait for it to finish (a copy across filesystems
+    /// can take minutes); they then run in the order they were made. Past
+    /// 64 such waiting commands a new one fails at once with
+    /// [`SessionError::Busy`]. Other methods, reads included, are not held.
+    ///
+    /// A move across filesystems copies the files and deletes the
+    /// originals; sparse regions of a file (pieces not downloaded yet) are
+    /// allocated at the target, so it can take more disk space there.
+    pub async fn move_storage(&self, path: PathBuf, mode: MoveMode) -> Result<(), SessionError> {
+        self.call(|tx| Cmd::MoveStorage { path, mode, tx }).await?
+    }
+
+    /// Gives file `index` the path `path`, relative to the save path (not
+    /// to the torrent's directory, as libtorrent), `/`-separated. Returns
+    /// once the file is renamed, with
+    /// [`Event::FileRenamed`](crate::Event::FileRenamed) or
+    /// [`Event::FileRenameFailed`](crate::Event::FileRenameFailed)
+    /// emitted; reads wait meanwhile, as for
+    /// [`move_storage`](Self::move_storage).
+    ///
+    /// Fails with [`SessionError::InvalidPath`] for a path that is not a
+    /// plain relative one (empty, `.`, `..` or empty components, or any
+    /// name the torrent path sanitiser would change), that collides with
+    /// another file (the same path ignoring case and Unicode normalisation,
+    /// or one being a directory of the other), or that is the part file's
+    /// ([`FsStorage::part_path`](crate::storage::FsStorage::part_path))
+    /// or below it; [`SessionError::InvalidFileIndex`] for an index out of
+    /// range or naming a pad file; [`SessionError::NoMetadata`] before a
+    /// magnet's metadata; [`SessionError::Busy`] at once while the torrent
+    /// checks its data or waits to, as for
+    /// [`move_storage`](Self::move_storage); [`SessionError::Storage`]
+    /// when the rename fails (a file not ours at the target is never
+    /// overwritten).
+    pub async fn rename_file(&self, index: usize, path: &str) -> Result<(), SessionError> {
+        let meta = self.metainfo().ok_or(SessionError::NoMetadata)?;
+        let files = meta.info.files.len();
+        if meta.info.files.get(index).is_none_or(|f| f.pad) {
+            return Err(SessionError::InvalidFileIndex { index, files });
+        }
+        let path = plain_rel_path(path)?;
+        self.call(|tx| Cmd::RenameFile { index, path, tx }).await?
+    }
+
+    /// Adds the web seed (BEP 19) `url`, an `http://` or `https://` URL as
+    /// in a `.torrent`'s `url-list`: a URL ending in `/` is the directory
+    /// the torrent's name (and, for a multi-file torrent, its paths) are
+    /// below. It is fetched from while the torrent is downloading and
+    /// active (never while paused or queued), private torrents included,
+    /// with [`Settings::proxy`](crate::Settings::proxy) applying as for
+    /// peers (`proxy_peers`) and the download limits as for peers. Adding
+    /// a URL already there does nothing, except that a retired one is
+    /// taken back into use.
+    ///
+    /// Fails with [`SessionError::InvalidUrl`] for anything but an `http`
+    /// or `https` URL of at most 2048 bytes, and with
+    /// [`SessionError::TooManyWebSeeds`] when the torrent has
+    /// [`MAX_WEB_SEEDS`](fbt_metainfo::MAX_WEB_SEEDS) (16).
+    pub async fn add_web_seed(&self, url: String) -> Result<(), SessionError> {
+        self.call(|tx| Cmd::AddWebSeed(url, tx)).await?
+    }
+
+    /// Removes the web seed `url`, cancelling its request in flight;
+    /// nothing if there is none.
+    pub async fn remove_web_seed(&self, url: &str) -> Result<(), SessionError> {
+        let url = url.to_owned();
+        self.call(|tx| Cmd::RemoveWebSeed(url, tx)).await
+    }
+
+    /// The torrent's web seeds, in the order added (the `.torrent`'s or
+    /// magnet's first), retired ones included
+    /// ([`TorrentStatus::num_web_seeds`] counts those in use).
+    pub async fn web_seeds(&self) -> Result<Vec<String>, SessionError> {
+        self.call(Cmd::WebSeeds).await
+    }
+
+    /// Puts the torrent under the session's queue ([`Settings::queue`](crate::Settings::queue))
+    /// or takes it out of it. Taken out, a queued torrent starts at once
+    /// and the queue never stops it; put back, the queue may stop it at
+    /// once. Returns once the queue has applied the change.
+    pub async fn set_auto_managed(&self, auto_managed: bool) -> Result<(), SessionError> {
+        let session = self.session()?;
+        session.set_auto_managed(&self.inner.info_hashes, auto_managed);
+        self.call(|tx| Cmd::SetAutoManaged(auto_managed, tx))
+            .await?;
+        session.queue_pass();
+        self.send_unsent(&session).await?;
+        self.call(Cmd::Sync).await
+    }
+
+    /// Moves the torrent to `position` in the session's queue (0 runs
+    /// first; past the end, `usize::MAX` say, is the bottom). The torrents
+    /// in between shift by one, and the queue starts and stops torrents
+    /// for their new order. Returns once this torrent's
+    /// [`TorrentStatus::queue_position`] shows the new place.
+    pub async fn set_queue_position(&self, position: usize) -> Result<(), SessionError> {
+        if self.inner.shared.is_shutdown() {
+            return Err(SessionError::Shutdown);
+        }
+        let session = self.session()?;
+        session.move_in_queue(&self.inner.info_hashes, position)?;
+        self.send_unsent(&session).await?;
+        self.call(Cmd::Sync).await
+    }
+
+    /// Sends, with a wait, the queue commands for this torrent that the
+    /// last pass found no room for.
+    async fn send_unsent(&self, session: &SessionInner) -> Result<(), SessionError> {
+        for cmd in session.take_unsent_queue_cmds(&self.inner.info_hashes) {
+            self.send(cmd).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends `cmd`, waiting for room in the actor's queue.
+    async fn send(&self, cmd: Cmd) -> Result<(), SessionError> {
+        if self.inner.shared.is_shutdown() {
+            return Err(SessionError::Shutdown);
+        }
+        self.inner.cmds.send(cmd).await.map_err(|_| self.gone())
+    }
+
+    /// The session, while this torrent is in it.
+    fn session(&self) -> Result<Arc<SessionInner>, SessionError> {
+        self.inner.session.upgrade().ok_or_else(|| self.gone())
+    }
+
+    /// Reads the latest status without copying it.
+    pub(crate) fn with_status<R>(&self, f: impl FnOnce(&TorrentStatus) -> R) -> R {
+        f(&self.inner.status.borrow())
+    }
+
+    /// Sends `cmd` without waiting; false if the queue is full or the
+    /// actor is gone.
+    pub(crate) fn try_cmd(&self, cmd: Cmd) -> bool {
+        self.inner.cmds.try_send(cmd).is_ok()
+    }
+
     /// Tests: the pieces open readers wait for, earliest deadline first,
     /// with the time left until each is due; empty once the torrent is gone.
     #[doc(hidden)]
@@ -386,12 +673,65 @@ impl TorrentHandle {
             .is_ok()
     }
 
+    /// Tells the actor the IP filter changed; returns once it closed the
+    /// peers the new filter blocks.
+    pub(crate) async fn filter_changed(&self) -> Result<(), SessionError> {
+        self.call(Cmd::FilterChanged).await
+    }
+
+    /// Tells the actor, without waiting, that a ban was added elsewhere in
+    /// the session. If its queue is full the command is sent from a task of
+    /// its own, so the caller never waits and the ban still reaches it.
+    pub(crate) fn bans_changed(&self) {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) =
+            self.inner.cmds.try_send(Cmd::BansChanged)
+        {
+            let cmds = self.inner.cmds.clone();
+            tokio::spawn(async move {
+                let _ = cmds.send(cmd).await;
+            });
+        }
+    }
+
+    /// The smart-ban trust points this torrent holds for the peer at
+    /// `addr` (0 if it never sent a block). For tests.
+    #[doc(hidden)]
+    pub async fn peer_trust(&self, addr: SocketAddr) -> Result<i32, SessionError> {
+        self.call(|tx| Cmd::PeerTrust(addr, tx)).await
+    }
+
     /// Asks the actor to stop; the receiver completes once it has.
     pub(crate) async fn send_shutdown(&self) -> Option<oneshot::Receiver<()>> {
         let (tx, rx) = oneshot::channel();
         self.inner.cmds.send(Cmd::Shutdown(tx)).await.ok()?;
         Some(rx)
     }
+
+    /// Asks the actor to stop and save; the receiver gets its resume data.
+    pub(crate) async fn send_shutdown_save(
+        &self,
+    ) -> Option<oneshot::Receiver<Result<Vec<u8>, SessionError>>> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.cmds.send(Cmd::ShutdownSave(tx)).await.ok()?;
+        Some(rx)
+    }
+}
+
+/// `path` split on `/` as a sanitised relative path, refused when
+/// sanitising would change it.
+fn plain_rel_path(path: &str) -> Result<RelPath, SessionError> {
+    let invalid = || SessionError::InvalidPath(path.to_owned());
+    let raw: Vec<&str> = path.split('/').collect();
+    let rel = sanitize_path(raw.iter().map(|c| c.as_bytes())).map_err(|_| invalid())?;
+    if rel
+        .components()
+        .iter()
+        .map(String::as_str)
+        .ne(raw.iter().copied())
+    {
+        return Err(invalid());
+    }
+    Ok(rel)
 }
 
 /// True if `a` and `b` are the same state, ignoring checking progress.

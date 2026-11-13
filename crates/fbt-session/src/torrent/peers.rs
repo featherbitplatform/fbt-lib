@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::PoisonError;
 
 use fbt_core::{Bitfield, BlockRef, PeerId};
 use fbt_metainfo::Metainfo;
@@ -18,7 +19,9 @@ use super::holepunch::{RelayAction, relay};
 use super::known::dialable;
 use super::metadata::{FetchStep, MAX_METADATA_REQUESTS_PER_PEER, serve_metadata};
 use super::pex::{PexPeer, connectable_addr};
+use super::smartban::BlockSource;
 use super::swarm::{BanTarget, ConnectOutcome};
+use crate::bans::{BanList, BlockReason};
 use crate::choker::PeerChokeInfo;
 use crate::event::Event;
 use crate::peer::DisconnectReason;
@@ -27,6 +30,15 @@ use crate::peer::transport::Transport;
 use crate::picker::{PeerKey, PeerPieces, PiecePicker};
 use crate::session::HolepunchCounters;
 use crate::status::TorrentState;
+
+/// A piece reserved for a peer on parole is forfeited after this many
+/// request timeouts without a block of it arriving. One timeout is a
+/// single unanswered request (or a choke that dropped them); the second
+/// lets the owner answer the requests it gets again after an unchoke, so
+/// a seed that rotates its unchokes keeps the piece, while one that holds
+/// it and sends nothing loses it within two timeouts (2 minutes with the
+/// default 60 s).
+pub(super) const PAROLE_GRACE_TIMEOUTS: u32 = 2;
 
 impl Actor {
     // ----- peer events --------------------------------------------------------
@@ -484,6 +496,7 @@ impl Actor {
             }
             picker.release_peer(key);
             picker.remove_peer_pieces(p.pieces());
+            self.drop_forfeited();
         }
         // `PeerDisconnected` stays paired with `PeerConnected`. A
         // connection that got through reports its end only if it is the one
@@ -744,6 +757,104 @@ impl Actor {
         self.close_peer(key);
     }
 
+    /// Frees the pieces the picker forfeited (parole downloads whose owner
+    /// left or stalled): their partial data, budget reservation and the
+    /// blocks smart ban recorded of the attempt. Called right after every
+    /// picker call that can forfeit.
+    pub(super) fn drop_forfeited(&mut self) {
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        let Some(picker) = l.picker.as_mut() else {
+            return;
+        };
+        for piece in picker.take_forfeited() {
+            l.bufs.remove(&piece);
+            self.cache.release_partial(piece);
+            self.smartban.drop_attempt(piece);
+        }
+    }
+
+    /// Forfeits the parole pieces whose owner has delivered none of their
+    /// blocks for [`PAROLE_GRACE_TIMEOUTS`] request timeouts, so other
+    /// peers may download them. A request of the owner's still pending
+    /// for such a piece is no longer the picker's: its answer counts as
+    /// wasted, or it times out.
+    pub(super) fn expire_parole_pieces(&mut self) {
+        let grace = self
+            .shared
+            .settings
+            .request_timeout
+            .saturating_mul(PAROLE_GRACE_TIMEOUTS);
+        let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) else {
+            return;
+        };
+        picker.expire_exclusive(Instant::now().into_std(), grace);
+        self.drop_forfeited();
+    }
+
+    /// Who sent us peer `key`'s blocks, as smart ban keys it: the peer's
+    /// whole IP (port 0), or with `ban_endpoints` its address.
+    pub(super) fn block_source(&self, key: PeerKey) -> Option<BlockSource> {
+        let p = self.peers.get(&key)?;
+        Some(self.peer_block_source(p.addr))
+    }
+
+    /// The smart-ban source of a peer at `addr` (IPv4-mapped written as
+    /// IPv4, as in the ban list).
+    pub(super) fn peer_block_source(&self, addr: SocketAddr) -> BlockSource {
+        BlockSource::Peer(BanList::key(addr, self.shared.settings.ban_endpoints))
+    }
+
+    /// Bans a source of bad blocks (smart ban). A web seed is retired
+    /// ([`Event::WebSeedError`] with `retired: true`). A peer key goes into the
+    /// session's ban list and every matching peer is closed with
+    /// `Blocked(Banned)` and reported ([`Event::PeerBlocked`]), or the key
+    /// is reported if none is connected here. Unlike [`ban`](Self::ban)
+    /// (bad metadata, this torrent only), the ban is session-wide: every
+    /// other torrent is told to close its matching peers too.
+    pub(super) fn smart_ban(&mut self, s: BlockSource) {
+        match s {
+            BlockSource::Peer(key) => {
+                let added = self
+                    .shared
+                    .bans
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .ban(key);
+                debug!(torrent = %self.name(), %key, added, "banned a peer that sent bad blocks");
+                if self.close_blocked() == 0 && added {
+                    self.emit_blocked(key, BlockReason::Banned);
+                }
+                if added {
+                    self.tell_other_torrents_bans_changed();
+                }
+            }
+            BlockSource::WebSeed(key) => {
+                debug!(torrent = %self.name(), ?key, "a web seed sent bad blocks");
+                self.retire_web_seed(key, "sent data that failed a hash check".to_owned());
+            }
+        }
+    }
+
+    /// Sends [`Cmd::BansChanged`](super::Cmd::BansChanged) to every other
+    /// torrent of the session, without waiting.
+    fn tell_other_torrents_bans_changed(&self) {
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        let others: Vec<_> = session
+            .registry()
+            .torrents
+            .iter()
+            .filter(|(ih, _)| **ih != self.ih)
+            .map(|(_, e)| e.handle.clone())
+            .collect();
+        for h in others {
+            h.bans_changed();
+        }
+    }
+
     /// What to ban for peer `key`: the address we dialled; for an incoming
     /// peer its advertised listen address, else its IP.
     pub(super) fn ban_target(&self, key: PeerKey) -> Option<BanTarget> {
@@ -879,12 +990,16 @@ impl Actor {
         }
         let max = self.shared.settings.max_outstanding_requests;
         let generation = self.generation;
+        let parole = self
+            .block_source(key)
+            .is_some_and(|s| self.smartban.on_parole(s));
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
         let (Some(picker), Some(p)) = (l.picker.as_mut(), self.peers.get(&key)) else {
             return;
         };
+        picker.set_parole(key, parole);
         let cap = partial_cap(
             picker.num_in_progress(),
             self.cache.partial_room(u64::from(l.layout.piece_len())),
@@ -897,6 +1012,7 @@ impl Actor {
             );
             for piece in evicted {
                 self.cache.release_partial(piece);
+                self.smartban.forget(piece);
             }
         }
         if !p.connected || p.tx.is_none() || p.generation != generation {

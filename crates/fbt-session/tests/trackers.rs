@@ -378,3 +378,102 @@ async fn completed_is_retried_after_a_failed_walk() {
     leech.shutdown().await;
     seed.shutdown().await;
 }
+
+/// Every tracker that took a `started` in this run gets the `stopped`:
+/// tier 1 answers the first announce, then fails, so a forced re-announce
+/// reaches tier 2, which takes a `started` of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopped_goes_to_every_started_tracker() {
+    let t1 = FakeTracker::http(Reply::Peers).await;
+    let t2 = FakeTracker::http(Reply::Peers).await;
+    let (m, payload) = torrent(vec![vec![t1.url.clone()], vec![t2.url.clone()]]);
+    let (s, h) = seeder(&m, &payload, &t1.url).await;
+    let port = s.local_addr().port();
+    assert!(t2.events_of(port).is_empty(), "tier 2 not reached yet");
+    t1.set_reply(Reply::ServerError);
+    h.force_reannounce().await.unwrap();
+    assert!(
+        wait_until(|| t2.events_of(port) == ["started"], T).await,
+        "tier 2: {:?}, tier 1: {:?}",
+        t2.events_of(port),
+        t1.events_of(port)
+    );
+    s.shutdown().await;
+    assert_eq!(t1.events_of(port), ["started", "none", "stopped"]);
+    assert_eq!(t2.events_of(port), ["started", "stopped"]);
+}
+
+/// A tracker that never answered gets no `stopped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopped_skips_trackers_that_never_answered() {
+    let bad = FakeTracker::http(Reply::ServerError).await;
+    let good = FakeTracker::http(Reply::Peers).await;
+    let (m, payload) = torrent(vec![vec![bad.url.clone()], vec![good.url.clone()]]);
+    let (s, _h) = seeder(&m, &payload, &good.url).await;
+    let port = s.local_addr().port();
+    s.shutdown().await;
+    let bad_events = bad.events_of(port);
+    assert!(!bad_events.is_empty());
+    assert!(bad_events.iter().all(|e| e == "started"), "{bad_events:?}");
+    assert_eq!(good.events_of(port), ["started", "stopped"]);
+}
+
+/// `scrape_trackers` scrapes the first tracker of each tier, over HTTP and
+/// UDP, and reports each as an event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scrape_trackers_reports_counts() {
+    let http = FakeTracker::http(Reply::Peers).await;
+    let udp = FakeTracker::udp(Reply::Peers).await;
+    let (m, payload) = torrent(vec![vec![http.url.clone()], vec![udp.url.clone()]]);
+    let (seed, sh) = seeder(&m, &payload, &http.url).await;
+    let (leech, _lh, _storage, mut lev) = leecher(&m, payload.len()).await;
+    finished(&mut lev).await;
+    let lport = leech.local_addr().port();
+    assert!(wait_until(|| http.events_of(lport).iter().any(|e| e == "completed"), T).await);
+
+    let mut ev = seed.subscribe(EventMask::TRACKER);
+    sh.scrape_trackers().await.unwrap();
+    let mut replies = std::collections::HashMap::new();
+    while replies.len() < 2 {
+        let e = next_matching(&mut ev, |e| matches!(e, Event::ScrapeReply { .. }), T)
+            .await
+            .expect("scrape replies");
+        if let Event::ScrapeReply {
+            torrent,
+            url,
+            complete,
+            incomplete,
+            downloaded,
+        } = e
+        {
+            assert_eq!(torrent, m.info_hashes);
+            replies.insert(url, (complete, incomplete, downloaded));
+        }
+    }
+    // Seed and finished leecher; the UDP tier was never announced to.
+    assert_eq!(replies[&http.url], (2, 0, 1));
+    assert_eq!(replies[&udp.url], (0, 0, 0));
+
+    // A failing scrape is reported; it never drops the tracker.
+    http.set_reply(Reply::Failure("no scrape for you".into()));
+    sh.scrape_trackers().await.unwrap();
+    let failed = next_matching(&mut ev, |e| matches!(e, Event::ScrapeFailed { .. }), T)
+        .await
+        .expect("scrape failure");
+    assert!(
+        matches!(&failed, Event::ScrapeFailed { url, message, .. }
+            if *url == http.url && message.contains("no scrape for you")),
+        "{failed:?}"
+    );
+    http.set_reply(Reply::Peers);
+    sh.scrape_trackers().await.unwrap();
+    next_matching(
+        &mut ev,
+        |e| matches!(e, Event::ScrapeReply { url, .. } if *url == http.url),
+        T,
+    )
+    .await
+    .expect("scraped again");
+    leech.shutdown().await;
+    seed.shutdown().await;
+}
