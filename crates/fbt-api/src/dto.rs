@@ -3,7 +3,7 @@
 //!
 //! Conventions (every DTO follows them): hashes are lowercase hex,
 //! durations are seconds as `f64`, rates are bytes per second, states and
-//! enums are snake_case strings, addresses and paths are strings. DTOs are
+//! enums are snake_case strings, timestamps are integer Unix seconds, addresses and paths are strings. DTOs are
 //! built by `From` impls from `fbt` types; request DTOs use
 //! `#[serde(deny_unknown_fields)]`. A DTO named in a route's
 //! `#[utoipa::path]` (`body = ...`) lands in the document's
@@ -87,10 +87,11 @@ impl From<&Session> for SessionInfo {
     }
 }
 
-/// A file's download priority.
+/// A file's download priority as reported (response side). Requests use
+/// their own type with the four real values.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PriorityDto {
+pub(crate) enum FilePriority {
     /// Not downloaded.
     Skip,
     /// Downloaded after everything else.
@@ -99,16 +100,19 @@ pub(crate) enum PriorityDto {
     Normal,
     /// Downloaded first.
     High,
+    /// A priority this API version does not know.
+    Unknown,
 }
 
-impl From<Priority> for PriorityDto {
+impl From<Priority> for FilePriority {
     fn from(p: Priority) -> Self {
         match p {
-            Priority::Skip => PriorityDto::Skip,
-            Priority::Low => PriorityDto::Low,
-            Priority::High => PriorityDto::High,
-            // `Normal`, and any priority a later `fbt` adds.
-            _ => PriorityDto::Normal,
+            Priority::Skip => FilePriority::Skip,
+            Priority::Low => FilePriority::Low,
+            Priority::Normal => FilePriority::Normal,
+            Priority::High => FilePriority::High,
+            // A priority a later `fbt` adds.
+            _ => FilePriority::Unknown,
         }
     }
 }
@@ -139,7 +143,8 @@ pub(crate) struct TorrentInfo {
     pub(crate) info_hash_v1: Option<String>,
     /// The v2 info hash, lowercase hex; null for a v1-only torrent.
     pub(crate) info_hash_v2: Option<String>,
-    /// `v1`, `v2` or `hybrid`; null until the metadata is known.
+    /// `v1`, `v2` or `hybrid`; null until the metadata is known (or for a
+    /// version this API does not know).
     #[schema(example = "hybrid")]
     pub(crate) version: Option<&'static str>,
     /// The torrent's name (a magnet's `dn` before the metadata).
@@ -200,10 +205,12 @@ impl TorrentInfo {
     /// The info for `handle`: its latest status and its metadata version.
     pub(crate) fn of(handle: &TorrentHandle) -> Self {
         let mut info = TorrentInfo::from(&handle.status());
-        info.version = handle.metainfo().map(|m| match m.version() {
-            TorrentVersion::V1 => "v1",
-            TorrentVersion::V2 => "v2",
-            _ => "hybrid",
+        info.version = handle.metainfo().and_then(|m| match m.version() {
+            TorrentVersion::V1 => Some("v1"),
+            TorrentVersion::V2 => Some("v2"),
+            TorrentVersion::Hybrid => Some("hybrid"),
+            // A version a later `fbt` adds.
+            _ => None,
         });
         info
     }
@@ -259,7 +266,7 @@ pub(crate) struct FileInfo {
     /// A BEP 47 pad file, never written to disk.
     pub(crate) pad: bool,
     /// Its download priority.
-    pub(crate) priority: PriorityDto,
+    pub(crate) priority: FilePriority,
     /// Bytes of the file inside verified pieces.
     pub(crate) downloaded: u64,
 }
@@ -284,7 +291,7 @@ pub(crate) struct PeerInfo {
     pub(crate) addr: String,
     /// Its client name, when known.
     pub(crate) client: Option<String>,
-    /// `tcp` or `utp`.
+    /// `tcp`, `utp` or `unknown`.
     pub(crate) transport: &'static str,
     /// The connection is encrypted (MSE).
     pub(crate) encrypted: bool,
@@ -320,7 +327,8 @@ impl From<&PeerStatus> for PeerInfo {
             client: p.client.clone(),
             transport: match p.transport {
                 Transport::Tcp => "tcp",
-                _ => "utp",
+                Transport::Utp => "utp",
+                _ => "unknown",
             },
             encrypted: p.encrypted,
             incoming: p.incoming,
@@ -360,7 +368,8 @@ pub(crate) struct TrackerInfo {
     pub(crate) info_hash: String,
     /// The last announce's error.
     pub(crate) last_error: Option<String>,
-    /// When it last answered, seconds since the Unix epoch.
+    /// When it last answered, as integer Unix seconds (like every
+    /// timestamp in this API).
     pub(crate) last_reply: Option<u64>,
     /// Seconds until the next announce to it.
     pub(crate) next_announce: Option<f64>,

@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
-use fbt::{Magnet, TorrentHandle};
+use fbt::{Magnet, SessionError, TorrentHandle};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -182,7 +182,14 @@ async fn get_resume_data(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Response, ApiErrorResponse> {
-    let bytes = lookup(&state, &id)?.save_resume_data().await?;
+    let bytes = lookup(&state, &id)?
+        .save_resume_data()
+        .await
+        .map_err(|e| match e {
+            // Output side: our own state failed to encode, not bad input.
+            SessionError::Resume(e) => ApiErrorResponse::internal(e.to_string()),
+            e => e.into(),
+        })?;
     Ok((
         [(
             header::CONTENT_TYPE,
