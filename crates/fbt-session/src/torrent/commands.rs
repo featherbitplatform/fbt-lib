@@ -645,12 +645,13 @@ impl Actor {
         if let Some(a) = self.announcer.take()
             && remove.is_none()
         {
-            let mut task = a.task;
-            if tokio::time::timeout_at(announce_deadline, &mut task)
-                .await
-                .is_err()
-            {
-                task.abort();
+            for mut task in a.tasks {
+                if tokio::time::timeout_at(announce_deadline, &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                }
             }
         }
         if let Some(e) = self.write_error.take() {

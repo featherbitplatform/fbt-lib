@@ -44,7 +44,7 @@ use crate::peer::messages::PeerEvent;
 use crate::picker::{PeerKey, PiecePicker};
 use crate::rate::RateMeter;
 use crate::resume::ResumeState;
-use crate::session::{AddTorrent, Priority, SessionInner, Shared, TorrentSource};
+use crate::session::{AddTorrent, Priority, SessionInner, Shared, TorrentSource, wire_hashes};
 use crate::status::{TorrentState, TorrentStatus};
 use crate::storage::cache::{FlushReason, PieceCache};
 use crate::storage::{Storage, error_path};
@@ -463,7 +463,7 @@ impl Actor {
             .map(|dht| {
                 dht::spawn(DhtParams {
                     dht,
-                    info_hash: ih.wire_hash(),
+                    info_hashes: wire_hashes(&ih),
                     port: shared.listen_port,
                     interval: shared.settings.dht_announce_interval,
                     signals: signals.subscribe(),
@@ -1008,7 +1008,7 @@ impl Actor {
         if self.connectable() && !self.is_private() {
             self.shared
                 .lsd
-                .want(self.ih.wire_hash(), std::time::Instant::now());
+                .want(&wire_hashes(&self.ih), std::time::Instant::now());
         }
     }
 

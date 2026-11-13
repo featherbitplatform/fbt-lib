@@ -12,6 +12,10 @@
 //! (`left` counts wanted bytes, as libtorrent's does). Found peers reach
 //! the actor through a bounded channel it polls; the actor never waits.
 //!
+//! A hybrid runs one such loop per wire hash of its registry key (the v1
+//! hash, then the truncated v2 hash), so peers that only know its `btmh`
+//! find it; a hash only the metadata revealed is not announced.
+//!
 //! Private torrents get no announcer. A magnet's privacy is unknown until
 //! its metadata arrives, so it runs one meanwhile; the actor drops it (which
 //! aborts the task) once the metadata says private.
@@ -34,23 +38,28 @@ const PEER_QUEUE: usize = 16;
 /// Peers forwarded from one lookup batch.
 const MAX_PEERS_PER_BATCH: usize = 200;
 
-/// The actor's side of a running DHT announcer; dropping it stops the task.
+/// The actor's side of a running DHT announcer; dropping it stops its
+/// tasks.
 #[derive(Debug)]
 pub(super) struct DhtAnnouncer {
-    task: JoinHandle<()>,
+    /// One task per announced hash.
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl Drop for DhtAnnouncer {
     fn drop(&mut self) {
-        self.task.abort();
+        for t in &self.tasks {
+            t.abort();
+        }
     }
 }
 
 /// Everything a DHT announcer task needs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct DhtParams {
     pub dht: Dht,
-    pub info_hash: [u8; 20],
+    /// The hashes announced, one lookup each.
+    pub info_hashes: Vec<[u8; 20]>,
     /// The peer listener's port, announced to the DHT.
     pub port: u16,
     pub interval: Duration,
@@ -58,11 +67,16 @@ pub(super) struct DhtParams {
     pub status: watch::Receiver<TorrentStatus>,
 }
 
-/// Starts the DHT announcer; peers found arrive on the returned receiver.
+/// Starts the DHT announcer, one task per hash; peers found arrive on the
+/// returned receiver.
 pub(super) fn spawn(p: DhtParams) -> (DhtAnnouncer, mpsc::Receiver<Vec<SocketAddr>>) {
     let (tx, rx) = mpsc::channel(PEER_QUEUE);
-    let task = tokio::spawn(run(p, tx));
-    (DhtAnnouncer { task }, rx)
+    let tasks = p
+        .info_hashes
+        .iter()
+        .map(|&h| tokio::spawn(run(p.clone(), h, tx.clone())))
+        .collect();
+    (DhtAnnouncer { tasks }, rx)
 }
 
 /// Whether the task goes on after a wait.
@@ -71,7 +85,8 @@ enum Next {
     Exit,
 }
 
-async fn run(mut p: DhtParams, peers: mpsc::Sender<Vec<SocketAddr>>) {
+/// The announce loop of `info_hash`.
+async fn run(mut p: DhtParams, info_hash: [u8; 20], peers: mpsc::Sender<Vec<SocketAddr>>) {
     let mut nodes = p.dht.subscribe_stats();
     // When the last announce began; pause and resume do not reset it.
     let mut last: Option<Instant> = None;
@@ -112,7 +127,7 @@ async fn run(mut p: DhtParams, peers: mpsc::Sender<Vec<SocketAddr>>) {
         }
         last = Some(Instant::now());
         let seed = p.status.borrow().is_seed;
-        let mut lookup = p.dht.announce(p.info_hash, Some(p.port), seed);
+        let mut lookup = p.dht.announce(info_hash, Some(p.port), seed);
         loop {
             tokio::select! {
                 batch = lookup.next() => match batch {

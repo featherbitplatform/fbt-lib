@@ -282,23 +282,26 @@ impl LsdHub {
         }
     }
 
-    /// A public torrent is running: queues its announce unless it was
-    /// queued within the interval.
-    pub(crate) fn want(&self, wire_hash: [u8; 20], now: Instant) {
+    /// A public torrent is running: queues the announce of each of its
+    /// `wire_hashes` (both hashes of a hybrid, in order, so they share a
+    /// message) unless it was queued within the interval.
+    pub(crate) fn want(&self, wire_hashes: &[[u8; 20]], now: Instant) {
         if self.lsd.is_none() {
             return;
         }
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if st
-            .last
-            .get(&wire_hash)
-            .is_some_and(|t| now.saturating_duration_since(*t) < self.interval)
-        {
-            return;
-        }
-        st.last.insert(wire_hash, now);
-        if st.queued.insert(wire_hash) {
-            st.pending.push_back(wire_hash);
+        for &wire_hash in wire_hashes {
+            if st
+                .last
+                .get(&wire_hash)
+                .is_some_and(|t| now.saturating_duration_since(*t) < self.interval)
+            {
+                continue;
+            }
+            st.last.insert(wire_hash, now);
+            if st.queued.insert(wire_hash) {
+                st.pending.push_back(wire_hash);
+            }
         }
     }
 
@@ -765,7 +768,7 @@ mod tests {
         let hub = hub(Duration::from_secs(300));
         let t0 = Instant::now();
         for i in 0..200 {
-            hub.want(h(i), t0);
+            hub.want(&[h(i)], t0);
         }
         // A burst of 5 messages (80 hashes), then nothing until credit refills.
         assert_eq!(hub.take_batch(t0).len(), 5 * LSD_HASHES_PER_MESSAGE);
@@ -789,19 +792,29 @@ mod tests {
     }
 
     #[test]
+    fn every_hash_of_a_torrent_goes_out_together_in_order() {
+        let hub = hub(Duration::from_secs(300));
+        let t0 = Instant::now();
+        hub.want(&[h(1), h(2)], t0);
+        assert_eq!(hub.take_batch(t0), vec![h(1), h(2)]);
+        hub.want(&[h(1), h(2)], t0 + Duration::from_secs(1));
+        assert!(hub.take_batch(t0 + Duration::from_secs(1)).is_empty());
+    }
+
+    #[test]
     fn a_torrent_is_announced_again_after_the_interval_only() {
         let interval = Duration::from_secs(300);
         let hub = hub(interval);
         let t0 = Instant::now();
-        hub.want(h(1), t0);
+        hub.want(&[h(1)], t0);
         assert_eq!(hub.take_batch(t0), vec![h(1)]);
         let mid = t0 + interval / 2;
-        hub.want(h(1), mid);
+        hub.want(&[h(1)], mid);
         assert!(hub.take_batch(mid).is_empty(), "within the interval");
         let later = t0 + interval + Duration::from_secs(1);
-        hub.want(h(1), later);
+        hub.want(&[h(1)], later);
         assert_eq!(hub.take_batch(later), vec![h(1)], "after the interval");
-        hub.want(h(1), later + Duration::from_secs(1));
+        hub.want(&[h(1)], later + Duration::from_secs(1));
         assert!(hub.take_batch(later + Duration::from_secs(1)).is_empty());
     }
 }

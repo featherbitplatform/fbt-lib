@@ -477,3 +477,83 @@ async fn scrape_trackers_reports_counts() {
     leech.shutdown().await;
     seed.shutdown().await;
 }
+
+/// A hybrid announces under its v1 hash and its truncated v2 hash, each
+/// with its own `started` and `stopped`, and says which in `TrackerReply`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_announces_both_hashes() {
+    use fbt_core::InfoHashes;
+    use fbt_metainfo::TorrentVersion;
+    let tracker = FakeTracker::http(Reply::Peers).await;
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(dir.path()),
+        TorrentVersion::Hybrid,
+        32_768,
+    );
+    let mut m = Metainfo::from_bytes(&bytes).unwrap();
+    m.trackers = vec![vec![tracker.url.clone()]];
+    let v1 = m.info_hashes.v1.expect("v1 hash").0;
+    let v2 = InfoHashes::from_v2(m.info_hashes.v2.expect("v2 hash")).wire_hash();
+    assert_ne!(v1, v2);
+    let s = Session::new(settings()).await.unwrap();
+    let mut ev = s.subscribe(EventMask::TRACKER);
+    let h = s
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    let mut replied = std::collections::HashSet::new();
+    while replied.len() < 2 {
+        let e = next_matching(&mut ev, |e| is_reply(e, &tracker.url), T)
+            .await
+            .expect("tracker replies");
+        if let Event::TrackerReply {
+            torrent, info_hash, ..
+        } = e
+        {
+            assert_eq!(torrent, m.info_hashes, "the registry key");
+            replied.insert(info_hash);
+        }
+    }
+    assert_eq!(replied, std::collections::HashSet::from([v1, v2]));
+    let port = s.local_addr().port();
+    let events = |hash: [u8; 20]| -> Vec<String> {
+        tracker
+            .announces()
+            .into_iter()
+            .filter(|a| a.port == port && a.info_hash == hash)
+            .map(|a| a.event)
+            .collect()
+    };
+    assert_eq!(events(v1), ["started"]);
+    assert_eq!(events(v2), ["started"]);
+    h.pause().await.unwrap();
+    assert!(
+        wait_until(|| events(v1).len() == 2 && events(v2).len() == 2, T).await,
+        "v1: {:?}, v2: {:?}",
+        events(v1),
+        events(v2)
+    );
+    assert_eq!(events(v1), ["started", "stopped"]);
+    assert_eq!(events(v2), ["started", "stopped"]);
+    s.shutdown().await;
+}
+
+/// A v1 torrent announces under its one hash: one announce per interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v1_announces_once() {
+    let tracker = FakeTracker::http(Reply::Peers).await;
+    let (m, payload) = torrent(vec![vec![tracker.url.clone()]]);
+    let (s, _h) = seeder(&m, &payload, &tracker.url).await;
+    let port = s.local_addr().port();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let announces: Vec<_> = tracker
+        .announces()
+        .into_iter()
+        .filter(|a| a.port == port)
+        .collect();
+    assert_eq!(announces.len(), 1, "{announces:?}");
+    assert_eq!(announces[0].info_hash, m.info_hashes.wire_hash());
+    assert_eq!(announces[0].event, "started");
+    s.shutdown().await;
+}
