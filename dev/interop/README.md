@@ -71,6 +71,34 @@
   is out (three progress lines in the downloading state); the seed's
   announce, sent once it has verified its data, is then the only way the
   download can learn `fbt-lsd`'s address.
+- **Resume without recheck:** Transmission stops its copy of the first
+  torrent, so qBittorrent is the only source. `fbt-example download
+  --resume /interop/fbt-resume/r.dat --stop-at 50 --no-dht` (port 6900)
+  stops once half is done: it pauses the torrent, saves its resume data to
+  `r.dat` (through a temporary file and a rename) and exits 0; its log
+  (`fbt-resume-stop.log`) must show `stop at 50%: <p>% done` with `<p>`
+  below 100. The same command without `--stop-at` then loads `r.dat`; its
+  log (`fbt-resume-again.log`) must show `resume: trusted (<n> pieces)` (the
+  CLI prints it from `TorrentStatus::resume_trusted`) and neither
+  `resume: checking` nor a progress line in the checking state; the data
+  must match and qBittorrent's `uploaded` must grow in both runs.
+- **Web seed:** a sixth trackerless torrent, `transmission-create -w
+  http://webseed/ -s 256` over its own payload (`payload6`, made unless
+  present), whose only source is its url-list: the `webseed` service
+  (nginx) serves `payload6` read-only. `fbt-example download --no-dht`
+  (port 6901, no `--peer`) must finish with matching hashes and no peer
+  connection, and nginx's access log (`logs/webseed-nginx.log`) must show
+  `206` range responses.
+- **SOCKS5 proxy:** qBittorrent is the only source again. `fbt-example
+  download --proxy socks5://socks5:1080` (port 6902, DHT on) sends its
+  tracker announce, peer connections and UDP (DHT, uTP) through the
+  `socks5` service (Dante, no authentication). It must finish with matching
+  hashes; while it runs, qBittorrent's `/api/v2/sync/torrentPeers` is
+  sampled every second and must list the `socks5` container's address and
+  never `fbt`'s; its log must show a `tracker reply
+  http://tracker:6969/announce: ...` line (the CLI prints every
+  `Event::TrackerReply`). opentracker is not consulted: its `/stats` modes
+  report counts, not peer addresses.
 
 Every `fbt-example` run passes `--dht-bootstrap dht-node:6881`. On success it
 prints `interop: download OK (qbittorrent, transmission)`,
@@ -78,9 +106,11 @@ prints `interop: download OK (qbittorrent, transmission)`,
 `interop: encryption OK (qbittorrent, transmission)`,
 `interop: magnet via DHT OK`, `interop: PEX OK`,
 `interop: uTP download OK (qbittorrent)`, `interop: uTP seed OK (qbittorrent)`,
-`interop: stream with seeks OK (qbittorrent)` and `interop: LSD OK`, and
-exits 0. It also prints how long the DHT took to
-join and the total time. CI runs it as the `interop` job (55-minute timeout).
+`interop: stream with seeks OK (qbittorrent)`, `interop: LSD OK`,
+`interop: resume without recheck OK (qbittorrent)`,
+`interop: web seed OK (nginx)` and `interop: SOCKS5 proxy OK (qbittorrent)`,
+and exits 0. It also prints how long the DHT took to
+join and the total time. CI runs it as the `interop` job (65-minute timeout).
 
 ## Layout
 
@@ -109,9 +139,11 @@ outcome.
 | `transmission` | Transmission daemon, `transmission/settings.json` | peers 51413, RPC 9091 |
 | `dht-node` | `fbt-example dht-node` (same image as `fbt`): the private DHT's bootstrap node | DHT 6881 UDP |
 | `dht-helper-1` to `dht-helper-11` | the same, bootstrapped from `dht-node:6881`; one container (and address) each | DHT 6881 UDP |
-| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe, then the stream scenario) |
+| `fbt` | `fbt-example` built from this checkout by `Dockerfile`, plus `curl`/`jq`; on `swarm` and `lan` | 6890 (download), 6891 (seed), 6892 (magnet), 6893 (encrypted download), 6894 (PEX), 6895 (encrypted seed, then uTP download), 6896 (uTP seed), 6898 (LSD download), 6899 (LSD probe, then the stream scenario), 6900 (resume), 6901 (web seed), 6902 (SOCKS5 proxy) |
 | `fbt-lsd` | the same image, idle like `fbt`; on `swarm` and `lan` | 6897 (LSD seed), 6899 (LSD probe) |
 | `fbt-mcast-route`, `fbt-lsd-mcast-route` | one-shot, in the network namespace of `fbt` / `fbt-lsd`: routes 224.0.0.0/4 out of the `lan` interface | none |
+| `socks5` | Dante (`danted`) built by `socks5/Dockerfile`, `socks5/danted.conf`: no authentication, CONNECT and UDP ASSOCIATE | SOCKS5 1080 |
+| `webseed` | nginx, `webseed/nginx.conf`: serves `target/interop/payload6` read-only, logs each request's status and `Range` | HTTP 80 |
 
 ### Multicast and LSD
 
@@ -233,7 +265,8 @@ uid/gid, so the directory stays removable. On failure it writes
 example `RUST_LOG=debug`) to raise `fbt-example`'s log level.
 
 To chase one scenario, `INTEROP_ONLY` takes a comma-separated list of
-`download`, `seed`, `encryption`, `magnet`, `pex`, `utp`, `lsd` and `stream`;
+`download`, `seed`, `encryption`, `magnet`, `pex`, `utp`, `lsd`, `stream`,
+`resume`, `webseed` and `proxy`;
 an unknown name fails at once with `interop: unknown scenario '<name>' (known:
 ...)`, before the setup. The shared setup and the uTP scenarios always run,
 the others only when named. A partial run ends with `interop: selected
@@ -256,7 +289,8 @@ reference resolves to the native image on amd64 CI runners and arm64 Macs.
 | `lscr.io/linuxserver/transmission` | `4.1.4-r0-ls368` | `sha256:fb8fe625941cf15eb69aba4e5c0a678e035ddb11605fd85af4516a4e641f2687` | Transmission upstream ships no image; LinuxServer.io's is the maintained, widely used one, tracks the current 4.1 release, honours `PUID`/`PGID` and includes `transmission-create`/`transmission-remote`; amd64 and arm64. |
 | `alpine` (opentracker) | `3.22` | `sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f` | No maintained multi-arch opentracker image exists (the common ones are amd64-only and years old), so `tracker/Dockerfile` installs Alpine's packaged `opentracker`. |
 | `rust` (builder) | `1.99-bookworm` | `sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c` | The workspace `rust-version`; has the C toolchain `ring` needs. |
-| `debian` (runtime) | `bookworm-slim` | `sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` | Same glibc as the builder; small. |
+| `debian` (runtime) | `bookworm-slim` | `sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` | Same glibc as the builder; small. Also the base of `socks5/Dockerfile`, which installs Debian's `dante-server` (Dante 1.4). |
+| `nginx` (web seed) | `1.30.6-alpine` | `sha256:583b7f2fce1cdb8da5ad5c39ebd3c33b98b87d493190e548bdee1fa8c619c311` | The official image; serves byte ranges (`206`) from static files out of the box; amd64 and arm64. |
 
 To bump an image, take the new index digest from
 `docker buildx imagetools inspect <image>:<tag>` and update `compose.yaml` or the

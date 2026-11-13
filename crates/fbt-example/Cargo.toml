@@ -22,3 +22,5 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The loopback web seed of `fbt-session`'s tests (`tests/support/web_seed.rs`).
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time"] }

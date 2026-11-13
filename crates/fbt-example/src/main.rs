@@ -4,15 +4,16 @@
 
 use std::io::{SeekFrom, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fbt::{
-    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, Magnet, MapMethod, MapProtocol,
-    Metainfo, PeerSource, Priority, RateLimit, ReadAhead, Session, SessionError, Settings,
-    TorrentHandle, TorrentState, TorrentStatus, Transport,
+    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, InfoHashes, Magnet, MapMethod,
+    MapProtocol, Metainfo, PeerSource, Priority, ProxyConfig, ProxyKind, RateLimit, ReadAhead,
+    Session, SessionError, Settings, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
+    Transport,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
@@ -63,6 +64,13 @@ struct NetArgs {
     /// Disk cache size in MiB.
     #[arg(long, value_name = "N")]
     cache_mb: Option<u64>,
+    /// Proxy for peers, web seeds and trackers:
+    /// `socks5://[user:pass@]host:port` or `http://[user:pass@]host:port`
+    /// (credentials percent-decoded). SOCKS5 also carries the DHT, uTP and
+    /// UDP trackers; an HTTP proxy cannot carry UDP, so the DHT then runs
+    /// directly unless `--no-dht` is given.
+    #[arg(long, value_name = "URL", value_parser = parse_proxy)]
+    proxy: Option<ProxyConfig>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -97,6 +105,83 @@ fn parse_rate(s: &str) -> Result<u64, String> {
     };
     let n: u64 = digits.and_then(|d| d.parse().ok()).ok_or_else(bad)?;
     n.checked_mul(mult).ok_or_else(bad)
+}
+
+/// Parses `socks5://[user:pass@]host:port` or `http://[user:pass@]host:port`
+/// (an IPv6 host in brackets; user and password percent-decoded) into a
+/// [`ProxyConfig`] that proxies peers, trackers and host names.
+fn parse_proxy(s: &str) -> Result<ProxyConfig, String> {
+    const USAGE: &str = "expected socks5://[user:pass@]host:port or http://[user:pass@]host:port";
+    let bad = |why: &str| format!("invalid proxy URL {s:?}: {why} ({USAGE})");
+    let (scheme, rest) = s.split_once("://").ok_or_else(|| bad("no scheme"))?;
+    let kind = if scheme.eq_ignore_ascii_case("socks5") {
+        ProxyKind::Socks5
+    } else if scheme.eq_ignore_ascii_case("http") {
+        ProxyKind::Http
+    } else {
+        return Err(bad("unsupported scheme"));
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    if rest.contains(['/', '?', '#']) {
+        return Err(bad("a path, query or fragment is not allowed"));
+    }
+    let (credentials, host_port) = match rest.rsplit_once('@') {
+        Some((c, hp)) => (Some(c), hp),
+        None => (None, rest),
+    };
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .ok_or_else(|| bad("missing port"))?;
+    let host = match host.strip_prefix('[') {
+        Some(h) => h
+            .strip_suffix(']')
+            .ok_or_else(|| bad("unclosed IPv6 bracket"))?,
+        None if host.contains(':') => return Err(bad("put an IPv6 host in brackets")),
+        None => host,
+    };
+    if host.is_empty() {
+        return Err(bad("missing host"));
+    }
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| bad("missing or invalid port"))?;
+    let mut config = ProxyConfig::default();
+    config.kind = kind;
+    config.host = host.to_string();
+    config.port = port;
+    if let Some(c) = credentials {
+        let (user, pass) = match c.split_once(':') {
+            Some((u, p)) => (u, Some(p)),
+            None => (c, None),
+        };
+        let user = percent_decode(user).ok_or_else(|| bad("bad percent-encoding"))?;
+        if user.is_empty() {
+            return Err(bad("empty user name"));
+        }
+        config.username = Some(user);
+        config.password = pass
+            .map(|p| percent_decode(p).ok_or_else(|| bad("bad percent-encoding")))
+            .transpose()?;
+    }
+    Ok(config)
+}
+
+/// Decodes `%XX` escapes; `None` for a broken escape or non-UTF-8 result.
+fn percent_decode(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = char::from(bytes.next()?).to_digit(16)?;
+            let lo = char::from(bytes.next()?).to_digit(16)?;
+            out.push(u8::try_from(hi * 16 + lo).ok()?);
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -146,6 +231,9 @@ impl NetArgs {
         if !self.dht_bootstrap.is_empty() {
             settings.dht_bootstrap_nodes = self.dht_bootstrap.clone();
         }
+        if let Some(proxy) = &self.proxy {
+            settings.proxy = proxy.clone();
+        }
     }
 }
 
@@ -167,6 +255,18 @@ enum Command {
         /// Extra peer to connect to; may be repeated.
         #[arg(long, value_name = "ADDR")]
         peer: Vec<SocketAddr>,
+        /// Resume data file: loaded when present (its saved pieces are
+        /// trusted when the files are unchanged), and written on exit,
+        /// after pausing the torrent, through a temporary file and a rename.
+        #[arg(long, value_name = "PATH")]
+        resume: Option<PathBuf>,
+        /// Once this much of the torrent is done: pause, save the resume
+        /// data (with `--resume`), shut down and exit 0.
+        #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        stop_at: Option<u8>,
+        /// Web seed (BEP 19) base URL; may be repeated.
+        #[arg(long, value_name = "URL")]
+        web_seed: Vec<String>,
         #[command(flatten)]
         net: NetArgs,
     },
@@ -299,6 +399,9 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             port,
             seed_for,
             peer,
+            resume,
+            stop_at,
+            web_seed,
             net,
         } => {
             let source = if torrent
@@ -309,7 +412,16 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             } else {
                 Source::File(load(std::path::Path::new(&torrent))?)
             };
-            transfer(source, out, port, seed_for, &peer, true, &net).await
+            let opts = TransferOpts {
+                port,
+                seed_for,
+                peers: peer,
+                download: true,
+                resume,
+                stop_at,
+                web_seeds: web_seed,
+            };
+            transfer(source, out, opts, &net).await
         }
         Command::Seed {
             torrent,
@@ -319,7 +431,13 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
             net,
         } => {
             let source = Source::File(load(&torrent)?);
-            transfer(source, data, port, seed_for, &[], false, &net).await
+            let opts = TransferOpts {
+                port,
+                seed_for,
+                download: false,
+                ..TransferOpts::default()
+            };
+            transfer(source, data, opts, &net).await
         }
         Command::Stream {
             torrent,
@@ -436,41 +554,131 @@ enum Source {
     Magnet(Magnet),
 }
 
-/// Runs one torrent until it finishes (plus `seed_for`), errors, or Ctrl-C.
+impl Source {
+    fn info_hashes(&self) -> InfoHashes {
+        match self {
+            Source::File(m) => m.info_hashes,
+            Source::Magnet(m) => m.info_hashes,
+        }
+    }
+}
+
+/// How `transfer` runs: `download` and `seed` differ in these.
+#[derive(Default)]
+struct TransferOpts {
+    port: Option<u16>,
+    seed_for: Option<u64>,
+    peers: Vec<SocketAddr>,
+    /// A download (exits once done) rather than a seed.
+    download: bool,
+    /// Resume data file, loaded when present and written on exit.
+    resume: Option<PathBuf>,
+    /// Stop at this percentage done.
+    stop_at: Option<u8>,
+    web_seeds: Vec<String>,
+}
+
+/// The add parameters: from the resume file when it exists (it must be for
+/// the same torrent), else fresh.
+fn add_params(source: Source, dir: PathBuf, resume: Option<&Path>) -> Result<AddTorrent, Error> {
+    if let Some(path) = resume
+        && path.exists()
+    {
+        let bytes = std::fs::read(path)?;
+        let mut params = AddTorrent::from_resume(&bytes)
+            .map_err(|e| format!("resume file {}: {e}", path.display()))?;
+        let saved = match &params.source {
+            TorrentSource::Metainfo(m) => Some(m.info_hashes),
+            TorrentSource::Magnet(m) => Some(m.info_hashes),
+            _ => None,
+        };
+        if saved != Some(source.info_hashes()) {
+            return Err(format!("resume file {} is for another torrent", path.display()).into());
+        }
+        params.save_path = dir;
+        // Saved after a pause (so its stamps hold); this run downloads.
+        params.paused = false;
+        return Ok(params);
+    }
+    Ok(match source {
+        Source::File(m) => AddTorrent::new(m, dir),
+        Source::Magnet(m) => AddTorrent::magnet(m, dir),
+    })
+}
+
+/// Writes `bytes` to `path` through a temporary file next to it and a
+/// rename, so a crash never leaves a half-written resume file.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Runs one torrent until it finishes (plus `seed_for`), reaches
+/// `stop_at`, errors, or Ctrl-C.
 async fn transfer(
     source: Source,
     dir: PathBuf,
-    port: Option<u16>,
-    seed_for: Option<u64>,
-    peers: &[SocketAddr],
-    download: bool,
+    opts: TransferOpts,
     net: &NetArgs,
 ) -> Result<ExitCode, Error> {
     let mut settings = Settings::default();
     net.apply(&mut settings);
-    if let Some(port) = port
+    if let Some(port) = opts.port
         && net.listen.is_empty()
     {
         settings.listen_addrs = vec![SocketAddr::from(([0, 0, 0, 0], port))];
     }
+    let params = add_params(source, dir, opts.resume.as_deref())?;
     let session = Session::new(settings).await?;
     println!("listening on {}", session.local_addr());
-    let mut events = session.subscribe(EventMask::STATUS | EventMask::PEER | EventMask::NAT);
-    let params = match source {
-        Source::File(m) => AddTorrent::new(m, dir),
-        Source::Magnet(m) => AddTorrent::magnet(m, dir),
-    };
+    let mut events = session
+        .subscribe(EventMask::STATUS | EventMask::PEER | EventMask::NAT | EventMask::TRACKER);
     let handle = session.add_torrent(params).await?;
-    for peer in peers {
+    for url in &opts.web_seeds {
+        handle.add_web_seed(url.clone()).await?;
+    }
+    for peer in &opts.peers {
         handle.add_peer(*peer).await?;
     }
-    let code = watch(
-        &handle,
-        &mut events,
-        seed_for.map(Duration::from_secs),
-        download,
-    )
-    .await;
+    let limits = WatchLimits {
+        seed_for: opts.seed_for.map(Duration::from_secs),
+        download: opts.download,
+        stop_at: opts.stop_at,
+    };
+    let mut code = watch(&handle, &mut events, limits).await;
+    if opts.stop_at.is_some() || opts.resume.is_some() {
+        // Nothing may be written after the save, or its stamps would not
+        // hold on the next start.
+        handle.pause().await?;
+    }
+    if let Some(path) = &opts.resume {
+        match handle.save_resume_data().await {
+            Ok(bytes) => {
+                if let Err(e) = write_atomically(path, &bytes) {
+                    eprintln!("error: writing {}: {e}", path.display());
+                    code = ExitCode::FAILURE;
+                } else {
+                    println!("resume data saved to {}", path.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("error: saving resume data: {e}");
+                code = ExitCode::FAILURE;
+            }
+        }
+    }
     session.shutdown().await;
     Ok(code)
 }
@@ -984,6 +1192,8 @@ fn print_event(handle: &TorrentHandle, event: &Event) {
             };
             println!("peer connected {addr} via {via}");
         }
+        Event::TrackerReply { url, peers, .. } => println!("tracker reply {url}: {peers} peers"),
+        Event::TrackerError { url, message, .. } => println!("tracker error {url}: {message}"),
         Event::PortMapped {
             protocol,
             method,
@@ -1007,12 +1217,40 @@ fn print_event(handle: &TorrentHandle, event: &Event) {
     }
 }
 
-async fn watch(
-    handle: &TorrentHandle,
-    events: &mut EventStream,
+/// When `watch` returns.
+struct WatchLimits {
+    /// Keep going this long after finishing (download) or at all (seed).
     seed_for: Option<Duration>,
+    /// A download: done once seeding (plus `seed_for`).
     download: bool,
-) -> ExitCode {
+    /// Return once this percentage is done (download only).
+    stop_at: Option<u8>,
+}
+
+/// Prints `resume: trusted (<n> pieces)` or `resume: checking` once the
+/// torrent added from resume data knows which; returns whether it printed.
+async fn report_resume(handle: &TorrentHandle, status: &TorrentStatus) -> bool {
+    match status.resume_trusted {
+        Some(true) => {
+            let n = handle.pieces().await.map_or(0, |p| p.count_ones());
+            eprintln!("resume: trusted ({n} pieces)");
+            true
+        }
+        Some(false) => {
+            eprintln!("resume: checking");
+            true
+        }
+        None => false,
+    }
+}
+
+async fn watch(handle: &TorrentHandle, events: &mut EventStream, limits: WatchLimits) -> ExitCode {
+    let WatchLimits {
+        seed_for,
+        download,
+        stop_at,
+    } = limits;
+    let mut resume_reported = false;
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut seeding_since: Option<Instant> = None;
@@ -1034,6 +1272,9 @@ async fn watch(
         }
         let status = handle.status();
         println!("{}", progress_line(&status));
+        if !resume_reported {
+            resume_reported = report_resume(handle, &status).await;
+        }
         if matches!(status.state, TorrentState::Error) {
             eprintln!(
                 "error: {}",
@@ -1042,6 +1283,16 @@ async fn watch(
             return ExitCode::FAILURE;
         }
         if download {
+            if let Some(percent) = stop_at
+                && matches!(
+                    status.state,
+                    TorrentState::Downloading | TorrentState::Seeding
+                )
+                && status.progress * 100.0 >= f64::from(percent)
+            {
+                println!("stop at {percent}%: {:.1}% done", status.progress * 100.0);
+                return ExitCode::SUCCESS;
+            }
             if matches!(status.state, TorrentState::Seeding) {
                 let since = *seeding_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= seed_for.unwrap_or_default() {
@@ -1060,7 +1311,7 @@ async fn watch(
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, fill_pattern, human_bytes, parse_rate, probe_lsd};
+    use super::{Cli, Command, fill_pattern, human_bytes, parse_proxy, parse_rate, probe_lsd};
 
     #[test]
     fn parse_rate_accepts_numbers_and_suffixes() {
@@ -1140,6 +1391,37 @@ mod tests {
             panic!("not bench");
         };
         assert_eq!((size, torrents, idle_secs), (8, 3, 1));
+    }
+
+    #[test]
+    fn proxy_url_fields() {
+        let p = parse_proxy("socks5://us%3Aer:p%40ss@socks5:1080").expect("socks5");
+        assert_eq!(p.kind, fbt::ProxyKind::Socks5);
+        assert_eq!((p.host.as_str(), p.port), ("socks5", 1080));
+        assert_eq!(p.username.as_deref(), Some("us:er"));
+        assert_eq!(p.password.as_deref(), Some("p@ss"));
+        assert!(p.proxy_peers && p.proxy_trackers && p.proxy_hostnames);
+
+        let p = parse_proxy("HTTP://[::1]:8080/").expect("http");
+        assert_eq!(p.kind, fbt::ProxyKind::Http);
+        assert_eq!((p.host.as_str(), p.port), ("::1", 8080));
+        assert_eq!((p.username, p.password), (None, None));
+
+        let p = parse_proxy("http://alice@proxy.test:1").expect("user only");
+        assert_eq!((p.username.as_deref(), p.password), (Some("alice"), None));
+
+        for bad in [
+            "socks5://proxy.test",
+            "socks5://proxy.test:0",
+            "socks5://:1080",
+            "socks5://@proxy.test:1080",
+            "socks5://::1:1080",
+            "socks5://[::1:1080",
+            "socks5://u:%zz@proxy.test:1080",
+            "ftp://proxy.test:21",
+        ] {
+            assert!(parse_proxy(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 
     #[test]
