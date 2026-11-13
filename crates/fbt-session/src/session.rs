@@ -370,11 +370,30 @@ pub(crate) fn release(counter: &AtomicUsize) {
     let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
 }
 
+/// The hashes a peer may name a torrent by in its handshake: the v1 hash,
+/// then the truncated v2 hash, either one when only it exists (the all-zero
+/// [`InfoHashes::wire_hash`] when neither does).
+pub(crate) fn wire_hashes(ih: &InfoHashes) -> Vec<[u8; 20]> {
+    let mut out = Vec::with_capacity(2);
+    if let Some(v1) = ih.v1 {
+        out.push(v1.0);
+    }
+    if let Some(v2) = ih.v2 {
+        out.push(InfoHashes::from_v2(v2).wire_hash());
+    }
+    if out.is_empty() {
+        out.push(ih.wire_hash());
+    }
+    out
+}
+
 /// One registered torrent.
 #[derive(Debug)]
 pub(crate) struct TorrentEntry {
     pub handle: TorrentHandle,
-    pub wire_hash: [u8; 20],
+    /// Every hash a peer may name it by (see [`wire_hashes`]), plus any
+    /// alias its metadata revealed: one or two.
+    pub wire_hashes: Vec<[u8; 20]>,
     /// Under the queue's control.
     pub auto_managed: bool,
     /// What the scheduler last told the actor: stay queued.
@@ -400,6 +419,7 @@ pub(crate) struct Registry {
     pub torrents: HashMap<InfoHashes, TorrentEntry>,
     /// Every torrent in queue order: an index is a queue position.
     pub order: Vec<InfoHashes>,
+    /// Every wire hash of every torrent (v1 and truncated v2) to its key.
     pub by_wire: HashMap<[u8; 20], InfoHashes>,
     /// `HASH('req2', wire hash)` to the wire hash (the MSE `SKEY`), kept
     /// with `by_wire`, so an MSE responder finds its torrent in one lookup.
@@ -433,8 +453,10 @@ impl SessionInner {
         let mut reg = self.registry();
         match reg.torrents.remove(ih) {
             Some(e) => {
-                reg.by_wire.remove(&e.wire_hash);
-                reg.by_req2.remove(&req2_hash(&e.wire_hash));
+                for w in &e.wire_hashes {
+                    reg.by_wire.remove(w);
+                    reg.by_req2.remove(&req2_hash(w));
+                }
                 reg.order.retain(|o| o != ih);
                 // Positions behind it moved up, and a slot may be free.
                 self.shared.queue_dirty.notify_one();
@@ -442,6 +464,27 @@ impl SessionInner {
             }
             None => false,
         }
+    }
+
+    /// Registers `wire` as one more wire hash of the torrent keyed `key`
+    /// (a hash its metadata revealed). False, with nothing changed, when
+    /// the torrent is gone, already has it, or another torrent owns it.
+    pub(crate) fn add_alias(&self, key: &InfoHashes, wire: [u8; 20]) -> bool {
+        let mut reg = self.registry();
+        let reg = &mut *reg;
+        let Some(e) = reg.torrents.get_mut(key) else {
+            return false;
+        };
+        if let Some(owner) = reg.by_wire.get(&wire) {
+            if owner != key {
+                warn!(torrent = %key, other = %owner, "revealed hash belongs to another torrent; alias skipped");
+            }
+            return false;
+        }
+        e.wire_hashes.push(wire);
+        reg.by_wire.insert(wire, *key);
+        reg.by_req2.insert(req2_hash(&wire), wire);
+        true
     }
 
     /// One scheduler pass: every torrent's queue entry from its status, the
@@ -1100,11 +1143,12 @@ impl Session {
     /// Adds a torrent and starts checking its existing data. A magnet
     /// starts in [`TorrentState::DownloadingMetadata`](crate::TorrentState)
     /// and is registered under its own info hashes, which stay its identity
-    /// after the metadata arrives.
+    /// after the metadata arrives. A torrent is found under each of its wire
+    /// hashes (v1 and truncated v2): adding one that shares any of them with
+    /// a torrent already added fails with [`SessionError::DuplicateTorrent`].
     ///
-    /// Fails with [`SessionError::V2OnlyUnsupported`] for a magnet without a
-    /// v1 info hash and with [`SessionError::InvalidPriorities`] (expecting
-    /// 0) for a magnet with file priorities.
+    /// Fails with [`SessionError::InvalidPriorities`] (expecting 0) for a
+    /// magnet with file priorities.
     pub async fn add_torrent(&self, params: AddTorrent) -> Result<TorrentHandle, SessionError> {
         let shared = &self.inner.shared;
         if shared.is_shutdown() {
@@ -1112,13 +1156,8 @@ impl Session {
         }
         let num_files = match &params.source {
             TorrentSource::Metainfo(m) => m.info.files.len(),
-            TorrentSource::Magnet(m) => {
-                if m.info_hashes.v1.is_none() {
-                    return Err(SessionError::V2OnlyUnsupported);
-                }
-                // Unknown until the metadata arrives.
-                0
-            }
+            // Unknown until the metadata arrives.
+            TorrentSource::Magnet(_) => 0,
         };
         if !params.file_priorities.is_empty() && params.file_priorities.len() != num_files {
             return Err(SessionError::InvalidPriorities {
@@ -1127,12 +1166,12 @@ impl Session {
             });
         }
         let ih = params.source.info_hashes();
-        let wire_hash = ih.wire_hash();
+        let wires = wire_hashes(&ih);
         let mut reg = self.inner.registry();
         if shared.is_shutdown() {
             return Err(SessionError::Shutdown);
         }
-        if reg.torrents.contains_key(&ih) || reg.by_wire.contains_key(&wire_hash) {
+        if reg.torrents.contains_key(&ih) || wires.iter().any(|w| reg.by_wire.contains_key(w)) {
             return Err(SessionError::DuplicateTorrent);
         }
         // The queue's first pass for it runs before its actor starts, so an
@@ -1199,14 +1238,16 @@ impl Session {
             Arc::clone(shared),
             Arc::downgrade(&self.inner),
         );
-        reg.by_wire.insert(wire_hash, ih);
-        reg.by_req2.insert(req2_hash(&wire_hash), wire_hash);
+        for w in &wires {
+            reg.by_wire.insert(*w, ih);
+            reg.by_req2.insert(req2_hash(w), *w);
+        }
         reg.order.insert(position, ih);
         reg.torrents.insert(
             ih,
             TorrentEntry {
                 handle: handle.clone(),
-                wire_hash,
+                wire_hashes: wires,
                 auto_managed,
                 queued,
                 position_sent: Some(position),
@@ -1221,12 +1262,17 @@ impl Session {
         Ok(handle)
     }
 
-    /// The torrent with these info hashes.
+    /// The torrent with these info hashes, else the one known by any of
+    /// their wire hashes (a hybrid is found by its v1 or its v2 hash alone).
     pub fn torrent(&self, ih: &InfoHashes) -> Option<TorrentHandle> {
-        self.inner
-            .registry()
-            .torrents
+        let reg = self.inner.registry();
+        reg.torrents
             .get(ih)
+            .or_else(|| {
+                wire_hashes(ih)
+                    .iter()
+                    .find_map(|w| reg.by_wire.get(w).and_then(|k| reg.torrents.get(k)))
+            })
             .map(|e| e.handle.clone())
     }
 

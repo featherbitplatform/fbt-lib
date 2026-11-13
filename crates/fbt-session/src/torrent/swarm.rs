@@ -426,6 +426,9 @@ impl Actor {
         }
         let key = self.new_key();
         let mut ctx = self.ctx(key, &addr);
+        // The hash the peer named (v1 or truncated v2: the listener found
+        // this torrent by it) is the one we answer with.
+        ctx.info_hash = hs.info_hash;
         ctx.encrypted = stream.is_encrypted();
         ctx.transport = stream.get_ref().kind();
         let transport = ctx.transport;

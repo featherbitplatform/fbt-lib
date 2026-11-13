@@ -1,6 +1,6 @@
 //! BEP 52 v2 and hybrid torrents between sessions on loopback: downloads,
 //! pieces that must pass both hashes of a hybrid, layers built from
-//! verified data, and recheck.
+//! verified data, recheck, and one torrent under each of its wire hashes.
 //!
 //! Every torrent is made by `CreateTorrent` over three files of 100 000, 0
 //! and 300 000 bytes with 32 KiB pieces: four pieces for `a` (then a pad),
@@ -13,9 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fbt_bencode::{OwnedValue, decode, encode};
-use fbt_metainfo::{Metainfo, TorrentVersion};
+use fbt_core::InfoHashes;
+use fbt_metainfo::{Magnet, Metainfo, TorrentVersion};
 use fbt_session::storage::{MemStorage, check_pieces};
-use fbt_session::{AddTorrent, Event, EventMask, Session, TorrentHandle, TorrentState};
+use fbt_session::{
+    AddTorrent, Event, EventMask, Session, SessionError, TorrentHandle, TorrentState,
+};
 use fbt_wire::Message;
 use support::*;
 
@@ -228,4 +231,83 @@ async fn recheck_verifies_v2() {
     assert_eq!(have.count_ones(), PIECES - 1);
     assert!(!have.get(C_FIRST + 4));
     s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_is_one_torrent_under_both_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::Hybrid, PIECE);
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let v1 = m.info_hashes.v1.expect("v1 hash");
+    let v2 = m.info_hashes.v2.expect("v2 hash");
+    let s = Session::new(test_settings()).await.unwrap();
+    let h = s
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    // Its `btmh`-only magnet, then its `btih`-only magnet.
+    for ih in [InfoHashes::from_v2(v2), InfoHashes::from_v1(v1)] {
+        let mg = Magnet::from_info_hashes(ih);
+        let r = s
+            .add_torrent(AddTorrent::magnet(mg, PathBuf::from("unused")))
+            .await;
+        assert!(
+            matches!(r, Err(SessionError::DuplicateTorrent)),
+            "{ih}: {r:?}"
+        );
+    }
+    assert_eq!(s.torrents().len(), 1);
+    let found = s
+        .torrent(&InfoHashes::from_v2(v2))
+        .expect("found by its v2 hash");
+    assert_eq!(found.info_hashes(), h.info_hashes());
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_handshake_reaches_a_hybrid() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::Hybrid, PIECE);
+    let (s, h) = seed(&bytes, dir.path()).await;
+    let v2 = h.info_hashes().v2.expect("v2 hash");
+    let truncated = InfoHashes::from_v2(v2).wire_hash();
+    assert_ne!(truncated, h.info_hashes().wire_hash());
+    let peer = ScriptedPeer::connect(s.local_addr(), truncated).await;
+    assert_eq!(peer.remote.info_hash, truncated);
+    assert!(peer.remote.reserved.supports_v2());
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_magnet_registers_the_revealed_v1_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::Hybrid, PIECE);
+    let (seeder, sh) = seed(&bytes, dir.path()).await;
+    let ih = sh.info_hashes();
+    let v2_only = InfoHashes::from_v2(ih.v2.expect("v2 hash"));
+    let leecher = Session::new(test_settings()).await.unwrap();
+    let mut ev = leecher.subscribe(EventMask::ALL);
+    let leech_dir = tempfile::tempdir().unwrap();
+    let mg = Magnet::from_info_hashes(v2_only);
+    let lh = leecher
+        .add_torrent(AddTorrent::magnet(mg, leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(
+        leecher
+            .torrent(&InfoHashes::from_v1(ih.v1.expect("v1")))
+            .is_none()
+    );
+    lh.add_peer(seeder.local_addr()).await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::MetadataReceived { .. }), T)
+        .await
+        .expect("MetadataReceived");
+    let v1_only = InfoHashes::from_v1(ih.v1.expect("v1 hash"));
+    assert!(
+        wait_until(|| leecher.torrent(&v1_only).is_some(), T).await,
+        "the v1 hash names the torrent"
+    );
+    assert_eq!(lh.info_hashes(), v2_only, "the key stays the magnet's");
+    leecher.shutdown().await;
+    seeder.shutdown().await;
 }

@@ -323,6 +323,8 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let mut reserved = Reserved::default();
     reserved.set_fast();
     reserved.set_extended();
+    // BEP 52: we speak v2 on every connection, as libtorrent does.
+    reserved.set_v2();
     if ctx.ext.dht_port.is_some() {
         reserved.set_dht();
     }

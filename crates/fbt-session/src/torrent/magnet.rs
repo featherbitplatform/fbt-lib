@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use fbt_core::Bitfield;
+use fbt_core::{Bitfield, InfoHashes};
 use fbt_metainfo::{Magnet, Metainfo, MetainfoError};
 use tokio::time::Instant;
 
@@ -14,6 +14,7 @@ use super::swarm::BanTarget;
 use crate::event::Event;
 use crate::peer::messages::PeerCommand;
 use crate::picker::PeerKey;
+use crate::session::wire_hashes;
 use crate::storage::{FsStorage, Storage};
 
 /// A magnet torrent until its metadata arrives.
@@ -84,6 +85,7 @@ impl Actor {
             Some(s) => s,
             None => Arc::new(FsStorage::with_paths(m.save_path, &meta, renamed)),
         };
+        self.register_revealed_hashes(&meta.info_hashes);
         let meta = Arc::new(meta);
         let mut loaded = Loaded::new(Arc::clone(&meta), file_prio, m.sequential);
         loaded.renamed = renamed.iter().cloned().collect();
@@ -126,6 +128,21 @@ impl Actor {
         self.metadata_check = true;
         self.start_check();
         self.refresh_state();
+    }
+
+    /// Registers each wire hash of the verified metadata that the magnet's
+    /// own hashes lacked (a hybrid's other hash) as an alias of this torrent,
+    /// so peers naming it reach us. Not announced.
+    fn register_revealed_hashes(&self, revealed: &InfoHashes) {
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        let known = wire_hashes(&self.ih);
+        for w in wire_hashes(revealed) {
+            if !known.contains(&w) {
+                session.add_alias(&self.ih, w);
+            }
+        }
     }
 
     /// Advances the metadata fetch's timers.

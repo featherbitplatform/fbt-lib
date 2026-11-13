@@ -41,8 +41,9 @@ pub enum SessionError {
     /// has not received yet.
     #[error("the torrent's metadata is not known yet")]
     NoMetadata,
-    /// A magnet with only a v2 (`btmh`) info hash: v2-only torrents are not
-    /// supported yet.
+    /// No longer produced: v2-only magnets are supported. Kept for
+    /// compatibility; it will be removed in a later breaking release.
+    #[deprecated(note = "no longer produced: v2 magnets are supported")]
     #[error("v2-only torrents are not supported")]
     V2OnlyUnsupported,
     /// The file index is out of range or names a pad file.
