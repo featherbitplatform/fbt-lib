@@ -1034,7 +1034,7 @@ fi
 if want api; then
 # ------------------------------------------------------------ HTTP/JSON API --
 # fbt-example download --api serves fbt-api next to its session. It is held
-# to 4 MiB/s and seeds 30 s after the finish, so the API is up while curl
+# to 2 MiB/s and seeds 30 s after the finish, so the API is up while curl
 # (in the same container) lists the torrent, streams three byte ranges of
 # beta.bin and checks 401 and 416; the event stream starts before the
 # download ends and must carry its torrent_finished.
@@ -1046,7 +1046,7 @@ api_auth="Authorization: Bearer $api_token"
 api_log=$logs/fbt-api-download.log
 fbt timeout 300 fbt-example download /interop/fixture.torrent --out /interop/fbt-api --port 6908 \
     --no-dht --dht-bootstrap "$dht_bootstrap" --api 0.0.0.0:8090 --api-token "$api_token" \
-    --download-limit 4M --seed-for 30 >"$api_log" 2>&1 &
+    --download-limit 2M --seed-for 30 >"$api_log" 2>&1 &
 api_pid=$!
 api_listening() {
     kill -0 "$api_pid" 2>/dev/null || fail "fbt-example download --api exited early (see $api_log)"
@@ -1084,10 +1084,11 @@ code=$(api_status torrents)
 [ "$code" = 401 ] || fail "GET /torrents without the token answered $code, not 401"
 code=$(api_status "$api_stream" -H "$api_auth" -H "Range: bytes=$api_beta_len-")
 [ "$code" = 416 ] || fail "a range past the end of beta.bin answered $code, not 416"
-# Still downloading once every check is done: 64 MiB at 4 MiB/s takes about
-# 16 s, the checks about 7 (measured).
-api_progress=$(api_get "torrents/$hash1" | fbt jq -r .progress)
-fbt jq -en --argjson p "$api_progress" '$p < 1' >/dev/null ||
+# Still downloading once every check is done: 64 MiB at 2 MiB/s takes about
+# 32 s, the checks about 7 (measured). A missing or non-numeric progress
+# fails too (jq orders null below every number).
+api_progress=$(api_get "torrents/$hash1" | fbt jq -c .progress)
+fbt jq -en --argjson p "$api_progress" '($p | type) == "number" and $p < 1' >/dev/null ||
     fail "the download had finished (progress $api_progress) before the API checks ended (see $api_log)"
 echo "interop: api: listed, streamed 3 ranges, 401 and 416 in $((SECONDS - api_started))s, at progress $api_progress"
 

@@ -150,7 +150,7 @@
   up by its own (`qbt_id`, `info_hash`). Both drop fbt's hybrid at the
   end.
 - **HTTP/JSON API:** `fbt-example download --api 0.0.0.0:8090 --api-token
-  <token> --download-limit 4M --seed-for 30` (port 6908) fetches the first
+  <token> --download-limit 2M --seed-for 30` (port 6908) fetches the first
   torrent and serves `fbt-api` next to its session. The limit and the 30 s
   of seeding keep the process, and so the API, up while `curl` (in the `fbt`
   container, on `127.0.0.1:8090`) drives it; a plain download would exit
@@ -164,7 +164,8 @@
   those bytes of `beta.bin` (`cmp`); a request without the token must get
   `401`, and `Range: bytes=25000000-` (past the end) `416`. After these
   checks, `GET /api/v1/torrents/<id>` must still report `progress` below 1
-  (the download takes about 16 s, the checks about 7). The download
+  (the download takes about 32 s, the checks about 7; a missing or
+  non-numeric `progress` fails). The download
   must exit 0 with matching data, and the event stream, which the API's
   shutdown ends, must hold an `event: torrent_finished` line.
 
