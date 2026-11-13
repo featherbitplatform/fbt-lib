@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use fbt::Session;
+use fbt_api::range::{RangeOutcome, parse_range};
 use fbt_api::{ApiConfig, ApiError, ApiServer, Auth, MAX_BODY_BYTES, openapi, router};
 
 const _: usize = MAX_BODY_BYTES;
@@ -17,6 +18,19 @@ fn functions() {
     let _: ApiConfig = ApiConfig::new(String::new());
     let _: ApiConfig = ApiConfig::new("token");
     let _: fn(&ApiServer) -> SocketAddr = ApiServer::local_addr;
+    let _: fn(&[u8], u64) -> RangeOutcome = parse_range;
+}
+
+fn range_variants(r: &RangeOutcome) -> bool {
+    matches!(
+        r,
+        RangeOutcome::Full
+            | RangeOutcome::Partial {
+                start: _,
+                end_inclusive: _
+            }
+            | RangeOutcome::Unsatisfiable
+    )
 }
 
 async fn server(session: Session, config: ApiConfig) -> Result<(), ApiError> {

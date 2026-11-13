@@ -28,6 +28,7 @@ mod dto;
 mod error;
 mod ids;
 mod paths;
+pub mod range;
 mod routes;
 mod server;
 

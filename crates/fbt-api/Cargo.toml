@@ -24,7 +24,7 @@ axum.workspace = true
 utoipa.workspace = true
 utoipa-axum.workspace = true
 tower-http.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 # ApiServer owns its connection tasks (a bounded shutdown); the core crates
 # never turn these server features on (dev/check-pure-rust.sh).
 hyper = { workspace = true, features = ["server", "http1"] }

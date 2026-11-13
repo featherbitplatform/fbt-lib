@@ -39,6 +39,7 @@ pub(crate) mod control;
 pub(crate) mod create;
 pub(crate) mod events;
 pub(crate) mod session;
+pub(crate) mod stream;
 pub(crate) mod torrents;
 
 /// The state every handler gets (`State<AppState>`); cheap to clone.
@@ -54,7 +55,6 @@ pub(crate) struct AppState {
     pub(crate) roots: Option<Arc<[crate::paths::Root]>>,
     /// Permits for open file streams ([`ApiConfig::max_streams`]); a
     /// stream body holds one until it is dropped.
-    #[allow(dead_code, reason = "the streaming route takes its permits")]
     pub(crate) streams: Arc<Semaphore>,
     /// Permits for open event streams ([`ApiConfig::max_event_streams`]).
     pub(crate) events: Arc<Semaphore>,
@@ -138,6 +138,7 @@ pub(crate) fn api_router() -> OpenApiRouter<AppState> {
         .merge(control::router())
         .merge(create::router())
         .merge(events::router())
+        .merge(stream::router())
         .routes(routes!(openapi_json))
 }
 
