@@ -24,7 +24,10 @@ if echo "$core" | grep -E '^(axum|tower-http|utoipa) '; then
     echo "error: fbt depends on the HTTP server stack" >&2
     exit 1
 fi
-if cargo tree -p fbt -e features -i hyper | grep -F 'hyper feature "server"'; then
+# Captured first: inside `if`, a failing `cargo tree` would read as "no
+# match" and pass; as an assignment, `set -e` stops the script instead.
+hyper_features=$(cargo tree -p fbt -e features -i hyper)
+if echo "$hyper_features" | grep -F 'hyper feature "server"'; then
     echo "error: fbt turns on hyper's server feature" >&2
     exit 1
 fi
