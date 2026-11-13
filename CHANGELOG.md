@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- BitTorrent v2 and hybrid torrents (BEP 52): `fbt-core` gains Merkle trees (`merkle` module: `MerkleTree`, `piece_root`, `layer_root`, `leaf_hashes`, `file_tree_height`, `verify_hashes`); `fbt-metainfo` parses v2-only and hybrid `.torrent` files with their piece layers (`Metainfo::version`, `TorrentVersion`, `Metainfo::v2_piece`, `V2Piece`, `Metainfo::with_piece_layers`, `validate_layer`, `MetainfoError::InconsistentHybrid`, `MAX_PIECE_LAYER_HASHES`); a hybrid is checked for consistency between its halves; `fbt-session` verifies pieces by SHA-1, by Merkle root or by both, and builds the piece layers a hybrid lacks while it downloads
+- `fbt-metainfo`: torrent creation: `CreateTorrent` (`new`, `version`, `piece_len`, `trackers`, `web_seeds`, `comment`, `created_by`, `creation_date`, `private`, `build` with a progress callback that can cancel), `CreateError`, `auto_piece_len` and `MAX_CREATE_FILES`, for v1, v2 and hybrid torrents; re-exported by `fbt`, with a creation doctest
+- `fbt-wire`: the BEP 52 messages `HashRequest`, `Hashes` and `HashReject` (`MAX_HASH_REQUEST_LEN`) and `Reserved::supports_v2` and `Reserved::set_v2`
+- `fbt-session`: a torrent is registered under every wire hash (a hybrid under both its v1 and truncated v2 hash) and a `btmh`-only (v2) magnet is accepted; `Session::torrent` also finds a torrent by any of its wire hashes
+- `fbt-session`: hash serving: a seed answers hash requests from its piece layers (Merkle trees cached, serving jobs and pending requests capped); a v2-only torrent whose `.torrent` or magnet metadata lacks piece layers fetches them from v2 peers over hash requests, verified against each file's `pieces root`
+- `fbt-session`: a hybrid torrent announces under both its info hashes: every tracker, the DHT and LSD run once per hash
+- `fbt-session`: resume data version 2 stores v2 info hashes and piece layers (see Changed)
+- `fbt-example`: `create PATH --out FILE [--format v1|v2|hybrid] [--piece-size BYTES] [--tracker URL] [--web-seed URL] [--private] [--comment TEXT]`
+- Fuzz target `hash_proof` (Merkle proof verification and hash messages), with seed corpora for the new wire messages
+- Interop scenarios `v2` and `hybrid` against qBittorrent-nox and Transmission: created torrents give the same hashes as qBittorrent's creator, v2 downloads and seeds both ways, a `btmh` magnet fetches its layers over hash requests
+
+### Changed
+
+- `SessionError::V2OnlyUnsupported` is deprecated and no longer produced: v2 (`btmh`-only) magnets are accepted, `Session::torrent()` also finds a torrent by any of its wire hashes and a hybrid is registered under both hashes
+- `MetainfoError::V2OnlyUnsupported` is deprecated and no longer produced
+- `FileEntry` gains `pieces_root` (breaking for struct literals), `Metainfo::piece_layers` is new, and `Info.pieces` is empty for a v2-only torrent
+- The v2 reserved bit is set on the handshakes of torrents that have a v2 hash, and a connection made under a truncated v2 hash counts as v2
+- A v2-only `.torrent` without piece layers starts in `DownloadingMetadata` (`has_metadata` false, `metainfo()` `None`) until its layers are fetched
+- `Event::TrackerReply` gains `info_hash`, the hash the announce was made under (breaking for struct patterns without `..`); hybrids announce under both hashes
+- `fbt_session::storage::check_pieces` has a new signature: it takes the `Metainfo` and also returns the v2 roots of the pieces that passed
+- Resume data is version 2, which older builds cannot read: `info-hash` is optional, and the new keys are `info-hash2` and `piece-layers`; version 1 is still read
+- `fbt_wire::Message` gains three variants (`HashRequest`, `Hashes`, `HashReject`); match with a wildcard arm
+- `fbt-example info` prints the wire hash (40 hex), `info hash v2:` when there is one, and `version:`
+- Created hybrids carry a tail pad, so their hashes match libtorrent 2.0 and qBittorrent 5.3 exactly
+
 ## [0.5.0] - 2026-11-13
 
 ### Added
