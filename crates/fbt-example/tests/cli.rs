@@ -322,9 +322,9 @@ fn download_from_seed_process() {
 /// number. Another test's seed can take that number in the gap, and 16 copies
 /// of this test picking ports at once is how that would show up. fbt-session's
 /// bind loop retries both sockets on a fresh port up to eight times, so what
-/// settles is what the listening line reports, which is what the leecher dials; nothing failed here. A run that lost every
-/// attempt would have no UDP socket at all and would end as a failed download,
-/// not as a flaky assertion.
+/// settles is what the listening line reports, which is what the leecher
+/// dials; nothing failed here. A run that lost every attempt would have no UDP
+/// socket at all and would end as a failed download, not as a flaky assertion.
 #[test]
 fn download_over_utp_from_seed_process() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -263,7 +263,7 @@ async fn honest_contributor_keeps_its_trust() {
         let left = end.saturating_duration_since(tokio::time::Instant::now());
         let e = next_matching(&mut l.ev, |_| true, left)
             .await
-            .expect("the torrent finishes from B");
+            .expect("a piece only B has arrives");
         assert!(!disconnected_b(&e), "B was disconnected: {e:?}");
         assert!(banned(&e).is_none_or(|a| a == l.a), "{e:?}");
         // A piece only B has passes (before the finished torrent would

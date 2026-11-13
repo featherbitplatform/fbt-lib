@@ -261,15 +261,16 @@ async fn ends_on_session_shutdown() {
 
 /// The future `router_with_shutdown` waits on ends an open event stream.
 ///
-/// Review note (0.8 deflake, not reproduced here: 100 runs at 4 copies and 100
-/// more at 72 copies with CPU load pass): this test held the shortest timing
-/// budget in the suite — 2 s for a body hyper ends only when its task is next
-/// polled, on the single-threaded runtime `#[tokio::test]` gives it. A loaded
-/// runner can delay that poll past two seconds, and because the stream was
-/// never shown to carry anything, a slow start looked exactly like the failure
-/// the test is about. The fix proves the stream is live first (the add must
-/// reach it) and then waits `T`, the suite's bounded-wait budget, which is also
-/// the 5 s floor the plan sets for timing-based waits.
+/// Review note (0.8 deflake; most likely cause of the 0.7 flake, which did
+/// not reproduce here — 100 runs at 4 copies and 100 more at 72 copies with
+/// CPU load pass): this test held the shortest timing budget in the suite —
+/// 2 s for a body hyper ends only when its task is next polled, on the
+/// single-threaded runtime `#[tokio::test]` gives it. A loaded runner can
+/// delay that poll past two seconds, and because the stream was never shown to
+/// carry anything, a slow start looked exactly like the failure the test is
+/// about. The fix proves the stream is live first (the add must reach it) and
+/// then waits `T`, the suite's bounded-wait budget, which is also the 5 s
+/// floor the plan sets for timing-based waits.
 #[tokio::test]
 async fn router_with_shutdown_ends_open_events() {
     let session = support::session().await;

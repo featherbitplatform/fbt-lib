@@ -677,7 +677,7 @@ async fn duplicate_peer_id_is_rejected() {
 /// Two sessions dialling each other at once end up with exactly one
 /// connection: both ends keep the one the lower peer id initiated.
 ///
-/// Cause of the 0.7 flake (0.8 deflake; not reproduced on this machine — 100
+/// Most likely cause of the 0.7 flake (0.8 deflake; not reproduced here — 100
 /// runs at 4 copies, each about 20 s, then 100 more at 12 copies with the
 /// machine under CPU load): the test slept a fixed 3 s and then read
 /// `status()` once. A status is a snapshot the actor publishes on its tick,
@@ -722,8 +722,8 @@ async fn simultaneous_dial_leaves_one_connection() {
 /// to us fastest and keeps its slot, while the optimistic slot rotates, so a
 /// peer that was unchoked gets a `Choke`.
 ///
-/// Cause of the 0.7 flake (0.8 deflake; the flake itself did not reproduce
-/// here — 100 runs at 4 copies and 100 more at 36 under CPU load passed, as did
+/// Most likely cause of the 0.7 flake (0.8 deflake; it did not reproduce here
+/// — 100 runs at 4 copies and 100 more at 36 under CPU load passed, as did
 /// several hundred before the change): with the default 30 s
 /// `optimistic_unchoke_interval` nothing rotated inside this test, so the only
 /// Choke it could see came from a peer that had taken a free slot between
