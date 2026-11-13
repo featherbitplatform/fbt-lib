@@ -1,15 +1,17 @@
 //! Answers to incoming queries: `ping`, `find_node`, `get_peers`,
 //! `announce_peer` (BEP 5), with `want` (BEP 32), `ip` (BEP 42), the
-//! scrape and seed flags (BEP 33) and `sample_infohashes` (BEP 51).
+//! scrape and seed flags (BEP 33), `sample_infohashes` (BEP 51) and the
+//! item queries `get` and `put` (BEP 44).
 //!
-//! Pure: the node runtime passes in its tables, tokens, peer store and the
-//! time. Every answer it builds fits in [`MAX_DATAGRAM`].
+//! Pure: the node runtime passes in its tables, tokens, peer and item
+//! stores and the time. Every answer it builds fits in [`MAX_DATAGRAM`].
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 
+use crate::items::{ItemStore, Put};
 use crate::krpc::{
     Body, ERR_METHOD_UNKNOWN, ERR_PROTOCOL, MAX_DATAGRAM, MAX_SAMPLES, MAX_VALUES, Message,
     NodeInfo, Query, QueryMsg, Response,
@@ -41,6 +43,7 @@ pub(crate) struct Server<'a> {
     pub(crate) table_v6: Option<&'a RoutingTable>,
     pub(crate) tokens: &'a Tokens,
     pub(crate) store: &'a mut PeerStore,
+    pub(crate) items: &'a mut ItemStore,
 }
 
 impl Server<'_> {
@@ -134,6 +137,59 @@ impl Server<'_> {
                 interval: Some(SAMPLE_INTERVAL_SECS),
                 ..self.nodes(family, q, target)
             }),
+            Query::Get { target, seq } => {
+                let mut r = Response {
+                    id: own,
+                    token: Some(self.tokens.issue(from.ip())),
+                    ..self.nodes(family, q, target)
+                };
+                if let Some(item) = self.items.get(&target.0, now) {
+                    match &item.signed {
+                        None => r.v = Some(item.v.clone()),
+                        // the requester has this one or a newer one: seq only
+                        Some(m) if seq.is_some_and(|s| s >= m.seq) => r.seq = Some(m.seq),
+                        Some(m) => {
+                            r.v = Some(item.v.clone());
+                            r.k = Some(m.k);
+                            r.sig = Some(m.sig);
+                            r.seq = Some(m.seq);
+                        }
+                    }
+                }
+                Body::Response(r)
+            }
+            Query::Put {
+                token,
+                v,
+                k,
+                sig,
+                seq,
+                salt,
+                cas,
+                reject,
+            } => {
+                let put = Put {
+                    v,
+                    k: k.as_ref(),
+                    sig: sig.as_ref(),
+                    seq: *seq,
+                    salt: salt.as_deref().unwrap_or_default(),
+                    cas: *cas,
+                    reject: *reject,
+                };
+                let checked = if self.tokens.verify(from.ip(), token) {
+                    self.items.put(&put, now)
+                } else {
+                    Err((ERR_PROTOCOL, "bad token"))
+                };
+                match checked {
+                    Ok(()) => Body::Response(empty(own)),
+                    Err((code, message)) => Body::Error {
+                        code,
+                        message: message.into(),
+                    },
+                }
+            }
             Query::AnnouncePeer {
                 info_hash,
                 port,
@@ -181,10 +237,12 @@ fn empty(id: crate::NodeId) -> Response {
 }
 
 /// Encodes `m`, dropping values, then `nodes6`, then `nodes` entries until
-/// the datagram fits in [`MAX_DATAGRAM`]. Filters and samples are never
-/// dropped, and no answer carries both: a scrape answer (two filters) or a
-/// sample answer (20 samples) with full node lists of both families comes
-/// to at most about 1,200 bytes.
+/// the datagram fits in [`MAX_DATAGRAM`]. Filters, samples and items are
+/// never dropped, and no answer carries two of them: a scrape answer (two
+/// filters) or a sample answer (20 samples) with full node lists of both
+/// families comes to at most about 1,200 bytes, and a `get` answer with a
+/// 1000-byte item, its key and signature to about 1,200 bytes with no
+/// nodes.
 pub(crate) fn bounded(mut m: Message) -> Vec<u8> {
     loop {
         let out = m.encode();
@@ -244,6 +302,7 @@ mod tests {
         let t6 = table(Family::V6, 200, &mut rng);
         let tokens = Tokens::new(&mut rng);
         let mut store = PeerStore::new(10, 500);
+        let mut items = ItemStore::new(10);
         let now = Instant::now();
         let ih = [5; 20];
         for k in 0..200u32 {
@@ -261,6 +320,7 @@ mod tests {
             table_v6: Some(&t6),
             tokens: &tokens,
             store: &mut store,
+            items: &mut items,
         };
         let from4: SocketAddr = "9.9.9.9:1".parse().unwrap();
         let from6: SocketAddr = "[2a01::1]:1".parse().unwrap();
@@ -339,6 +399,7 @@ mod tests {
         let t4 = table(Family::V4, 20, &mut rng);
         let tokens = Tokens::new(&mut rng);
         let mut store = PeerStore::new(2000, 10);
+        let mut items = ItemStore::new(10);
         let t0 = Instant::now();
         for k in 0..500u32 {
             let mut ih = [0u8; 20];
@@ -350,6 +411,7 @@ mod tests {
             table_v6: None,
             tokens: &tokens,
             store: &mut store,
+            items: &mut items,
         };
         let from: SocketAddr = "9.9.9.9:1".parse().unwrap();
         let mut ask = |s: &mut Server<'_>, at: Instant| {
@@ -378,17 +440,89 @@ mod tests {
     }
 
     #[test]
+    fn get_answers_fit_and_put_checks_the_token() {
+        let mut rng = StdRng::seed_from_u64(5);
+        let t4 = table(Family::V4, 200, &mut rng);
+        let t6 = table(Family::V6, 200, &mut rng);
+        let tokens = Tokens::new(&mut rng);
+        let mut store = PeerStore::new(10, 10);
+        let mut items = ItemStore::new(10);
+        let now = Instant::now();
+        let from: SocketAddr = "9.9.9.9:1".parse().unwrap();
+        // the largest mutable item: a 1000-byte value under a 64-byte salt
+        let mut v = b"996:".to_vec();
+        v.extend(std::iter::repeat_n(b'z', 996));
+        let salt = [0xa5u8; crate::krpc::MAX_SALT];
+        let (k, sig) = crate::items::sign(&[3; 32], &salt, 7, &v);
+        let target = NodeId(crate::items::mutable_target(&k, &salt));
+        let mut s = Server {
+            table_v4: Some(&t4),
+            table_v6: Some(&t6),
+            tokens: &tokens,
+            store: &mut store,
+            items: &mut items,
+        };
+        let put = |token: Vec<u8>| Query::Put {
+            token,
+            v: v.clone(),
+            k: Some(k),
+            sig: Some(sig),
+            seq: Some(7),
+            salt: Some(salt.to_vec()),
+            cas: None,
+            reject: None,
+        };
+        let want = Want { v4: true, v6: true };
+        let mut ask = |s: &mut Server<'_>, query: Query| {
+            let out = s
+                .answer(from, b"tt", &q(query, want), now, &mut rng)
+                .unwrap();
+            assert!(out.len() <= MAX_DATAGRAM, "{} bytes", out.len());
+            Message::decode(&out).unwrap().body
+        };
+        // a put without a valid token: 203, nothing stored
+        assert!(matches!(
+            ask(&mut s, put(b"12345678".to_vec())),
+            Body::Error {
+                code: ERR_PROTOCOL,
+                ..
+            }
+        ));
+        let get = |seq| Query::Get { target, seq };
+        let Body::Response(r) = ask(&mut s, get(None)) else {
+            panic!()
+        };
+        assert!(r.v.is_none() && !r.nodes.is_empty() && !r.nodes6.is_empty());
+        let token = r.token.unwrap();
+        assert!(matches!(ask(&mut s, put(token)), Body::Response(_)));
+        // the full item comes back whole; nodes make room for it
+        let Body::Response(r) = ask(&mut s, get(None)) else {
+            panic!()
+        };
+        assert_eq!(r.v.as_deref(), Some(v.as_slice()));
+        assert_eq!((r.k, r.sig, r.seq), (Some(k), Some(sig), Some(7)));
+        assert!(r.token.is_some());
+        // a requester that has seq 7 gets the seq only
+        let Body::Response(r) = ask(&mut s, get(Some(7))) else {
+            panic!()
+        };
+        assert_eq!((r.v, r.k, r.sig, r.seq), (None, None, None, Some(7)));
+    }
+
+    #[test]
     fn announce_with_port_zero_is_not_stored() {
         let mut rng = StdRng::seed_from_u64(4);
         let t4 = table(Family::V4, 0, &mut rng);
         let tokens = Tokens::new(&mut rng);
         let mut store = PeerStore::new(10, 10);
+        let mut items = ItemStore::new(10);
         let from: SocketAddr = "9.9.9.9:0".parse().unwrap();
         let mut s = Server {
             table_v4: Some(&t4),
             table_v6: None,
             tokens: &tokens,
             store: &mut store,
+            items: &mut items,
         };
         let token = tokens.issue(from.ip());
         let a = Query::AnnouncePeer {

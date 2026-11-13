@@ -1,6 +1,6 @@
 //! KRPC messages (BEP 5) with the BEP 32 (`nodes6`, `want`), BEP 33
 //! (`scrape`, `seed`, `BFsd`, `BFpe`), BEP 42 (`ip`), BEP 43 (`ro`) and
-//! BEP 51 (`sample_infohashes`) fields.
+//! BEP 51 (`sample_infohashes`) fields, and BEP 44 `get` and `put`.
 //!
 //! [`Message::decode`] parses hostile UDP datagrams: it never panics, decodes
 //! with [`KRPC_LIMITS`], and cuts every list to a named cap before allocating.
@@ -40,6 +40,14 @@ pub const MAX_SAMPLES: usize = 20;
 /// length are ignored.
 pub const BLOOM_FILTER_LEN: usize = crate::bloom::BLOOM_BYTES;
 
+/// BEP 44: longest item value (`v`, bencoded) accepted.
+pub const MAX_ITEM_VALUE: usize = 1000;
+/// BEP 44: longest salt accepted.
+pub const MAX_SALT: usize = 64;
+/// Bencode limits for an item value on its own: a `put` nests it two
+/// containers deep (`message > a > v`) within [`KRPC_LIMITS`].
+pub const ITEM_VALUE_LIMITS: Limits = Limits::new(KRPC_LIMITS.max_depth - 2, 500);
+
 /// KRPC error code: generic error.
 pub const ERR_GENERIC: i64 = 201;
 /// KRPC error code: server error.
@@ -48,6 +56,17 @@ pub const ERR_SERVER: i64 = 202;
 pub const ERR_PROTOCOL: i64 = 203;
 /// KRPC error code: method unknown.
 pub const ERR_METHOD_UNKNOWN: i64 = 204;
+/// BEP 44 error code: the value is longer than [`MAX_ITEM_VALUE`].
+pub const ERR_VALUE_TOO_BIG: i64 = 205;
+/// BEP 44 error code: the signature does not verify.
+pub const ERR_INVALID_SIGNATURE: i64 = 206;
+/// BEP 44 error code: the salt is longer than [`MAX_SALT`].
+pub const ERR_SALT_TOO_BIG: i64 = 207;
+/// BEP 44 error code: `cas` does not match the stored `seq`.
+pub const ERR_CAS_MISMATCH: i64 = 301;
+/// BEP 44 error code: `seq` is lower than the stored one (or equal, with
+/// another value).
+pub const ERR_SEQ_TOO_LOW: i64 = 302;
 
 /// A compact node entry: id + IPv4 address.
 const NODE_V4_LEN: usize = NODE_ID_LEN + COMPACT_V4_LEN;
@@ -108,6 +127,38 @@ pub enum Query {
         /// Where in the id space the answer's `nodes` should be close to.
         target: NodeId,
     },
+    /// BEP 44 `get`.
+    Get {
+        /// The item's target: SHA-1 of the value (immutable) or of the
+        /// public key and salt (mutable).
+        target: NodeId,
+        /// Only answer with the value if the stored `seq` is higher.
+        seq: Option<i64>,
+    },
+    /// BEP 44 `put`.
+    Put {
+        /// The write token from an earlier `get` answer.
+        token: Vec<u8>,
+        /// The value: one canonical bencoded value, at most
+        /// [`MAX_ITEM_VALUE`] bytes (empty when the decoder cut it, see
+        /// `reject`).
+        v: Vec<u8>,
+        /// Mutable items: the ed25519 public key.
+        k: Option<[u8; 32]>,
+        /// Mutable items: the ed25519 signature.
+        sig: Option<[u8; 64]>,
+        /// Mutable items: the sequence number.
+        seq: Option<i64>,
+        /// Mutable items: the salt, at most [`MAX_SALT`] bytes.
+        salt: Option<Vec<u8>>,
+        /// Compare-and-swap: store only if the stored `seq` equals it.
+        cas: Option<i64>,
+        /// Set by the decoder only (never encoded):
+        /// [`ERR_VALUE_TOO_BIG`] when `v` was too long and
+        /// [`ERR_SALT_TOO_BIG`] when the salt was, so the server can answer
+        /// with that code.
+        reject: Option<i64>,
+    },
     /// Any other method, by name (cut to [`MAX_METHOD_LEN`] bytes), so the
     /// server can answer [`ERR_METHOD_UNKNOWN`].
     Unknown(String),
@@ -151,6 +202,15 @@ pub struct Response {
     pub num: Option<u32>,
     /// BEP 51 `interval`: seconds before the responder's samples change.
     pub interval: Option<u32>,
+    /// BEP 44 item value (raw canonical bencode, at most
+    /// [`MAX_ITEM_VALUE`] bytes; other values are dropped).
+    pub v: Option<Vec<u8>>,
+    /// BEP 44 public key of a mutable item.
+    pub k: Option<[u8; 32]>,
+    /// BEP 44 signature of a mutable item.
+    pub sig: Option<[u8; 64]>,
+    /// BEP 44 sequence number of a mutable item.
+    pub seq: Option<i64>,
 }
 
 impl Default for Response {
@@ -167,6 +227,10 @@ impl Default for Response {
             samples: Vec::new(),
             num: None,
             interval: None,
+            v: None,
+            k: None,
+            sig: None,
+            seq: None,
         }
     }
 }
@@ -230,6 +294,75 @@ fn int(d: &Dict<'_>, key: &str) -> Option<i64> {
     d.get(key.as_bytes()).and_then(Value::as_int)
 }
 
+/// Whether `raw` is a valid item value: one bencoded value within
+/// [`ITEM_VALUE_LIMITS`], at most [`MAX_ITEM_VALUE`] bytes, in canonical
+/// form (sorted keys), so that re-encoding it gives the same bytes:
+/// signatures and targets cover them.
+pub(crate) fn is_item_value(raw: &[u8]) -> bool {
+    raw.len() <= MAX_ITEM_VALUE
+        && decode_with(raw, ITEM_VALUE_LIMITS).is_ok_and(|v| encode(&v.to_owned_value()) == raw)
+}
+
+fn canonical(v: &Value<'_>) -> Option<Vec<u8>> {
+    is_item_value(v.raw()).then(|| v.raw().to_vec())
+}
+
+/// An optional key of fixed length: absent is `None`, any other shape is
+/// malformed.
+fn fixed<const N: usize>(d: &Dict<'_>, key: &'static str) -> Result<Option<[u8; N]>, KrpcError> {
+    d.get(key.as_bytes())
+        .map(|v| {
+            v.as_bytes()
+                .and_then(|b| <[u8; N]>::try_from(b).ok())
+                .ok_or(KrpcError::Malformed(key))
+        })
+        .transpose()
+}
+
+/// An optional integer: absent is `None`, any other shape is malformed.
+fn opt_int(d: &Dict<'_>, key: &'static str) -> Result<Option<i64>, KrpcError> {
+    d.get(key.as_bytes())
+        .map(|v| v.as_int().ok_or(KrpcError::Malformed(key)))
+        .transpose()
+}
+
+fn decode_put(a: &Dict<'_>) -> Result<Query, KrpcError> {
+    let token = bytes(a, "token")?;
+    if token.len() > MAX_TOKEN_LEN {
+        return Err(KrpcError::Malformed("token"));
+    }
+    let raw_v = a.get(b"v").ok_or(KrpcError::Malformed("v"))?;
+    let mut reject = None;
+    let v = if raw_v.raw().len() > MAX_ITEM_VALUE {
+        reject = Some(ERR_VALUE_TOO_BIG);
+        Vec::new()
+    } else {
+        canonical(raw_v).ok_or(KrpcError::Malformed("v"))?
+    };
+    let salt = match a.get(b"salt") {
+        None => None,
+        Some(s) => {
+            let s = s.as_bytes().ok_or(KrpcError::Malformed("salt"))?;
+            if s.len() > MAX_SALT {
+                reject = reject.or(Some(ERR_SALT_TOO_BIG));
+                None
+            } else {
+                Some(s.to_vec())
+            }
+        }
+    };
+    Ok(Query::Put {
+        token: token.to_vec(),
+        v,
+        k: fixed::<32>(a, "k")?,
+        sig: fixed::<64>(a, "sig")?,
+        seq: opt_int(a, "seq")?,
+        salt,
+        cas: opt_int(a, "cas")?,
+        reject,
+    })
+}
+
 /// Decodes one compact address of either size; other sizes give `None`.
 fn compact_addr(b: &[u8]) -> Option<SocketAddr> {
     if let Ok(a) = <&[u8; COMPACT_V4_LEN]>::try_from(b) {
@@ -289,6 +422,11 @@ fn decode_query(top: &Dict<'_>) -> Result<QueryMsg, KrpcError> {
         b"sample_infohashes" => Query::SampleInfohashes {
             target: NodeId(hash20(a, "target")?),
         },
+        b"get" => Query::Get {
+            target: NodeId(hash20(a, "target")?),
+            seq: opt_int(a, "seq")?,
+        },
+        b"put" => decode_put(a)?,
         b"announce_peer" => {
             let info_hash = hash20(a, "info_hash")?;
             let implied_port = int(a, "implied_port").is_some_and(|v| v != 0);
@@ -387,6 +525,10 @@ fn decode_response(top: &Dict<'_>) -> Result<Response, KrpcError> {
         })
         .unwrap_or_default();
     let u32_of = |key: &str| int(r, key).and_then(|v| u32::try_from(v).ok());
+    // BEP 44 fields are optional and lenient: wrong shapes are dropped
+    let v = r.get(b"v").and_then(canonical);
+    let k = fixed::<32>(r, "k").ok().flatten();
+    let sig = fixed::<64>(r, "sig").ok().flatten();
     Ok(Response {
         id,
         nodes,
@@ -398,6 +540,10 @@ fn decode_response(top: &Dict<'_>) -> Result<Response, KrpcError> {
         samples,
         num: u32_of("num"),
         interval: u32_of("interval"),
+        v,
+        k,
+        sig,
+        seq: int(r, "seq"),
     })
 }
 
@@ -425,6 +571,15 @@ fn nodes_bytes(nodes: &[NodeInfo], v6: bool) -> Option<OwnedValue> {
         compact::encode(n.addr, &mut out);
     }
     (!out.is_empty()).then_some(OwnedValue::Bytes(out))
+}
+
+/// An item value as an owned tree. Values in a [`Message`] are canonical
+/// bencode (the decoder and the `Dht` API check it), so this re-encodes to
+/// the same bytes; anything else is sent as a byte string.
+fn raw_value(v: &[u8]) -> OwnedValue {
+    decode_with(v, ITEM_VALUE_LIMITS)
+        .map(|x| x.to_owned_value())
+        .unwrap_or_else(|_| OwnedValue::Bytes(v.to_vec()))
 }
 
 fn compact_bytes(addr: SocketAddr) -> OwnedValue {
@@ -498,6 +653,42 @@ impl Message {
                         a.insert(b"target".to_vec(), OwnedValue::Bytes(target.0.to_vec()));
                         b"sample_infohashes"
                     }
+                    Query::Get { target, seq } => {
+                        a.insert(b"target".to_vec(), OwnedValue::Bytes(target.0.to_vec()));
+                        if let Some(seq) = seq {
+                            a.insert(b"seq".to_vec(), OwnedValue::Int(*seq));
+                        }
+                        b"get"
+                    }
+                    Query::Put {
+                        token,
+                        v,
+                        k,
+                        sig,
+                        seq,
+                        salt,
+                        cas,
+                        reject: _,
+                    } => {
+                        a.insert(b"token".to_vec(), OwnedValue::Bytes(token.clone()));
+                        a.insert(b"v".to_vec(), raw_value(v));
+                        if let Some(k) = k {
+                            a.insert(b"k".to_vec(), OwnedValue::Bytes(k.to_vec()));
+                        }
+                        if let Some(sig) = sig {
+                            a.insert(b"sig".to_vec(), OwnedValue::Bytes(sig.to_vec()));
+                        }
+                        if let Some(seq) = seq {
+                            a.insert(b"seq".to_vec(), OwnedValue::Int(*seq));
+                        }
+                        if let Some(salt) = salt {
+                            a.insert(b"salt".to_vec(), OwnedValue::Bytes(salt.clone()));
+                        }
+                        if let Some(cas) = cas {
+                            a.insert(b"cas".to_vec(), OwnedValue::Int(*cas));
+                        }
+                        b"put"
+                    }
                     Query::AnnouncePeer {
                         info_hash,
                         port,
@@ -565,6 +756,18 @@ impl Message {
                 }
                 if let Some(i) = r.interval {
                     d.insert(b"interval".to_vec(), OwnedValue::Int(i64::from(i)));
+                }
+                if let Some(v) = &r.v {
+                    d.insert(b"v".to_vec(), raw_value(v));
+                }
+                if let Some(k) = &r.k {
+                    d.insert(b"k".to_vec(), OwnedValue::Bytes(k.to_vec()));
+                }
+                if let Some(sig) = &r.sig {
+                    d.insert(b"sig".to_vec(), OwnedValue::Bytes(sig.to_vec()));
+                }
+                if let Some(seq) = r.seq {
+                    d.insert(b"seq".to_vec(), OwnedValue::Int(seq));
                 }
                 top.insert(b"r".to_vec(), OwnedValue::Dict(d));
                 b"r"
@@ -1057,6 +1260,154 @@ mod tests {
             panic!()
         };
         assert!(r.bf_seeds.is_none());
+    }
+
+    #[test]
+    fn get_put_round_trip() {
+        for query in [
+            Query::Get {
+                target: NodeId([3; 20]),
+                seq: None,
+            },
+            Query::Get {
+                target: NodeId([3; 20]),
+                seq: Some(7),
+            },
+            // immutable
+            Query::Put {
+                token: b"tok".to_vec(),
+                v: b"12:Hello World!".to_vec(),
+                k: None,
+                sig: None,
+                seq: None,
+                salt: None,
+                cas: None,
+                reject: None,
+            },
+            // mutable, nested value
+            Query::Put {
+                token: b"tok".to_vec(),
+                v: b"d1:al1:bi-3ee1:cd0:0:ee".to_vec(),
+                k: Some([4; 32]),
+                sig: Some([5; 64]),
+                seq: Some(i64::MAX),
+                salt: Some(b"foobar".to_vec()),
+                cas: Some(-1),
+                reject: None,
+            },
+        ] {
+            let m = Message {
+                tid: b"aa".to_vec(),
+                ip: None,
+                version: Some(b"FB01".to_vec()),
+                body: Body::Query(QueryMsg {
+                    id: NodeId([9; 20]),
+                    query,
+                    want: Want::default(),
+                    read_only: false,
+                }),
+            };
+            assert_eq!(Message::decode(&m.encode()).unwrap(), m);
+        }
+        for r in [
+            Response {
+                id: NodeId([1; 20]),
+                token: Some(b"tok".to_vec()),
+                v: Some(b"li1ei2ee".to_vec()),
+                ..Response::default()
+            },
+            Response {
+                id: NodeId([1; 20]),
+                token: Some(b"tok".to_vec()),
+                v: Some(b"12:Hello World!".to_vec()),
+                k: Some([4; 32]),
+                sig: Some([5; 64]),
+                seq: Some(1),
+                ..Response::default()
+            },
+        ] {
+            let m = Message {
+                tid: b"aa".to_vec(),
+                ip: None,
+                version: Some(b"FB01".to_vec()),
+                body: Body::Response(r),
+            };
+            let bytes = m.encode();
+            assert_eq!(Message::decode(&bytes).unwrap(), m);
+        }
+        // BEP 44 key names on the wire; the item's `v` is the raw value,
+        // the client version stays at the top level
+        let q = b"d1:ad2:id20:abcdefghij01234567893:seqi4e6:target20:mnopqrstuvwxyz123456e1:q3:get1:t2:aa1:y1:qe";
+        assert!(matches!(
+            Message::decode(q).unwrap().body,
+            Body::Query(QueryMsg {
+                query: Query::Get { seq: Some(4), .. },
+                ..
+            })
+        ));
+        assert_eq!(Message::decode(q).unwrap().encode(), q);
+        let r = b"d1:rd2:id20:abcdefghij01234567895:token3:tok1:vli1ei2eee1:t2:aa1:v4:FB011:y1:re";
+        let m = Message::decode(r).unwrap();
+        assert_eq!(m.version.as_deref(), Some(&b"FB01"[..]));
+        assert!(
+            matches!(m.body, Body::Response(Response { v: Some(ref v), .. }) if v == b"li1ei2ee")
+        );
+        assert_eq!(m.encode(), r);
+        // hostile puts: bad key or signature lengths, non-integer seq or cas,
+        // a value that is not canonical bencode, a missing value or token
+        let put = |args: &str| {
+            format!("d1:ad2:id20:abcdefghij0123456789{args}5:token3:toke1:q3:put1:t2:aa1:y1:qe")
+                .into_bytes()
+        };
+        for (args, key) in [
+            ("1:k3:abc1:v1:x", "k"),
+            (
+                "1:k32:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3:sig3:abc1:v1:x",
+                "sig",
+            ),
+            ("3:seq1:11:v1:x", "seq"),
+            ("3:casle1:v1:x", "cas"),
+            ("4:salti1e1:v1:x", "salt"),
+            ("1:vd1:bi1e1:ai2ee", "v"),
+            ("", "v"),
+        ] {
+            assert!(
+                matches!(Message::decode(&put(args)), Err(KrpcError::Malformed(k)) if k == key),
+                "{args}"
+            );
+        }
+        assert!(matches!(
+            Message::decode(b"d1:ad2:id20:abcdefghij01234567891:vi1ee1:q3:put1:t2:aa1:y1:qe"),
+            Err(KrpcError::Malformed("token"))
+        ));
+        assert!(matches!(
+            Message::decode(b"d1:ad2:id20:abcdefghij0123456789e1:q3:get1:t2:aa1:y1:qe"),
+            Err(KrpcError::Malformed("target"))
+        ));
+        // a seq that overflows i64 is no bencode integer at all
+        assert!(matches!(
+            Message::decode(&put("3:seqi9223372036854775808e1:v1:x")),
+            Err(KrpcError::Bencode(_))
+        ));
+        // a negative seq decodes; the put rules refuse it
+        assert!(matches!(
+            Message::decode(&put("3:seqi-5e1:v1:x")).unwrap().body,
+            Body::Query(QueryMsg {
+                query: Query::Put { seq: Some(-5), .. },
+                ..
+            })
+        ));
+        // lenient responses: bad lengths and non-canonical values are dropped
+        let Body::Response(r) = Message::decode(&response_with(
+            b"1:k3:abc3:seq1:13:sig3:abc1:v",
+            b"d1:bi1e1:ai2ee",
+        ))
+        .unwrap()
+        .body
+        else {
+            panic!()
+        };
+        assert_eq!((r.k, r.sig, r.seq, r.v), (None, None, None, None));
     }
 
     proptest! {

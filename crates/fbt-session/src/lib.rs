@@ -19,7 +19,10 @@
 //! seeding torrent announces itself as a seed (BEP 33);
 //! [`Session::dht_scrape`] estimates a torrent's seeds and peers (BEP 33)
 //! and [`Session::dht_sample_infohashes`] asks one node for samples of the
-//! info hashes it stores (BEP 51).
+//! info hashes it stores (BEP 51). [`Session::dht_put_immutable`],
+//! [`Session::dht_get_immutable`], [`Session::dht_put_mutable`] and
+//! [`Session::dht_get_mutable`] store and fetch BEP 44 items
+//! ([`MutableItem`]).
 //!
 //! # Magnet links
 //!
@@ -90,7 +93,7 @@ pub use bans::BlockReason;
 pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::{SessionError, StreamError};
 pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
-pub use fbt_dht::{DhtSamples, DhtScrape, DhtStats, NodeId, NodeInfo};
+pub use fbt_dht::{DhtSamples, DhtScrape, DhtStats, MutableItem, NodeId, NodeInfo};
 pub use fbt_net::ipfilter::IpFilter;
 pub use fbt_net::proxy::{ProxyConfig, ProxyKind};
 pub use fbt_net::{MapMethod, MapProtocol};

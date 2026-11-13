@@ -449,3 +449,233 @@ async fn long_bootstrap_attempts_are_spaced_from_their_end() {
     }
     dht.shutdown().await;
 }
+
+fn sha1(b: &[u8]) -> [u8; 20] {
+    use sha1::Digest as _;
+    sha1::Sha1::digest(b).into()
+}
+
+/// The ed25519 public key of a 32-byte secret seed.
+fn ed25519_public_key(seed: [u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+        .verifying_key()
+        .to_bytes()
+}
+
+/// A swarm of `n` loopback nodes whose tables hold at least `min` nodes.
+async fn ready_swarm(n: usize, min: usize) -> Vec<Dht> {
+    let nodes = swarm(n, "127.0.0.1:0").await;
+    assert!(
+        wait_until(Duration::from_secs(10), || nodes
+            .iter()
+            .all(|d| d.stats().nodes_v4 >= min))
+        .await
+    );
+    nodes
+}
+
+/// Sends `query` from `sock` to `to` and returns the answer's body.
+async fn ask_raw(sock: &UdpSocket, to: SocketAddr, query: Query) -> Body {
+    let m = Message {
+        tid: b"bq".to_vec(),
+        ip: None,
+        version: None,
+        body: Body::Query(QueryMsg {
+            id: fbt_dht::NodeId([0x77; 20]),
+            query,
+            want: Default::default(),
+            read_only: true,
+        }),
+    };
+    sock.send_to(&m.encode(), to).await.unwrap();
+    let mut buf = [0u8; 1500];
+    let (n, _) = timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    Message::decode(&buf[..n]).unwrap().body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immutable_put_then_get() {
+    let nodes = ready_swarm(10, 5).await;
+    let value = b"d4:name5:hello4:sizei42ee".to_vec();
+    let (target, stored) = nodes[1].put_immutable(value.clone()).await.unwrap();
+    assert_eq!(target, sha1(&value));
+    assert!(stored >= 1, "stored on {stored} nodes");
+    let got = nodes[7].get_immutable(target).await.unwrap();
+    assert_eq!(got, Some(value));
+    // nobody stores this one
+    assert_eq!(nodes[7].get_immutable([0xab; 20]).await.unwrap(), None);
+    // values must be canonical bencode of at most 1000 bytes
+    for bad in [
+        b"not bencode".to_vec(),
+        b"d1:bi1e1:ai2ee".to_vec(),
+        [b"998:".as_slice(), &[b'x'; 998]].concat(),
+    ] {
+        assert!(matches!(
+            nodes[1].put_immutable(bad).await,
+            Err(DhtError::InvalidValue)
+        ));
+    }
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutable_put_then_get_highest_seq() {
+    // 9 nodes: each put reaches the K = 8 others, so after two puts from
+    // different nodes every node holds the item, and the refusals below
+    // (which BEP 44 only applies over a stored item) come from all of them
+    let nodes = ready_swarm(9, 5).await;
+    let seed = [0x21u8; 32];
+    assert!(
+        nodes[2]
+            .put_mutable(seed, Vec::new(), b"3:one".to_vec(), 1, None)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        nodes[3]
+            .put_mutable(seed, Vec::new(), b"3:two".to_vec(), 2, Some(1))
+            .await
+            .unwrap()
+            >= 1
+    );
+    let public_key = ed25519_public_key(seed);
+    assert_eq!(nodes[8].get_mutable([0; 32], b"").await.unwrap(), None);
+    // a salted item under the same key
+    assert!(
+        nodes[4]
+            .put_mutable(seed, b"foobar".to_vec(), b"i5e".to_vec(), 5, None)
+            .await
+            .unwrap()
+            >= 1
+    );
+    let salted = nodes[8]
+        .get_mutable(public_key, b"foobar")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (salted.seq, salted.value.as_slice(), salted.salt.as_slice()),
+        (5, &b"i5e"[..], &b"foobar"[..])
+    );
+    let item = nodes[8]
+        .get_mutable(public_key, b"")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((item.seq, item.value.as_slice()), (2, &b"3:two"[..]));
+    assert_eq!(item.public_key, public_key);
+    assert!(item.salt.is_empty());
+    // a lower seq is refused by every node: 302
+    assert!(matches!(
+        nodes[5]
+            .put_mutable(seed, Vec::new(), b"3:old".to_vec(), 1, None)
+            .await,
+        Err(DhtError::Remote { code: 302 })
+    ));
+    // a stale cas: 301 (node 3 holds seq 1 from node 2's put, the others
+    // seq 2: cas 0 matches neither)
+    assert!(matches!(
+        nodes[5]
+            .put_mutable(seed, Vec::new(), b"5:three".to_vec(), 3, Some(0))
+            .await,
+        Err(DhtError::Remote { code: 301 })
+    ));
+    // another salt is another item
+    assert_eq!(
+        nodes[8].get_mutable(public_key, b"other").await.unwrap(),
+        None
+    );
+    // invalid arguments never leave the node
+    assert!(matches!(
+        nodes[5]
+            .put_mutable(seed, vec![0; 65], b"i1e".to_vec(), 9, None)
+            .await,
+        Err(DhtError::InvalidValue)
+    ));
+    assert!(matches!(
+        nodes[5]
+            .put_mutable(seed, Vec::new(), b"i1e".to_vec(), -1, None)
+            .await,
+        Err(DhtError::InvalidValue)
+    ));
+    let item = nodes[0]
+        .get_mutable(public_key, b"")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.seq, 2);
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_signature_is_refused() {
+    let nodes = ready_swarm(4, 3).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let to = nodes[0].local_addrs()[0];
+    let seed = [0x42u8; 32];
+    let key = ed25519_public_key(seed);
+    let Body::Response(r) = ask_raw(
+        &sock,
+        to,
+        Query::Get {
+            target: fbt_dht::NodeId(sha1(&key)),
+            seq: None,
+        },
+    )
+    .await
+    else {
+        panic!("no answer to get")
+    };
+    let token = r.token.expect("get answers carry a write token");
+    let put = Query::Put {
+        token,
+        v: b"6:forged".to_vec(),
+        k: Some(key),
+        sig: Some([0x11; 64]),
+        seq: Some(1),
+        salt: None,
+        cas: None,
+        reject: None,
+    };
+    assert!(matches!(
+        ask_raw(&sock, to, put).await,
+        Body::Error { code: 206, .. }
+    ));
+    for n in &nodes[1..] {
+        assert_eq!(n.get_mutable(key, b"").await.unwrap(), None);
+    }
+    shutdown(&nodes).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_without_a_token_is_refused() {
+    let nodes = ready_swarm(4, 3).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let to = nodes[0].local_addrs()[0];
+    for token in [Vec::new(), b"12345678".to_vec()] {
+        let put = Query::Put {
+            token,
+            v: b"5:hello".to_vec(),
+            k: None,
+            sig: None,
+            seq: None,
+            salt: None,
+            cas: None,
+            reject: None,
+        };
+        assert!(matches!(
+            ask_raw(&sock, to, put).await,
+            Body::Error { code: 203, .. }
+        ));
+    }
+    // nothing was stored
+    assert_eq!(
+        nodes[1].get_immutable(sha1(b"5:hello")).await.unwrap(),
+        None
+    );
+    shutdown(&nodes).await;
+}

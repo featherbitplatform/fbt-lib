@@ -101,6 +101,11 @@
 //! [`Session::dht_sample_infohashes`] asks one node for samples of the info
 //! hashes it stores ([`DhtSamples`], BEP 51).
 //!
+//! The DHT also stores small items (BEP 44, values of at most 1000 bencoded
+//! bytes): [`Session::dht_put_immutable`] and [`Session::dht_get_immutable`]
+//! by the value's SHA-1, [`Session::dht_put_mutable`] and
+//! [`Session::dht_get_mutable`] signed with an ed25519 key ([`MutableItem`]).
+//!
 //! Private torrents use neither the DHT nor PEX.
 //!
 //! # Transports
@@ -279,10 +284,10 @@ pub use fbt_session::{
     AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtSamples,
     DhtScrape, DhtStats, DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream,
     ExternalIpSource, FileReader, IpFilter, ListenError, MAX_METADATA_SIZE, MapMethod, MapProtocol,
-    MixedMode, MoveMode, NodeId, NodeInfo, PeerClassLimits, PeerSource, Priority, ProxyConfig,
-    ProxyKind, QueueSettings, RateLimit, ReadAhead, RemoveMode, ResumeError, SeedChokingAlgorithm,
-    Session, SessionError, SessionState, Settings, StorageError, StreamError, TorrentHandle,
-    TorrentSource, TorrentState, TorrentStatus, Transport,
+    MixedMode, MoveMode, MutableItem, NodeId, NodeInfo, PeerClassLimits, PeerSource, Priority,
+    ProxyConfig, ProxyKind, QueueSettings, RateLimit, ReadAhead, RemoveMode, ResumeError,
+    SeedChokingAlgorithm, Session, SessionError, SessionState, Settings, StorageError, StreamError,
+    TorrentHandle, TorrentSource, TorrentState, TorrentStatus, Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

@@ -38,6 +38,9 @@ rc4 = "0.2"
 crypto-bigint = { version = "0.7", default-features = false }
 tempfile = "3"
 sha2 = "0.11"
+# BEP 44 mutable items: ed25519 signatures. 3.0.0 has no `std` feature;
+# `fast` (precomputed tables) and `zeroize` (secret keys wiped on drop) only.
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 rand = "0.10"
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }

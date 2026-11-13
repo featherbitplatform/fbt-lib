@@ -308,4 +308,18 @@ async fn dht_methods(s: &Session, addr: std::net::SocketAddr) {
         let _: (fbt::NodeId, std::net::SocketAddr) = (id, addr);
         let _: [u8; 20] = id.0;
     }
+    // BEP 44 items
+    let r: Result<Option<Vec<u8>>, SessionError> = s.dht_get_immutable([0; 20]).await;
+    let _ = r;
+    let r: Result<([u8; 20], usize), SessionError> = s.dht_put_immutable(b"i1e".to_vec()).await;
+    let _ = r;
+    let r: Result<Option<fbt::MutableItem>, SessionError> = s.dht_get_mutable([0; 32], b"").await;
+    if let Ok(Some(item)) = r {
+        let _: ([u8; 32], &Vec<u8>, i64, &Vec<u8>) =
+            (item.public_key, &item.salt, item.seq, &item.value);
+    }
+    let r: Result<usize, SessionError> = s
+        .dht_put_mutable([0; 32], Vec::new(), b"i1e".to_vec(), 1, Some(0))
+        .await;
+    let _ = r;
 }

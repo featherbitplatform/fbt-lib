@@ -10,6 +10,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::bloom::BloomFilter;
 use crate::id::{NodeId, is_local};
+use crate::items::{self, Found, ItemWant};
 use crate::krpc::{NodeInfo, Query, Response};
 use crate::node::{Link, QueryError};
 use crate::table::{Family, K, dialable};
@@ -238,7 +239,7 @@ impl Lookup {
 }
 
 /// What a lookup is for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum Goal {
     /// `find_node`: fills the routing table (bootstrap, refresh).
     FindNode,
@@ -249,6 +250,40 @@ pub(crate) enum Goal {
     Announce(Option<u16>, bool),
     /// BEP 33 `get_peers` with `scrape`: the closest answers' filters.
     Scrape,
+    /// BEP 44 `get` (with `seq`): the best item that is `want`ed (the
+    /// first immutable one, the mutable one of the highest `seq`), and
+    /// the closest responders' write tokens.
+    Get { want: ItemWant, seq: Option<i64> },
+}
+
+/// What a finished lookup found.
+#[derive(Debug, Default)]
+pub(crate) struct Outcome {
+    /// The union of the `K` closest answers' BEP 33 filters (empty unless
+    /// the goal is [`Goal::Scrape`]).
+    pub(crate) filters: Filters,
+    /// The best checked item (only for [`Goal::Get`]).
+    pub(crate) item: Option<Found>,
+    /// The `K` closest responders that gave a write token, closest first.
+    pub(crate) responders: Vec<(NodeInfo, Vec<u8>)>,
+}
+
+impl Outcome {
+    fn of(lookup: &Lookup, item: Option<Found>) -> Outcome {
+        Outcome {
+            filters: lookup.filters(),
+            item,
+            responders: lookup.responders(),
+        }
+    }
+}
+
+/// Keeps the better of two items: a higher `seq` wins, the first otherwise.
+fn better(best: Option<Found>, new: Found) -> Option<Found> {
+    match best {
+        Some(b) if b.seq >= new.seq => Some(b),
+        _ => Some(new),
+    }
 }
 
 /// Keeps `nodes` of `family` that can be dialed; a non-local responder
@@ -279,8 +314,7 @@ fn peers_from(responder: SocketAddr, values: &[SocketAddr]) -> Vec<SocketAddr> {
 
 /// Runs one lookup on `family` towards `target` from `seeds`. Peers found
 /// go to `peers` (de-duplicated across batches). Returns when done, with
-/// the union of the `K` closest answers' BEP 33 filters (empty unless
-/// `goal` is [`Goal::Scrape`]).
+/// what it found.
 pub(crate) async fn run(
     link: Link,
     family: Family,
@@ -289,10 +323,11 @@ pub(crate) async fn run(
     seeds: Vec<NodeInfo>,
     goal: Goal,
     peers: Option<mpsc::Sender<Vec<SocketAddr>>>,
-) -> Filters {
+) -> Outcome {
     let mut lookup = Lookup::new(target, seeds);
     let mut seen: HashSet<SocketAddr> = HashSet::new();
-    let query = match goal {
+    let mut item: Option<Found> = None;
+    let query = match &goal {
         Goal::FindNode => Query::FindNode { target },
         Goal::GetPeers | Goal::Announce(..) => Query::GetPeers {
             info_hash: target.0,
@@ -302,6 +337,7 @@ pub(crate) async fn run(
             info_hash: target.0,
             scrape: true,
         },
+        Goal::Get { seq, .. } => Query::Get { target, seq: *seq },
     };
     let mut set: JoinSet<(NodeInfo, Result<Response, QueryError>)> = JoinSet::new();
     loop {
@@ -338,19 +374,25 @@ pub(crate) async fn run(
                     && let Some(tx) = &peers
                     && tx.send(fresh).await.is_err()
                 {
-                    return lookup.filters();
+                    return Outcome::of(&lookup, item);
+                }
+                if let Goal::Get { want, .. } = &goal
+                    && let Some(found) = items::accept(want, &target.0, &r)
+                {
+                    item = better(item, found);
                 }
                 lookup.on_response(&n.id, &usable(n.addr, family, own, nodes), r.token);
-                if let Goal::Scrape = goal {
+                if let Goal::Scrape = &goal {
                     lookup.on_filters(&n.id, r.bf_seeds, r.bf_peers);
                 }
             }
-            Err(QueryError::Shutdown) => return lookup.filters(),
+            Err(QueryError::Shutdown) => return Outcome::of(&lookup, item),
             Err(QueryError::Busy) => lookup.on_busy(&n.id),
             Err(_) => lookup.on_failure(&n.id),
         }
     }
-    if let Goal::Announce(port, seed) = goal {
+    if let Goal::Announce(port, seed) = &goal {
+        let (port, seed) = (*port, *seed);
         let mut set = JoinSet::new();
         for (n, token) in lookup.responders() {
             let link = link.clone();
@@ -365,7 +407,7 @@ pub(crate) async fn run(
         }
         while set.join_next().await.is_some() {}
     }
-    lookup.filters()
+    Outcome::of(&lookup, item)
 }
 
 /// Peers found by [`crate::Dht::get_peers`] or [`crate::Dht::announce`],
@@ -392,7 +434,7 @@ impl PeerLookup {
                     v.own,
                     target,
                     v.closest,
-                    goal,
+                    goal.clone(),
                     Some(tx.clone()),
                 ));
             }

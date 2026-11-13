@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_core::{InfoHashes, PeerId};
-use fbt_dht::{Dht, DhtConfig, DhtError, DhtSamples, DhtScrape, DhtState, DhtStats, NodeId};
+use fbt_dht::{
+    Dht, DhtConfig, DhtError, DhtSamples, DhtScrape, DhtState, DhtStats, MutableItem, NodeId,
+};
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::PortMapper;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
@@ -888,6 +890,74 @@ impl Session {
     ) -> Result<DhtSamples, SessionError> {
         let dht = self.dht()?;
         dht.sample_infohashes(node, NodeId(target))
+            .await
+            .map_err(dht_error)
+    }
+
+    /// BEP 44: the immutable item stored in the DHT under `target` (the
+    /// SHA-1 of its bencoded value), or `None` when no node close to it has
+    /// it.
+    ///
+    /// Fails with [`SessionError::DhtDisabled`] with the DHT off,
+    /// [`SessionError::Dht`] while the DHT knows no node yet, and
+    /// [`SessionError::Shutdown`] once the session has shut down.
+    pub async fn dht_get_immutable(
+        &self,
+        target: [u8; 20],
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        let dht = self.dht()?;
+        dht.get_immutable(target).await.map_err(dht_error)
+    }
+
+    /// BEP 44: stores `value` (one canonical bencoded value of at most 1000
+    /// bytes) in the DHT as an immutable item, on the nodes closest to its
+    /// target. Returns the target (the SHA-1 of `value`) and the number of
+    /// nodes that stored it. Items live about 2 hours on a node: put them
+    /// again to keep them.
+    ///
+    /// Fails like [`dht_get_immutable`](Self::dht_get_immutable), and with
+    /// [`SessionError::Dht`] for an invalid value.
+    pub async fn dht_put_immutable(
+        &self,
+        value: Vec<u8>,
+    ) -> Result<([u8; 20], usize), SessionError> {
+        let dht = self.dht()?;
+        dht.put_immutable(value).await.map_err(dht_error)
+    }
+
+    /// BEP 44: the mutable item of `public_key` and `salt` (empty for none)
+    /// with the highest sequence number whose signature verifies, or `None`
+    /// when no node close to it has one.
+    ///
+    /// Fails like [`dht_get_immutable`](Self::dht_get_immutable).
+    pub async fn dht_get_mutable(
+        &self,
+        public_key: [u8; 32],
+        salt: &[u8],
+    ) -> Result<Option<MutableItem>, SessionError> {
+        let dht = self.dht()?;
+        dht.get_mutable(public_key, salt).await.map_err(dht_error)
+    }
+
+    /// BEP 44: signs `value` with the ed25519 key of `secret_seed` (never
+    /// sent) under `salt` and `seq`, and stores it in the DHT as a mutable
+    /// item. With `cas`, nodes replace only an item of exactly that `seq`.
+    /// Returns the number of nodes that stored it.
+    ///
+    /// Fails like [`dht_put_immutable`](Self::dht_put_immutable); also with
+    /// [`SessionError::Dht`] for a salt over 64 bytes or a negative `seq`,
+    /// and when every node refused it (`seq` not above theirs, or `cas`
+    /// mismatch).
+    pub async fn dht_put_mutable(
+        &self,
+        secret_seed: [u8; 32],
+        salt: Vec<u8>,
+        value: Vec<u8>,
+        seq: i64,
+        cas: Option<i64>,
+    ) -> Result<usize, SessionError> {
+        let dht = self.dht()?;
+        dht.put_mutable(secret_seed, salt, value, seq, cas)
             .await
             .map_err(dht_error)
     }

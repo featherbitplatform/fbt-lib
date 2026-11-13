@@ -545,6 +545,7 @@ dependencies = [
 name = "fbt-dht"
 version = "0.4.0"
 dependencies = [
+ "ed25519-dalek",
  "fbt-bencode",
  "fbt-core",
  "proptest",
@@ -605,6 +606,7 @@ version = "0.4.0"
 dependencies = [
  "bitflags",
  "bytes",
+ "ed25519-dalek",
  "fbt-bencode",
  "fbt-core",
  "fbt-dht",
