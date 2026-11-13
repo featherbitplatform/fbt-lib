@@ -89,6 +89,8 @@ async fn get_torrent(
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
         (status = 409, description = "No metadata yet (`no_metadata`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn get_files(
@@ -110,6 +112,8 @@ async fn get_files(
         (status = 400, description = "Malformed id (`invalid_id`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn get_peers(
@@ -131,6 +135,8 @@ async fn get_peers(
         (status = 400, description = "Malformed id (`invalid_id`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn get_trackers(
@@ -152,6 +158,8 @@ async fn get_trackers(
         (status = 400, description = "Malformed id (`invalid_id`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn get_pieces(
@@ -176,6 +184,8 @@ async fn get_pieces(
         (status = 400, description = "Malformed id (`invalid_id`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn get_resume_data(

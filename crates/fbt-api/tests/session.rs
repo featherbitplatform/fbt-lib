@@ -201,6 +201,42 @@ async fn create_torrent_endpoint() {
 }
 
 #[tokio::test]
+async fn create_counts_empty_tiers_against_the_url_cap() {
+    let (_session, server, base, _) = api().await;
+    let dir = two_files();
+    let path = dir.path().join("pack").to_str().unwrap().to_owned();
+    let url = format!("{base}/api/v1/create-torrent");
+    let empty_tiers: Vec<Vec<String>> = vec![Vec::new(); 257];
+    let one_tier_of_blanks = vec![vec![String::new(); 257]];
+    for trackers in [empty_tiers, one_tier_of_blanks] {
+        let (status, _, body) = send_json(
+            Method::POST,
+            &url,
+            Some(TOKEN),
+            &j!({"path": path, "trackers": trackers}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(error_code(&body), "invalid_request");
+    }
+    // 200 empty tiers and 57 web seeds: one past the cap together.
+    let (status, _, body) = send_json(
+        Method::POST,
+        &url,
+        Some(TOKEN),
+        &j!({
+            "path": path,
+            "trackers": vec![Vec::<String>::new(); 200],
+            "web_seeds": vec!["http://127.0.0.1:1/"; 57],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(error_code(&body), "invalid_request");
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn create_outside_roots_is_403() {
     let allowed = tempfile::tempdir().expect("tempdir");
     let allowed_path = allowed.path().to_path_buf();

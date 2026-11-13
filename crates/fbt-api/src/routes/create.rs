@@ -20,8 +20,9 @@ use crate::routes::AppState;
 
 /// Torrent creations running at once; beyond that, `503 busy`.
 pub(crate) const MAX_CONCURRENT_CREATES: usize = 2;
-/// Most tracker URLs (all tiers together) and web seeds in one request.
-const MAX_CREATE_URLS: usize = 256;
+/// Most tracker URLs (all tiers together, an empty tier counting as one)
+/// and web seeds in one request.
+pub(crate) const MAX_CREATE_URLS: usize = 256;
 /// Longest comment, in bytes.
 const MAX_COMMENT_BYTES: usize = 64 * 1024;
 
@@ -56,6 +57,7 @@ impl Drop for CancelOnDrop {
         (status = 403, description = "The source is outside `allowed_roots` (`path_not_allowed`).", body = ErrorBody),
         (status = 404, description = "The source does not exist (`not_found`).", body = ErrorBody),
         (status = 409, description = "A file changed while it was hashed (`busy`).", body = ErrorBody),
+        (status = 500, description = "Reading the source failed (`internal`).", body = ErrorBody),
         (status = 503, description = "Two creations already run (`busy`), or the session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
@@ -63,16 +65,20 @@ async fn create_torrent(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<CreateTorrentRequest>,
 ) -> Result<Response, ApiErrorResponse> {
-    let urls = body
+    let trackers: Option<Vec<Vec<String>>> = body
         .trackers
+        .map(|tiers| tiers.0.into_iter().map(|tier| tier.0).collect());
+    let web_seeds = body.web_seeds.map(|w| w.0);
+    // An empty tier counts as a URL, so `[[],[],...]` is capped too.
+    let urls = trackers
         .iter()
         .flatten()
-        .map(Vec::len)
-        .chain(body.web_seeds.iter().map(Vec::len))
+        .map(|tier| tier.len().max(1))
+        .chain(web_seeds.iter().map(Vec::len))
         .fold(0usize, usize::saturating_add);
     if urls > MAX_CREATE_URLS {
         return Err(ApiErrorResponse::invalid_request(format!(
-            "at most {MAX_CREATE_URLS} tracker and web seed URLs are accepted"
+            "at most {MAX_CREATE_URLS} tracker URLs (an empty tier counting as one) and web seeds are accepted"
         )));
     }
     if body
@@ -99,10 +105,10 @@ async fn create_torrent(
     if let Some(len) = body.piece_length {
         creator = creator.piece_len(len);
     }
-    if let Some(trackers) = body.trackers {
+    if let Some(trackers) = trackers {
         creator = creator.trackers(trackers);
     }
-    if let Some(web_seeds) = body.web_seeds {
+    if let Some(web_seeds) = web_seeds {
         creator = creator.web_seeds(web_seeds);
     }
     if let Some(comment) = body.comment {

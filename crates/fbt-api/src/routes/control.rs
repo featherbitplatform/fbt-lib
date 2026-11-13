@@ -17,6 +17,11 @@ use crate::paths::check_path;
 use crate::routes::AppState;
 use crate::routes::torrents::lookup;
 
+/// Most priorities one `PUT .../file-priorities` takes: the bencode item
+/// cap of a `.torrent` (`MAX_TORRENT_ITEMS` in `fbt-metainfo`), which no
+/// torrent's file count reaches. More get `400 invalid_request`.
+pub(crate) const MAX_FILE_PRIORITIES: usize = 4_194_304;
+
 /// The control routes. `POST /torrents` and `DELETE /torrents/{id}` share
 /// their paths with read routes; axum merges the methods.
 pub(crate) fn router() -> OpenApiRouter<AppState> {
@@ -92,6 +97,7 @@ fn flags(
         (status = 403, description = "Save path outside the allowed roots (`path_not_allowed`).", body = ErrorBody),
         (status = 409, description = "Already in the session (`duplicate_torrent`).", body = ErrorBody),
         (status = 413, description = "Body over the limit (`body_too_large`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
         (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
@@ -149,6 +155,7 @@ async fn add_torrent(
         (status = 403, description = "Save path outside the allowed roots (`path_not_allowed`).", body = ErrorBody),
         (status = 409, description = "Already in the session (`duplicate_torrent`).", body = ErrorBody),
         (status = 413, description = "Body over the limit (`body_too_large`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
         (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
@@ -176,6 +183,8 @@ async fn add_resume(
         (status = 400, description = "Malformed id or query (`invalid_id`, `invalid_request`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn remove_torrent(
@@ -203,6 +212,8 @@ async fn remove_torrent(
         (status = 400, description = "Malformed id (`invalid_id`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn pause(
@@ -225,6 +236,8 @@ async fn pause(
         (status = 400, description = "Malformed id (`invalid_id`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn resume(
@@ -247,6 +260,8 @@ async fn resume(
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
         (status = 409, description = "No metadata yet (`no_metadata`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn recheck(
@@ -268,6 +283,8 @@ async fn recheck(
         (status = 400, description = "Malformed id (`invalid_id`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn reannounce(
@@ -289,6 +306,8 @@ async fn reannounce(
         (status = 400, description = "Malformed id (`invalid_id`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn scrape(
@@ -308,10 +327,12 @@ async fn scrape(
     request_body = FilePrioritiesRequest,
     responses(
         (status = 204, description = "The priorities apply."),
-        (status = 400, description = "Malformed id or body (`invalid_id`, `invalid_request`), or not one priority per file (`invalid_priorities`).", body = ErrorBody),
+        (status = 400, description = "Malformed id or body, or more than 4 194 304 priorities (`invalid_id`, `invalid_request`), or not one priority per file (`invalid_priorities`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
         (status = 409, description = "No metadata yet (`no_metadata`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn set_file_priorities(
@@ -320,7 +341,7 @@ async fn set_file_priorities(
     ApiJson(body): ApiJson<FilePrioritiesRequest>,
 ) -> Result<StatusCode, ApiErrorResponse> {
     let handle = lookup(&state, &id)?;
-    let priorities = body.priorities.into_iter().map(Into::into).collect();
+    let priorities = body.priorities.0.into_iter().map(Into::into).collect();
     handle.set_file_priorities(priorities).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -337,6 +358,8 @@ async fn set_file_priorities(
         (status = 400, description = "Malformed id or body (`invalid_id`, `invalid_request`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn set_limits(
@@ -361,6 +384,8 @@ async fn set_limits(
         (status = 400, description = "Malformed id or body (`invalid_id`, `invalid_request`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn set_queue_position(
@@ -386,6 +411,8 @@ async fn set_queue_position(
         (status = 400, description = "Malformed id or body (`invalid_id`, `invalid_request`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn set_auto_managed(
@@ -413,6 +440,8 @@ async fn set_auto_managed(
         (status = 403, description = "Target outside the allowed roots (`path_not_allowed`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
         (status = 409, description = "A target file exists (`already_exists`) or too many waiting commands (`busy`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn move_storage(
@@ -439,6 +468,8 @@ async fn move_storage(
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent or file (`not_found`).", body = ErrorBody),
         (status = 409, description = "No metadata yet (`no_metadata`), the torrent is checking (`busy`) or the target exists (`already_exists`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn rename_file(
@@ -465,6 +496,8 @@ async fn rename_file(
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
         (status = 409, description = "The torrent has 16 web seeds (`busy`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn add_web_seed(
@@ -487,6 +520,8 @@ async fn add_web_seed(
         (status = 400, description = "Malformed id or query (`invalid_id`, `invalid_request`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn remove_web_seed(
@@ -510,6 +545,8 @@ async fn remove_web_seed(
         (status = 400, description = "Malformed id, body or address (`invalid_id`, `invalid_request`).", body = ErrorBody),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
         (status = 404, description = "Unknown torrent (`not_found`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
+        (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]
 async fn add_peer(

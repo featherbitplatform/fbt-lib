@@ -231,6 +231,32 @@ async fn wrong_priority_count_is_400() {
 }
 
 #[tokio::test]
+async fn too_many_priorities_is_400() {
+    let (_session, _server, base, _) = api().await;
+    let p = payload();
+    let id = add_seeding(&base, &p).await;
+    // One past `MAX_FILE_PRIORITIES` (4 194 304), well under the body limit.
+    let mut body = String::from("{\"priorities\":[");
+    for i in 0..4_194_305 {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str("\"low\"");
+    }
+    body.push_str("]}");
+    let (status, _, body) = send_body(
+        Method::PUT,
+        &format!("{base}/api/v1/torrents/{id}/file-priorities"),
+        Some(TOKEN),
+        Some("application/json"),
+        body.into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "invalid_request");
+}
+
+#[tokio::test]
 async fn limits_and_queue() {
     let (_session, _server, base, _) = api().await;
     let p = payload();
@@ -573,6 +599,49 @@ async fn malformed_json_is_400() {
     let (status, res) = add_file(&base, b"d", &format!("{query}&paused=maybe")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&res), "invalid_request");
+}
+
+/// Every operation on a torrent that calls into the session lists `503
+/// shutting_down` and `500 internal`; only the reads served from the
+/// handle (status, magnet, a stream's HEAD) do not.
+#[test]
+fn actor_routes_document_503_and_500() {
+    let doc = serde_json::to_value(fbt_api::openapi()).expect("document");
+    let paths = doc["paths"].as_object().expect("paths");
+    let local = [
+        ("/api/v1/torrents/{id}", "get"),
+        ("/api/v1/torrents/{id}/magnet", "get"),
+        ("/api/v1/torrents/{id}/files/{index}/stream", "head"),
+    ];
+    let mut checked = 0;
+    for (path, item) in paths {
+        if !path.contains("{id}") {
+            continue;
+        }
+        for (method, op) in item.as_object().expect("path item") {
+            if local.contains(&(path.as_str(), method.as_str())) {
+                continue;
+            }
+            let responses = &op["responses"];
+            let unavailable = responses["503"]["description"].as_str().unwrap_or("");
+            assert!(
+                unavailable.contains("shutting_down"),
+                "{method} {path} lists no 503 shutting_down"
+            );
+            assert!(responses["500"].is_object(), "{method} {path} lists no 500");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 21, "{checked} operations checked");
+    for (path, method) in [
+        ("/api/v1/torrents", "post"),
+        ("/api/v1/torrents/resume", "post"),
+        ("/api/v1/session/state", "get"),
+    ] {
+        let responses = &doc["paths"][path][method]["responses"];
+        assert!(responses["503"].is_object(), "{method} {path}");
+        assert!(responses["500"].is_object(), "{method} {path}");
+    }
 }
 
 #[test]

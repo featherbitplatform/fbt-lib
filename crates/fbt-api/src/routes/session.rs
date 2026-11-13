@@ -105,6 +105,7 @@ async fn set_queue(
     responses(
         (status = 200, description = "The filter's rules.", body = IpFilterDto),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
+        (status = 500, description = "The filter could not be read (`internal`).", body = ErrorBody),
     ),
 )]
 async fn get_ip_filter(
@@ -172,6 +173,7 @@ async fn banned_peers(State(state): State<AppState>) -> Json<Vec<String>> {
     responses(
         (status = 200, description = "The bencoded session state.", content_type = "application/octet-stream", body = Vec<u8>),
         (status = 401, description = "No valid token (`unauthorized`).", body = ErrorBody),
+        (status = 500, description = "An internal failure, such as a storage error (`internal`).", body = ErrorBody),
         (status = 503, description = "The session is shutting down (`shutting_down`).", body = ErrorBody),
     ),
 )]

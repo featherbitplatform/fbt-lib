@@ -9,6 +9,8 @@
 //! `#[utoipa::path]` (`body = ...`) lands in the document's
 //! `components.schemas` on its own.
 
+use std::fmt;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
@@ -18,10 +20,50 @@ use fbt::{
     MapMethod, MapProtocol, MoveMode, PeerSource, PeerStatus, Priority, QueueSettings, Session,
     TorrentHandle, TorrentState, TorrentStatus, TorrentVersion, TrackerStatus, Transport,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::ids::hex;
+use crate::routes::control::MAX_FILE_PRIORITIES;
+use crate::routes::create::MAX_CREATE_URLS;
+
+/// A JSON array of at most `N` items. A longer one is refused while it is
+/// parsed, after item `N + 1`, so a request cannot inflate a run of tiny
+/// items (`[[],[],...]`) into a large allocation before a handler counts
+/// them.
+#[derive(Debug)]
+pub(crate) struct Capped<T, const N: usize>(pub(crate) Vec<T>);
+
+impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Capped<T, N> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Collects up to `N` items.
+        struct CappedVisitor<T, const N: usize>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>, const N: usize> Visitor<'de> for CappedVisitor<T, N> {
+            type Value = Capped<T, N>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "an array of at most {N} items")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // The hint comes from the client: never trust it past `N`.
+                let hint = seq.size_hint().unwrap_or(0).min(N).min(1024);
+                let mut items = Vec::with_capacity(hint);
+                while let Some(item) = seq.next_element()? {
+                    if items.len() == N {
+                        return Err(A::Error::invalid_length(N.saturating_add(1), &self));
+                    }
+                    items.push(item);
+                }
+                Ok(Capped(items))
+            }
+        }
+
+        deserializer.deserialize_seq(CappedVisitor(PhantomData))
+    }
+}
 
 /// The body of every error response.
 #[derive(Debug, Serialize, ToSchema)]
@@ -522,8 +564,10 @@ pub(crate) struct RemoveOptions {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FilePrioritiesRequest {
-    /// One priority per file, pad files included, in file order.
-    pub(crate) priorities: Vec<PriorityDto>,
+    /// One priority per file, pad files included, in file order; at most
+    /// 4 194 304.
+    #[schema(value_type = Vec<PriorityDto>)]
+    pub(crate) priorities: Capped<PriorityDto, MAX_FILE_PRIORITIES>,
 }
 
 /// `PUT /api/v1/torrents/{id}/limits`.
@@ -810,10 +854,13 @@ pub(crate) struct CreateTorrentRequest {
     /// The piece length in bytes: a power of two of at least 16 KiB
     /// (default: automatic).
     pub(crate) piece_length: Option<u32>,
-    /// Announce tiers.
-    pub(crate) trackers: Option<Vec<Vec<String>>>,
+    /// Announce tiers. Tiers (an empty one counts as one URL), their URLs
+    /// and the web seeds together are at most 256.
+    #[schema(value_type = Option<Vec<Vec<String>>>)]
+    pub(crate) trackers: Option<Capped<Capped<String, MAX_CREATE_URLS>, MAX_CREATE_URLS>>,
     /// BEP 19 web seed URLs.
-    pub(crate) web_seeds: Option<Vec<String>>,
+    #[schema(value_type = Option<Vec<String>>)]
+    pub(crate) web_seeds: Option<Capped<String, MAX_CREATE_URLS>>,
     /// A free-form comment.
     pub(crate) comment: Option<String>,
     /// The BEP 27 private flag.
@@ -1358,5 +1405,198 @@ impl From<&Event> for EventDto {
                 debug: format!("{other:?}"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `EventDto` of every variant, in declaration order.
+    fn every_event() -> Vec<EventDto> {
+        vec![
+            EventDto::TorrentAdded {
+                torrent: String::new(),
+            },
+            EventDto::TorrentRemoved {
+                torrent: String::new(),
+            },
+            EventDto::StateChanged {
+                torrent: String::new(),
+                state: "",
+                checking_progress: None,
+            },
+            EventDto::PieceFinished {
+                torrent: String::new(),
+                piece: 0,
+            },
+            EventDto::HashFailed {
+                torrent: String::new(),
+                piece: 0,
+            },
+            EventDto::MetadataReceived {
+                torrent: String::new(),
+            },
+            EventDto::TorrentFinished {
+                torrent: String::new(),
+            },
+            EventDto::SeedLimitReached {
+                torrent: String::new(),
+            },
+            EventDto::TrackerReply {
+                torrent: String::new(),
+                info_hash: String::new(),
+                url: String::new(),
+                peers: 0,
+            },
+            EventDto::TrackerError {
+                torrent: String::new(),
+                url: String::new(),
+                message: String::new(),
+            },
+            EventDto::ScrapeReply {
+                torrent: String::new(),
+                url: String::new(),
+                complete: 0,
+                incomplete: 0,
+                downloaded: 0,
+            },
+            EventDto::ScrapeFailed {
+                torrent: String::new(),
+                url: String::new(),
+                message: String::new(),
+            },
+            EventDto::WebSeedError {
+                torrent: String::new(),
+                url: String::new(),
+                message: String::new(),
+                retired: false,
+            },
+            EventDto::PeersFound {
+                torrent: String::new(),
+                source: "",
+                count: 0,
+            },
+            EventDto::DhtBootstrapped { nodes: 0 },
+            EventDto::PeerConnected {
+                torrent: String::new(),
+                addr: String::new(),
+                transport: "",
+                encrypted: false,
+            },
+            EventDto::PeerDisconnected {
+                torrent: String::new(),
+                addr: String::new(),
+                reason: "",
+                detail: None,
+            },
+            EventDto::PeerBlocked {
+                torrent: None,
+                addr: String::new(),
+                reason: "",
+            },
+            EventDto::FileError {
+                torrent: String::new(),
+                path: None,
+                message: String::new(),
+            },
+            EventDto::StorageMoved {
+                torrent: String::new(),
+                path: String::new(),
+            },
+            EventDto::StorageMoveFailed {
+                torrent: String::new(),
+                message: String::new(),
+            },
+            EventDto::FileRenamed {
+                torrent: String::new(),
+                index: 0,
+                path: String::new(),
+            },
+            EventDto::FileRenameFailed {
+                torrent: String::new(),
+                index: 0,
+                message: String::new(),
+            },
+            EventDto::PortMapped {
+                protocol: "",
+                method: "",
+                external: String::new(),
+            },
+            EventDto::PortMappingFailed {
+                protocol: "",
+                method: "",
+                message: String::new(),
+            },
+            EventDto::ExternalIpChanged {
+                ip: String::new(),
+                source: "",
+            },
+            EventDto::ProxyError {
+                message: String::new(),
+            },
+            EventDto::Lagged { missed: 0 },
+            EventDto::Other {
+                debug: String::new(),
+            },
+        ]
+    }
+
+    /// The declaration position of `e`'s variant; no wildcard, so a new
+    /// variant fails to compile here until [`every_event`] lists it.
+    fn ordinal(e: &EventDto) -> usize {
+        match e {
+            EventDto::TorrentAdded { .. } => 0,
+            EventDto::TorrentRemoved { .. } => 1,
+            EventDto::StateChanged { .. } => 2,
+            EventDto::PieceFinished { .. } => 3,
+            EventDto::HashFailed { .. } => 4,
+            EventDto::MetadataReceived { .. } => 5,
+            EventDto::TorrentFinished { .. } => 6,
+            EventDto::SeedLimitReached { .. } => 7,
+            EventDto::TrackerReply { .. } => 8,
+            EventDto::TrackerError { .. } => 9,
+            EventDto::ScrapeReply { .. } => 10,
+            EventDto::ScrapeFailed { .. } => 11,
+            EventDto::WebSeedError { .. } => 12,
+            EventDto::PeersFound { .. } => 13,
+            EventDto::DhtBootstrapped { .. } => 14,
+            EventDto::PeerConnected { .. } => 15,
+            EventDto::PeerDisconnected { .. } => 16,
+            EventDto::PeerBlocked { .. } => 17,
+            EventDto::FileError { .. } => 18,
+            EventDto::StorageMoved { .. } => 19,
+            EventDto::StorageMoveFailed { .. } => 20,
+            EventDto::FileRenamed { .. } => 21,
+            EventDto::FileRenameFailed { .. } => 22,
+            EventDto::PortMapped { .. } => 23,
+            EventDto::PortMappingFailed { .. } => 24,
+            EventDto::ExternalIpChanged { .. } => 25,
+            EventDto::ProxyError { .. } => 26,
+            EventDto::Lagged { .. } => 27,
+            EventDto::Other { .. } => 28,
+        }
+    }
+
+    #[test]
+    fn event_kind_is_the_serde_type_for_every_variant() {
+        let events = every_event();
+        let ordinals: Vec<usize> = events.iter().map(ordinal).collect();
+        assert_eq!(ordinals, (0..29).collect::<Vec<_>>());
+        for event in &events {
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["type"], event.kind(), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn capped_refuses_one_past_the_cap() {
+        let ok: Capped<u8, 3> = serde_json::from_str("[1,2,3]").unwrap();
+        assert_eq!(ok.0, [1, 2, 3]);
+        let empty: Capped<u8, 3> = serde_json::from_str("[]").unwrap();
+        assert!(empty.0.is_empty());
+        let err = serde_json::from_str::<Capped<u8, 3>>("[1,2,3,4]").unwrap_err();
+        assert!(err.to_string().contains("at most 3"), "{err}");
+        assert!(serde_json::from_str::<Capped<u8, 3>>("null").is_err());
     }
 }

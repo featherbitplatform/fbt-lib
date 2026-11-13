@@ -330,3 +330,33 @@ async fn unknown_path_and_wrong_method_need_token() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(error_code(&body), "unauthorized");
 }
+
+/// Every route in the OpenAPI document but the document itself answers
+/// `401` without a token, whatever its method: a route merged outside the
+/// auth layer fails here.
+#[tokio::test]
+async fn every_documented_route_needs_the_token() {
+    let (_session, server, base, _token) = api().await;
+    let doc = serde_json::to_value(fbt_api::openapi()).expect("document");
+    let paths = doc["paths"].as_object().expect("paths");
+    let mut checked = 0;
+    for (path, item) in paths {
+        let concrete = path
+            .replace("{id}", &"ab".repeat(20))
+            .replace("{index}", "0");
+        for method in item.as_object().expect("path item").keys() {
+            if path == "/api/v1/openapi.json" {
+                continue;
+            }
+            let method = Method::from_bytes(method.to_uppercase().as_bytes()).expect("method");
+            let req = request(method.clone(), &format!("{base}{concrete}"), None)
+                .body(empty())
+                .expect("request builds");
+            let (status, _, _) = send(req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 30, "{checked} operations checked");
+    server.shutdown().await;
+}
