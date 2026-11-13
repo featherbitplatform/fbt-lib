@@ -99,9 +99,10 @@ impl Actor {
             Cmd::AddPeer(addr, tx) => {
                 if !self.refuse_blocked(addr)
                     && !self.retries.is_never(&addr)
-                    && self.remember(addr)
+                    && self.remember(addr, PeerSource::Manual)
                 {
-                    self.queue_addr(addr);
+                    let source = self.known_source(&addr);
+                    self.queue_addr(addr, source);
                     self.try_connect();
                 }
                 let _ = tx.send(());
@@ -255,6 +256,16 @@ impl Actor {
             }
             Cmd::Files(tx) => {
                 let _ = tx.send(self.file_statuses());
+            }
+            Cmd::Peers(tx) => {
+                let now = Instant::now();
+                let peers = self
+                    .peers
+                    .values()
+                    .filter(|p| p.live())
+                    .map(|p| p.status(now))
+                    .collect();
+                let _ = tx.send(peers);
             }
             Cmd::Trackers(tx) => {
                 let now = Instant::now();

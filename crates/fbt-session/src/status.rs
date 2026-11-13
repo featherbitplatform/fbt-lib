@@ -1,10 +1,13 @@
 //! Plain-data torrent status snapshots.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use fbt_core::InfoHashes;
 
+use crate::event::PeerSource;
+use crate::peer::Transport;
 use crate::session::Priority;
 
 /// What a torrent is doing.
@@ -175,6 +178,47 @@ pub struct FileStatus {
     pub priority: Priority,
     /// Bytes of the file inside verified pieces.
     pub downloaded: u64,
+}
+
+/// One connected peer of a torrent, from
+/// [`TorrentHandle::peers`](crate::TorrentHandle::peers).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PeerStatus {
+    /// Its address: the one we dialled, or the remote end of an incoming
+    /// connection.
+    pub addr: SocketAddr,
+    /// Its client: the BEP 10 handshake's `v`, else decoded from an
+    /// Azureus-style peer id. Peer input: control characters removed, at
+    /// most 64 characters.
+    pub client: Option<String>,
+    /// The transport the connection runs over.
+    pub transport: Transport,
+    /// The connection is RC4-encrypted (MSE).
+    pub encrypted: bool,
+    /// The peer connected to us.
+    pub incoming: bool,
+    /// Payload bytes per second from it, over the last few seconds.
+    pub download_rate: u64,
+    /// Payload bytes per second to it, over the last few seconds.
+    pub upload_rate: u64,
+    /// Payload bytes received from it on this connection.
+    pub total_downloaded: u64,
+    /// Payload bytes sent to it on this connection.
+    pub total_uploaded: u64,
+    /// It chokes us.
+    pub peer_choking: bool,
+    /// It is interested in our pieces.
+    pub peer_interested: bool,
+    /// We choke it.
+    pub am_choking: bool,
+    /// We are interested in its pieces.
+    pub am_interested: bool,
+    /// The share of the torrent's pieces it has, from 0.0 to 1.0 (0.0
+    /// before the metadata).
+    pub progress: f64,
+    /// Where we learnt of it.
+    pub source: PeerSource,
 }
 
 /// One tracker of a torrent under one announced hash, from

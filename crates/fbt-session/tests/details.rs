@@ -1,5 +1,5 @@
-//! Detail calls: a torrent's files and trackers, and the session's limit
-//! and queue getters.
+//! Detail calls: a torrent's files, peers and trackers, and the session's
+//! limit and queue getters.
 
 mod support;
 
@@ -10,8 +10,8 @@ use std::time::Duration;
 use fbt_core::{InfoHashV1, InfoHashes};
 use fbt_metainfo::{Magnet, Metainfo, TorrentVersion};
 use fbt_session::{
-    AddTorrent, Event, EventMask, PeerClassLimits, QueueSettings, RateLimit, Session, SessionError,
-    Settings, TorrentState,
+    AddTorrent, Event, EventMask, PeerClassLimits, PeerSource, PeerStatus, QueueSettings,
+    RateLimit, Session, SessionError, Settings, TorrentHandle, TorrentState, Transport,
 };
 use support::*;
 
@@ -85,6 +85,88 @@ async fn files_without_metadata() {
     let r = h.files().await;
     assert!(matches!(r, Err(SessionError::NoMetadata)), "{r:?}");
     session.shutdown().await;
+}
+
+/// Polls `h.peers()` until `pred` holds for the list; returns that list.
+async fn wait_peers(
+    h: &TorrentHandle,
+    pred: impl Fn(&[PeerStatus]) -> bool,
+) -> Option<Vec<PeerStatus>> {
+    let deadline = tokio::time::Instant::now() + T;
+    loop {
+        let peers = h.peers().await.unwrap();
+        if pred(&peers) {
+            return Some(peers);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_report_the_seed() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    // Upload-limited, so the leech is still downloading when it looks.
+    let (m, payload) = make_torrent(&[("a", 1024 * 1024 + 4096)], 32_768);
+    write_payload(seed_dir.path(), &m, &payload);
+    let mut seed_settings = settings();
+    seed_settings.rate_limit_local_peers = true;
+    seed_settings.rate_limit = RateLimit::new(0, 64 * 1024);
+    let seeder = Session::new(seed_settings).await.unwrap();
+    let sh = seeder
+        .add_torrent(AddTorrent::new(m.clone(), seed_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&sh, |s| *s == TorrentState::Seeding, T).await);
+    let leecher = Session::new(dial_tcp(settings())).await.unwrap();
+    let mut ev = leecher.subscribe(EventMask::ALL);
+    let lh = leecher
+        .add_torrent(AddTorrent::new(m.clone(), leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&lh, |s| *s == TorrentState::Downloading, T).await);
+    assert!(lh.peers().await.unwrap().is_empty());
+
+    let seed_addr = seeder.local_addr();
+    lh.add_peer(seed_addr).await.unwrap();
+    let peers = wait_peers(&lh, |ps| {
+        ps.iter()
+            .any(|p| p.addr == seed_addr && p.total_downloaded > 0)
+    })
+    .await
+    .expect("the seed listed with payload from it");
+    let st = lh.status();
+    assert_eq!(
+        st.state,
+        TorrentState::Downloading,
+        "snapshot before the finish"
+    );
+    let p = peers.iter().find(|p| p.addr == seed_addr).unwrap();
+    assert_eq!(p.source, PeerSource::Manual);
+    assert_eq!(p.transport, Transport::Tcp);
+    assert!(!p.incoming);
+    assert!(p.am_interested);
+    assert!((p.progress - 1.0).abs() < f64::EPSILON, "{p:?}");
+    assert!(p.client.is_some(), "{p:?}");
+
+    let seen = wait_peers(&sh, |ps| !ps.is_empty())
+        .await
+        .expect("the leech listed by the seed");
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].incoming, "{seen:?}");
+    assert_eq!(seen[0].source, PeerSource::Incoming);
+
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    wait_peers(&lh, |ps| ps.iter().all(|p| p.addr != seed_addr))
+        .await
+        .expect("the seed closed after the finish");
+    leecher.shutdown().await;
+    seeder.shutdown().await;
 }
 
 fn is_reply(e: &Event, url: &str) -> bool {

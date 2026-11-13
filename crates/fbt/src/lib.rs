@@ -472,10 +472,10 @@ pub use fbt_session::{
     EventStream, ExternalIpSource, FileReader, FileStatus, IpFilter, ListenError,
     MAX_IP_FILTER_RANGES, MAX_METADATA_SIZE, MAX_RESUME_BYTES, MAX_RESUME_ITEMS, MAX_RESUME_PEERS,
     MAX_SESSION_TORRENTS, MapMethod, MapProtocol, MixedMode, MoveMode, MutableItem, NodeId,
-    NodeInfo, PeerClassLimits, PeerSource, Priority, ProxyConfig, ProxyError, ProxyKind,
-    QueueSettings, RateLimit, ReadAhead, RemoveMode, ResumeError, SeedChokingAlgorithm, Session,
-    SessionError, SessionState, Settings, StorageError, StreamError, TorrentHandle, TorrentSource,
-    TorrentState, TorrentStatus, TrackerStatus, Transport,
+    NodeInfo, PeerClassLimits, PeerSource, PeerStatus, Priority, ProxyConfig, ProxyError,
+    ProxyKind, QueueSettings, RateLimit, ReadAhead, RemoveMode, ResumeError, SeedChokingAlgorithm,
+    Session, SessionError, SessionState, Settings, StorageError, StreamError, TorrentHandle,
+    TorrentSource, TorrentState, TorrentStatus, TrackerStatus, Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

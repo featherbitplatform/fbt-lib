@@ -11,7 +11,7 @@ use fbt::{
     SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
     TrackerConfig, TrackerError, Transport,
 };
-use fbt::{BlockReason, FileStatus, IpFilter, MoveMode, QueueSettings, TrackerStatus};
+use fbt::{BlockReason, FileStatus, IpFilter, MoveMode, PeerStatus, QueueSettings, TrackerStatus};
 use fbt::{
     CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
     PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
@@ -68,6 +68,7 @@ fn names(
     _: Option<V2Piece>,
     _: Option<TorrentStatus>,
     _: Option<FileStatus>,
+    _: Option<PeerStatus>,
     _: Option<TrackerStatus>,
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
@@ -407,6 +408,32 @@ async fn detail_methods(s: &Session, h: &TorrentHandle) {
                 (f.index, f.path, f.len, f.pad, f.priority, f.downloaded);
         }
     }
+    let r: Result<Vec<PeerStatus>, SessionError> = h.peers().await;
+    if let Ok(peers) = r {
+        for p in peers {
+            let _: (std::net::SocketAddr, Option<String>, Transport, bool, bool) =
+                (p.addr, p.client, p.transport, p.encrypted, p.incoming);
+            let _: (u64, u64, u64, u64) = (
+                p.download_rate,
+                p.upload_rate,
+                p.total_downloaded,
+                p.total_uploaded,
+            );
+            let _: (bool, bool, bool, bool) = (
+                p.peer_choking,
+                p.peer_interested,
+                p.am_choking,
+                p.am_interested,
+            );
+            let _: (f64, PeerSource) = (p.progress, p.source);
+        }
+    }
+    let _ = [
+        PeerSource::Incoming,
+        PeerSource::Manual,
+        PeerSource::Resume,
+        PeerSource::Holepunch,
+    ];
     let r: Result<Vec<TrackerStatus>, SessionError> = h.trackers().await;
     if let Ok(trackers) = r {
         for t in trackers {

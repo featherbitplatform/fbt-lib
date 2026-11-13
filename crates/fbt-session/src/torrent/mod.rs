@@ -61,7 +61,7 @@ use crate::error::{SessionError, StreamError};
 use crate::event::PeerSource;
 use crate::peer::conn::PeerStream;
 use crate::session::{AddTorrent, Priority, RemoveMode, SessionInner, Shared, TorrentSource};
-use crate::status::{FileStatus, TorrentState, TorrentStatus, TrackerStatus};
+use crate::status::{FileStatus, PeerStatus, TorrentState, TorrentStatus, TrackerStatus};
 use crate::storage::{MoveMode, Storage};
 use crate::stream::reader::ReaderLink;
 use crate::stream::{FileReader, ReadAhead};
@@ -158,6 +158,8 @@ pub(crate) enum Cmd {
     WebSeeds(oneshot::Sender<Vec<String>>),
     /// Every file with its progress.
     Files(oneshot::Sender<Result<Vec<FileStatus>, SessionError>>),
+    /// Every connected peer.
+    Peers(oneshot::Sender<Vec<PeerStatus>>),
     /// What each (tracker, hash) last answered.
     Trackers(oneshot::Sender<Vec<TrackerStatus>>),
 }
@@ -576,6 +578,16 @@ impl TorrentHandle {
     /// with [`SessionError::NoMetadata`] before a magnet's metadata.
     pub async fn files(&self) -> Result<Vec<FileStatus>, SessionError> {
         self.call(Cmd::Files).await?
+    }
+
+    /// The torrent's connected peers (handshake done, not closed), in no
+    /// particular order: address, client, transport, choke and interest
+    /// state, rates, this connection's payload totals, the share of the
+    /// pieces it has, and where we learnt of it. Connections still being
+    /// dialled and web seeds are not listed. The client name is peer input,
+    /// with control characters removed and at most 64 characters.
+    pub async fn peers(&self) -> Result<Vec<PeerStatus>, SessionError> {
+        self.call(Cmd::Peers).await
     }
 
     /// The torrent's trackers, one entry per (tracker, announced hash): a

@@ -15,7 +15,7 @@ use super::actor::{Actor, Phase};
 use super::peer::Peer;
 use super::retries::AfterFailure;
 use crate::bans::BlockReason;
-use crate::event::Event;
+use crate::event::{Event, PeerSource};
 use crate::peer::DisconnectReason;
 use crate::peer::conn::{PeerCtx, PeerStream, spawn_incoming, spawn_outgoing};
 use crate::peer::ext::ExtConfig;
@@ -143,16 +143,29 @@ impl Actor {
         if !self.connectable() {
             return;
         }
-        let known: Vec<SocketAddr> = self.known.iter().copied().collect();
-        for addr in known {
-            self.queue_addr(addr);
+        let known: Vec<(SocketAddr, PeerSource)> = self
+            .known
+            .iter()
+            .filter_map(|a| self.known.get(a).map(|k| (*a, k.source)))
+            .collect();
+        for (addr, source) in known {
+            self.queue_addr(addr, source);
         }
     }
 
-    /// Queues `addr` for connecting unless it is ourselves, waiting for a
+    /// Where `addr` was learnt from, for redialling it: its known source.
+    /// Every dialled address is known first except a relay's BEP 55
+    /// introduction, so an address not known is a holepunch one.
+    pub(super) fn known_source(&self, addr: &SocketAddr) -> PeerSource {
+        self.known
+            .get(addr)
+            .map_or(PeerSource::Holepunch, |k| k.source)
+    }
+
+    /// Queues `addr`, learnt from `source`, for connecting unless it is ourselves, waiting for a
     /// retry, already connected, already queued, or blocked by the session
     /// (silently: where it came from reported that).
-    pub(super) fn queue_addr(&mut self, addr: SocketAddr) {
+    pub(super) fn queue_addr(&mut self, addr: SocketAddr, source: PeerSource) {
         if self.retries.is_never(&addr)
             || self.retries.is_pending(&addr)
             || self.shared.blocked(addr).is_some()
@@ -163,8 +176,8 @@ impl Actor {
         if self.upload_only_sent && self.seed_addrs.contains(&addr) {
             return;
         }
-        if !self.addr_busy(&addr) && !self.candidates.contains(&addr) {
-            self.candidates.push_back(addr);
+        if !self.addr_busy(&addr) && !self.candidates.iter().any(|(a, _)| *a == addr) {
+            self.candidates.push_back((addr, source));
         }
     }
 
@@ -177,15 +190,17 @@ impl Actor {
 
     /// Remembers `addr` for connecting; when the table is full, the oldest
     /// address that is neither connected nor waiting for a retry is
-    /// forgotten (and unqueued). Returns whether it is known now.
-    pub(super) fn remember(&mut self, addr: SocketAddr) -> bool {
+    /// forgotten (and unqueued). `source` is where it was learnt from (an
+    /// address known already keeps its first source). Returns whether it is
+    /// known now.
+    pub(super) fn remember(&mut self, addr: SocketAddr, source: PeerSource) -> bool {
         let peers = &self.peers;
         let retries = &self.retries;
-        let (known, evicted) = self.known.remember(addr, |a| {
+        let (known, evicted) = self.known.remember(addr, source, |a| {
             retries.is_pending(a) || peers.values().any(|p| p.addr == *a && p.tx.is_some())
         });
         if let Some(old) = evicted {
-            self.candidates.retain(|a| *a != old);
+            self.candidates.retain(|(a, _)| *a != old);
         }
         known
     }
@@ -196,7 +211,8 @@ impl Actor {
             return;
         }
         for addr in self.retries.due(Instant::now()) {
-            self.queue_addr(addr);
+            let source = self.known_source(&addr);
+            self.queue_addr(addr, source);
         }
     }
 
@@ -224,7 +240,12 @@ impl Actor {
     }
 
     /// Dials `addr` over `transport` in slots already reserved.
-    fn spawn_dial(&mut self, addr: SocketAddr, transport: Transport) -> PeerKey {
+    fn spawn_dial(
+        &mut self,
+        addr: SocketAddr,
+        transport: Transport,
+        source: PeerSource,
+    ) -> PeerKey {
         let utp = match transport {
             Transport::Utp => self.shared.utp_for(&addr).cloned(),
             Transport::Tcp => None,
@@ -234,7 +255,7 @@ impl Actor {
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();
         let tx = spawn_outgoing(addr, ctx, self.mse_provide(&addr), transport, utp);
-        let mut peer = Peer::new(addr, tx, self.generation, num_pieces, transport);
+        let mut peer = Peer::new(addr, tx, self.generation, num_pieces, transport, source);
         peer.outgoing = true;
         peer.connecting = true;
         peer.have_sent = Some(have);
@@ -248,7 +269,7 @@ impl Actor {
             if !self.reserve_dial() {
                 break;
             }
-            let Some(addr) = self.candidates.pop_front() else {
+            let Some((addr, source)) = self.candidates.pop_front() else {
                 self.unreserve_dial();
                 break;
             };
@@ -286,7 +307,7 @@ impl Actor {
                 self.unreserve_dial();
                 continue;
             };
-            self.spawn_dial(addr, transport);
+            self.spawn_dial(addr, transport, source);
         }
     }
 
@@ -313,7 +334,7 @@ impl Actor {
             return false;
         }
         debug!(%addr, "holepunch: dialling over uTP");
-        let key = self.spawn_dial(addr, Transport::Utp);
+        let key = self.spawn_dial(addr, Transport::Utp, PeerSource::Holepunch);
         if let Some(p) = self.peers.get_mut(&key) {
             p.holepunch = true;
         }
@@ -442,7 +463,14 @@ impl Actor {
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();
         let tx = spawn_incoming(stream, hs, addr, ctx);
-        let mut peer = Peer::new(addr, tx, self.generation, num_pieces, transport);
+        let mut peer = Peer::new(
+            addr,
+            tx,
+            self.generation,
+            num_pieces,
+            transport,
+            PeerSource::Incoming,
+        );
         peer.have_sent = Some(have);
         self.peers.insert(key, peer);
     }
@@ -573,7 +601,8 @@ impl Actor {
             self.close_peer(key);
         }
         let shared = &self.shared;
-        self.candidates.retain(|a| shared.blocked(*a).is_none());
+        self.candidates
+            .retain(|(a, _)| shared.blocked(*a).is_none());
         closed
     }
 
@@ -708,12 +737,12 @@ impl Actor {
                 && self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp
             {
                 self.known.remove(&p.addr);
-                self.candidates.retain(|a| *a != p.addr);
+                self.candidates.retain(|(a, _)| *a != p.addr);
             }
         } else if reason == DisconnectReason::SelfConnection {
             self.retries.never(p.addr);
             self.known.remove(&p.addr);
-            self.candidates.retain(|a| *a != p.addr);
+            self.candidates.retain(|(a, _)| *a != p.addr);
         } else if p.outgoing
             && !p.connected
             && matches!(reason, DisconnectReason::Encryption(_))
@@ -723,7 +752,7 @@ impl Actor {
             // The first failed MSE handshake to this address: dial it again
             // at once, in plaintext, without counting an attempt.
             debug!(addr = %p.addr, "MSE handshake failed; retrying in plaintext");
-            self.queue_addr(p.addr);
+            self.queue_addr(p.addr, p.source);
         } else if let Some(t) = connect_failed.filter(|_| p.outgoing && !p.connected)
             && self.transport_usable(&p.addr, t.other())
             && self.retries.transport_failed(p.addr, t)
@@ -731,7 +760,7 @@ impl Actor {
             // The first connect failure on this transport: dial the other
             // one at once, without counting an attempt.
             debug!(addr = %p.addr, failed = ?t, "connect failed; retrying over the other transport");
-            self.queue_addr(p.addr);
+            self.queue_addr(p.addr, p.source);
         } else if p.outgoing && !p.connected && reason == DisconnectReason::Shutdown {
             // We closed the attempt: a fallback it was does not carry over.
             self.retries.clear_transport_failed(&p.addr);
@@ -745,7 +774,7 @@ impl Actor {
             if self.retries.failed(p.addr, Instant::now()) == AfterFailure::GiveUp {
                 // Forgotten: `requeue_known` must not dial it again.
                 self.known.remove(&p.addr);
-                self.candidates.retain(|a| *a != p.addr);
+                self.candidates.retain(|(a, _)| *a != p.addr);
             }
         } else if p.outgoing
             && p.connected
@@ -944,14 +973,21 @@ pub(super) mod tests {
     async fn tcp_success_after_utp_failure_clears_the_pex_utp_flag() {
         let mut a = actor();
         let peer_addr = addr(1);
-        assert!(a.remember(peer_addr));
+        assert!(a.remember(peer_addr, crate::event::PeerSource::Tracker));
         for round in 0..2 {
             // A PEX `UTP` flag came in (again).
             a.known.get_mut(&peer_addr).expect("known").utp = true;
             assert!(a.retries.transport_failed(peer_addr, Transport::Utp));
             let key = a.new_key();
             let (tx, _rx) = mpsc::channel(4);
-            let mut p = Peer::new(peer_addr, tx, a.generation, 1, Transport::Tcp);
+            let mut p = Peer::new(
+                peer_addr,
+                tx,
+                a.generation,
+                1,
+                Transport::Tcp,
+                crate::event::PeerSource::Tracker,
+            );
             p.outgoing = true;
             a.peers.insert(key, p);
             assert_eq!(
@@ -982,11 +1018,18 @@ pub(super) mod tests {
         let mut a = actor();
         let stranger = addr(1);
         let known = addr(2);
-        assert!(a.remember(known));
+        assert!(a.remember(known, crate::event::PeerSource::Tracker));
         for target in [stranger, known] {
             let key = a.new_key();
             let (tx, _rx) = mpsc::channel(4);
-            let mut p = Peer::new(target, tx, a.generation, 1, Transport::Utp);
+            let mut p = Peer::new(
+                target,
+                tx,
+                a.generation,
+                1,
+                Transport::Utp,
+                crate::event::PeerSource::Tracker,
+            );
             p.outgoing = true;
             p.holepunch = true;
             a.peers.insert(key, p);
@@ -1013,10 +1056,17 @@ pub(super) mod tests {
             let mut a = actor();
             a.upload_only_sent = upload_only;
             let seed_addr = addr(1);
-            assert!(a.remember(seed_addr));
+            assert!(a.remember(seed_addr, crate::event::PeerSource::Tracker));
             let key = a.new_key();
             let (tx, _rx) = mpsc::channel(4);
-            let mut p = Peer::new(seed_addr, tx, a.generation, 1, Transport::Tcp);
+            let mut p = Peer::new(
+                seed_addr,
+                tx,
+                a.generation,
+                1,
+                Transport::Tcp,
+                crate::event::PeerSource::Tracker,
+            );
             p.outgoing = true;
             p.connected = true;
             p.seed = true;
@@ -1065,13 +1115,27 @@ pub(super) mod tests {
         let c = addr(1);
         let (tx, _rx1) = mpsc::channel(4);
         let live = a.new_key();
-        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        let mut p = Peer::new(
+            c,
+            tx,
+            a.generation,
+            1,
+            Transport::Utp,
+            crate::event::PeerSource::Tracker,
+        );
         p.connected = true;
         p.reported = Some(c);
         a.peers.insert(live, p);
         let (tx, _rx2) = mpsc::channel(4);
         let attempt = a.new_key();
-        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        let mut p = Peer::new(
+            c,
+            tx,
+            a.generation,
+            1,
+            Transport::Utp,
+            crate::event::PeerSource::Tracker,
+        );
         p.outgoing = true;
         p.holepunch = true;
         a.peers.insert(attempt, p);
@@ -1085,7 +1149,14 @@ pub(super) mod tests {
         // Nobody reported for the address: the failure is reported.
         let (tx, _rx3) = mpsc::channel(4);
         let lone = a.new_key();
-        let mut p = Peer::new(c, tx, a.generation, 1, Transport::Utp);
+        let mut p = Peer::new(
+            c,
+            tx,
+            a.generation,
+            1,
+            Transport::Utp,
+            crate::event::PeerSource::Tracker,
+        );
         p.outgoing = true;
         a.peers.insert(lone, p);
         a.on_peer_event(gone(lone, timeout.clone(), Some(Transport::Utp)));
