@@ -308,6 +308,14 @@ impl TorrentHandle {
     /// [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES), or more values than
     /// [`MAX_RESUME_ITEMS`](crate::MAX_RESUME_ITEMS)) fails here with
     /// [`SessionError::Resume`] instead.
+    ///
+    /// The v2 piece layers the torrent holds are saved too, those it
+    /// fetched or built from verified data included, unless they would
+    /// push the data over [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES):
+    /// then they are left out. A v2-only torrent restored without one
+    /// fetches it from peers before it starts; a hybrid builds it from
+    /// data it verifies, so one whose pieces were trusted (nothing
+    /// verified) lacks it until its next check or download of that file.
     pub async fn save_resume_data(&self) -> Result<Vec<u8>, SessionError> {
         self.call(Cmd::SaveResume).await?
     }

@@ -509,10 +509,17 @@ impl Actor {
             (None, Some(p)) => &p.file_prio[..],
             (None, None) => &[][..],
         };
+        // The key's hashes, with any the metadata revealed (a magnet's
+        // `info` is checked against both on load).
+        let meta = self.known_meta();
+        let hashes = meta.map(|m| m.info_hashes);
         let bytes = resume::encode(&ResumeRecord {
-            info_hash: self.ih.wire_hash(),
+            info_hash: self.ih.v1.or(hashes.and_then(|h| h.v1)).map(|h| h.0),
+            info_hash2: self.ih.v2.or(hashes.and_then(|h| h.v2)).map(|h| h.0),
             save_path: &save_path,
-            info: self.known_meta().map(|m| m.raw_info()),
+            info: meta.map(|m| m.raw_info()),
+            // Fetched and built layers are merged into the metadata held.
+            piece_layers: meta.map(|m| &m.piece_layers),
             magnet,
             trackers,
             file_priorities,
