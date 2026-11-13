@@ -191,7 +191,13 @@ fn symlinks_are_skipped() {
     ] {
         let m =
             Metainfo::from_bytes(&build(&CreateTorrent::new(&root).version(v)).unwrap()).unwrap();
-        let names: Vec<_> = m.info.files.iter().map(|f| f.path.key()).collect();
+        let names: Vec<_> = m
+            .info
+            .files
+            .iter()
+            .filter(|f| !f.pad)
+            .map(|f| f.path.key())
+            .collect();
         assert_eq!(names.len(), 1, "{v:?}: {names:?}");
         assert!(names[0].ends_with("f0"));
     }
@@ -323,4 +329,82 @@ fn one_file_directory_stays_a_directory() {
         let got = piece_root(&chunk[..v2.len as usize], v2.leaves as usize);
         assert_eq!(Some(got), v2.expected);
     }
+}
+
+/// libtorrent 2.0 (qBittorrent 5.3) pads the last file of a hybrid to a
+/// piece boundary too (`.pad/<n>`, `attr` `p`), as the interop `hybrid`
+/// scenario measured; v1 and v2 get no pads, an aligned end no tail pad.
+#[test]
+fn hybrid_has_a_tail_pad() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("c");
+    write_tree(&root, &[(0, 0, vec![1; 40_000]), (1, 1, vec![2; 10])]);
+    let pl = 16_384u64;
+    let hy = Metainfo::from_bytes(
+        &build(
+            &CreateTorrent::new(&root)
+                .version(TorrentVersion::Hybrid)
+                .piece_len(pl as u32),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let names: Vec<(Vec<String>, u64, bool)> = hy
+        .info
+        .files
+        .iter()
+        .map(|f| (f.path.components().to_vec(), f.len, f.pad))
+        .collect();
+    // 40 000 bytes, a pad to 49 152, 10 bytes, a tail pad to 65 536.
+    let pad1 = 3 * pl - 40_000;
+    let tail = pl - 10;
+    let comps = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            (comps(&["c", "d0", "f0"]), 40_000, false),
+            (comps(&["c", ".pad", &pad1.to_string()]), pad1, true),
+            (comps(&["c", "d1", "f1"]), 10, false),
+            (comps(&["c", ".pad", &tail.to_string()]), tail, true),
+        ]
+    );
+    assert_eq!(hy.info.pieces.len(), 4);
+    let v1 = Metainfo::from_bytes(
+        &build(
+            &CreateTorrent::new(&root)
+                .version(TorrentVersion::V1)
+                .piece_len(pl as u32),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(v1.info.files.iter().all(|f| !f.pad));
+    // v2-only writes no `files` list (the parser lays pads out itself).
+    let v2 = build(
+        &CreateTorrent::new(&root)
+            .version(TorrentVersion::V2)
+            .piece_len(pl as u32),
+    )
+    .unwrap();
+    let v = decode(&v2).unwrap();
+    let info = v.as_dict().unwrap().get(b"info").unwrap();
+    assert!(info.as_dict().unwrap().get(b"files").is_none());
+
+    // An end on a piece boundary gets no tail pad.
+    let aligned = dir.path().join("a");
+    write_tree(
+        &aligned,
+        &[(0, 0, vec![3; 10]), (1, 1, vec![4; pl as usize])],
+    );
+    let m = Metainfo::from_bytes(
+        &build(
+            &CreateTorrent::new(&aligned)
+                .version(TorrentVersion::Hybrid)
+                .piece_len(pl as u32),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let last = m.info.files.last().unwrap();
+    assert!(!last.pad && last.len == pl, "{:?}", m.info.files);
 }

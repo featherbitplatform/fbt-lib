@@ -3,7 +3,8 @@
 //!
 //! The files are hashed in one pass. A v1 hash covers the padded byte stream
 //! (hybrids get BEP 47 pads so every non-empty file starts on a piece
-//! boundary), a v2 tree covers each file's own bytes in 16 KiB leaves.
+//! boundary, and the last one ends on one, as libtorrent 2.0 does), a v2
+//! tree covers each file's own bytes in 16 KiB leaves.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -206,6 +207,18 @@ impl CreateTorrent {
             hashed.push(hasher.file(f)?);
             v1_files.push(file_entry(f.len, &f.comps, false));
             offset += f.len;
+        }
+        // libtorrent 2.0 pads the last file of a hybrid to a piece boundary
+        // too (measured against qBittorrent 5.3). A single-file torrent has
+        // no file list to hold a pad.
+        if pads && !single && !offset.is_multiple_of(pl) {
+            let pad = pl - offset % pl;
+            hasher.pad(pad)?;
+            v1_files.push(file_entry(
+                pad,
+                &[".pad".to_string(), pad.to_string()],
+                true,
+            ));
         }
         hasher.finish()?;
         // Lengths are re-checked once, after everything is hashed.

@@ -206,7 +206,7 @@ The owner authorised milestones 1 to 7 to run unattended. The spec's section 8 i
   - **Piece length.** `auto_piece_len(total)` is the smallest power of two ≥ 16 KiB giving at most 2048 pieces, capped at 16 MiB.
   - **Walking the input.** Recursive, `symlink_metadata`, symlinks skipped, hidden files kept. Names must be UTF-8 (`InvalidName`).
   - **File order.** Files sorted by their component lists bytewise (the v2 tree is a sorted dict, so the hybrid v1 list uses the same order).
-  - **Pads.** Hybrids get `.pad/<n>` pads (`attr` `p`) before every non-empty file whose offset is not a multiple of the piece length, as libtorrent does; no tail pad. v1 gets no pads.
+  - **Pads.** Hybrids get `.pad/<n>` pads (`attr` `p`) before every non-empty file whose offset is not a multiple of the piece length, and a tail pad after the last file when its end is not piece-aligned, as libtorrent 2.0 does (the tail pad was measured against qBittorrent 5.3 by the interop `hybrid` scenario and added in Task 11's fix round; a single-file hybrid has no file list and so no pad). v1 and v2-only get no pads.
   - **Other keys.** `creation date` and `created by` are left out unless set, so output is deterministic.
   - **Changed files.** Lengths are re-checked once after all hashing, and `UnexpectedEof` while reading maps to `FileChanged`.
   - **Caps.** At most `MAX_CREATE_FILES` = 1_000_000 files.
@@ -222,7 +222,7 @@ The owner authorised milestones 1 to 7 to run unattended. The spec's section 8 i
   - **qBittorrent's torrents.** qBittorrent 5.3 creates the v2 and hybrid torrents through its WebUI `torrentcreator` API (`addTask`, poll `status`, fetch `torrentFile`, `deleteTask`), so we parse libtorrent's output.
   - **Our torrents.** `fbt-example create` makes ours, and qBittorrent (both formats) and Transmission (hybrid only; it has no v2) download them from an fbt seed.
   - **v2 magnets.** fbt downloads a `btmh`-only magnet from a qBittorrent seed, which proves our layer fetch. qBittorrent downloads an fbt v2 seed by `btmh` magnet, which proves our hash serving.
-  - **Cross-check.** fbt's and qBittorrent's v2 info hash for the same payload and piece size must be equal: a hard check, proving tree, ordering and encoding. The payload files are mode 0644 (libtorrent records `attr` `x`), and fbt creates from a directory with the same final name (it is the `name`). The hybrid hashes are compared and only logged, since libtorrent may name or attribute pads differently.
+  - **Cross-check.** fbt's and qBittorrent's v2 info hash for the same payload and piece size must be equal: a hard check, proving tree, ordering and encoding. The payload files are mode 0644 (libtorrent records `attr` `x`), and fbt creates from a directory with the same final name (it is the `name`). The hybrid hashes (v1 and v2) must be equal too: a hard check since Task 11's fix round gave created hybrids libtorrent's tail pad (measured against qBittorrent 5.3).
   - **Transmission fallback.** If Transmission 4.1 refuses a hybrid, that leg is dropped with a note in `dev/interop/README.md`.
 - **New fuzz target:** `hash_proof` (`fbt_core::merkle::verify_hashes` on arbitrary input).
   - `metainfo`, `magnet`, `wire_codec` and `resume` get v2 seeds.
@@ -235,7 +235,7 @@ From the pre-flight scan (`.superpowers/sdd/2026-11-13-milestone-6-v2-hybrid/pre
 
 - **Task 1.** One-piece files compared at their own tree width; `proofs_verify` separates layer size and span (F8). `proptest` dev-dependency (F13).
 - **Task 2.** `V2Piece.len`; roots over the file's bytes only (F2). Pads before each unaligned non-empty file; empty files anywhere and a tail pad accepted; `libtorrent_style_hybrid_parses` (F5). Depth past the bencode limit is `MetainfoError::Bencode` (F14). `with_piece_layers` merges (F21).
-- **Task 3.** Proptest hashes `&data[..len]` (F2). libtorrent pad placement, no tail pad (F5). Lengths re-checked after hashing, `UnexpectedEof` → `FileChanged` (F16). Generator: a non-empty file, fixed distinct names (F17). Re-exports `validate_layer` and `MAX_PIECE_LAYER_HASHES`; `merkle` internal; `CreateTorrent` without `Default` (F20).
+- **Task 3.** Proptest hashes `&data[..len]` (F2). libtorrent pad placement (F5); the tail pad was added in Task 11's fix round, measured against qBittorrent 5.3. Lengths re-checked after hashing, `UnexpectedEof` → `FileChanged` (F16). Generator: a non-empty file, fixed distinct names (F17). Re-exports `validate_layer` and `MAX_PIECE_LAYER_HASHES`; `merkle` internal; `CreateTorrent` without `Default` (F20).
 - **Task 4.** The `inbound.rs` arm keeps `fbt-session` compiling (F3).
 - **Task 5.** `verify_piece` truncates to `V2Piece.len` (F2). Session half of `hybrid_piece_must_pass_both` uses a `ScriptedPeer` (F7). Only `Loaded.meta` is swapped; `piece_layers_known` via a `Cmd` (F11). `lib_surface.rs` in Files (F12). Batched layer swaps; `check_pieces` breaking; no `PieceVerifier` (F21). Split from old Task 5 (F23).
 - **Task 6.** `SessionError::V2OnlyUnsupported` no longer produced; `magnet_v2_only_is_accepted` (F1). `swarm.rs`, `magnet.rs`, `error.rs`, `tests/magnet.rs` in Files; `unregister` removes every hash (F12). Split from old Task 5 (F23).
@@ -709,7 +709,7 @@ CHANGELOG.md, README.md, CLAUDE.md, crates/fbt-metainfo/tests/fixtures/README.md
       5. qBittorrent downloads fbt's v2 seed by `btmh` magnet.
     - **hybrid.**
       1. qBittorrent creates a hybrid (as v2 step 1, `format=hybrid`) and seeds it, and fbt downloads it.
-      2. `fbt-example create` of the same payload: both hashes are compared and logged.
+      2. `fbt-example create` of the same payload: both hashes must equal qBittorrent's (a hard check since the fix round's tail pad).
       3. fbt seeds its own hybrid; qBittorrent and Transmission download it.
       4. Transmission fallback: see Decisions.
 
