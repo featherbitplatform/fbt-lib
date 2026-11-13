@@ -97,6 +97,8 @@ pub(super) struct Peer {
     /// to TCP nor asks for a rendezvous, and is retried only for an address
     /// we knew already.
     pub holepunch: bool,
+    /// It set the v2 reserved bit: a source for the layer fetch.
+    pub v2: bool,
 }
 
 impl Peer {
@@ -118,6 +120,7 @@ impl Peer {
             peer_id: None,
             seed: false,
             bits: Bitfield::new(num_pieces),
+            v2: false,
             choked_us: true,
             am_interested: false,
             peer_interested: false,

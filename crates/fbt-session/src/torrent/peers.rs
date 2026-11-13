@@ -51,8 +51,11 @@ impl Actor {
                 addr,
                 encrypted,
                 transport,
-                ..
-            } => self.on_peer_connected(key, peer_id, addr, encrypted, transport),
+                reserved,
+            } => {
+                self.on_peer_connected(key, peer_id, addr, encrypted, transport);
+                self.on_peer_v2(key, reserved.supports_v2());
+            }
             PeerEvent::Pieces { key, pieces } => self.on_pieces(key, pieces),
             PeerEvent::Have { key, piece } => self.on_have(key, piece),
             PeerEvent::DontHave { key, piece } => self.on_donthave(key, piece),
@@ -118,10 +121,8 @@ impl Actor {
             PeerEvent::Holepunch { key, msg } => self.on_holepunch(key, msg),
             PeerEvent::DhtPort { key, port } => self.on_dht_port(key, port),
             PeerEvent::HashRequest { key, req } => self.on_hash_request(key, req),
-            PeerEvent::Hashes { key, req, hashes } => {
-                self.on_hash_answer(key, req, hashes.len() / 32);
-            }
-            PeerEvent::HashReject { key, req } => self.on_hash_answer(key, req, 0),
+            PeerEvent::Hashes { key, req, hashes } => self.on_hash_answer(key, req, Some(hashes)),
+            PeerEvent::HashReject { key, req } => self.on_hash_answer(key, req, None),
             PeerEvent::Disconnected {
                 key,
                 reason,
@@ -493,6 +494,7 @@ impl Actor {
             let sends = m.fetch.on_peer_gone(key);
             self.send_metadata(sends);
         }
+        self.layer_source_gone(key);
         if p.generation == self.generation
             && let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut())
         {
@@ -737,7 +739,7 @@ impl Actor {
         let msg = if p.metadata_requests > MAX_METADATA_REQUESTS_PER_PEER {
             MetadataMsg::Reject { piece }
         } else {
-            serve_metadata(self.loaded.as_ref().map(|l| l.meta.raw_info()), piece)
+            serve_metadata(self.known_meta().map(|m| m.raw_info()), piece)
         };
         self.send(key, PeerCommand::SendMetadata(msg));
     }

@@ -25,7 +25,7 @@ use super::data::Job;
 use super::deadline::Deadlines;
 use super::dht::{self, DhtAnnouncer, DhtParams};
 use super::known::{Known, dialable};
-use super::layers::{HashServing, LayerBuilder};
+use super::layers::{HashServing, LayerBuilder, LayerFetch, PendingLayers};
 use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
 use super::peer::Peer;
@@ -65,8 +65,8 @@ thread_local! {
 /// Where the torrent is in its life.
 #[derive(Debug)]
 pub(super) enum Phase {
-    /// A magnet without metadata: peers connect and the metadata is
-    /// fetched from them.
+    /// A magnet without metadata, or a v2-only torrent without its piece
+    /// layers: peers connect and what is missing is fetched from them.
     Metadata,
     /// Waiting for one of the session's `max_active_checks` slots; the
     /// waiting job is aborted through `cancel`.
@@ -205,6 +205,10 @@ pub(crate) struct Actor {
     pub(super) storage: Option<Arc<dyn Storage>>,
     /// `Some` while a magnet waits for its metadata.
     pub(super) magnet: Option<Box<MagnetState>>,
+    /// `Some` while a v2-only torrent, its metadata known (from any
+    /// source), fetches the piece layers it lacks; `loaded` is `None` and
+    /// the phase `Metadata` meanwhile.
+    pub(super) pending_layers: Option<Box<PendingLayers>>,
     /// The handle's view of the metadata, filled once it is known.
     pub(super) metainfo_cell: Arc<OnceLock<Arc<Metainfo>>>,
     /// The check that follows a magnet's metadata is running: the announcer
@@ -382,17 +386,32 @@ impl Actor {
         let resume = params.resume;
         let save_path = params.save_path.clone();
         let web_seed_throttle = shared.bandwidth.web_seed(&rate);
-        let (loaded, magnet, trackers, web_seed_urls) = match params.source {
+        let mut storage = storage;
+        let (loaded, magnet, pending_layers, trackers, web_seed_urls) = match params.source {
             TorrentSource::Metainfo(m) => {
                 let trackers = m.trackers.clone();
                 let urls = m.web_seeds.clone();
-                let meta = Arc::new(*m);
-                let _ = metainfo_cell.set(Arc::clone(&meta));
-                let mut loaded = Loaded::new(meta, params.file_priorities, params.sequential);
-                if let Some(r) = &resume {
-                    loaded.renamed = r.renamed.iter().cloned().collect();
+                if let Some(fetch) = LayerFetch::new(&m) {
+                    // Like a magnet's metadata: the storage is built once
+                    // the layers are in (only a custom one is kept).
+                    storage = None;
+                    let pending = PendingLayers {
+                        meta: Arc::new(*m),
+                        fetch,
+                        storage: params.storage,
+                        file_prio: params.file_priorities,
+                        sequential: params.sequential,
+                    };
+                    (None, None, Some(Box::new(pending)), trackers, urls)
+                } else {
+                    let meta = Arc::new(*m);
+                    let _ = metainfo_cell.set(Arc::clone(&meta));
+                    let mut loaded = Loaded::new(meta, params.file_priorities, params.sequential);
+                    if let Some(r) = &resume {
+                        loaded.renamed = r.renamed.iter().cloned().collect();
+                    }
+                    (Some(loaded), None, None, trackers, urls)
                 }
-                (Some(loaded), None, trackers, urls)
             }
             TorrentSource::Magnet(magnet) => {
                 // One tier per `tr`, in order.
@@ -408,7 +427,7 @@ impl Actor {
                     storage: params.storage,
                     sequential: params.sequential,
                 };
-                (None, Some(Box::new(state)), trackers, urls)
+                (None, Some(Box::new(state)), None, trackers, urls)
             }
         };
         let phase = if loaded.is_some() {
@@ -435,7 +454,8 @@ impl Actor {
         })
         .unzip();
         // A magnet's privacy is unknown yet: it runs one until it is known.
-        let private = loaded.as_ref().is_some_and(|l| l.meta.info.private);
+        let private = loaded.as_ref().is_some_and(|l| l.meta.info.private)
+            || pending_layers.as_ref().is_some_and(|p| p.meta.info.private);
         let (dht_announcer, dht_rx) = shared
             .dht
             .clone()
@@ -458,6 +478,7 @@ impl Actor {
             loaded,
             storage,
             magnet,
+            pending_layers,
             metainfo_cell,
             metadata_check: false,
             check_seq: 0,
@@ -542,7 +563,7 @@ impl Actor {
             actor.init_web_seeds(r.web_seeds.clone());
             actor.resume = Some(r);
         }
-        if actor.magnet.is_some() {
+        if actor.loaded.is_none() {
             actor.last_state = actor.state();
         }
         actor
@@ -637,6 +658,7 @@ impl Actor {
                     self.top_up_all(None);
                     self.web_seed_tick();
                     self.metadata_tick();
+                    self.layer_tick();
                     self.pex_tick();
                     self.lsd_tick();
                     self.queue_retries();
@@ -656,11 +678,19 @@ impl Actor {
     /// The torrent's name; until the metadata is known, the magnet's `dn`
     /// or empty.
     pub(super) fn name(&self) -> &str {
-        match (&self.loaded, &self.magnet) {
-            (Some(l), _) => l.meta.info.name.as_str(),
+        match (self.known_meta(), &self.magnet) {
+            (Some(m), _) => m.info.name.as_str(),
             (None, Some(m)) => m.magnet.display_name.as_deref().unwrap_or(""),
             (None, None) => "",
         }
+    }
+
+    /// The metadata, installed or waiting for its layers.
+    pub(super) fn known_meta(&self) -> Option<&Arc<Metainfo>> {
+        self.loaded
+            .as_ref()
+            .map(|l| &l.meta)
+            .or_else(|| self.pending_layers.as_ref().map(|p| &p.meta))
     }
 
     /// Sets the metadata and the storage built for it: the one place either
@@ -996,7 +1026,7 @@ impl Actor {
     /// The torrent is known to be private (BEP 27): no DHT, PEX or `Port`.
     /// A magnet is not, until its metadata arrives.
     pub(super) fn is_private(&self) -> bool {
-        self.loaded.as_ref().is_some_and(|l| l.meta.info.private)
+        self.known_meta().is_some_and(|m| m.info.private)
     }
 
     // ----- checking -----------------------------------------------------------

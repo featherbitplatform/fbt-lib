@@ -202,6 +202,9 @@ pub(crate) enum PeerCommand {
     SendHashes { req: HashRequest, hashes: Bytes },
     /// Refuse a `hash request`.
     RejectHashes(HashRequest),
+    /// Ask for hashes of a piece layer (BEP 52 `hash request`); sent only
+    /// to a remote that set the v2 bit.
+    RequestHashes(HashRequest),
     /// Send a `ut_metadata` message (dropped if the remote lacks it).
     SendMetadata(MetadataMsg),
     /// Send a `ut_pex` message (dropped if the remote lacks it).

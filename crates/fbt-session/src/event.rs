@@ -79,7 +79,9 @@ pub enum Event {
         /// Piece index.
         piece: u32,
     },
-    /// A magnet torrent received and verified its metadata.
+    /// A magnet torrent received and verified its metadata; for a v2-only
+    /// torrent, once the piece layers it lacked are fetched too (a v2
+    /// `.torrent` without them included).
     MetadataReceived {
         /// The torrent.
         torrent: InfoHashes,

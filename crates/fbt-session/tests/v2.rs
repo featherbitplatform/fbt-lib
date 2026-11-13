@@ -452,3 +452,156 @@ async fn hash_request_burst_is_answered_and_frees_its_slots() {
     );
     s.shutdown().await;
 }
+
+/// Adds `magnet` to a fresh leech with the seed of `seed_bytes` (files
+/// below `seed_dir`) as its peer; waits for the metadata and the finish and
+/// compares the data. Returns the leech and its handle, with the seed.
+async fn download_magnet(
+    seed_bytes: &[u8],
+    magnet: Magnet,
+    seed_dir: &Path,
+    leech_dir: &Path,
+) -> (Session, TorrentHandle, Session) {
+    let (seeder, _sh) = seed(seed_bytes, seed_dir).await;
+    let leecher = Session::new(test_settings()).await.unwrap();
+    let mut ev = leecher.subscribe(EventMask::ALL);
+    let lh = leecher
+        .add_torrent(AddTorrent::magnet(magnet, leech_dir.to_path_buf()))
+        .await
+        .unwrap();
+    lh.add_peer(seeder.local_addr()).await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::MetadataReceived { .. }), T)
+        .await
+        .expect("MetadataReceived");
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    assert!(wait_state(&lh, |s| *s == TorrentState::Seeding, T).await);
+    let m = Metainfo::from_bytes(seed_bytes).unwrap();
+    assert!(
+        payload_of(&m, leech_dir) == payload_of(&m, seed_dir),
+        "data differs"
+    );
+    (leecher, lh, seeder)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_magnet_downloads() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(seed_dir.path()),
+        TorrentVersion::V2,
+        PIECE,
+    );
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    assert_eq!(m.piece_layers.len(), 2);
+    let mg = Magnet::from_info_hashes(m.info_hashes);
+    assert!(mg.info_hashes.v1.is_none());
+    let (l, lh, s) = download_magnet(&bytes, mg, seed_dir.path(), leech_dir.path()).await;
+    // The metadata came with the fetched layers.
+    assert_eq!(lh.metainfo().unwrap().piece_layers, m.piece_layers);
+    assert_eq!(lh.piece_layers_known().await, 2);
+    l.shutdown().await;
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_torrent_without_layers_fetches_them() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(seed_dir.path()),
+        TorrentVersion::V2,
+        PIECE,
+    );
+    let full = Metainfo::from_bytes(&bytes).unwrap();
+    let m = Metainfo::from_bytes(&strip_layers(&bytes)).unwrap();
+    assert!(m.piece_layers.is_empty());
+    let (seeder, _sh) = seed(&bytes, seed_dir.path()).await;
+    let leecher = Session::new(test_settings()).await.unwrap();
+    let mut ev = leecher.subscribe(EventMask::ALL);
+    let lh = leecher
+        .add_torrent(AddTorrent::new(m.clone(), leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    // Held before its download until the layers are in.
+    let st = lh.status();
+    assert!(!st.has_metadata);
+    assert_eq!(st.state, TorrentState::DownloadingMetadata);
+    assert!(lh.metainfo().is_none());
+    lh.add_peer(seeder.local_addr()).await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::MetadataReceived { .. }), T)
+        .await
+        .expect("MetadataReceived");
+    assert_eq!(lh.metainfo().unwrap().piece_layers, full.piece_layers);
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    assert!(wait_state(&lh, |s| *s == TorrentState::Seeding, T).await);
+    assert!(
+        payload_of(&m, leech_dir.path()) == payload_of(&m, seed_dir.path()),
+        "data differs"
+    );
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_magnet_downloads_without_layer_fetch() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(seed_dir.path()),
+        TorrentVersion::Hybrid,
+        PIECE,
+    );
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let mg = Magnet::from_info_hashes(InfoHashes::from_v2(m.info_hashes.v2.expect("v2 hash")));
+    let (l, lh, s) = download_magnet(&bytes, mg, seed_dir.path(), leech_dir.path()).await;
+    let multi_piece = m
+        .info
+        .files
+        .iter()
+        .filter(|f| !f.pad && f.len > u64::from(PIECE))
+        .count();
+    // Built from the verified data, not fetched: the metadata had none.
+    assert!(lh.metainfo().unwrap().piece_layers.is_empty());
+    assert_eq!(lh.piece_layers_known().await, multi_piece);
+    l.shutdown().await;
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seed_without_v2_peers_stays_in_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::V2, PIECE);
+    let m = Metainfo::from_bytes(&strip_layers(&bytes)).unwrap();
+    // Dialling the scripted peer: plain TCP.
+    let mut settings = dial_tcp(test_settings());
+    settings.encryption = fbt_session::EncryptionPolicy::Disabled;
+    let leecher = Session::new(settings).await.unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let lh = leecher
+        .add_torrent(AddTorrent::new(m, leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    lh.add_peer(listener.local_addr().unwrap()).await.unwrap();
+    let mut reserved = fbt_wire::Reserved::default();
+    reserved.set_fast();
+    let mut peer = ScriptedPeer::accept_with(&listener, reserved).await;
+    assert!(!reserved.supports_v2());
+    peer.send(Message::HaveAll).await;
+    peer.send(Message::Unchoke).await;
+    let got = peer
+        .next_matching_within(std::time::Duration::from_secs(3), |m| {
+            matches!(m, Message::Request(_) | Message::HashRequest(_))
+        })
+        .await;
+    assert!(got.is_none(), "{got:?}");
+    let st = lh.status();
+    assert_eq!(st.state, TorrentState::DownloadingMetadata);
+    assert!(!st.has_metadata);
+    leecher.shutdown().await;
+}

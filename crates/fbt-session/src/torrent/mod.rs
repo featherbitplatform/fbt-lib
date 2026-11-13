@@ -200,7 +200,10 @@ pub(crate) fn spawn(
     let ih = params.source.info_hashes();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
     let mut initial = match &params.source {
-        TorrentSource::Metainfo(m) => TorrentStatus::initial(ih, m.info.name.clone(), true),
+        // A v2-only torrent lacking layers has no metadata until they are in.
+        TorrentSource::Metainfo(m) => {
+            TorrentStatus::initial(ih, m.info.name.clone(), !layers::missing_layers(m))
+        }
         TorrentSource::Magnet(m) => {
             TorrentStatus::initial(ih, m.display_name.clone().unwrap_or_default(), false)
         }
@@ -264,7 +267,8 @@ impl TorrentHandle {
         self.inner.info_hashes
     }
 
-    /// The torrent's metadata; `None` for a magnet until
+    /// The torrent's metadata; `None` for a magnet, and for a v2-only
+    /// torrent lacking piece layers, until
     /// [`Event::MetadataReceived`](crate::Event::MetadataReceived).
     ///
     /// Set once: piece layers the torrent builds or fetches later are not
