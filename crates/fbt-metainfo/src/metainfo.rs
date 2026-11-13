@@ -51,7 +51,9 @@ pub enum MetainfoError {
     },
     /// Two files share a path, or a file path is a directory prefix of another.
     ///
-    /// No longer produced: colliding paths are renamed at parse time.
+    /// No longer produced: colliding paths are renamed at parse time. Kept
+    /// for compatibility; it will be removed in a later breaking release.
+    #[deprecated(note = "no longer produced: colliding paths are renamed at parse time")]
     #[error("duplicate path `{0}`")]
     DuplicatePath(String),
     /// A v2-only torrent (no v1 `pieces`); supported from milestone 6.
