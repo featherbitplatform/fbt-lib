@@ -259,6 +259,17 @@ async fn ends_on_session_shutdown() {
     .expect("the body ends within 5 s of session shutdown");
 }
 
+/// The future `router_with_shutdown` waits on ends an open event stream.
+///
+/// Review note (0.8 deflake, not reproduced here: 100 runs at 4 copies and 100
+/// more at 72 copies with CPU load pass): this test held the shortest timing
+/// budget in the suite — 2 s for a body hyper ends only when its task is next
+/// polled, on the single-threaded runtime `#[tokio::test]` gives it. A loaded
+/// runner can delay that poll past two seconds, and because the stream was
+/// never shown to carry anything, a slow start looked exactly like the failure
+/// the test is about. The fix proves the stream is live first (the add must
+/// reach it) and then waits `T`, the suite's bounded-wait budget, which is also
+/// the 5 s floor the plan sets for timing-based waits.
 #[tokio::test]
 async fn router_with_shutdown_ends_open_events() {
     let session = support::session().await;
@@ -276,12 +287,17 @@ async fn router_with_shutdown_ends_open_events() {
     let (status, _, sse) = Sse::open(&format!("{base}/api/v1/events"), Some(TOKEN)).await;
     assert_eq!(status, StatusCode::OK);
     let mut sse = sse.expect("stream");
+    // Show the stream is live before asking it to end: an add has to reach it.
+    let p = payload();
+    add(&base, &p).await;
+    let first = tokio::time::timeout(T, sse.next())
+        .await
+        .expect("an event on the open stream");
+    assert!(first.is_some(), "the stream ended before the add arrived");
     fire.send(()).expect("the router waits on the future");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while sse.next().await.is_some() {}
-    })
-    .await
-    .expect("the body ends within 2 s of the shutdown future");
+    tokio::time::timeout(T, async { while sse.next().await.is_some() {} })
+        .await
+        .expect("the body ends within T of the shutdown future");
     serving.abort();
     session.shutdown().await;
 }
