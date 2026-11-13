@@ -7,6 +7,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends dante-server \
     && rm -rf /var/lib/apt/lists/*
 COPY danted.conf /etc/danted.conf
+# Port 1080 needs no privilege: run as Debian's `nobody`.
+USER nobody
 EXPOSE 1080/tcp
 # Logs every connection and UDP association to stderr (compose logs).
 CMD ["danted", "-f", "/etc/danted.conf"]
