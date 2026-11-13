@@ -8,6 +8,7 @@ use std::sync::Arc;
 use axum::http::HeaderValue;
 
 use crate::ApiError;
+use crate::paths::Root;
 
 /// The largest request body: a `.torrent` or resume upload (32 MiB). The
 /// default of [`ApiConfig::max_body_bytes`].
@@ -58,7 +59,9 @@ pub struct ApiConfig {
     pub cors_origins: Vec<String>,
     /// When set, the directories every path a request names (save paths,
     /// move targets, creation sources) must be inside. Each must exist.
-    /// Default `None`: any path.
+    /// A path must be absolute, free of `..` and written below a root (as
+    /// given here, or in its canonical form); symlinks in it are resolved
+    /// and must stay inside. Default `None`: any path.
     pub allowed_roots: Option<Vec<PathBuf>>,
     /// The largest request body; larger ones get `413`. Default
     /// [`MAX_BODY_BYTES`].
@@ -112,10 +115,15 @@ impl ApiConfig {
                 roots
                     .iter()
                     .map(|r| {
-                        r.canonicalize()
-                            .map_err(|_| ApiError::InvalidRoot(r.clone()))
+                        let canonical = r
+                            .canonicalize()
+                            .map_err(|_| ApiError::InvalidRoot(r.clone()))?;
+                        Ok(Root {
+                            given: r.clone(),
+                            canonical,
+                        })
                     })
-                    .collect::<Result<Arc<[PathBuf]>, _>>()?,
+                    .collect::<Result<Arc<[Root]>, ApiError>>()?,
             ),
         };
         Ok(Validated { origins, roots })
@@ -126,8 +134,8 @@ impl ApiConfig {
 pub(crate) struct Validated {
     /// [`ApiConfig::cors_origins`] as header values.
     pub(crate) origins: Vec<HeaderValue>,
-    /// [`ApiConfig::allowed_roots`], canonicalised.
-    pub(crate) roots: Option<Arc<[PathBuf]>>,
+    /// [`ApiConfig::allowed_roots`], as given and canonicalised.
+    pub(crate) roots: Option<Arc<[Root]>>,
 }
 
 /// A loopback address, IPv4-mapped IPv6 (`::ffff:127.0.0.0/104`) included.

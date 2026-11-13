@@ -47,7 +47,7 @@ type Created = (StatusCode, Json<TorrentInfo>);
 
 /// Adds `params` after the save-path check.
 async fn add(state: &AppState, mut params: AddTorrent) -> Result<Created, ApiErrorResponse> {
-    params.save_path = check_path(state, &params.save_path)?;
+    params.save_path = check_path(state, &params.save_path).await?;
     let handle = state.session.add_torrent(params).await?;
     Ok((StatusCode::CREATED, Json(TorrentInfo::of(&handle))))
 }
@@ -115,6 +115,13 @@ async fn add_torrent(
         flags(&mut params, opts.paused, opts.auto_managed, opts.sequential);
         add(&state, params).await
     } else {
+        // The JSON body carries every option: a query string is unknown
+        // input, as it is for the `.torrent` form's `AddOptions`.
+        if req.uri().query().is_some_and(|q| !q.is_empty()) {
+            return Err(ApiErrorResponse::invalid_request(
+                "a JSON add takes its options in the body, not the query string",
+            ));
+        }
         let ApiJson(body) = ApiJson::<AddTorrentRequest>::from_request(req, &()).await?;
         let magnet = body
             .magnet
@@ -414,7 +421,7 @@ async fn move_storage(
     ApiJson(body): ApiJson<MoveRequest>,
 ) -> Result<StatusCode, ApiErrorResponse> {
     let handle = lookup(&state, &id)?;
-    let path = check_path(&state, &body.path)?;
+    let path = check_path(&state, &body.path).await?;
     handle.move_storage(path, body.mode.into()).await?;
     Ok(StatusCode::NO_CONTENT)
 }

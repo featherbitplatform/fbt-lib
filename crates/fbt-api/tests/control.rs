@@ -555,6 +555,16 @@ async fn malformed_json_is_400() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(error_code(&res), "invalid_request", "{body}");
     }
+    // A JSON add takes no query string.
+    let (status, _, res) = send_json(
+        Method::POST,
+        &format!("{url}?paused=true"),
+        Some(TOKEN),
+        &j!({"magnet": magnet, "save_path": save}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&res), "invalid_request");
     // A bad `.torrent` and a bad query string.
     let query = format!("save_path={}", query_escape(&save));
     let (status, res) = add_file(&base, b"not bencode", &query).await;

@@ -21,7 +21,6 @@
 //! Every route sits behind the auth layer; [`crate::auth`] lists the
 //! token-exempt and `?token=` routes.
 
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use axum::http::{HeaderValue, StatusCode, header};
@@ -48,9 +47,9 @@ pub(crate) struct AppState {
     /// The validated config.
     #[allow(dead_code, reason = "the routes read their caps from it")]
     pub(crate) config: Arc<ApiConfig>,
-    /// [`ApiConfig::allowed_roots`], canonicalised once; `None` allows any
-    /// path.
-    pub(crate) roots: Option<Arc<[PathBuf]>>,
+    /// [`ApiConfig::allowed_roots`], as given and canonicalised once;
+    /// `None` allows any path.
+    pub(crate) roots: Option<Arc<[crate::paths::Root]>>,
     /// Permits for open file streams ([`ApiConfig::max_streams`]); a
     /// stream body holds one until it is dropped.
     #[allow(dead_code, reason = "the streaming route takes its permits")]
@@ -70,7 +69,7 @@ impl AppState {
     pub(crate) fn new(
         session: Session,
         config: ApiConfig,
-        roots: Option<Arc<[PathBuf]>>,
+        roots: Option<Arc<[crate::paths::Root]>>,
         shutdown: CancellationToken,
     ) -> Self {
         AppState {
