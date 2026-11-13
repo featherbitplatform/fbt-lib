@@ -1,8 +1,8 @@
 use bytes::{Bytes, BytesMut};
 use fbt_core::{BlockRef, PeerId};
 use fbt_wire::{
-    HANDSHAKE_LEN, Handshake, HandshakeError, Message, MessageCodec, Reserved, WireError,
-    allowed_fast_set, read_handshake, write_handshake,
+    HANDSHAKE_LEN, Handshake, HandshakeError, HashRequest, Message, MessageCodec, Reserved,
+    WireError, allowed_fast_set, read_handshake, write_handshake,
 };
 use proptest::prelude::*;
 use tokio_util::codec::{Decoder, Encoder};
@@ -192,4 +192,80 @@ proptest! {
             }
         }
     }
+}
+
+fn hreq() -> HashRequest {
+    HashRequest {
+        pieces_root: [0xab; 32],
+        base_layer: 3,
+        index: 4,
+        length: 8,
+        proof_layers: 2,
+    }
+}
+
+#[test]
+fn hash_messages_round_trip() {
+    let mut c = MessageCodec::new(1 << 20);
+    let msgs = [
+        (21u8, Message::HashRequest(hreq())),
+        (
+            22,
+            Message::Hashes {
+                req: hreq(),
+                hashes: Bytes::from(vec![0x11; 64]),
+            },
+        ),
+        (23, Message::HashReject(hreq())),
+    ];
+    for (id, m) in msgs {
+        let mut b = BytesMut::new();
+        c.encode(m.clone(), &mut b).unwrap();
+        assert_eq!(b[4], id);
+        assert_eq!(&b[5..37], &[0xab; 32]);
+        assert_eq!(&b[37..41], &3u32.to_be_bytes());
+        assert_eq!(c.decode(&mut b).unwrap(), Some(m));
+        assert!(b.is_empty());
+    }
+}
+
+#[test]
+fn bad_hash_messages_are_rejected() {
+    let mut c = MessageCodec::new(1 << 20);
+    let frame = |id: u8, body: usize| {
+        let mut b = BytesMut::new();
+        b.extend_from_slice(&((body + 1) as u32).to_be_bytes());
+        b.extend_from_slice(&[id]);
+        b.extend_from_slice(&vec![0; body]);
+        b
+    };
+    for (id, body) in [
+        (21, 47),
+        (21, 49),
+        (23, 47),
+        (23, 49),
+        (22, 47),
+        (22, 48 + 31),
+    ] {
+        let mut b = frame(id, body);
+        assert!(
+            matches!(c.decode(&mut b), Err(WireError::BadLength { .. })),
+            "id {id} body {body}"
+        );
+    }
+    // A header-only hashes body and a whole number of hashes are fine.
+    assert!(c.decode(&mut frame(22, 48)).unwrap().is_some());
+    assert!(c.decode(&mut frame(22, 48 + 32)).unwrap().is_some());
+}
+
+#[test]
+fn v2_reserved_bit() {
+    let mut r = Reserved([0; 8]);
+    assert!(!r.supports_v2());
+    r.set_v2();
+    assert!(r.supports_v2());
+    assert_eq!(r.0, [0, 0, 0, 0, 0, 0, 0, 0x10]);
+    let mut r = Reserved([0xff, 0, 0, 0, 0, 0x10, 0, 0x05]);
+    r.set_v2();
+    assert_eq!(r.0, [0xff, 0, 0, 0, 0, 0x10, 0, 0x15]);
 }

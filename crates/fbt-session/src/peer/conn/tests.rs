@@ -18,6 +18,9 @@ use super::*;
 
 const KEY: PeerKey = PeerKey(7);
 const HASH: [u8; 20] = [0xab; 20];
+/// The truncated v2 hash of the harness's torrent: a hybrid whose v1 hash
+/// is `HASH`, unless a test says otherwise.
+const V2_HASH: [u8; 20] = [0xcd; 20];
 const OUR_ID: PeerId = PeerId([1; 20]);
 const THEIR_ID: PeerId = PeerId([2; 20]);
 const PIECE: u32 = 32_768;
@@ -82,12 +85,25 @@ fn start_full(
     ext: ExtConfig,
     settings: Settings,
 ) -> Harness {
+    start_hashes(have, layout, ext, settings, Some(V2_HASH))
+}
+
+/// [`start_full`] for a torrent whose truncated v2 hash is `v2_hash`
+/// (`HASH` itself for a v2-only torrent, `None` for a v1-only one).
+fn start_hashes(
+    have: Bitfield,
+    layout: Option<PieceLayout>,
+    ext: ExtConfig,
+    settings: Settings,
+    v2_hash: Option<[u8; 20]>,
+) -> Harness {
     let (ours, remote) = tokio::io::duplex(1 << 20);
     let (etx, events) = mpsc::channel(1024);
     let (cmds, crx) = mpsc::channel(256);
     let ctx = PeerCtx {
         key: KEY,
         info_hash: HASH,
+        v2_hash,
         our_id: OUR_ID,
         layout,
         have,
@@ -1287,6 +1303,7 @@ fn direct(settings: Settings, down: u64, up: u64) -> Direct {
     let ctx = PeerCtx {
         key: KEY,
         info_hash: HASH,
+        v2_hash: Some(V2_HASH),
         our_id: OUR_ID,
         layout: Some(layout(PIECES)),
         have: Bitfield::full(PIECES),
@@ -1798,4 +1815,148 @@ async fn snubbed_peer_gets_one_request() {
     assert_eq!(recv(&mut wire).await, Message::Cancel(block(0, 0)));
     assert_eq!(recv(&mut wire).await, Message::Cancel(block(0, 16_384)));
     assert_eq!(recv(&mut wire).await, Message::Request(block(2, 0)));
+}
+
+// ----- BEP 52 hash messages -----------------------------------------------
+
+fn hash_req(index: u32) -> fbt_wire::HashRequest {
+    fbt_wire::HashRequest {
+        pieces_root: [9; 32],
+        base_layer: 1,
+        index,
+        length: 2,
+        proof_layers: 3,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hash_messages_routed_from_a_v2_peer() {
+    let h = start(Bitfield::new(PIECES));
+    let mut bits = reserved(true, false, false);
+    bits.set_v2();
+    let (mut wire, mut r, ours) = connect_ext(h, bits).await;
+    assert!(ours.reserved.supports_v2());
+    assert_eq!(recv(&mut wire).await, Message::HaveNone);
+    let hashes = Bytes::from(vec![5u8; 64]);
+    send(&mut wire, Message::HashRequest(hash_req(0))).await;
+    send(
+        &mut wire,
+        Message::Hashes {
+            req: hash_req(2),
+            hashes: hashes.clone(),
+        },
+    )
+    .await;
+    send(&mut wire, Message::HashReject(hash_req(4))).await;
+    assert_eq!(
+        r.next().await,
+        PeerEvent::HashRequest {
+            key: KEY,
+            req: hash_req(0)
+        }
+    );
+    assert_eq!(
+        r.next().await,
+        PeerEvent::Hashes {
+            key: KEY,
+            req: hash_req(2),
+            hashes: hashes.clone()
+        }
+    );
+    assert_eq!(
+        r.next().await,
+        PeerEvent::HashReject {
+            key: KEY,
+            req: hash_req(4)
+        }
+    );
+    // Our answers go out as sent.
+    r.cmd(PeerCommand::SendHashes {
+        req: hash_req(0),
+        hashes: hashes.clone(),
+    })
+    .await;
+    r.cmd(PeerCommand::RejectHashes(hash_req(6))).await;
+    assert_eq!(
+        recv(&mut wire).await,
+        Message::Hashes {
+            req: hash_req(0),
+            hashes
+        }
+    );
+    assert_eq!(recv(&mut wire).await, Message::HashReject(hash_req(6)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn hash_message_without_the_v2_bit_closes() {
+    for m in [
+        Message::HashRequest(hash_req(0)),
+        Message::Hashes {
+            req: hash_req(0),
+            hashes: Bytes::from(vec![0u8; 32]),
+        },
+        Message::HashReject(hash_req(0)),
+    ] {
+        let h = start(Bitfield::new(PIECES));
+        let (mut wire, mut r, _) = connect_ext(h, reserved(true, false, false)).await;
+        send(&mut wire, m).await;
+        let (reason, _) = r.disconnected().await;
+        assert!(
+            matches!(reason, DisconnectReason::Protocol(ref s) if s.contains("v2")),
+            "{reason:?}"
+        );
+    }
+}
+
+/// libtorrent (`bt_peer_connection.cpp`) treats a connection made under a
+/// torrent's truncated v2 hash as v2 without the reserved bit, and sets the
+/// bit only on v1-hash connections of a v2 torrent: its hash messages on a
+/// v2-only torrent come without it.
+#[tokio::test(start_paused = true)]
+async fn v2_hash_connection_is_v2_without_the_bit() {
+    let h = start_hashes(
+        Bitfield::new(PIECES),
+        Some(layout(PIECES)),
+        ext_cfg(),
+        Settings::default(),
+        Some(HASH),
+    );
+    let (wire, mut r, ours) = h
+        .handshake_with(HASH, THEIR_ID, reserved(true, true, false))
+        .await;
+    let mut wire = wire;
+    assert!(ours.reserved.supports_v2());
+    match r.next().await {
+        PeerEvent::Connected { reserved, .. } => assert!(reserved.supports_v2()),
+        other => panic!("expected Connected, got {other:?}"),
+    }
+    send(&mut wire, Message::HashRequest(hash_req(0))).await;
+    loop {
+        match r.next().await {
+            PeerEvent::HashRequest { req, .. } => {
+                assert_eq!(req, hash_req(0));
+                break;
+            }
+            PeerEvent::Disconnected { reason, .. } => panic!("closed: {reason:?}"),
+            _ => {}
+        }
+    }
+}
+
+/// libtorrent drops an incoming plaintext handshake that sets the v2 bit
+/// for a torrent it knows to be v1-only, so a torrent without a v2 hash
+/// never sets it.
+#[tokio::test(start_paused = true)]
+async fn v1_torrent_handshake_has_no_v2_bit() {
+    let h = start_hashes(
+        Bitfield::new(PIECES),
+        Some(layout(PIECES)),
+        ext_cfg(),
+        Settings::default(),
+        None,
+    );
+    let (_wire, _r, ours) = h
+        .handshake_with(HASH, THEIR_ID, reserved(true, true, false))
+        .await;
+    assert!(!ours.reserved.supports_v2());
 }

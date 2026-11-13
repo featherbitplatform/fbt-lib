@@ -160,6 +160,13 @@ impl Actor {
                 let s = self.peer_block_source(addr);
                 let _ = tx.send(self.smartban.trust_of(s));
             }
+            Cmd::PieceLayersKnown(tx) => {
+                let n = self
+                    .loaded
+                    .as_ref()
+                    .map_or(0, |l| l.meta.piece_layers.len());
+                let _ = tx.send(n);
+            }
             Cmd::Shutdown(tx) => {
                 let _ = self.stop(None).await;
                 let _ = tx.send(());
@@ -433,7 +440,9 @@ impl Actor {
     pub(super) async fn resume_data(&mut self) -> Result<Vec<u8>, ResumeError> {
         self.flush_and_wait().await;
         self.account_time();
-        let num_pieces = self.loaded.as_ref().map_or(0, |l| l.layout.num_pieces());
+        let num_pieces = self
+            .known_meta()
+            .map_or(0, |m| m.piece_layout().num_pieces());
         let picker_have = self
             .loaded
             .as_ref()
@@ -454,10 +463,11 @@ impl Actor {
                 (have, Vec::new())
             }
         };
-        let (magnet, sequential) = match (&self.loaded, &self.magnet) {
-            (Some(l), _) => (None, l.sequential),
-            (None, Some(m)) => (Some(m.magnet.to_uri()), m.sequential),
-            (None, None) => (None, false),
+        let (magnet, sequential) = match (&self.loaded, &self.magnet, &self.pending_layers) {
+            (Some(l), _, _) => (None, l.sequential),
+            (None, Some(m), _) => (Some(m.magnet.to_uri()), m.sequential),
+            (None, None, Some(p)) => (None, p.sequential),
+            (None, None, None) => (None, false),
         };
         let save_path = match &self.magnet {
             // A magnet's save path is moved with it until the metadata.
@@ -471,6 +481,8 @@ impl Actor {
                 .loaded
                 .as_ref()
                 .map(|l| l.renamed.iter().map(|(i, p)| (*i, p.clone())).collect())
+                // Waiting for its layers: the renames it was added with.
+                .or_else(|| self.resume.as_ref().map(|r| r.renamed.clone()))
                 .unwrap_or_default(),
             web_seeds: self.web_seeds.urls(),
             queue_position: Some(self.queue_position),
@@ -484,19 +496,30 @@ impl Actor {
         };
         let no_trackers: Vec<Vec<String>> = Vec::new();
         let magnet_trackers: Vec<Vec<String>>;
-        let trackers = match (&self.loaded, &self.magnet) {
-            (Some(l), _) => &l.meta.trackers,
+        let trackers = match (self.known_meta(), &self.magnet) {
+            (Some(meta), _) => &meta.trackers,
             (None, Some(m)) => {
                 magnet_trackers = m.magnet.trackers.iter().map(|t| vec![t.clone()]).collect();
                 &magnet_trackers
             }
             (None, None) => &no_trackers,
         };
-        let file_priorities = self.loaded.as_ref().map_or(&[][..], |l| &l.file_prio[..]);
+        let file_priorities = match (&self.loaded, &self.pending_layers) {
+            (Some(l), _) => &l.file_prio[..],
+            (None, Some(p)) => &p.file_prio[..],
+            (None, None) => &[][..],
+        };
+        // The key's hashes, with any the metadata revealed (a magnet's
+        // `info` is checked against both on load).
+        let meta = self.known_meta();
+        let hashes = meta.map(|m| m.info_hashes);
         let bytes = resume::encode(&ResumeRecord {
-            info_hash: self.ih.wire_hash(),
+            info_hash: self.ih.v1.or(hashes.and_then(|h| h.v1)).map(|h| h.0),
+            info_hash2: self.ih.v2.or(hashes.and_then(|h| h.v2)).map(|h| h.0),
             save_path: &save_path,
-            info: self.loaded.as_ref().map(|l| l.meta.raw_info()),
+            info: meta.map(|m| m.raw_info()),
+            // Fetched and built layers are merged into the metadata held.
+            piece_layers: meta.map(|m| &m.piece_layers),
             magnet,
             trackers,
             file_priorities,
@@ -629,12 +652,13 @@ impl Actor {
         if let Some(a) = self.announcer.take()
             && remove.is_none()
         {
-            let mut task = a.task;
-            if tokio::time::timeout_at(announce_deadline, &mut task)
-                .await
-                .is_err()
-            {
-                task.abort();
+            for mut task in a.tasks {
+                if tokio::time::timeout_at(announce_deadline, &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                }
             }
         }
         if let Some(e) = self.write_error.take() {

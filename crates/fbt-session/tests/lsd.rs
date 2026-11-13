@@ -61,6 +61,21 @@ impl Lan {
         out
     }
 
+    /// Every message received within `d`.
+    async fn messages_within(&self, d: Duration) -> Vec<LsdMessage> {
+        let mut out = Vec::new();
+        let end = tokio::time::Instant::now() + d;
+        let mut buf = [0u8; 2048];
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout_at(end, self.socket.recv_from(&mut buf)).await
+        {
+            if let Ok(m) = LsdMessage::decode(&buf[..n]) {
+                out.push(m);
+            }
+        }
+        out
+    }
+
     async fn announce_to(&self, to: SocketAddr, hash: [u8; 20], port: u16) {
         let m = LsdMessage {
             port,
@@ -201,5 +216,35 @@ async fn private_torrent_not_announced() {
     )
     .await;
     assert!(some.is_some());
+    session.shutdown().await;
+}
+
+/// A hybrid goes out in one message carrying both of its hashes: the v1
+/// hash, then the truncated v2 hash.
+#[tokio::test]
+async fn lsd_carries_both_hashes() {
+    use fbt_core::InfoHashes;
+    use fbt_metainfo::TorrentVersion;
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(
+        &write_v2_payload(dir.path()),
+        TorrentVersion::Hybrid,
+        32_768,
+    );
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let v1 = m.info_hashes.v1.expect("v1 hash").0;
+    let v2 = InfoHashes::from_v2(m.info_hashes.v2.expect("v2 hash")).wire_hash();
+    let lan = Lan::new().await;
+    let session = Session::new(lsd_settings(free_udp(), lan.addr))
+        .await
+        .unwrap();
+    let h = session
+        .add_torrent(AddTorrent::new(m, dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
+    let messages = lan.messages_within(Duration::from_secs(3)).await;
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0].info_hashes, vec![v1, v2]);
     session.shutdown().await;
 }

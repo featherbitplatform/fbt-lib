@@ -36,6 +36,32 @@
 //! # }
 //! ```
 //!
+//! # Creating a torrent
+//!
+//! [`CreateTorrent`] hashes a file or a directory and returns the bencoded
+//! `.torrent`. It makes a hybrid (v1 and v2) torrent by default; hashing is
+//! synchronous, so async callers run it on `spawn_blocking`.
+//!
+//! ```
+//! use std::ops::ControlFlow;
+//! use fbt::{CreateTorrent, Metainfo, TorrentVersion};
+//!
+//! # fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let dir = tempfile::tempdir()?;
+//! std::fs::write(dir.path().join("hello.txt"), b"hello, swarm")?;
+//!
+//! let bytes = CreateTorrent::new(dir.path().join("hello.txt"))
+//!     .version(TorrentVersion::Hybrid)
+//!     .build(&mut |_done, _total| ControlFlow::Continue(()))?;
+//!
+//! let metainfo = Metainfo::from_bytes(&bytes)?;
+//! assert_eq!(metainfo.version(), TorrentVersion::Hybrid);
+//! assert!(metainfo.info_hashes.v1.is_some() && metainfo.info_hashes.v2.is_some());
+//! # Ok(())
+//! # }
+//! # run().unwrap();
+//! ```
+//!
 //! # Magnet links
 //!
 //! Add a torrent by its info hash and wait for the metadata (BEP 9) to
@@ -435,7 +461,9 @@ pub use fbt_core::{
     LayoutError, ParseInfoHashError, PeerId, PieceLayout,
 };
 pub use fbt_metainfo::{
-    FileEntry, Info, MAX_WEB_SEEDS, Magnet, MagnetError, Metainfo, MetainfoError, RelPath,
+    CreateError, CreateTorrent, FileEntry, Info, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES,
+    MAX_V2_PIECES, MAX_WEB_SEEDS, Magnet, MagnetError, Metainfo, MetainfoError, RelPath,
+    TorrentVersion, V2Piece, auto_piece_len, validate_layer,
 };
 pub use fbt_session::storage::{FileStamp, FsStorage, MemStorage, Storage};
 pub use fbt_session::{

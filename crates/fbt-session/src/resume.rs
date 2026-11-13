@@ -8,15 +8,19 @@
 //! checked (a failure is a [`ResumeError`] naming the field, never a panic).
 //! A [`SessionState`] bundles the DHT state and every torrent's resume data.
 //!
-//! The dictionary (keys in bencode order; the first three are required):
+//! The dictionary (keys in bencode order; `fbt-resume-version`,
+//! `save-path` and at least one of `info-hash` and `info-hash2` are
+//! required):
 //!
 //! | key | value |
 //! |---|---|
-//! | `fbt-resume-version` | 1 |
-//! | `info-hash` | the v1 info hash, 20 bytes |
+//! | `fbt-resume-version` | 2 (version 1, v1 hashes only, is still read) |
+//! | `info-hash` | the v1 info hash, 20 bytes; absent for a v2-only torrent |
+//! | `info-hash2` | the v2 info hash, 32 bytes; absent for a v1-only torrent |
 //! | `save-path` | the directory the files are below |
-//! | `info` | the raw `info` dictionary; its SHA-1 must be `info-hash` |
-//! | `magnet` | without `info`: the magnet URI |
+//! | `info` | the raw `info` dictionary; its SHA-1 must be `info-hash` and its SHA-256 `info-hash2` (each one present) |
+//! | `piece-layers` | with `info`: `pieces root` → the file's concatenated layer hashes, every layer the torrent holds (fetched or built ones included) |
+//! | `magnet` | without `info`: the magnet URI; its `btih` must be `info-hash` and its `btmh` `info-hash2` (each one present) |
 //! | `file-priorities` | one per file: 0 skip, 1 low, 4 normal, 7 high |
 //! | `renamed` | `[index, [component, ...]]` per renamed file |
 //! | `pieces` | the verified pieces, a bitfield |
@@ -30,6 +34,16 @@
 //! | `url-list` | the web seeds, retired ones included |
 //! | `peers`, `peers6` | compact addresses, at most 200 each |
 //! | `stamps` | per file then the part file: `[len, mtime]`, or `[]` for none |
+//!
+//! Each piece layer is checked on load against its file
+//! ([`Metainfo::with_piece_layers`]); one that does not match is dropped,
+//! not fatal: a v2-only torrent fetches it from peers again, a hybrid
+//! builds it from its verified data. Layers that would push the data over
+//! [`MAX_RESUME_BYTES`] are left out on save the same way. A hybrid whose
+//! layers were neither in its metadata nor saved (resume data of version
+//! 1, or left out) gets them only from data it verifies: a trusted resume
+//! verifies nothing, so it lacks them until its next check (or until it
+//! downloads a piece of the file).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -38,10 +52,10 @@ use std::time::Duration;
 
 use fbt_bencode::{DecodeError, Dict, Limits, OwnedValue, Value, decode_with, encode_into};
 use fbt_core::compact::{decode_v4_list, decode_v6_list};
-use fbt_core::{Bitfield, InfoHashV1, compact};
+use fbt_core::{Bitfield, InfoHashV1, InfoHashV2, compact};
 use fbt_metainfo::{
-    FileEntry, MAX_TORRENT_DEPTH, MAX_TORRENT_ITEMS, MAX_WEB_SEEDS, Magnet, MagnetError, Metainfo,
-    MetainfoError, RelPath, sanitize_path,
+    FileEntry, MAX_PIECE_LAYER_HASHES, MAX_TORRENT_DEPTH, MAX_TORRENT_ITEMS, MAX_WEB_SEEDS, Magnet,
+    MagnetError, Metainfo, MetainfoError, RelPath, sanitize_path,
 };
 
 use crate::bandwidth::RateLimit;
@@ -61,8 +75,12 @@ pub const MAX_RESUME_BYTES: usize = 64 * 1024 * 1024;
 /// file costs at least six values there and adds four here (its priority
 /// and its stamp), so the per-file fields take at most two thirds of the
 /// other share, and the rest (about 1.4 million values) is left for the
-/// renamed paths and the fixed fields. Resume data a torrent saves never
-/// exceeds it unless its renamed paths hold more components than that;
+/// renamed paths and the fixed fields. A piece layer adds two values (its
+/// root and its hashes) for a file with a `pieces root`, which costs at
+/// least eight values in the `info` (more in a hybrid's), so the per-file
+/// fields still take at most three quarters of the other share. Resume
+/// data a torrent saves never exceeds it unless its renamed paths hold
+/// more components than that;
 /// [`TorrentHandle::save_resume_data`](crate::TorrentHandle::save_resume_data)
 /// checks its own output and fails rather than return data that would not
 /// load.
@@ -78,8 +96,8 @@ const MAX_RESUME_DEPTH: usize = MAX_TORRENT_DEPTH;
 pub const MAX_RESUME_PEERS: usize = 200;
 /// Most torrents a [`SessionState`] holds.
 pub const MAX_SESSION_TORRENTS: usize = 100_000;
-/// The resume data format written and read.
-const RESUME_VERSION: i64 = 1;
+/// The resume data format written; it and every earlier one are read.
+const RESUME_VERSION: i64 = 2;
 /// The session state format written and read.
 const SESSION_VERSION: i64 = 1;
 
@@ -104,8 +122,9 @@ pub enum ResumeError {
     /// for the torrent, an unsafe or colliding renamed path, ...).
     #[error("invalid `{0}` in resume data")]
     Invalid(&'static str),
-    /// The `info` dictionary (or the magnet) is not that of `info-hash`.
-    #[error("the resume data's torrent does not match its `info-hash`")]
+    /// The `info` dictionary (or the magnet) is not that of `info-hash`
+    /// or `info-hash2`.
+    #[error("the resume data's torrent does not match its info hash")]
     InfoHashMismatch,
     /// The `info` dictionary does not parse.
     #[error("invalid `info` in resume data: {0}")]
@@ -176,15 +195,19 @@ pub fn decode_resume(bytes: &[u8]) -> Result<DecodedResume, ResumeError> {
     let d = root.as_dict().ok_or(ResumeError::Invalid("resume"))?;
     let version =
         int(d, "fbt-resume-version")?.ok_or(ResumeError::Missing("fbt-resume-version"))?;
-    if version != RESUME_VERSION {
+    if !(1..=RESUME_VERSION).contains(&version) {
         return Err(ResumeError::Version(version));
     }
-    let ih: [u8; 20] = d
-        .get(b"info-hash")
-        .ok_or(ResumeError::Missing("info-hash"))?
-        .as_bytes()
-        .and_then(|b| b.try_into().ok())
-        .ok_or(ResumeError::Invalid("info-hash"))?;
+    let ih = hash::<20>(d, "info-hash")?;
+    // Version 1 knew v1 hashes only.
+    let ih2 = if version >= 2 {
+        hash::<32>(d, "info-hash2")?
+    } else {
+        None
+    };
+    if ih.is_none() && ih2.is_none() {
+        return Err(ResumeError::Missing("info-hash"));
+    }
     let save_path = path_from_bytes(
         d.get(b"save-path")
             .ok_or(ResumeError::Missing("save-path"))?
@@ -199,17 +222,25 @@ pub fn decode_resume(bytes: &[u8]) -> Result<DecodedResume, ResumeError> {
     let (source, meta) = match (d.get(b"info"), d.get(b"magnet")) {
         (Some(info), _) => {
             let raw = info.raw();
-            if InfoHashV1::of(raw).0 != ih {
+            if ih.is_some_and(|h| InfoHashV1::of(raw).0 != h)
+                || ih2.is_some_and(|h| InfoHashV2::of(raw).0 != h)
+            {
                 return Err(ResumeError::InfoHashMismatch);
             }
-            let m = parse_info(raw, &trackers)?;
+            let mut m = parse_info(raw, &trackers)?;
+            if version >= 2 {
+                let layers = piece_layers(d, &m)?;
+                m = m.with_piece_layers(layers);
+            }
             let source = TorrentSource::Metainfo(Box::new(m.clone()));
             (source, Some(m))
         }
         (None, Some(magnet)) => {
             let uri = magnet.as_str().ok_or(ResumeError::Invalid("magnet"))?;
             let mut m = Magnet::parse(uri).map_err(ResumeError::Magnet)?;
-            if m.info_hashes.v1.map(|h| h.0) != Some(ih) {
+            if ih.is_some_and(|h| m.info_hashes.v1.map(|v| v.0) != Some(h))
+                || ih2.is_some_and(|h| m.info_hashes.v2.map(|v| v.0) != Some(h))
+            {
                 return Err(ResumeError::InfoHashMismatch);
             }
             // `url-list` is the current set of web seeds.
@@ -284,6 +315,59 @@ fn parse_info(raw: &[u8], trackers: &[Vec<String>]) -> Result<Metainfo, ResumeEr
     torrent.extend_from_slice(raw);
     torrent.push(b'e');
     Metainfo::from_bytes(&torrent).map_err(ResumeError::Metainfo)
+}
+
+/// An info hash field of `N` bytes; `Invalid` if it is not one.
+fn hash<const N: usize>(d: &Dict<'_>, key: &'static str) -> Result<Option<[u8; N]>, ResumeError> {
+    d.get(key.as_bytes())
+        .map(|v| {
+            v.as_bytes()
+                .and_then(|b| b.try_into().ok())
+                .ok_or(ResumeError::Invalid(key))
+        })
+        .transpose()
+}
+
+/// The saved piece layers of `meta`'s files, not yet checked against them
+/// ([`Metainfo::with_piece_layers`] does). An entry that cannot be a layer
+/// of one of its files (a key that is no file's `pieces root`, a value
+/// that is not whole hashes) is dropped, as is any past
+/// [`MAX_PIECE_LAYER_HASHES`] hashes in all: counted before anything is
+/// copied.
+fn piece_layers(
+    d: &Dict<'_>,
+    meta: &Metainfo,
+) -> Result<BTreeMap<[u8; 32], Vec<[u8; 32]>>, ResumeError> {
+    let mut out = BTreeMap::new();
+    let Some(v) = d.get(b"piece-layers") else {
+        return Ok(out);
+    };
+    let layers = v.as_dict().ok_or(ResumeError::Invalid("piece-layers"))?;
+    let roots: HashSet<[u8; 32]> = meta
+        .info
+        .files
+        .iter()
+        .filter_map(|f| f.pieces_root)
+        .collect();
+    let mut total: usize = 0;
+    for (key, value) in layers.iter() {
+        let Ok(root) = <[u8; 32]>::try_from(key) else {
+            continue;
+        };
+        let Some(raw) = value.as_bytes() else {
+            continue;
+        };
+        let (hashes, rest) = raw.as_chunks::<32>();
+        if !roots.contains(&root) || !rest.is_empty() || hashes.is_empty() {
+            continue;
+        }
+        if total.saturating_add(hashes.len()) > MAX_PIECE_LAYER_HASHES {
+            continue;
+        }
+        total += hashes.len();
+        out.insert(root, hashes.to_vec());
+    }
+    Ok(out)
 }
 
 /// An integer field; `Invalid` if it is not one.
@@ -531,10 +615,15 @@ fn path_bytes(p: &Path) -> Vec<u8> {
 /// Everything resume data is written from.
 #[derive(Debug)]
 pub(crate) struct ResumeRecord<'a> {
-    pub info_hash: [u8; 20],
+    /// The v1 info hash; `None` for a v2-only torrent.
+    pub info_hash: Option<[u8; 20]>,
+    /// The v2 info hash; `None` for a v1-only torrent.
+    pub info_hash2: Option<[u8; 32]>,
     pub save_path: &'a Path,
     /// The raw `info` dictionary, once the metadata is known.
     pub info: Option<&'a [u8]>,
+    /// The piece layers held (written with `info` only).
+    pub piece_layers: Option<&'a BTreeMap<[u8; 32], Vec<[u8; 32]>>>,
     /// Without metadata: the magnet URI.
     pub magnet: Option<String>,
     pub trackers: &'a [Vec<String>],
@@ -546,11 +635,57 @@ pub(crate) struct ResumeRecord<'a> {
     pub state: &'a ResumeState,
 }
 
-/// One value of the resume dictionary: owned, or raw bytes spliced in as
-/// they are (the `info` dictionary, whose hash must not change).
+/// One value of the resume dictionary: encoded, or raw bytes spliced in
+/// as they are (the `info` dictionary, whose hash must not change).
 enum Field<'a> {
-    Value(OwnedValue),
+    Encoded(Vec<u8>),
     Raw(&'a [u8]),
+}
+
+impl Field<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Field::Encoded(b) => b,
+            Field::Raw(b) => b,
+        }
+    }
+}
+
+/// The length of the bencoded byte string of `n` bytes.
+fn bytes_len(n: usize) -> usize {
+    n.to_string().len() + 1 + n
+}
+
+/// The `piece-layers` dictionary, encoded: every layer of `layers` that
+/// keeps it within `budget` bytes, in root order (the others are left
+/// out). `None` when none fits.
+fn encode_layers(layers: &BTreeMap<[u8; 32], Vec<[u8; 32]>>, budget: usize) -> Option<Vec<u8>> {
+    // `d`, `e`.
+    let mut size = 2usize;
+    let mut kept = Vec::new();
+    for (root, layer) in layers {
+        let entry = bytes_len(32) + bytes_len(layer.len().saturating_mul(32));
+        if size.saturating_add(entry) <= budget {
+            size += entry;
+            kept.push((root, layer));
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(size);
+    out.push(b'd');
+    for (root, layer) in kept {
+        out.extend_from_slice(b"32:");
+        out.extend_from_slice(root);
+        out.extend_from_slice((layer.len() * 32).to_string().as_bytes());
+        out.push(b':');
+        for h in layer {
+            out.extend_from_slice(h);
+        }
+    }
+    out.push(b'e');
+    Some(out)
 }
 
 fn int_value(n: u64) -> OwnedValue {
@@ -566,10 +701,17 @@ pub(crate) fn encode(r: &ResumeRecord<'_>) -> Vec<u8> {
     let s = r.state;
     let mut f: BTreeMap<&'static [u8], Field<'_>> = BTreeMap::new();
     let mut put = |k: &'static str, v: OwnedValue| {
-        f.insert(k.as_bytes(), Field::Value(v));
+        let mut b = Vec::new();
+        encode_into(&v, &mut b);
+        f.insert(k.as_bytes(), Field::Encoded(b));
     };
     put("fbt-resume-version", OwnedValue::Int(RESUME_VERSION));
-    put("info-hash", OwnedValue::Bytes(r.info_hash.to_vec()));
+    if let Some(h) = r.info_hash {
+        put("info-hash", OwnedValue::Bytes(h.to_vec()));
+    }
+    if let Some(h) = r.info_hash2 {
+        put("info-hash2", OwnedValue::Bytes(h.to_vec()));
+    }
     put("save-path", OwnedValue::Bytes(path_bytes(r.save_path)));
     if let Some(m) = &r.magnet {
         put("magnet", OwnedValue::from(m.as_str()));
@@ -673,14 +815,31 @@ pub(crate) fn encode(r: &ResumeRecord<'_>) -> Vec<u8> {
     if let Some(info) = r.info {
         f.insert(b"info", Field::Raw(info));
     }
-    let mut out = Vec::new();
+    const LAYERS_KEY: &[u8] = b"piece-layers";
+    // `d`, `e`, every field and the layers' key.
+    let size = f
+        .iter()
+        .map(|(k, v)| bytes_len(k.len()) + v.bytes().len())
+        .sum::<usize>()
+        + 2
+        + bytes_len(LAYERS_KEY.len());
+    let layers = r
+        .piece_layers
+        .filter(|l| r.info.is_some() && !l.is_empty())
+        .and_then(|l| encode_layers(l, MAX_RESUME_BYTES.saturating_sub(size)));
+    if let Some(l) = layers {
+        f.insert(LAYERS_KEY, Field::Encoded(l));
+    }
+    let mut out = Vec::with_capacity(
+        f.iter()
+            .map(|(k, v)| bytes_len(k.len()) + v.bytes().len())
+            .sum::<usize>()
+            + 2,
+    );
     out.push(b'd');
     for (k, v) in &f {
         encode_into(&OwnedValue::Bytes(k.to_vec()), &mut out);
-        match v {
-            Field::Value(v) => encode_into(v, &mut out),
-            Field::Raw(raw) => out.extend_from_slice(raw),
-        }
+        out.extend_from_slice(v.bytes());
     }
     out.push(b'e');
     out
@@ -892,9 +1051,11 @@ mod tests {
 
     fn record<'a>(m: &'a Metainfo, s: &'a ResumeState, prio: &'a [Priority]) -> ResumeRecord<'a> {
         ResumeRecord {
-            info_hash: m.info_hashes.wire_hash(),
+            info_hash: m.info_hashes.v1.map(|h| h.0),
+            info_hash2: m.info_hashes.v2.map(|h| h.0),
             save_path: Path::new("/save/here"),
             info: Some(m.raw_info()),
+            piece_layers: Some(&m.piece_layers),
             magnet: None,
             trackers: &[],
             file_priorities: prio,
@@ -913,6 +1074,40 @@ mod tests {
         };
         f(&mut d);
         bencode(&OwnedValue::Dict(d))
+    }
+
+    /// Version 1 resume data of [`three`]: what the encoder wrote before
+    /// version 2 (a v1 torrent's data differs only in the version).
+    fn version_1_data() -> Vec<u8> {
+        let m = three();
+        let s = state(&m);
+        let prio = [Priority::Low, Priority::Normal, Priority::High];
+        edit(&encode(&record(&m, &s, &prio)), |d| {
+            d.insert(b"fbt-resume-version".to_vec(), 1.into());
+        })
+    }
+
+    /// Writes `tests/fixtures/resume-v1.bin` and the v2 and hybrid seeds
+    /// of the `resume` fuzz target.
+    #[test]
+    #[ignore = "writes the committed fixture and fuzz seeds"]
+    fn regenerate_fixtures() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        std::fs::write(
+            format!("{dir}/tests/fixtures/resume-v1.bin"),
+            version_1_data(),
+        )
+        .unwrap();
+        for (name, version) in [
+            ("v2", fbt_metainfo::TorrentVersion::V2),
+            ("hybrid", fbt_metainfo::TorrentVersion::Hybrid),
+        ] {
+            let m = created(version);
+            let mut s = plain_state(&m);
+            s.have.set(0);
+            let bytes = encode(&record(&m, &s, &[]));
+            std::fs::write(format!("{dir}/../../fuzz/seeds/resume/{name}"), bytes).unwrap();
+        }
     }
 
     #[test]
@@ -996,8 +1191,8 @@ mod tests {
             })
         };
         assert!(matches!(
-            e(&with("fbt-resume-version", 2.into())),
-            ResumeError::Version(2)
+            e(&with("fbt-resume-version", 3.into())),
+            ResumeError::Version(3)
         ));
         assert!(matches!(
             e(&without("fbt-resume-version")),
@@ -1079,6 +1274,282 @@ mod tests {
             d.insert(b"info".to_vec(), info);
         });
         assert!(matches!(e(&swapped), ResumeError::InfoHashMismatch));
+    }
+
+    #[test]
+    fn version_1_still_reads() {
+        let d = decode_resume(include_bytes!("../tests/fixtures/resume-v1.bin")).unwrap();
+        let m = three();
+        let TorrentSource::Metainfo(got) = &d.source else {
+            panic!("metainfo expected");
+        };
+        assert_eq!(got.info_hashes, m.info_hashes);
+        assert_eq!(got.raw_info(), m.raw_info());
+        assert_eq!(d.state.have, state(&m).have);
+        assert_eq!(d.state.renamed, state(&m).renamed);
+        assert_eq!(
+            d.file_priorities,
+            [Priority::Low, Priority::Normal, Priority::High]
+        );
+        // The committed bytes are what the generator writes today.
+        assert_eq!(
+            include_bytes!("../tests/fixtures/resume-v1.bin").as_slice(),
+            version_1_data()
+        );
+    }
+
+    #[test]
+    fn version_3_is_refused() {
+        let m = three();
+        let s = state(&m);
+        let good = encode(&record(&m, &s, &[]));
+        let v3 = edit(&good, |d| {
+            d.insert(b"fbt-resume-version".to_vec(), 3.into());
+        });
+        assert!(matches!(decode_resume(&v3), Err(ResumeError::Version(3))));
+        let v0 = edit(&good, |d| {
+            d.insert(b"fbt-resume-version".to_vec(), 0.into());
+        });
+        assert!(matches!(decode_resume(&v0), Err(ResumeError::Version(0))));
+    }
+
+    const V2_PIECE: u32 = 32_768;
+
+    /// A torrent of `version` made by `CreateTorrent` over two files of
+    /// 100 000 and 300 000 bytes (a layer each) in 32 KiB pieces.
+    fn created(version: fbt_metainfo::TorrentVersion) -> Metainfo {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("payload");
+        std::fs::create_dir(&root).unwrap();
+        for (name, len) in [("a", 100_000u32), ("c", 300_000)] {
+            let data: Vec<u8> = (0..len)
+                .map(|i| (i % 251) as u8 ^ name.as_bytes()[0])
+                .collect();
+            std::fs::write(root.join(name), data).unwrap();
+        }
+        let bytes = fbt_metainfo::CreateTorrent::new(&root)
+            .version(version)
+            .piece_len(V2_PIECE)
+            .build(&mut |_, _| std::ops::ControlFlow::Continue(()))
+            .unwrap();
+        let m = Metainfo::from_bytes(&bytes).unwrap();
+        assert_eq!(m.piece_layers.len(), 2);
+        m
+    }
+
+    /// Plain resume data of `m`: its pieces all missing, nothing renamed.
+    fn plain_state(m: &Metainfo) -> ResumeState {
+        ResumeState {
+            have: Bitfield::new(m.piece_layout().num_pieces()),
+            stamps: Vec::new(),
+            renamed: Vec::new(),
+            ..state(m)
+        }
+    }
+
+    #[test]
+    fn v2_and_hybrid_round_trip_with_layers() {
+        use fbt_metainfo::TorrentVersion;
+        for version in [TorrentVersion::V2, TorrentVersion::Hybrid] {
+            let m = created(version);
+            let s = plain_state(&m);
+            let bytes = encode(&record(&m, &s, &[]));
+            let OwnedValue::Dict(d) = fbt_bencode::decode(&bytes).unwrap().to_owned_value() else {
+                panic!("not a dict");
+            };
+            assert_eq!(d.get(&b"fbt-resume-version"[..]), Some(&OwnedValue::Int(2)));
+            assert_eq!(
+                d.get(&b"info-hash"[..]),
+                m.info_hashes
+                    .v1
+                    .map(|h| OwnedValue::Bytes(h.0.to_vec()))
+                    .as_ref()
+            );
+            assert_eq!(
+                d.get(&b"info-hash2"[..]),
+                m.info_hashes
+                    .v2
+                    .map(|h| OwnedValue::Bytes(h.0.to_vec()))
+                    .as_ref()
+            );
+            let decoded = decode_resume(&bytes).unwrap();
+            let TorrentSource::Metainfo(got) = &decoded.source else {
+                panic!("metainfo expected");
+            };
+            assert_eq!(got.info_hashes, m.info_hashes);
+            assert_eq!(got.piece_layers, m.piece_layers, "{version:?}");
+            // Without either hash it is refused.
+            let neither = edit(&bytes, |d| {
+                d.remove(&b"info-hash"[..]);
+                d.remove(&b"info-hash2"[..]);
+            });
+            assert!(matches!(
+                decode_resume(&neither),
+                Err(ResumeError::Missing("info-hash"))
+            ));
+        }
+    }
+
+    #[test]
+    fn v2_resume_requires_a_matching_hash() {
+        use fbt_metainfo::TorrentVersion;
+        for version in [TorrentVersion::V2, TorrentVersion::Hybrid] {
+            let m = created(version);
+            let s = plain_state(&m);
+            let good = encode(&record(&m, &s, &[]));
+            let wrong = edit(&good, |d| {
+                d.insert(b"info-hash2".to_vec(), OwnedValue::Bytes(vec![1; 32]));
+            });
+            assert!(
+                matches!(decode_resume(&wrong), Err(ResumeError::InfoHashMismatch)),
+                "{version:?}"
+            );
+            let short = edit(&good, |d| {
+                d.insert(b"info-hash2".to_vec(), OwnedValue::Bytes(vec![1; 20]));
+            });
+            assert!(matches!(
+                decode_resume(&short),
+                Err(ResumeError::Invalid("info-hash2"))
+            ));
+        }
+        // A hybrid's right v2 hash does not excuse a wrong v1 one.
+        let m = created(TorrentVersion::Hybrid);
+        let s = plain_state(&m);
+        let wrong_v1 = edit(&encode(&record(&m, &s, &[])), |d| {
+            d.insert(b"info-hash".to_vec(), OwnedValue::Bytes(vec![1; 20]));
+        });
+        assert!(matches!(
+            decode_resume(&wrong_v1),
+            Err(ResumeError::InfoHashMismatch)
+        ));
+    }
+
+    #[test]
+    fn v2_magnet_resume_without_info() {
+        let m = created(fbt_metainfo::TorrentVersion::V2);
+        let s = ResumeState {
+            have: Bitfield::new(0),
+            ..plain_state(&m)
+        };
+        let rec = ResumeRecord {
+            info: None,
+            magnet: Some(m.magnet().to_uri()),
+            piece_layers: None,
+            ..record(&m, &s, &[])
+        };
+        let good = encode(&rec);
+        let d = decode_resume(&good).unwrap();
+        let TorrentSource::Magnet(got) = &d.source else {
+            panic!("magnet expected");
+        };
+        assert_eq!(got.info_hashes, m.info_hashes);
+        let other = edit(&good, |d| {
+            d.insert(b"info-hash2".to_vec(), OwnedValue::Bytes(vec![1; 32]));
+        });
+        assert!(matches!(
+            decode_resume(&other),
+            Err(ResumeError::InfoHashMismatch)
+        ));
+        // A v1 hash the magnet does not carry.
+        let v1 = edit(&good, |d| {
+            d.insert(b"info-hash".to_vec(), OwnedValue::Bytes(vec![1; 20]));
+        });
+        assert!(matches!(
+            decode_resume(&v1),
+            Err(ResumeError::InfoHashMismatch)
+        ));
+    }
+
+    #[test]
+    fn bad_layers_are_dropped() {
+        let m = created(fbt_metainfo::TorrentVersion::V2);
+        let s = plain_state(&m);
+        let good = encode(&record(&m, &s, &[]));
+        let (bad_root, kept_root) = {
+            let mut roots = m.piece_layers.keys().copied();
+            (roots.next().unwrap(), roots.next().unwrap())
+        };
+        type Layers = BTreeMap<Vec<u8>, OwnedValue>;
+        let corrupt = |f: &dyn Fn(&mut Layers)| {
+            edit(&good, |d| {
+                let Some(OwnedValue::Dict(layers)) = d.get_mut(&b"piece-layers"[..]) else {
+                    panic!("piece-layers expected");
+                };
+                f(layers);
+            })
+        };
+        let flipped = corrupt(&|l| {
+            let Some(OwnedValue::Bytes(b)) = l.get_mut(&bad_root[..]) else {
+                panic!("layer expected");
+            };
+            b[5] ^= 1;
+        });
+        let ragged = corrupt(&|l| {
+            let Some(OwnedValue::Bytes(b)) = l.get_mut(&bad_root[..]) else {
+                panic!("layer expected");
+            };
+            b.pop();
+        });
+        let not_bytes = corrupt(&|l| {
+            l.insert(bad_root.to_vec(), 7.into());
+        });
+        let short_key = corrupt(&|l| {
+            let v = l.remove(&bad_root[..]).unwrap();
+            l.insert(bad_root[..31].to_vec(), v);
+        });
+        for bytes in [flipped, ragged, not_bytes, short_key] {
+            let d = decode_resume(&bytes).unwrap();
+            let TorrentSource::Metainfo(got) = &d.source else {
+                panic!("metainfo expected");
+            };
+            assert!(!got.piece_layers.contains_key(&bad_root));
+            assert!(got.piece_layers.contains_key(&kept_root));
+        }
+        let not_a_dict = edit(&good, |d| {
+            d.insert(b"piece-layers".to_vec(), 1.into());
+        });
+        assert!(matches!(
+            decode_resume(&not_a_dict),
+            Err(ResumeError::Invalid("piece-layers"))
+        ));
+    }
+
+    #[test]
+    fn oversized_layers_are_left_out() {
+        let m = created(fbt_metainfo::TorrentVersion::V2);
+        let s = plain_state(&m);
+        // Two layers of 40 MiB each: one fits under the cap, both do not.
+        // `encode` does not judge them (`decode_resume` would drop them).
+        let n = 40 * 1024 * 1024 / 32;
+        let layers: BTreeMap<[u8; 32], Vec<[u8; 32]>> = [
+            ([1u8; 32], vec![[3u8; 32]; n]),
+            ([2u8; 32], vec![[4u8; 32]; n]),
+        ]
+        .into_iter()
+        .collect();
+        let rec = ResumeRecord {
+            piece_layers: Some(&layers),
+            ..record(&m, &s, &[])
+        };
+        let bytes = encode(&rec);
+        assert!(bytes.len() <= MAX_RESUME_BYTES, "{}", bytes.len());
+        let OwnedValue::Dict(d) = fbt_bencode::decode(&bytes).unwrap().to_owned_value() else {
+            panic!("not a dict");
+        };
+        let Some(OwnedValue::Dict(kept)) = d.get(&b"piece-layers"[..]) else {
+            panic!("piece-layers expected");
+        };
+        assert_eq!(kept.len(), 1);
+        assert!(decode_resume(&bytes).is_ok());
+        // Layers that fit are all kept.
+        let bytes = encode(&record(&m, &s, &[]));
+        let OwnedValue::Dict(d) = fbt_bencode::decode(&bytes).unwrap().to_owned_value() else {
+            panic!("not a dict");
+        };
+        let Some(OwnedValue::Dict(kept)) = d.get(&b"piece-layers"[..]) else {
+            panic!("piece-layers expected");
+        };
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

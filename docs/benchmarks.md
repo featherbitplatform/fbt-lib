@@ -27,6 +27,11 @@ difference against a 10-torrent run, divided by 990. TCP and uTP rows use only
 that transport on both sides. CPU time comes from `ps` on macOS (centisecond
 resolution) and from `/proc/<pid>/stat` on Linux (clock-tick resolution).
 
+Hybrid torrents hash every piece twice, SHA-1 for v1 and the SHA-256 Merkle
+root for v2, so checking, downloading and creating one costs more CPU than the
+same data as v1 or v2 alone. The recorded rows use v1 torrents and do not
+include this cost.
+
 ## Status
 
 First row (0.2.0), against each target:

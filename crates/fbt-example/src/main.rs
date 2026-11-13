@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fbt::{
-    AddTorrent, EncryptionPolicy, Event, EventMask, EventStream, InfoHashes, Magnet, MapMethod,
-    MapProtocol, Metainfo, PeerSource, Priority, ProxyConfig, ProxyKind, RateLimit, ReadAhead,
-    Session, SessionError, Settings, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
-    Transport,
+    AddTorrent, CreateTorrent, EncryptionPolicy, Event, EventMask, EventStream, InfoHashV1,
+    InfoHashes, Magnet, MapMethod, MapProtocol, Metainfo, PeerSource, Priority, ProxyConfig,
+    ProxyKind, RateLimit, ReadAhead, Session, SessionError, Settings, TorrentHandle, TorrentSource,
+    TorrentState, TorrentStatus, TorrentVersion, Transport,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
@@ -427,6 +427,42 @@ enum Command {
         /// The .torrent file.
         torrent: PathBuf,
     },
+    /// Create a .torrent from a file or a directory.
+    Create {
+        /// The file or directory to share; its final name is the torrent's
+        /// name.
+        path: PathBuf,
+        /// Where to write the .torrent.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// Which metainfo versions to write.
+        #[arg(long, value_enum, default_value = "hybrid")]
+        format: Format,
+        /// Piece length in bytes: a power of two of at least 16 KiB
+        /// (default: picked from the total size).
+        #[arg(long, value_name = "BYTES")]
+        piece_size: Option<u32>,
+        /// Tracker announce URL, one tier each; may be repeated.
+        #[arg(long, value_name = "URL")]
+        tracker: Vec<String>,
+        /// Web seed (BEP 19) base URL; may be repeated.
+        #[arg(long, value_name = "URL")]
+        web_seed: Vec<String>,
+        /// Set the private flag (BEP 27).
+        #[arg(long)]
+        private: bool,
+        /// A free-form comment.
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
+    },
+}
+
+/// `create --format`.
+#[derive(Clone, Copy, ValueEnum)]
+enum Format {
+    V1,
+    V2,
+    Hybrid,
 }
 
 type Error = Box<dyn std::error::Error>;
@@ -451,6 +487,43 @@ async fn run(command: Command) -> Result<ExitCode, Error> {
     match command {
         Command::Info { torrent } => {
             info(&torrent)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Create {
+            path,
+            out,
+            format,
+            piece_size,
+            tracker,
+            web_seed,
+            private,
+            comment,
+        } => {
+            let version = match format {
+                Format::V1 => TorrentVersion::V1,
+                Format::V2 => TorrentVersion::V2,
+                Format::Hybrid => TorrentVersion::Hybrid,
+            };
+            let mut create = CreateTorrent::new(path)
+                .version(version)
+                .trackers(tracker.into_iter().map(|t| vec![t]).collect())
+                .web_seeds(web_seed)
+                .private(private);
+            if let Some(pl) = piece_size {
+                create = create.piece_len(pl);
+            }
+            if let Some(c) = comment {
+                create = create.comment(c);
+            }
+            // Hashing reads every byte, so it runs off the async workers.
+            let bytes = tokio::task::spawn_blocking(move || {
+                create.build(&mut |_, _| std::ops::ControlFlow::Continue(()))
+            })
+            .await??;
+            let m = Metainfo::from_bytes(&bytes)?;
+            std::fs::write(&out, &bytes)?;
+            println!("created: {}", out.display());
+            print_hashes(&m);
             Ok(ExitCode::SUCCESS)
         }
         Command::Download {
@@ -545,10 +618,10 @@ fn load(path: &std::path::Path) -> Result<Metainfo, Error> {
 fn info(path: &std::path::Path) -> Result<(), Error> {
     let m = load(path)?;
     println!("name: {}", m.info.name);
-    println!("info hash: {}", m.info_hashes);
+    print_hashes(&m);
     println!(
         "pieces: {} x {}",
-        m.info.pieces.len(),
+        m.piece_layout().num_pieces(),
         human_bytes(u64::from(m.info.piece_len))
     );
     println!("size: {}", human_bytes(m.total_len()));
@@ -567,6 +640,22 @@ fn info(path: &std::path::Path) -> Result<(), Error> {
     magnet.trackers = m.trackers.iter().flatten().cloned().collect();
     println!("magnet: {}", magnet.to_uri());
     Ok(())
+}
+
+/// `info hash:` (the 20-byte wire hash: v1, else the truncated v2, which is
+/// then qBittorrent's torrent id; qBittorrent names a hybrid by its
+/// truncated v2 hash), `info hash v2:` when there is one, and `version:`.
+fn print_hashes(m: &Metainfo) {
+    println!("info hash: {}", InfoHashV1(m.info_hashes.wire_hash()));
+    if let Some(v2) = m.info_hashes.v2 {
+        println!("info hash v2: {v2}");
+    }
+    let version = match m.version() {
+        TorrentVersion::V1 => "v1",
+        TorrentVersion::V2 => "v2",
+        _ => "hybrid",
+    };
+    println!("version: {version}");
 }
 
 fn human_bytes(n: u64) -> String {

@@ -143,6 +143,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
             Message::Extended { id, payload } => self.on_extended(id, &payload).await?,
             Message::KeepAlive | Message::Unknown { .. } => {}
+            Message::HashRequest(req) => {
+                self.require_v2()?;
+                self.emit(PeerEvent::HashRequest { key, req }).await?;
+            }
+            Message::Hashes { req, hashes } => {
+                self.require_v2()?;
+                self.emit(PeerEvent::Hashes { key, req, hashes }).await?;
+            }
+            Message::HashReject(req) => {
+                self.require_v2()?;
+                self.emit(PeerEvent::HashReject { key, req }).await?;
+            }
         }
         Ok(())
     }
@@ -201,6 +213,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Ok(())
         } else {
             Err(protocol("fast extension message without fast support"))
+        }
+    }
+
+    /// BEP 52 hash messages only on a v2 connection: the remote set the v2
+    /// bit, or the connection runs under the truncated v2 hash (`run_peer`
+    /// sets the bit for it).
+    fn require_v2(&self) -> Flow {
+        if self.remote_reserved.supports_v2() {
+            Ok(())
+        } else {
+            Err(protocol("hash message without v2 support"))
         }
     }
 

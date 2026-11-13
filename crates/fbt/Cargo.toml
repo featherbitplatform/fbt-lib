@@ -28,4 +28,5 @@ fbt-core = { path = "../fbt-core" }
 fbt-tracker = { path = "../fbt-tracker" }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

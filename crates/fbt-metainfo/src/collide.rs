@@ -286,6 +286,7 @@ mod tests {
             path: RelPath::from_components(parts),
             len: 1,
             pad: false,
+            pieces_root: None,
         }
     }
 

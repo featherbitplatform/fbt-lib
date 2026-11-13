@@ -28,6 +28,7 @@ mod deadline;
 mod dht;
 mod holepunch;
 mod known;
+mod layers;
 mod magnet;
 mod metadata;
 mod peer;
@@ -90,6 +91,8 @@ pub(crate) enum Cmd {
     BansChanged,
     /// Tests: the smart-ban trust points of the peer at this address.
     PeerTrust(SocketAddr, oneshot::Sender<i32>),
+    /// Tests: how many piece layers the actor's metainfo holds.
+    PieceLayersKnown(oneshot::Sender<usize>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -197,7 +200,10 @@ pub(crate) fn spawn(
     let ih = params.source.info_hashes();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
     let mut initial = match &params.source {
-        TorrentSource::Metainfo(m) => TorrentStatus::initial(ih, m.info.name.clone(), true),
+        // A v2-only torrent lacking layers has no metadata until they are in.
+        TorrentSource::Metainfo(m) => {
+            TorrentStatus::initial(ih, m.info.name.clone(), !layers::missing_layers(m))
+        }
         TorrentSource::Magnet(m) => {
             TorrentStatus::initial(ih, m.display_name.clone().unwrap_or_default(), false)
         }
@@ -261,8 +267,12 @@ impl TorrentHandle {
         self.inner.info_hashes
     }
 
-    /// The torrent's metadata; `None` for a magnet until
+    /// The torrent's metadata; `None` for a magnet, and for a v2-only
+    /// torrent lacking piece layers, until
     /// [`Event::MetadataReceived`](crate::Event::MetadataReceived).
+    ///
+    /// Set once: piece layers the torrent builds or fetches later are not
+    /// added to it (the torrent still uses them).
     pub fn metainfo(&self) -> Option<Arc<Metainfo>> {
         self.inner.metainfo.get().cloned()
     }
@@ -298,6 +308,14 @@ impl TorrentHandle {
     /// [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES), or more values than
     /// [`MAX_RESUME_ITEMS`](crate::MAX_RESUME_ITEMS)) fails here with
     /// [`SessionError::Resume`] instead.
+    ///
+    /// The v2 piece layers the torrent holds are saved too, those it
+    /// fetched or built from verified data included, unless they would
+    /// push the data over [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES):
+    /// then they are left out. A v2-only torrent restored without one
+    /// fetches it from peers before it starts; a hybrid builds it from
+    /// data it verifies, so one whose pieces were trusted (nothing
+    /// verified) lacks it until its next check or download of that file.
     pub async fn save_resume_data(&self) -> Result<Vec<u8>, SessionError> {
         self.call(Cmd::SaveResume).await?
     }
@@ -698,6 +716,15 @@ impl TorrentHandle {
     #[doc(hidden)]
     pub async fn peer_trust(&self, addr: SocketAddr) -> Result<i32, SessionError> {
         self.call(|tx| Cmd::PeerTrust(addr, tx)).await
+    }
+
+    /// How many BEP 52 piece layers the torrent holds now, those built from
+    /// verified data included (0 before the metadata is known, or once the
+    /// torrent is gone). [`metainfo`](Self::metainfo) keeps the layers
+    /// known when it was first set. For tests.
+    #[doc(hidden)]
+    pub async fn piece_layers_known(&self) -> usize {
+        self.call(Cmd::PieceLayersKnown).await.unwrap_or(0)
     }
 
     /// Asks the actor to stop; the receiver completes once it has.

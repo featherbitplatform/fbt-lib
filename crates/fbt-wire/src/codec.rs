@@ -4,7 +4,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fbt_core::BlockRef;
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::Message;
+use crate::{HashRequest, Message};
 
 /// Codec errors.
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +61,27 @@ fn put_block(dst: &mut BytesMut, id: u8, b: BlockRef) {
     dst.put_u32(b.piece);
     dst.put_u32(b.offset);
     dst.put_u32(b.len);
+}
+
+/// Reads the 48-byte header; the caller has checked `body.len() >= 48`.
+fn hash_request(body: &mut Bytes) -> HashRequest {
+    let mut pieces_root = [0u8; 32];
+    body.copy_to_slice(&mut pieces_root);
+    HashRequest {
+        pieces_root,
+        base_layer: body.get_u32(),
+        index: body.get_u32(),
+        length: body.get_u32(),
+        proof_layers: body.get_u32(),
+    }
+}
+
+fn put_hash_request(dst: &mut BytesMut, r: &HashRequest) {
+    dst.put_slice(&r.pieces_root);
+    dst.put_u32(r.base_layer);
+    dst.put_u32(r.index);
+    dst.put_u32(r.length);
+    dst.put_u32(r.proof_layers);
 }
 
 impl Decoder for MessageCodec {
@@ -158,6 +179,24 @@ impl Decoder for MessageCodec {
                     payload: body,
                 }
             }
+            21 | 23 => {
+                if payload != 48 {
+                    return Err(bad());
+                }
+                let r = hash_request(&mut body);
+                if id == 21 {
+                    Message::HashRequest(r)
+                } else {
+                    Message::HashReject(r)
+                }
+            }
+            22 => {
+                if payload < 48 || !(payload - 48).is_multiple_of(32) {
+                    return Err(bad());
+                }
+                let req = hash_request(&mut body);
+                Message::Hashes { req, hashes: body }
+            }
             _ => Message::Unknown { id, payload: body },
         };
         Ok(Some(msg))
@@ -217,6 +256,22 @@ impl Encoder<Message> for MessageCodec {
                 dst.put_u8(20);
                 dst.put_u8(id);
                 dst.put_slice(&payload);
+            }
+            Message::HashRequest(r) | Message::HashReject(r) => {
+                let id = if matches!(item, Message::HashRequest(_)) {
+                    21
+                } else {
+                    23
+                };
+                dst.put_u32(49);
+                dst.put_u8(id);
+                put_hash_request(dst, &r);
+            }
+            Message::Hashes { req, hashes } => {
+                dst.put_u32(frame(48 + hashes.len())?);
+                dst.put_u8(22);
+                put_hash_request(dst, &req);
+                dst.put_slice(&hashes);
             }
             Message::Unknown { id, payload } => {
                 dst.put_u32(frame(payload.len())?);

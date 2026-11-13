@@ -613,14 +613,17 @@ async fn magnet_announces_left_16384_until_metadata() {
 }
 
 #[tokio::test]
-async fn magnet_v2_only_rejected() {
+async fn magnet_v2_only_is_accepted() {
     let session = Session::new(settings()).await.unwrap();
-    let mg = Magnet::from_info_hashes(InfoHashes::from_v2(InfoHashV2([3; 32])));
-    let r = session
+    let ih = InfoHashes::from_v2(InfoHashV2([3; 32]));
+    let mg = Magnet::from_info_hashes(ih);
+    let h = session
         .add_torrent(AddTorrent::magnet(mg, PathBuf::from("unused")))
-        .await;
-    assert!(matches!(r, Err(SessionError::V2OnlyUnsupported)), "{r:?}");
-    assert!(session.torrents().is_empty());
+        .await
+        .unwrap();
+    assert_eq!(h.info_hashes(), ih);
+    assert!(wait_state(&h, |s| *s == TorrentState::DownloadingMetadata, T).await);
+    assert_eq!(session.torrents().len(), 1);
     session.shutdown().await;
 }
 
