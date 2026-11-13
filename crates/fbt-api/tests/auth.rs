@@ -301,3 +301,32 @@ async fn shutdown_stops_serving() {
         .expect("shutdown returns within 6 s");
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
 }
+
+#[tokio::test]
+async fn options_without_cors_needs_token() {
+    let (_session, _server, base, _token) = api().await;
+    let (status, headers, body) = send(preflight(
+        &format!("{base}/api/v1/session"),
+        "http://ui.example",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[WWW_AUTHENTICATE], "Bearer");
+    assert_eq!(error_code(&body), "unauthorized");
+}
+
+#[tokio::test]
+async fn unknown_path_and_wrong_method_need_token() {
+    let (_session, _server, base, _token) = api().await;
+    let (status, _, body) = get(&format!("{base}/api/v1/nope"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error_code(&body), "unauthorized");
+    let (status, _, body) = support::post_json(
+        &format!("{base}/api/v1/session"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error_code(&body), "unauthorized");
+}

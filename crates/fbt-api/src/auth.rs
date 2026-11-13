@@ -7,6 +7,10 @@
 //! suffix of their matched path, so a client that `nest`s the router
 //! under a prefix keeps the same rules. A request with no matched path (a
 //! 404) needs the header.
+//!
+//! CORS preflights never get here when CORS is on: the CORS layer, outside
+//! this one, answers them itself. With CORS off an `OPTIONS` request is
+//! like any other and needs the token.
 
 use std::sync::Arc;
 
@@ -61,7 +65,7 @@ fn check(state: &AuthState, req: &Request) -> Result<(), ApiErrorResponse> {
         .extensions()
         .get::<MatchedPath>()
         .map(MatchedPath::as_str);
-    if is_preflight(req) || route_in(EXEMPT, req.method(), matched) {
+    if route_in(EXEMPT, req.method(), matched) {
         return Ok(());
     }
     if let Some(given) = bearer(req.headers())
@@ -76,14 +80,6 @@ fn check(state: &AuthState, req: &Request) -> Result<(), ApiErrorResponse> {
         return Ok(());
     }
     Err(ApiErrorResponse::unauthorized())
-}
-
-/// A CORS preflight: `OPTIONS` with `Access-Control-Request-Method`.
-fn is_preflight(req: &Request) -> bool {
-    req.method() == Method::OPTIONS
-        && req
-            .headers()
-            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
 }
 
 fn route_in(routes: &[(Method, &str)], method: &Method, matched: Option<&str>) -> bool {
