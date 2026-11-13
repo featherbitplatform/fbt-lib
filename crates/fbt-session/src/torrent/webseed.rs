@@ -2,16 +2,18 @@
 //! files, each fetched from as a pseudo-peer.
 //!
 //! Each URL gets a [`PeerKey`] of its own and counts as a `HaveAll` peer in
-//! the picker while it is not retired. An idle seed takes a run of whole,
-//! consecutive, unstarted pieces ([`PiecePicker::pick_run`], up to
-//! [`WEB_SEED_REQUEST_MAX`] and what the cache budget has room for), so a
-//! request is one byte range, split only at file boundaries; the ranges
+//! the picker while it is not retired. An idle seed takes a run of
+//! consecutive pieces ([`PiecePicker::pick_run`], up to
+//! [`WEB_SEED_REQUEST_MAX`] and what the cache budget has room for): pieces
+//! nobody started, or partial pieces no peer is working on (left by a peer
+//! that went away), of which it fetches the missing blocks. A request is
+//! one byte range, split only at file boundaries; the ranges
 //! are fetched one after the other through
 //! [`TrackerClient::fetch_range`](fbt_tracker::TrackerClient::fetch_range)
 //! and the blocks come back as a [`Job::WebSeed`], fed to
 //! [`Actor::accept_block`] like a peer's. One request per seed is in
-//! flight at a time, only while the torrent is active and its download
-//! limits have tokens; the bytes are charged to them afterwards.
+//! flight at a time, only while the torrent is active; the body is read at
+//! the pace of the download limits, each frame charged before it is read.
 //!
 //! A failed request releases its blocks and backs the seed off, 30 s
 //! doubling to 30 minutes; a 4xx other than 408 and 429 (or a URL that
@@ -20,11 +22,11 @@
 //! added again by hand). Every failure is an
 //! [`Event::WebSeedError`](crate::Event::WebSeedError).
 //!
-//! Parole: a web seed only ever takes pieces nobody started and holds
-//! every block of them, so its pieces already have a single contributor
-//! (bar end-game duplicates from peers, which arrive first or are not
-//! accepted from the seed). Parole would change nothing for it, so the
-//! picker never puts a web seed on parole; smart ban still charges and
+//! Parole: a web seed never takes a piece reserved for a peer on parole,
+//! nor one with requests outstanding, and holds every block it fetches.
+//! Its pieces have a single contributor unless it completes a piece a
+//! departed peer left partial, which smart ban treats as any mixed piece.
+//! The picker never puts a web seed on parole; smart ban still charges and
 //! bans it as any sender.
 
 use std::future::Future;
