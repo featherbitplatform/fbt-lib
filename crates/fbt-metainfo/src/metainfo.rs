@@ -9,8 +9,8 @@ use crate::collide::resolve_collisions;
 use crate::magnet::Magnet;
 use crate::path::{RelPath, sanitize_component, sanitize_path};
 use crate::v2::{
-    MAX_PIECE_LAYER_HASHES, TorrentVersion, V2Piece, layer_ok, layer_targets, locate, merge_hybrid,
-    parse_file_tree, parse_piece_layers, v2_file_starts, valid_v2_piece_len,
+    MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES, TorrentVersion, V2Piece, layer_ok, layer_targets,
+    locate, merge_hybrid, parse_file_tree, parse_piece_layers, v2_file_starts, valid_v2_piece_len,
 };
 
 /// Most web seed URLs kept (`url-list` here, `ws` in a magnet); later ones are
@@ -389,6 +389,13 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
         && usize::try_from(layout.num_pieces()).ok() != Some(p.len() / 20)
     {
         return Err(invalid("pieces", "count does not match total length"));
+    }
+    // Without `pieces` nothing else bounds the count: every per-piece
+    // vector of the session is sized from it.
+    if pieces_raw.is_none()
+        && usize::try_from(layout.num_pieces()).map_or(true, |n| n > MAX_V2_PIECES)
+    {
+        return Err(invalid("length", "too many pieces"));
     }
     resolve_collisions(&mut files);
 

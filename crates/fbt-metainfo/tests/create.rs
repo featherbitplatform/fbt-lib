@@ -7,7 +7,9 @@ use std::path::Path;
 
 use fbt_bencode::decode;
 use fbt_core::merkle::piece_root;
-use fbt_metainfo::{CreateError, CreateTorrent, Metainfo, TorrentVersion, auto_piece_len};
+use fbt_metainfo::{
+    CreateError, CreateTorrent, MAX_V2_PIECES, Metainfo, TorrentVersion, auto_piece_len,
+};
 use proptest::prelude::*;
 use sha1::{Digest as _, Sha1};
 
@@ -407,4 +409,27 @@ fn hybrid_has_a_tail_pad() {
     .unwrap();
     let last = m.info.files.last().unwrap();
     assert!(!last.pad && last.len == pl, "{:?}", m.info.files);
+}
+
+/// A sparse file one piece past the v2 cap at 16 KiB pieces: refused for a
+/// v2-only torrent before any byte is read, accepted for v1 (bounded by its
+/// `pieces` string; not built here, it would hash 64 GiB). Unix only: a
+/// sparse 64 GiB file is not portable to Windows CI disks.
+#[cfg(unix)]
+#[test]
+fn v2_past_the_piece_cap_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("big.bin");
+    let len = (u64::try_from(MAX_V2_PIECES).unwrap() + 1) * 16_384;
+    fs::File::create(&file).unwrap().set_len(len).unwrap();
+    let mut called = false;
+    let r = CreateTorrent::new(&file)
+        .version(TorrentVersion::V2)
+        .piece_len(16_384)
+        .build(&mut |_, _| {
+            called = true;
+            ControlFlow::Continue(())
+        });
+    assert!(matches!(r, Err(CreateError::TooManyPieces)), "{r:?}");
+    assert!(!called, "refused before hashing");
 }

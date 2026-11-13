@@ -30,4 +30,4 @@ pub use metainfo::{
 };
 
 pub use path::{PathError, RelPath, sanitize_component, sanitize_path};
-pub use v2::{MAX_PIECE_LAYER_HASHES, TorrentVersion, V2Piece, validate_layer};
+pub use v2::{MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES, TorrentVersion, V2Piece, validate_layer};

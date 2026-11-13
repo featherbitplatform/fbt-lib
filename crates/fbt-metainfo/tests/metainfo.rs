@@ -3,7 +3,7 @@ mod support;
 use fbt_bencode::{DictBuilder, OwnedValue};
 use fbt_core::merkle::piece_root;
 use fbt_core::{InfoHashV2, InfoHashes};
-use fbt_metainfo::{Metainfo, MetainfoError, TorrentVersion};
+use fbt_metainfo::{MAX_V2_PIECES, Metainfo, MetainfoError, TorrentVersion};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 use std::collections::BTreeMap;
@@ -912,4 +912,43 @@ fn with_piece_layers_keeps_valid_ones() {
     let fresh = Metainfo::from_bytes(&build_v2(&V2_FILES, 32_768, true, false)).unwrap();
     let fresh = fresh.with_piece_layers(BTreeMap::from([(f2_root(), bad)]));
     assert!(fresh.piece_layers.is_empty());
+}
+
+/// A v2-only torrent of one file of `pieces` 16 KiB pieces.
+fn v2_of_pieces(pieces: u64) -> Vec<u8> {
+    let len = i64::try_from(pieces * 16_384).unwrap();
+    simple_v2(tree_of("a", leaf_node(leaf_attrs(len, &[7u8; 32]))), 16_384)
+}
+
+#[test]
+fn v2_piece_count_is_capped() {
+    let too_many = MetainfoError::InvalidField {
+        field: "length",
+        reason: "too many pieces",
+    };
+    // The hostile torrent: about 150 bytes claiming 2^32 - 1 pieces.
+    let hostile = v2_of_pieces(u64::from(u32::MAX));
+    assert!(hostile.len() < 200, "{}", hostile.len());
+    assert_eq!(Metainfo::from_bytes(&hostile).unwrap_err(), too_many);
+
+    let cap = u64::try_from(MAX_V2_PIECES).unwrap();
+    let at_cap = Metainfo::from_bytes(&v2_of_pieces(cap)).unwrap();
+    assert_eq!(
+        at_cap.piece_layout().num_pieces(),
+        u32::try_from(cap).unwrap()
+    );
+    assert_eq!(
+        Metainfo::from_bytes(&v2_of_pieces(cap + 1)).unwrap_err(),
+        too_many
+    );
+
+    // The same refusal for metadata from peers.
+    let top = fbt_bencode::decode(&hostile).unwrap();
+    let info = top.as_dict().unwrap().get(b"info").unwrap();
+    let raw = fbt_bencode::encode(&info.to_owned_value());
+    let hashes = InfoHashes::from_v2(InfoHashV2::of(&raw));
+    assert_eq!(
+        Metainfo::from_info_bytes(&raw, hashes, vec![]).unwrap_err(),
+        too_many
+    );
 }

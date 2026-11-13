@@ -19,7 +19,7 @@ use sha2::Sha256;
 
 use crate::metainfo::MAX_PIECE_LEN;
 use crate::path::sanitize_component;
-use crate::v2::{TorrentVersion, valid_v2_piece_len};
+use crate::v2::{MAX_V2_PIECES, TorrentVersion, valid_v2_piece_len};
 
 /// Most files one torrent is created from.
 pub const MAX_CREATE_FILES: usize = 1_000_000;
@@ -56,6 +56,11 @@ pub enum CreateError {
     /// More than [`MAX_CREATE_FILES`] files.
     #[error("too many files")]
     TooManyFiles,
+    /// A v2-only torrent would have more than [`MAX_V2_PIECES`] pieces,
+    /// which the parser refuses: pick a larger piece length (or a v1 or
+    /// hybrid torrent, bounded by their `pieces` string instead).
+    #[error("too many pieces for a v2-only torrent")]
+    TooManyPieces,
     /// The progress callback asked to stop.
     #[error("cancelled")]
     Cancelled,
@@ -175,6 +180,10 @@ impl CreateTorrent {
             return Err(CreateError::Empty);
         }
         let piece_len = self.piece_len.unwrap_or_else(|| auto_piece_len(total));
+        if self.version == TorrentVersion::V2 && v2_pieces(&files, piece_len) > MAX_V2_PIECES as u64
+        {
+            return Err(CreateError::TooManyPieces);
+        }
         let v1 = self.version != TorrentVersion::V2;
         let v2 = self.version != TorrentVersion::V1;
         let pads = self.version == TorrentVersion::Hybrid;
@@ -381,6 +390,13 @@ fn utf8_name(path: &Path, name: &std::ffi::OsStr) -> Result<String, CreateError>
 }
 
 /// The torrent name, the files in order, and whether the input is one file.
+/// The piece count the parser sees for a v2-only torrent of `files`: every
+/// non-empty file starts on a piece boundary.
+fn v2_pieces(files: &[Entry], piece_len: u32) -> u64 {
+    let pl = u64::from(piece_len);
+    files.iter().map(|f| f.len.div_ceil(pl)).sum()
+}
+
 fn collect(root: &Path) -> Result<(String, Vec<Entry>, bool), CreateError> {
     let meta = fs::metadata(root).map_err(io_err(root))?;
     let leaf = match root.file_name() {

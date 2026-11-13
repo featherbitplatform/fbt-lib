@@ -12,6 +12,14 @@ use crate::path::{RelPath, sanitize_path};
 /// Most piece layer hashes kept in all, across every file.
 pub const MAX_PIECE_LAYER_HASHES: usize = 4_194_304;
 
+/// Most pieces a torrent without v1 `pieces` (v2-only) may have. A v1 or
+/// hybrid torrent is bounded by its `pieces` string (20 bytes a piece); a
+/// v2-only one only by its claimed lengths, so a tiny `.torrent` could
+/// otherwise ask for billions of pieces. Equal to
+/// [`MAX_PIECE_LAYER_HASHES`]: a file's layer has one hash per piece of the
+/// file, so every layer of a v2-only torrent fits that cap by construction.
+pub const MAX_V2_PIECES: usize = MAX_PIECE_LAYER_HASHES;
+
 /// Which BitTorrent metainfo versions a torrent carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]

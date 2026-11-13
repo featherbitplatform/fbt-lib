@@ -18,8 +18,8 @@ use fbt::{
     StorageError, StreamError,
 };
 use fbt::{
-    CreateError, CreateTorrent, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, TorrentVersion, V2Piece,
-    auto_piece_len, validate_layer,
+    CreateError, CreateTorrent, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES,
+    TorrentVersion, V2Piece, auto_piece_len, validate_layer,
 };
 
 fn names(
@@ -110,7 +110,7 @@ fn peer_connected(e: &Event) -> Option<(std::net::SocketAddr, Transport, bool)> 
 fn surface_compiles() {
     let _: [&str; 3] = DEFAULT_DHT_BOOTSTRAP;
     let _: usize = MAX_METADATA_SIZE;
-    let _: [usize; 2] = [MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES];
+    let _: [usize; 3] = [MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES];
     let _: u32 = auto_piece_len(1);
     let _: bool = validate_layer(&[0; 32], 1, 16384, &[]);
     let _ = CreateTorrent::new("x").version(TorrentVersion::V1);

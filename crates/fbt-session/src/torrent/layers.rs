@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fbt_core::merkle::{MERKLE_BLOCK_LEN, MerkleTree, file_tree_height, verify_hashes};
-use fbt_metainfo::{FileEntry, MAX_PIECE_LAYER_HASHES, Metainfo, TorrentVersion, validate_layer};
+use fbt_metainfo::{MAX_PIECE_LAYER_HASHES, Metainfo, TorrentVersion, validate_layer};
 use fbt_wire::{HashRequest, MAX_HASH_REQUEST_LEN};
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -282,19 +282,47 @@ const SPANS_PER_SOURCE: usize = 4;
 const MAX_LAYER_CANDIDATES: usize = 1024;
 
 /// True when `meta` is v2-only and a file of more than one piece lacks its
-/// layer: the torrent must fetch layers before its download starts.
+/// layer: the torrent must fetch layers before its download starts. The
+/// status's `has_metadata` and [`LayerFetch::new`] both use this predicate,
+/// so a torrent waits for a fetch exactly when there is one.
 pub(super) fn missing_layers(meta: &Metainfo) -> bool {
     meta.version() == TorrentVersion::V2 && fetch_targets(meta).next().is_some()
 }
 
-/// The multi-piece files of `meta` whose layer is missing.
-fn fetch_targets(meta: &Metainfo) -> impl Iterator<Item = &FileEntry> {
+/// A multi-piece file whose layer is missing, with its fetch geometry.
+struct Target {
+    root: [u8; 32],
+    tree_height: u32,
+    /// Log2 of the padded layer width (1 to 31).
+    w_log: u32,
+    /// Hashes in the layer: the file's piece count.
+    count: usize,
+}
+
+/// The multi-piece files of `meta` whose layer is missing. Every such file
+/// of a parsed torrent is a target: its padded layer is at least 2 wide,
+/// and the parser's [`fbt_metainfo::MAX_V2_PIECES`] keeps it below 2^32.
+fn fetch_targets(meta: &Metainfo) -> impl Iterator<Item = Target> + '_ {
     let pl = u64::from(meta.info.piece_len);
-    meta.info.files.iter().filter(move |f| {
-        !f.pad
-            && f.len > pl
-            && f.pieces_root
-                .is_some_and(|r| !meta.piece_layers.contains_key(&r))
+    let piece_height = (meta.info.piece_len / MERKLE_BLOCK_LEN).trailing_zeros();
+    meta.info.files.iter().filter_map(move |f| {
+        if f.pad || f.len <= pl {
+            return None;
+        }
+        let root = f
+            .pieces_root
+            .filter(|r| !meta.piece_layers.contains_key(r))?;
+        let tree_height = file_tree_height(f.len);
+        let w_log = tree_height
+            .checked_sub(piece_height)
+            .filter(|w| (1..32).contains(w))?;
+        let count = usize::try_from(f.len.div_ceil(pl)).ok()?;
+        Some(Target {
+            root,
+            tree_height,
+            w_log,
+            count,
+        })
     })
 }
 
@@ -366,36 +394,31 @@ pub(super) struct LayerFetch {
 
 impl LayerFetch {
     /// A fetch of the layers `meta` lacks; `None` unless `meta` is v2-only
-    /// and a multi-piece file lacks its layer. Files past
-    /// [`MAX_PIECE_LAYER_HASHES`] hashes in all are left out.
+    /// and a multi-piece file lacks its layer ([`missing_layers`]).
     pub(super) fn new(meta: &Metainfo) -> Option<Self> {
         if !missing_layers(meta) {
             return None;
         }
-        let pl = u64::from(meta.info.piece_len);
         let piece_height = (meta.info.piece_len / MERKLE_BLOCK_LEN).trailing_zeros();
         let mut files = Vec::new();
         let mut todo = VecDeque::new();
         let mut total: usize = 0;
-        for f in fetch_targets(meta) {
-            let Some(root) = f.pieces_root else {
-                continue;
-            };
-            let tree_height = file_tree_height(f.len);
-            // A multi-piece file's padded layer is at least 2 wide; its
-            // indices are `u32`s.
-            let Some(w_log) = tree_height
-                .checked_sub(piece_height)
-                .filter(|w| (1..32).contains(w))
-            else {
-                continue;
-            };
+        for Target {
+            root,
+            tree_height,
+            w_log,
+            count,
+        } in fetch_targets(meta)
+        {
             let length = LAYER_REQUEST_LEN.min(1 << w_log);
-            let (Ok(count), Ok(step)) =
-                (usize::try_from(f.len.div_ceil(pl)), usize::try_from(length))
-            else {
+            let Ok(step) = usize::try_from(length) else {
                 continue;
             };
+            // Unreachable for a parsed torrent: a v2-only torrent has at most
+            // `MAX_V2_PIECES` (= `MAX_PIECE_LAYER_HASHES`) pieces, and its
+            // layers hold one hash per piece, so no file is ever left out
+            // (which would leave the download unable to finish).
+            debug_assert!(total.saturating_add(count) <= MAX_PIECE_LAYER_HASHES);
             if total.saturating_add(count) > MAX_PIECE_LAYER_HASHES {
                 break;
             }
@@ -1218,6 +1241,28 @@ mod tests {
         assert!(!missing_layers(&full));
         let (hybrid, _) = hybrid_without_layer();
         assert!(LayerFetch::new(&hybrid).is_none());
+    }
+
+    #[test]
+    fn status_and_fetch_share_one_predicate() {
+        let (full, stripped) = v2_meta(&[("a", 300_000), ("b", 100), ("c", 40_000)]);
+        let (one_piece_full, one_piece) = v2_meta(&[("a", 100)]);
+        let (hybrid, _) = hybrid_without_layer();
+        for m in [&full, &stripped, &one_piece_full, &one_piece, &hybrid] {
+            assert_eq!(missing_layers(m), LayerFetch::new(m).is_some());
+        }
+        // Every multi-piece file lacking its layer is fetched: none is left
+        // out, so the download can always finish.
+        let f = LayerFetch::new(&stripped).unwrap();
+        let want: Vec<_> = stripped
+            .info
+            .files
+            .iter()
+            .filter(|e| !e.pad && e.len > u64::from(stripped.info.piece_len))
+            .filter_map(|e| e.pieces_root)
+            .collect();
+        assert_eq!(want.len(), 2);
+        assert_eq!(f.files.iter().map(|x| x.root).collect::<Vec<_>>(), want);
     }
 
     #[test]

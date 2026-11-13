@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- BitTorrent v2 and hybrid torrents (BEP 52): `fbt-core` gains Merkle trees (`merkle` module: `MerkleTree`, `piece_root`, `layer_root`, `leaf_hashes`, `file_tree_height`, `verify_hashes`); `fbt-metainfo` parses v2-only and hybrid `.torrent` files with their piece layers (`Metainfo::version`, `TorrentVersion`, `Metainfo::v2_piece`, `V2Piece`, `Metainfo::with_piece_layers`, `validate_layer`, `MetainfoError::InconsistentHybrid`, `MAX_PIECE_LAYER_HASHES`); a hybrid is checked for consistency between its halves; `fbt-session` verifies pieces by SHA-1, by Merkle root or by both, and builds the piece layers a hybrid lacks while it downloads
+- BitTorrent v2 and hybrid torrents (BEP 52): `fbt-core` gains Merkle trees (`merkle` module: `MerkleTree`, `piece_root`, `layer_root`, `leaf_hashes`, `file_tree_height`, `verify_hashes`); `fbt-metainfo` parses v2-only and hybrid `.torrent` files with their piece layers (`Metainfo::version`, `TorrentVersion`, `Metainfo::v2_piece`, `V2Piece`, `Metainfo::with_piece_layers`, `validate_layer`, `MetainfoError::InconsistentHybrid`, `MAX_PIECE_LAYER_HASHES`, `MAX_V2_PIECES`); a hybrid is checked for consistency between its halves; `fbt-session` verifies pieces by SHA-1, by Merkle root or by both, and builds the piece layers a hybrid lacks while it downloads
 - `fbt-metainfo`: torrent creation: `CreateTorrent` (`new`, `version`, `piece_len`, `trackers`, `web_seeds`, `comment`, `created_by`, `creation_date`, `private`, `build` with a progress callback that can cancel), `CreateError`, `auto_piece_len` and `MAX_CREATE_FILES`, for v1, v2 and hybrid torrents; re-exported by `fbt`, with a creation doctest
 - `fbt-wire`: the BEP 52 messages `HashRequest`, `Hashes` and `HashReject` (`MAX_HASH_REQUEST_LEN`) and `Reserved::supports_v2` and `Reserved::set_v2`
 - `fbt-session`: a torrent is registered under every wire hash (a hybrid under both its v1 and truncated v2 hash) and a `btmh`-only (v2) magnet is accepted; `Session::torrent` also finds a torrent by any of its wire hashes
@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fbt_wire::Message` gains three variants (`HashRequest`, `Hashes`, `HashReject`); match with a wildcard arm
 - `fbt-example info` prints the wire hash (40 hex), `info hash v2:` when there is one, and `version:`
 - Created hybrids carry a tail pad, so their hashes match libtorrent 2.0 and qBittorrent 5.3 exactly
+- `fbt-metainfo`: a torrent without v1 `pieces` (v2-only) is refused with `MetainfoError::InvalidField` (`length`, "too many pieces") when it has more than `MAX_V2_PIECES` (4,194,304, equal to `MAX_PIECE_LAYER_HASHES`) pieces, both from a `.torrent` and from metadata fetched for a `btmh` magnet; `CreateTorrent::build` refuses such a v2-only torrent with the new `CreateError::TooManyPieces`. Before, a 154-byte v2 `.torrent` could claim 2^32 - 1 pieces and abort the process when the session sized its per-piece state
 
 ## [0.5.0] - 2026-11-13
 
