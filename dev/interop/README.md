@@ -116,33 +116,39 @@
      directory (its final name is the `name`), because libtorrent records
      executable and hidden files as `attr` `x`/`h`, which our creator never
      writes.
-  3. fbt seeds its own v2 torrent of a 12-file payload (`payload-v2own`,
-     port 6905) and qBittorrent downloads it (`torrents/add` plus
-     `addPeers`). Twelve multi-piece files make libtorrent ask for more piece
-     layers than the seed serves at once (8 per torrent): the excess gets
-     `hash reject`, and the seed runs with
-     `RUST_LOG=info,fbt_session::torrent::layers=debug` so `run.sh` can
-     count the rejections (`hash request over the serving caps`).
-  4. `fbt-example download "magnet:?xt=urn:btmh:1220<infohash_v2>&tr=..."`
+  3. `fbt-example download "magnet:?xt=urn:btmh:1220<infohash_v2>&tr=..."`
      (port 6904, a `btmh`-only magnet) from qBittorrent's seed: metadata,
      then the piece layers over BEP 52 hash requests.
+  4. fbt seeds its own v2 torrent of a 12-file payload (`payload-v2own`,
+     port 6905) and qBittorrent downloads it (`torrents/add` plus
+     `addPeers`).
   5. qBittorrent drops fbt's torrent (keeping the files) and adds it again
      by `btmh` magnet into a fresh save path; fbt's seed is its only source,
-     so it must fetch the piece layers from our hash serving.
+     so it must fetch the twelve files' piece layers from our hash serving.
+     The seed runs with `RUST_LOG=info,fbt_session::torrent::layers=debug`
+     and `run.sh` logs how many hash requests it rejected over its serving
+     cap (8 per torrent, `hash request over the serving caps`). Measured: 0.
+     libtorrent keeps at most 2 hash requests outstanding per peer, so a
+     single qBittorrent never reaches the cap.
+
+  The magnet download (3) runs before fbt's seed starts, and that seed and
+  the hybrid one run for 1200 s (`--seed-for`; `stop_seed` ends them), more
+  than all the waits of the legs they serve, so a slow runner cannot outlast
+  them.
 - **Hybrid:** qBittorrent creates (`format=hybrid`) and seeds a hybrid of a
   fresh payload; `fbt-example download` (port 6906) fetches it.
   `fbt-example create --format hybrid` of the same directory prints both
-  hashes, which are logged next to qBittorrent's `infohash_v1` and
-  `infohash_v2`, not checked: libtorrent may lay out pad files differently
-  (measured with 5.3.0: it also pads the last file to a piece boundary,
-  `.pad/<n>` with `attr` `p`, which our creator leaves out, so both hashes
-  differ). fbt then seeds its own hybrid (port 6907); qBittorrent and
+  hashes, which must equal qBittorrent's `infohash_v1` and `infohash_v2`
+  (a hard check: the v1 file list with libtorrent's pads, `.pad/<n>` with
+  `attr` `p` before each unaligned file and after the last one, and the v2
+  tree). fbt then seeds its own hybrid (port 6907); qBittorrent and
   Transmission both download it, and the seed's log must show each
   connecting. Transmission 4.1 takes the hybrid (as v1) and writes its pad
   files to disk under `.pad/`; the data comparison leaves `.pad/` out.
   qBittorrent names a hybrid by its truncated v2 hash (its `hash` in
   `torrents/info`), Transmission by the v1 hash, so `run.sh` looks each
-  up by its own (`qbt_id`, `info_hash`).
+  up by its own (`qbt_id`, `info_hash`). Both drop fbt's hybrid at the
+  end.
 
 Every `fbt-example` run passes `--dht-bootstrap dht-node:6881`. On success it
 prints `interop: download OK (qbittorrent, transmission)`,

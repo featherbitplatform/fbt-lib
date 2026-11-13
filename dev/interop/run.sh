@@ -124,8 +124,10 @@ make_v2_payload() {
 }
 
 # make_many_payload <dir>: 12 files of 3 000 000 bytes (mode 0644), each a
-# few pieces long, so a v2 downloader asks for more than 8 piece layers at
-# once and meets the seed's serving cap.
+# few pieces long, so a v2 downloader fetching by magnet needs 12 piece
+# layers. libtorrent keeps at most 2 hash requests outstanding per peer, so
+# one qBittorrent never reaches the seed's serving cap (8 per torrent); the
+# scenario logs how many requests were rejected over it (0 so far).
 make_many_payload() {
     fbt sh -c "mkdir -p '$1' && for i in \$(seq -w 1 12); do
         head -c 3000000 /dev/urandom >'$1/part'\$i.bin && chmod 0644 '$1/part'\$i.bin; done"
@@ -375,15 +377,18 @@ set_encryption() {
 seed_service=fbt
 # Extra `docker compose exec` options for start_seed (e.g. `-e RUST_LOG=...`).
 seed_exec_env=()
+# How long start_seed's seed runs (--seed-for); a seed must outlive every
+# wait of every leg that uses it.
+seed_secs=420
 
 # start_seed <torrent> <data dir> <port> <log> [extra args...]: background
-# fbt-example seed (420 s) in $seed_service; sets seed_pid and waits until
-# it is seeding.
+# fbt-example seed ($seed_secs s) in $seed_service; sets seed_pid and waits
+# until it is seeding.
 start_seed() {
     local torrent=$1 data=$2 port=$3 log=$4
     shift 4
     dc exec -T ${seed_exec_env[@]+"${seed_exec_env[@]}"} "$seed_service" fbt-example seed "$torrent" --data "$data" --port "$port" \
-        --dht-bootstrap "$dht_bootstrap" --seed-for 420 "$@" >"$log" 2>&1 &
+        --dht-bootstrap "$dht_bootstrap" --seed-for "$seed_secs" "$@" >"$log" 2>&1 &
     seed_pid=$!
     seed_log=$log
     wait_for "fbt-example to verify and seed $torrent" 120 seed_ready
@@ -913,6 +918,16 @@ qbt_infohash_v2=$(qbt_field "$qbt_v2" .infohash_v2)
     fail "fbt-example create gave v2 info hash '$ours_v2', qBittorrent '$qbt_infohash_v2'"
 echo "interop: v2 info hash matches qBittorrent's: $ours_v2"
 
+echo "interop: fbt-example downloads a btmh-only magnet from qBittorrent (timeout 300s)"
+fbt_download "$logs/fbt-v2-magnet.log" "fbt-example download (btmh magnet)" \
+    "magnet:?xt=urn:btmh:1220$qbt_infohash_v2&dn=v2data&tr=$tracker_param" --out /interop/fbt-v2-magnet --port 6904
+same_data /interop/payload-v2 /interop/fbt-v2-magnet v2data ||
+    fail "the btmh magnet download differs from the payload"
+grep -q 'metadata received: v2data' "$logs/fbt-v2-magnet.log" ||
+    fail "no metadata received for the btmh magnet (see $logs/fbt-v2-magnet.log)"
+
+# fbt's v2 seed serves two legs (qBittorrent by .torrent, then by magnet):
+# up to 930 s of waits in all, so it runs for 1200 s (stop_seed ends it).
 echo "interop: fbt-example seeds its own v2 torrent; qBittorrent downloads it"
 make_many_payload /interop/payload-v2own/v2own
 fbt_create "$logs/fbt-create-v2.log" /interop/payload-v2own/v2own --out /interop/fbt-v2.torrent \
@@ -921,7 +936,9 @@ fbt_v2=$(qbt_id /interop/fbt-v2.torrent)
 fbt_v2_full=$(info_hash_v2 /interop/fbt-v2.torrent)
 [ -n "$fbt_v2" ] && [ -n "$fbt_v2_full" ] || fail "could not read fbt-v2.torrent"
 seed_exec_env=(-e "RUST_LOG=info,fbt_session::torrent::layers=debug")
+seed_secs=1200
 start_seed /interop/fbt-v2.torrent /interop/payload-v2own 6905 "$logs/fbt-v2-seed.log" --no-dht
+seed_secs=420
 seed_exec_env=()
 qbt_api torrents/add -F torrents=@/interop/fbt-v2.torrent -F savepath=/interop/qbt-v2dl >/dev/null
 wait_for "qBittorrent to add fbt's v2 torrent" 30 qbt_has "$fbt_v2"
@@ -930,14 +947,6 @@ wait_for "qBittorrent to complete fbt's v2 torrent" 300 qbt_complete "$fbt_v2"
 other_client_data /interop/payload-v2own /interop/qbt-v2dl v2own qBittorrent
 grep -Eq "^peer connected $qbt_ip:[0-9]+ via (tcp|utp)$" "$logs/fbt-v2-seed.log" ||
     fail "qBittorrent never connected to the v2 seed (see $logs/fbt-v2-seed.log)"
-
-echo "interop: fbt-example downloads a btmh-only magnet from qBittorrent (timeout 300s)"
-fbt_download "$logs/fbt-v2-magnet.log" "fbt-example download (btmh magnet)" \
-    "magnet:?xt=urn:btmh:1220$qbt_infohash_v2&dn=v2data&tr=$tracker_param" --out /interop/fbt-v2-magnet --port 6904
-same_data /interop/payload-v2 /interop/fbt-v2-magnet v2data ||
-    fail "the btmh magnet download differs from the payload"
-grep -q 'metadata received: v2data' "$logs/fbt-v2-magnet.log" ||
-    fail "no metadata received for the btmh magnet (see $logs/fbt-v2-magnet.log)"
 
 echo "interop: qBittorrent downloads fbt's v2 seed by btmh magnet"
 qbt_remove "$fbt_v2"
@@ -972,16 +981,20 @@ same_data /interop/payload-hyb /interop/fbt-hybrid hybdata || fail "the hybrid d
 grep -Eq "^peer connected $qbt_ip:6882 via (tcp|utp)$" "$logs/fbt-hybrid-download.log" ||
     fail "the hybrid download never connected to qBittorrent (see $logs/fbt-hybrid-download.log)"
 
-# Logged, not checked: libtorrent may name or attribute pad files otherwise.
+# The same payload and piece size give qBittorrent's two hashes: the v1
+# file list, pads included (libtorrent's `.pad/<n>`, `attr` `p`, before
+# each unaligned file and after the last), and the v2 tree.
 fbt_create "$logs/fbt-create-hybrid-same.log" /interop/payload-hyb/hybdata \
     --out /interop/fbt-hybrid-same.torrent --format hybrid --piece-size "$v2_piece_size" --tracker "$tracker_url"
 ours_v1=$(sed -n 's/^info hash: //p' "$logs/fbt-create-hybrid-same.log")
 ours_v2=$(sed -n 's/^info hash v2: //p' "$logs/fbt-create-hybrid-same.log")
 theirs_v1=$(qbt_field "$qbt_hyb" .infohash_v1)
 theirs_v2=$(qbt_field "$qbt_hyb" .infohash_v2)
-same() { if [ "$1" = "$2" ]; then echo same; else echo differs; fi; }
-echo "interop: hybrid v1 info hash: fbt $ours_v1, qBittorrent $theirs_v1 ($(same "$ours_v1" "$theirs_v1"))"
-echo "interop: hybrid v2 info hash: fbt $ours_v2, qBittorrent $theirs_v2 ($(same "$ours_v2" "$theirs_v2"))"
+[ -n "$ours_v1" ] && [ "$ours_v1" = "$theirs_v1" ] ||
+    fail "fbt-example create gave hybrid v1 info hash '$ours_v1', qBittorrent '$theirs_v1'"
+[ -n "$ours_v2" ] && [ "$ours_v2" = "$theirs_v2" ] ||
+    fail "fbt-example create gave hybrid v2 info hash '$ours_v2', qBittorrent '$theirs_v2'"
+echo "interop: hybrid info hashes match qBittorrent's: v1 $ours_v1, v2 $ours_v2"
 qbt_remove "$qbt_hyb"
 
 echo "interop: fbt-example seeds its own hybrid; qBittorrent and Transmission download it"
@@ -992,7 +1005,10 @@ fbt_create "$logs/fbt-create-hybrid.log" /interop/payload-hybown/hybown --out /i
 fbt_hyb=$(qbt_id /interop/fbt-hybrid.torrent)
 fbt_hyb_v1=$(info_hash /interop/fbt-hybrid.torrent)
 [ -n "$fbt_hyb" ] && [ -n "$fbt_hyb_v1" ] || fail "could not read fbt-hybrid.torrent"
+# Up to 870 s of waits below: the seed runs for 1200 s (stop_seed ends it).
+seed_secs=1200
 start_seed /interop/fbt-hybrid.torrent /interop/payload-hybown 6907 "$logs/fbt-hybrid-seed.log" --no-dht
+seed_secs=420
 mkdir -p "$INTEROP_DIR/tr-hybrid"
 qbt_api torrents/add -F torrents=@/interop/fbt-hybrid.torrent -F savepath=/interop/qbt-hybrid >/dev/null
 wait_for "qBittorrent to add fbt's hybrid" 30 qbt_has "$fbt_hyb"
@@ -1008,6 +1024,8 @@ grep -Eq "^peer connected $qbt_ip:[0-9]+ via (tcp|utp)$" "$logs/fbt-hybrid-seed.
 grep -Eq "^peer connected $tr_ip:[0-9]+ via (tcp|utp)$" "$logs/fbt-hybrid-seed.log" ||
     fail "Transmission never connected to the hybrid seed (see $logs/fbt-hybrid-seed.log)"
 stop_seed
+qbt_remove "$fbt_hyb"
+trc transmission-remote -t "$fbt_hyb_v1" -r >/dev/null
 echo "interop: hybrid OK (qbittorrent, transmission)"
 fi
 
