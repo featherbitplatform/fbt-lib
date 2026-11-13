@@ -676,6 +676,17 @@ async fn duplicate_peer_id_is_rejected() {
 
 /// Two sessions dialling each other at once end up with exactly one
 /// connection: both ends keep the one the lower peer id initiated.
+///
+/// Cause of the 0.7 flake (0.8 deflake; not reproduced on this machine — 100
+/// runs at 4 copies, each about 20 s, then 100 more at 12 copies with the
+/// machine under CPU load): the test slept a fixed 3 s and then read
+/// `status()` once. A status is a snapshot the actor publishes on its tick,
+/// and the dial it was waiting for is uTP first with TCP fallback only after
+/// `utp_connect_timeout`, so on a loaded runner three seconds need not be
+/// enough for the connection to exist, let alone be reported: the snapshot
+/// still says 0 peers. The fix waits for the condition instead of for the
+/// clock (bounded by `T`), which is both exact about what it needs and no
+/// longer a race with the tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_dial_leaves_one_connection() {
     let (m, payload) = make_torrent(&[("a", 1 << 20)], 65_536);
@@ -691,9 +702,16 @@ async fn simultaneous_dial_leaves_one_connection() {
     let (ra, rb) = tokio::join!(ha.add_peer(b.local_addr()), hb.add_peer(a.local_addr()));
     ra.unwrap();
     rb.unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!(ha.status().num_peers, 1, "seeder peers");
-    assert_eq!(hb.status().num_peers, 1, "leecher peers");
+    assert!(
+        wait_until(
+            || ha.status().num_peers == 1 && hb.status().num_peers == 1,
+            T
+        )
+        .await,
+        "one connection on each side: seeder {}, leecher {}",
+        ha.status().num_peers,
+        hb.status().num_peers
+    );
     finished(&mut ev).await;
     assert!(stored(&storage, payload.len()) == payload, "data differs");
     b.shutdown().await;
