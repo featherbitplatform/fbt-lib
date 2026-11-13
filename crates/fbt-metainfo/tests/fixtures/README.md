@@ -8,8 +8,12 @@ files redistributed). Regenerate with:
 
 - `single.torrent`: one 40 000-byte file, 16 KiB pieces.
 - `multi.torrent`: three files in nested directories, with an announce-list.
-- `hybrid.torrent`: synthetic; v1 keys plus `meta version` 2 and a minimal
-  `file tree`. Only info-hash computation is meaningful (no real v2 piece layers).
+- `hybrid.torrent`: the three files of `v2.torrent` as a hybrid: real v2 file
+  tree, roots and piece layers, and a v1 half in libtorrent's layout (a `.pad`
+  entry before the unaligned file).
+- `v2.torrent`: v2-only, three files (20 000, 0 and 70 000 bytes) in 32 KiB
+  pieces, with real roots and the one piece layer (the 70 000-byte file's).
+- `v2-single.torrent`: v2-only, one 50 000-byte file, 32 KiB pieces.
 - `ubuntu-like.torrent`: 6.1 GB single file, 4 MiB pieces, synthetic piece hashes.
 
 Tests assert hashes computed from the committed bytes, never external values.

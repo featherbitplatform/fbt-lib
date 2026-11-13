@@ -15,6 +15,7 @@ mod collide;
 mod magnet;
 mod metainfo;
 mod path;
+mod v2;
 
 pub use collide::collides;
 pub use magnet::{
@@ -27,3 +28,4 @@ pub use metainfo::{
 };
 
 pub use path::{PathError, RelPath, sanitize_component, sanitize_path};
+pub use v2::{MAX_PIECE_LAYER_HASHES, TorrentVersion, V2Piece, validate_layer};

@@ -205,6 +205,7 @@ mod tests {
             path: fbt_metainfo::sanitize_path(parts.iter().map(|p| p.as_bytes())).unwrap(),
             len: 1,
             pad: false,
+            pieces_root: None,
         }
     }
 
