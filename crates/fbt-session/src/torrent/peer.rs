@@ -97,7 +97,8 @@ pub(super) struct Peer {
     /// to TCP nor asks for a rendezvous, and is retried only for an address
     /// we knew already.
     pub holepunch: bool,
-    /// It set the v2 reserved bit: a source for the layer fetch.
+    /// A v2 connection (the v2 reserved bit, or the truncated v2 hash): a
+    /// source for the layer fetch.
     pub v2: bool,
 }
 

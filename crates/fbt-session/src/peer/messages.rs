@@ -137,17 +137,17 @@ pub(crate) enum PeerEvent {
     Holepunch { key: PeerKey, msg: HolepunchMsg },
     /// The remote's DHT port (BEP 5 `Port`), at most once per connection.
     DhtPort { key: PeerKey, port: u16 },
-    /// A BEP 52 `hash request` (from a remote that set the v2 bit; not
+    /// A BEP 52 `hash request` (from a v2 connection; not
     /// validated).
     HashRequest { key: PeerKey, req: HashRequest },
-    /// BEP 52 `hashes` (from a remote that set the v2 bit; a whole number
+    /// BEP 52 `hashes` (from a v2 connection; a whole number
     /// of 32-byte hashes, unverified).
     Hashes {
         key: PeerKey,
         req: HashRequest,
         hashes: Bytes,
     },
-    /// A BEP 52 `hash reject` (from a remote that set the v2 bit).
+    /// A BEP 52 `hash reject` (from a v2 connection).
     HashReject { key: PeerKey, req: HashRequest },
     /// The connection ended; `outstanding` lists requests never satisfied.
     Disconnected {
@@ -203,7 +203,7 @@ pub(crate) enum PeerCommand {
     /// Refuse a `hash request`.
     RejectHashes(HashRequest),
     /// Ask for hashes of a piece layer (BEP 52 `hash request`); sent only
-    /// to a remote that set the v2 bit.
+    /// to a v2 connection.
     RequestHashes(HashRequest),
     /// Send a `ut_metadata` message (dropped if the remote lacks it).
     SendMetadata(MetadataMsg),

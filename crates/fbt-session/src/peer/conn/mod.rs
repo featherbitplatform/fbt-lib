@@ -86,7 +86,10 @@ fn max_frame(num_pieces: Option<u32>) -> u32 {
 #[derive(Debug, Clone)]
 pub(crate) struct PeerCtx {
     pub key: PeerKey,
+    /// The hash this connection runs under (v1, or the truncated v2).
     pub info_hash: [u8; 20],
+    /// The torrent's truncated v2 hash, when it has one.
+    pub v2_hash: Option<[u8; 20]>,
     pub our_id: PeerId,
     /// `None` while the metadata is pending.
     pub layout: Option<PieceLayout>,
@@ -271,7 +274,14 @@ async fn run_peer_until<S: AsyncRead + AsyncWrite + Unpin>(
 ) {
     let (reason, outstanding) = match handshake(&mut stream, remote, &ctx, deadline).await {
         Err(reason) => (reason, Vec::new()),
-        Ok(theirs) => {
+        Ok(mut theirs) => {
+            // As libtorrent does (`bt_peer_connection.cpp`), a connection
+            // under the truncated v2 hash speaks v2 whatever its reserved
+            // bit: libtorrent sets the bit only to offer a v1-hash
+            // connection the upgrade.
+            if ctx.v2_hash == Some(ctx.info_hash) {
+                theirs.reserved.set_v2();
+            }
             // Counted for mixed mode while connected (dropped with this
             // scope).
             let throttles = ctx
@@ -325,8 +335,11 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let mut reserved = Reserved::default();
     reserved.set_fast();
     reserved.set_extended();
-    // BEP 52: we speak v2 on every connection, as libtorrent does.
-    reserved.set_v2();
+    // BEP 52, only for a torrent with a v2 hash: libtorrent drops an
+    // incoming plaintext handshake with the bit for a v1-only torrent.
+    if ctx.v2_hash.is_some() {
+        reserved.set_v2();
+    }
     if ctx.ext.dht_port.is_some() {
         reserved.set_dht();
     }

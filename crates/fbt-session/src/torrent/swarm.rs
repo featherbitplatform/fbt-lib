@@ -5,7 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fbt_core::{Bitfield, PeerId};
+use fbt_core::{Bitfield, InfoHashes, PeerId};
 use fbt_wire::{CryptoMethods, HolepunchMsg};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
@@ -84,6 +84,12 @@ impl Actor {
         PeerCtx {
             key,
             info_hash: self.ih.wire_hash(),
+            // The key's v2 hash, else the one the metadata revealed.
+            v2_hash: self
+                .ih
+                .v2
+                .or_else(|| self.known_meta().and_then(|m| m.info_hashes.v2))
+                .map(|v2| InfoHashes::from_v2(v2).wire_hash()),
             our_id: self.shared.peer_id,
             layout: l.map(|l| l.layout),
             have,

@@ -384,8 +384,39 @@ async fn seed_answers_hash_requests() {
         .await;
     assert_eq!(peer.wait_closed(T).await, PeerEnd::Closed);
 
-    // Hash messages from a peer without the v2 bit close it.
+    // A connection under the truncated v2 hash is v2 without the bit, as
+    // libtorrent decides (`bt_peer_connection.cpp`): it sends none on a
+    // v2-only torrent.
     let mut peer = ScriptedPeer::connect_fast(s.local_addr(), wire).await;
+    assert!(peer.remote.reserved.supports_v2());
+    peer.send(Message::HashRequest(hash_request(root, 1, 8, 8)))
+        .await;
+    match peer
+        .next_matching(|m| matches!(m, Message::Hashes { .. } | Message::HashReject(_)))
+        .await
+    {
+        Some(Message::Hashes { req, .. }) => assert_eq!(req, hash_request(root, 1, 8, 8)),
+        other => panic!("expected hashes, got {other:?}"),
+    }
+    s.shutdown().await;
+
+    // On a hybrid, a v1-hash connection without the bit is not v2: hash
+    // messages close it.
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::Hybrid, PIECE);
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let root = m
+        .info
+        .files
+        .iter()
+        .find(|f| f.len == 300_000)
+        .and_then(|f| f.pieces_root)
+        .unwrap();
+    let (s, _h) = seed(&bytes, dir.path()).await;
+    let v1 = m.info_hashes.v1.unwrap().0;
+    let mut peer = ScriptedPeer::connect_fast(s.local_addr(), v1).await;
+    // We offer the upgrade: the hybrid has a v2 hash.
+    assert!(peer.remote.reserved.supports_v2());
     peer.send(Message::HashRequest(hash_request(root, 1, 0, 8)))
         .await;
     assert_eq!(peer.wait_closed(T).await, PeerEnd::Closed);
@@ -572,8 +603,12 @@ async fn hybrid_magnet_downloads_without_layer_fetch() {
     s.shutdown().await;
 }
 
+/// A v2-only torrent's peer is a layer source without the v2 bit: the
+/// connection runs under the truncated v2 hash, which libtorrent takes as
+/// v2 (it sends no bit then). Until the layers arrive the torrent stays in
+/// the metadata phase and requests no block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn seed_without_v2_peers_stays_in_metadata() {
+async fn seed_without_the_v2_bit_is_asked_for_layers() {
     let dir = tempfile::tempdir().unwrap();
     let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::V2, PIECE);
     let m = Metainfo::from_bytes(&strip_layers(&bytes)).unwrap();
@@ -599,7 +634,7 @@ async fn seed_without_v2_peers_stays_in_metadata() {
             matches!(m, Message::Request(_) | Message::HashRequest(_))
         })
         .await;
-    assert!(got.is_none(), "{got:?}");
+    assert!(matches!(got, Some(Message::HashRequest(_))), "{got:?}");
     let st = lh.status();
     assert_eq!(st.state, TorrentState::DownloadingMetadata);
     assert!(!st.has_metadata);

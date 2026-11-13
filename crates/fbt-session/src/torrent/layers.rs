@@ -328,8 +328,8 @@ pub(super) enum LayerStep {
     Bad(PeerKey),
 }
 
-/// Fetching the piece layers a v2-only torrent lacks from peers that set
-/// the v2 bit (BEP 52 `hash request`). Pure: no I/O, `now` is passed in.
+/// Fetching the piece layers a v2-only torrent lacks from v2 peers (BEP 52
+/// `hash request`). Pure: no I/O, `now` is passed in.
 ///
 /// Each multi-piece file's padded layer (`W = 2^(H - p)` wide for tree
 /// height `H` and piece height `p`) is asked for in spans of
@@ -440,7 +440,7 @@ impl LayerFetch {
         })
     }
 
-    /// A connected peer that set the v2 bit: a source now, or once a slot
+    /// A connected v2 peer (v2 bit or truncated v2 hash): a source now, or once a slot
     /// frees.
     pub(super) fn add_source(&mut self, key: PeerKey, now: Instant) -> Vec<(PeerKey, HashRequest)> {
         if !self.sources.contains_key(&key)
@@ -749,6 +749,11 @@ impl Actor {
             return;
         };
         if !l.hash_serving.try_start(&mut p.hash_requests) {
+            debug!(
+                key = key.0,
+                ?req,
+                "hash request over the serving caps; rejected"
+            );
             self.send(key, PeerCommand::RejectHashes(req));
             return;
         }
@@ -808,6 +813,12 @@ impl Actor {
         if self.close_if_v1_only(key) {
             return;
         }
+        debug!(
+            key = key.0,
+            ?req,
+            answered = hashes.is_some(),
+            "hash answer"
+        );
         let Some(p) = self.pending_layers.as_mut() else {
             debug!(key = key.0, ?req, "unrequested hash answer dropped");
             return;
@@ -835,6 +846,7 @@ impl Actor {
         let Some(p) = self.peers.get_mut(&key) else {
             return;
         };
+        debug!(key = key.0, v2, "peer v2 connection");
         p.v2 = v2;
         if v2 && p.connected && p.tx.is_some() {
             self.add_layer_source(key);
@@ -869,6 +881,7 @@ impl Actor {
 
     fn send_hash_requests(&mut self, sends: Vec<(PeerKey, HashRequest)>) {
         for (key, req) in sends {
+            debug!(key = key.0, ?req, "hash request sent");
             self.send(key, PeerCommand::RequestHashes(req));
         }
     }

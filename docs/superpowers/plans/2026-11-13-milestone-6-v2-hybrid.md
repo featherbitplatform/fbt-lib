@@ -174,7 +174,7 @@ The owner authorised milestones 1 to 7 to run unattended. The spec's section 8 i
   - The same verifier runs in recheck.
   - Hybrids hash twice (SHA-1 and SHA-256): accepted cost, recorded in the benchmark notes.
 - **Layer fetch, v2-only only.** When a v2-only torrent's metadata (from a magnet, a `.torrent` or resume data without layers) lacks a layer, the torrent stays in `Phase::Metadata` (`TorrentState::DownloadingMetadata`) until every layer is fetched, whatever its source. Libtorrent fetches lazily; ours is simpler and costs 32 bytes per piece up front.
-  - **Sources.** Peers that set the v2 reserved bit, at most `MAX_LAYER_SOURCES` = 4 at once.
+  - **Sources.** v2 connections (the v2 reserved bit, or the truncated v2 hash), at most `MAX_LAYER_SOURCES` = 4 at once.
   - **Request geometry.** For a file with piece-layer height `p = log2(piece_len / 16 KiB)` and tree height `H = file_tree_height(len)`, the padded layer width is `W = 2^(H - p)` (at least 2 for a multi-piece file). Requests have `length = min(LAYER_REQUEST_LEN, W)` (`LAYER_REQUEST_LEN` = 512), `index` = `0, length, 2*length, ... < W`, `base_layer = p` and `proof_layers = H - p - log2(length)` (exactly the uncles up to, excluding, the root). Every span lies inside the padded layer; `length` 1 is never sent.
   - **Failures.** Each request times out after 30 s (the source is retired, no ban). `hash reject` moves the span to another source. Hashes that fail their proof, or arrive unrequested, close the peer and add it to the metadata ban set.
   - **Hybrids.** A hybrid never fetches layers; v1 verifies its pieces.
@@ -186,7 +186,7 @@ The owner authorised milestones 1 to 7 to run unattended. The spec's section 8 i
 - **Proof shape.** The answer carries `length` base-layer hashes, then one uncle hash per layer from `base + log2(length)` upward. There are `min(proof_layers, tree_height − base − log2(length))` uncles, bottom-up, where `tree_height` is the height of the file's root.
   - This is our reading of BEP 52 and of libtorrent's `merkle_tree::get_hashes`.
   - The interop `v2` scenario (a `btmh` magnet from qBittorrent, and qBittorrent's magnet from us) is the arbiter. If it shows a different shape, follow libtorrent and correct this paragraph in the same commit.
-- **The v2 reserved bit** (`reserved[7] & 0x10`) is set on every handshake we send, as libtorrent does. Hash messages from a peer that did not set it close the connection.
+- **The v2 reserved bit** (`reserved[7] & 0x10`) is set on our handshakes for torrents with a v2 hash only: libtorrent drops an incoming plaintext handshake carrying it for a v1-only torrent. A connection is v2 when the peer set the bit or the connection runs under the torrent's truncated v2 hash, as libtorrent's `bt_peer_connection.cpp` decides (libtorrent sets the bit only to offer a v1-hash connection of a v2 torrent the upgrade, so its v2-only connections come without it; found by the interop `v2` scenario). Hash messages on a connection that is not v2 close it.
 - **Identity.**
   - The registry key stays the `InfoHashes` the torrent was added with (events and handles keep it).
   - `by_wire` (and `by_req2`) hold every wire hash of the torrent: the v1 hash and the truncated v2 hash.
@@ -240,7 +240,7 @@ From the pre-flight scan (`.superpowers/sdd/2026-11-13-milestone-6-v2-hybrid/pre
 - **Task 5.** `verify_piece` truncates to `V2Piece.len` (F2). Session half of `hybrid_piece_must_pass_both` uses a `ScriptedPeer` (F7). Only `Loaded.meta` is swapped; `piece_layers_known` via a `Cmd` (F11). `lib_surface.rs` in Files (F12). Batched layer swaps; `check_pieces` breaking; no `PieceVerifier` (F21). Split from old Task 5 (F23).
 - **Task 6.** `SessionError::V2OnlyUnsupported` no longer produced; `magnet_v2_only_is_accepted` (F1). `swarm.rs`, `magnet.rs`, `error.rs`, `tests/magnet.rs` in Files; `unregister` removes every hash (F12). Split from old Task 5 (F23).
 - **Task 7.** Spans leaving the padded layer → `Reject` (F6). Split from old Task 6 (F23).
-- **Task 8.** `pending_layers` and `Phase::Metadata` for every source (F4). Request geometry and `fetch_request_geometry` (F6). `seed_without_v2_peers_stays_in_metadata` setup (F19). Split from old Task 6 (F23).
+- **Task 8.** `pending_layers` and `Phase::Metadata` for every source (F4). Request geometry and `fetch_request_geometry` (F6). `seed_without_the_v2_bit_is_asked_for_layers` (was `seed_without_v2_peers_stays_in_metadata`) setup (F19). Split from old Task 6 (F23).
 - **Task 9.** Revealed hashes are not announced; backlog (F18).
 - **Task 10.** `ResumeError::Version`, `ResumeError::InfoHashMismatch`, existing assertions, `resume-v1.bin` generator (F9). Magnet `btih`/`btmh` check and the `commands.rs` record (F10). Reads `Loaded.meta` (F11). Layers over `MAX_RESUME_BYTES` left out (F22).
 - **Task 11.** `torrentcreator` call, file mode and directory name, `infohash_v2` (F15). `info` prints `hex(wire_hash())` and `num_pieces()` (F16).
@@ -537,7 +537,7 @@ CHANGELOG.md, README.md, CLAUDE.md, crates/fbt-metainfo/tests/fixtures/README.md
   - Registry aliases: `by_wire`/`by_req2` entries for each wire hash, the duplicate check over all of them, `add_alias`, `unregister`, and the `torrent()` fallback.
   - Remove the `V2OnlyUnsupported` check and deprecate the variant.
   - Inbound connections echo the peer's hash.
-  - Every handshake we send sets the v2 bit.
+  - Every handshake we send for a torrent with a v2 hash sets the v2 bit.
 - [ ] **Step 4: Run the tests to see them pass.** Run `CARGO_INCREMENTAL=0 cargo test -p fbt-session`. Expected: PASS.
 - [ ] **Step 5: Commit.** `feat(session): register a torrent under every wire hash and accept v2 magnets`
 
@@ -558,7 +558,7 @@ CHANGELOG.md, README.md, CLAUDE.md, crates/fbt-metainfo/tests/fixtures/README.md
     - `Malformed`: `length` not a power of two or above `MAX_HASH_REQUEST_LEN`, `index` not a multiple of `length`, `base_layer` at or above the tree height.
     - `Reject`: unknown root, a layer we lack, `base_layer` below the piece layer, or a span that leaves the padded base layer.
   - Peer plumbing: `HashRequest`, `Hashes` and `HashReject` reach the actor as peer messages. `Hashes` and `HashReject` are dropped until Task 8 consumes them.
-  - Every torrent answers `HashRequest` through `serve_hash_request` from `Loaded.meta`, at most `MAX_PENDING_HASH_REQUESTS` per peer in flight (beyond → reject). Hash messages from a peer without the v2 bit, or on a v1-only torrent, close it.
+  - Every torrent answers `HashRequest` through `serve_hash_request` from `Loaded.meta`, at most `MAX_PENDING_HASH_REQUESTS` per peer in flight (beyond → reject). Hash messages on a connection that is not v2 (no v2 bit and not under the truncated v2 hash), or on a v1-only torrent, close it.
 
 - [ ] **Step 1: Write the failing unit tests** in `layers.rs`:
   - `serve_answers_piece_layer_spans`: the served bytes for `(root, piece_height, 0, 4, 10)` verify with `verify_hashes`.
@@ -618,7 +618,7 @@ CHANGELOG.md, README.md, CLAUDE.md, crates/fbt-metainfo/tests/fixtures/README.md
   - `v2_magnet_downloads`: a seed with a V2 torrent (the 300 000-byte file gives it a layer); a leech adds the `btmh`-only magnet with the seed as a peer, gets metadata and layers, and finishes with data equal.
   - `v2_torrent_without_layers_fetches_them`: a V2 `.torrent` stripped of `piece layers` downloads the same way.
   - `hybrid_magnet_downloads_without_layer_fetch`: the `btmh` magnet of a hybrid finishes; `piece_layers_known` on the leech after finishing equals the number of multi-piece files (built from data, not fetched).
-  - `seed_without_v2_peers_stays_in_metadata`: the leech adds a V2 `.torrent` stripped of `piece layers` (no metadata exchange needed) and connects to a `ScriptedPeer::accept_with` whose reserved bits lack 0x10. After 3 s its state is `DownloadingMetadata` and the peer has seen no `Request`.
+  - `seed_without_the_v2_bit_is_asked_for_layers` (renamed in Task 11 from `seed_without_v2_peers_stays_in_metadata`): the leech adds a V2 `.torrent` stripped of `piece layers` (no metadata exchange needed) and connects to a `ScriptedPeer::accept_with` whose reserved bits lack 0x10. The connection runs under the truncated v2 hash, so it is v2 anyway (libtorrent's rule, found by the interop `v2` scenario): the peer gets a `HashRequest` and no `Request`, and the state stays `DownloadingMetadata`.
 - [ ] **Step 3: Run them to see them fail.** Run `CARGO_INCREMENTAL=0 cargo test -p fbt-session layers && CARGO_INCREMENTAL=0 cargo test -p fbt-session --test v2`. Expected: FAIL.
 - [ ] **Step 4: Implement `LayerFetch` and the flow.**
 - [ ] **Step 5: Run the tests to see them pass.** Run `CARGO_INCREMENTAL=0 cargo test -p fbt-session`. Expected: PASS.
@@ -725,7 +725,7 @@ CHANGELOG.md, README.md, CLAUDE.md, crates/fbt-metainfo/tests/fixtures/README.md
 
 - [ ] **Step 1: Write the `CHANGELOG.md` `## [Unreleased]` entries.**
   - `### Added`: v2/hybrid support, creation, hash messages, both-hash announcing, resume v2, the `hash_proof` fuzz target and the interop scenarios.
-  - `### Changed`: `FileEntry::pieces_root` (breaking for struct literals), `Metainfo::piece_layers`, `Info.pieces` empty for v2-only, `Event::TrackerReply::info_hash`, `MetainfoError::V2OnlyUnsupported` and `SessionError::V2OnlyUnsupported` deprecated, `fbt_session::storage::check_pieces`'s new signature, `fbt_wire::Message`'s new variants, resume version 2 (version 1 read), the v2 reserved bit always set, and `fbt-example info` printing the wire hash.
+  - `### Changed`: `FileEntry::pieces_root` (breaking for struct literals), `Metainfo::piece_layers`, `Info.pieces` empty for v2-only, `Event::TrackerReply::info_hash`, `MetainfoError::V2OnlyUnsupported` and `SessionError::V2OnlyUnsupported` deprecated, `fbt_session::storage::check_pieces`'s new signature, `fbt_wire::Message`'s new variants, resume version 2 (version 1 read), the v2 reserved bit set for torrents with a v2 hash, and `fbt-example info` printing the wire hash.
   - `### Removed`: nothing unless a task removed something.
   - PR links use the PR number once known.
 - [ ] **Step 2: Check the docs build.** Run `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features && CARGO_INCREMENTAL=0 cargo test --workspace --doc`. Expected: PASS.
