@@ -1084,8 +1084,12 @@ code=$(api_status torrents)
 [ "$code" = 401 ] || fail "GET /torrents without the token answered $code, not 401"
 code=$(api_status "$api_stream" -H "$api_auth" -H "Range: bytes=$api_beta_len-")
 [ "$code" = 416 ] || fail "a range past the end of beta.bin answered $code, not 416"
-kill -0 "$api_pid" 2>/dev/null || fail "fbt-example download --api exited before the API checks ended (see $api_log)"
-echo "interop: api: listed, streamed 3 ranges, 401 and 416 in $((SECONDS - api_started))s, while downloading"
+# Still downloading once every check is done: 64 MiB at 4 MiB/s takes about
+# 16 s, the checks about 7 (measured).
+api_progress=$(api_get "torrents/$hash1" | fbt jq -r .progress)
+fbt jq -en --argjson p "$api_progress" '$p < 1' >/dev/null ||
+    fail "the download had finished (progress $api_progress) before the API checks ended (see $api_log)"
+echo "interop: api: listed, streamed 3 ranges, 401 and 416 in $((SECONDS - api_started))s, at progress $api_progress"
 
 set +e
 wait "$api_pid"

@@ -827,10 +827,7 @@ async fn transfer(
     println!("listening on {}", session.local_addr());
     let api = match opts.api.clone() {
         Some(config) => match ApiServer::start(session.clone(), config).await {
-            Ok(api) => {
-                println!("api: listening on {}", api.local_addr());
-                Some(api)
-            }
+            Ok(api) => Some(api),
             Err(e) => {
                 session.shutdown().await;
                 return Err(format!("api: {e}").into());
@@ -840,7 +837,8 @@ async fn transfer(
     };
     // Whatever happens below, the API stops and the session shuts down
     // (trackers get their `stopped`, the disk cache is flushed).
-    let result = run_transfer(&session, params, &opts).await;
+    let api_addr = api.as_ref().map(ApiServer::local_addr);
+    let result = run_transfer(&session, params, &opts, api_addr).await;
     if let Some(api) = api {
         api.shutdown().await;
     }
@@ -848,15 +846,21 @@ async fn transfer(
     result
 }
 
-/// The part of [`transfer`] that runs with the session up.
+/// The part of [`transfer`] that runs with the session up. `api_addr` is
+/// the API's bound address, announced once the torrent is in the session
+/// (so a client that waits for the line always finds it listed).
 async fn run_transfer(
     session: &Session,
     params: AddTorrent,
     opts: &TransferOpts,
+    api_addr: Option<SocketAddr>,
 ) -> Result<ExitCode, Error> {
     let mut events = session
         .subscribe(EventMask::STATUS | EventMask::PEER | EventMask::NAT | EventMask::TRACKER);
     let handle = session.add_torrent(params).await?;
+    if let Some(addr) = api_addr {
+        println!("api: listening on {addr}");
+    }
     for url in &opts.web_seeds {
         handle.add_web_seed(url.clone()).await?;
     }

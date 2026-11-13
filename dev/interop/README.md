@@ -155,14 +155,16 @@
   of seeding keep the process, and so the API, up while `curl` (in the `fbt`
   container, on `127.0.0.1:8090`) drives it; a plain download would exit
   once done and take the API with it. As soon as the log shows `api:
-  listening on`, `curl -sN --max-time 120` follows `GET /api/v1/events` in
+  listening on` (printed once the torrent is in the session), `curl -sN --max-time 120` follows `GET /api/v1/events` in
   the background (`logs/fbt-api-events.log`). Then, while the download
   runs: `GET /api/v1/torrents` must list the torrent alone, by its 40-hex
   wire hash; `GET /api/v1/torrents/<id>/files` gives `beta.bin`'s index;
   three `Range` requests on `/api/v1/torrents/<id>/files/<index>/stream`
   (the first, a middle and the last 64 KiB) must answer `206` and equal
   those bytes of `beta.bin` (`cmp`); a request without the token must get
-  `401`, and `Range: bytes=25000000-` (past the end) `416`. The download
+  `401`, and `Range: bytes=25000000-` (past the end) `416`. After these
+  checks, `GET /api/v1/torrents/<id>` must still report `progress` below 1
+  (the download takes about 16 s, the checks about 7). The download
   must exit 0 with matching data, and the event stream, which the API's
   shutdown ends, must hold an `event: torrent_finished` line.
 
