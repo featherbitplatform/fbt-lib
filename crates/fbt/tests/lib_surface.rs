@@ -180,6 +180,8 @@ async fn storage_methods(h: &TorrentHandle) {
         .move_storage(std::path::PathBuf::new(), MoveMode::default())
         .await;
     let _: Result<(), SessionError> = h.rename_file(0, "x").await;
+    // Hidden from the docs: a test hook, the piece layers the torrent holds.
+    let _: usize = h.piece_layers_known().await;
     let _: std::path::PathBuf = h.status().save_path;
     let _ = [
         SessionError::InvalidPath(String::new()),

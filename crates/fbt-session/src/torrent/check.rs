@@ -179,7 +179,7 @@ impl Actor {
                     result: Err(e),
                 };
             }
-            let result = check_pieces(&*storage, &layout, &meta.info.pieces, |i| {
+            let result = check_pieces(&*storage, &layout, &meta, |i| {
                 done.store(i.saturating_add(1), Ordering::Relaxed);
                 if cancel.load(Ordering::Relaxed) {
                     ControlFlow::Break(())

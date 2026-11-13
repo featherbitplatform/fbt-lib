@@ -25,6 +25,7 @@ use super::data::Job;
 use super::deadline::Deadlines;
 use super::dht::{self, DhtAnnouncer, DhtParams};
 use super::known::{Known, dialable};
+use super::layers::LayerBuilder;
 use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
 use super::peer::Peer;
@@ -120,6 +121,13 @@ pub(super) struct Loaded {
     pub wanted: Arc<WantedFiles>,
     /// Files given a new path by `rename_file`, relative to the save path.
     pub renamed: BTreeMap<usize, RelPath>,
+    /// Builds the piece layers a hybrid lacks from its verified pieces.
+    pub layer_builder: Option<LayerBuilder>,
+    /// Layers built and not yet merged into `meta` (see
+    /// [`Actor::swap_layers`]); bounded by the builder's cap.
+    pub built_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    /// When `meta` last took built layers.
+    pub layers_swapped: Option<Instant>,
 }
 
 /// The wanted flag of each file, for
@@ -164,6 +172,7 @@ impl Loaded {
         let piece_prio = piece_priorities(&meta, &file_prio);
         let total_wanted = wanted_bytes(&layout, &piece_prio);
         let wanted = Arc::new(WantedFiles::new(&file_prio));
+        let layer_builder = LayerBuilder::new(&meta);
         Loaded {
             meta,
             layout,
@@ -175,6 +184,9 @@ impl Loaded {
             bufs: HashMap::new(),
             wanted,
             renamed: BTreeMap::new(),
+            layer_builder,
+            built_layers: BTreeMap::new(),
+            layers_swapped: None,
         }
     }
 }
@@ -628,6 +640,7 @@ impl Actor {
                     self.try_connect();
                     self.account_time();
                     self.check_seed_limits();
+                    self.swap_layers(false);
                     self.publish();
                 }
                 _ = rechoke.tick() => self.rechoke(),

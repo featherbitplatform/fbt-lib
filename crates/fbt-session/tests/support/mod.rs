@@ -1189,3 +1189,47 @@ impl Storage for GatedReadStorage {
         self.inner.delete_files()
     }
 }
+
+/// Writes the three files of the v2 tests below `dir/payload` (100 000, 0
+/// and 300 000 random bytes, named `a`, `b` and `c`) and returns that
+/// directory: the torrent's name is `payload`.
+pub fn write_v2_payload(dir: &Path) -> std::path::PathBuf {
+    let root = dir.join("payload");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    for (name, len) in [("a", 100_000usize), ("b", 0), ("c", 300_000)] {
+        let mut data = vec![0u8; len];
+        rand::rng().fill(data.as_mut_slice());
+        std::fs::write(root.join(name), data).expect("write payload");
+    }
+    root
+}
+
+/// `.torrent` bytes for the file or directory `path`, made by
+/// `CreateTorrent`.
+pub fn create_torrent(
+    path: &Path,
+    version: fbt_metainfo::TorrentVersion,
+    piece_len: u32,
+) -> Vec<u8> {
+    fbt_metainfo::CreateTorrent::new(path)
+        .version(version)
+        .piece_len(piece_len)
+        .build(&mut |_, _| std::ops::ControlFlow::Continue(()))
+        .expect("create torrent")
+}
+
+/// The torrent's content as stored below `save_path`: its files in order,
+/// pads as zeros.
+pub fn payload_of(m: &Metainfo, save_path: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in &m.info.files {
+        if f.pad {
+            out.resize(out.len() + f.len as usize, 0);
+        } else if f.len > 0 {
+            let data = std::fs::read(save_path.join(f.path.to_path_buf())).expect("read file");
+            assert_eq!(data.len() as u64, f.len);
+            out.extend_from_slice(&data);
+        }
+    }
+    out
+}

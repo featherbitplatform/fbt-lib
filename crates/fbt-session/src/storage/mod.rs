@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use fbt_metainfo::{FileEntry, Metainfo, RelPath};
 
 pub use cache::CacheStats;
+pub(crate) use check::{PieceCheck, verify_piece};
 pub use check::{check_pieces, sha1_piece};
 pub use fs::{FsStorage, StorageError, error_path};
 pub use mem::MemStorage;
@@ -340,16 +341,18 @@ mod tests {
         let data: Vec<u8> = (0..64u8)
             .map(|b| b.wrapping_mul(7).wrapping_add(1))
             .collect();
-        let hashes = piece_hashes(&data, 16);
+        let mut m = m;
+        m.info.pieces = piece_hashes(&data, 16);
         let layout = PieceLayout::new(64, 16).unwrap();
         s.write(0, data.get(0..16).unwrap()).unwrap();
         s.write(32, data.get(32..48).unwrap()).unwrap();
         let mut seen = Vec::new();
-        let bf: Bitfield = check_pieces(&s, &layout, &hashes, |i| {
+        let (bf, roots): (Bitfield, _) = check_pieces(&s, &layout, &m, |i| {
             seen.push(i);
             ControlFlow::Continue(())
         })
         .unwrap();
+        assert!(roots.is_empty(), "no v2 roots for a v1 torrent");
         assert_eq!(bf.iter_ones().collect::<Vec<_>>(), vec![0, 2]);
         assert_eq!(seen, vec![0, 1, 2, 3]);
     }
@@ -357,21 +360,23 @@ mod tests {
     #[test]
     fn check_pieces_on_mem_storage_and_errors() {
         let data: Vec<u8> = (0..10u8).collect();
-        let hashes = piece_hashes(&data, 4);
+        let mut m = torrent("t", &[(&["a"], 10, false)], 4);
+        m.info.pieces = piece_hashes(&data, 4);
         let layout = PieceLayout::new(10, 4).unwrap();
         let s = MemStorage::from_bytes(data);
-        let bf = check_pieces(&s, &layout, &hashes, |_| ControlFlow::Continue(())).unwrap();
+        let (bf, _) = check_pieces(&s, &layout, &m, |_| ControlFlow::Continue(())).unwrap();
         assert!(bf.is_full());
     }
 
     #[test]
     fn check_pieces_can_be_cancelled() {
         let data: Vec<u8> = (0..10u8).collect();
-        let hashes = piece_hashes(&data, 4);
+        let mut m = torrent("t", &[(&["a"], 10, false)], 4);
+        m.info.pieces = piece_hashes(&data, 4);
         let layout = PieceLayout::new(10, 4).unwrap();
         let s = MemStorage::from_bytes(data);
         let mut seen = Vec::new();
-        let e = check_pieces(&s, &layout, &hashes, |i| {
+        let e = check_pieces(&s, &layout, &m, |i| {
             seen.push(i);
             if i == 1 {
                 ControlFlow::Break(())

@@ -28,6 +28,7 @@ mod deadline;
 mod dht;
 mod holepunch;
 mod known;
+mod layers;
 mod magnet;
 mod metadata;
 mod peer;
@@ -90,6 +91,8 @@ pub(crate) enum Cmd {
     BansChanged,
     /// Tests: the smart-ban trust points of the peer at this address.
     PeerTrust(SocketAddr, oneshot::Sender<i32>),
+    /// Tests: how many piece layers the actor's metainfo holds.
+    PieceLayersKnown(oneshot::Sender<usize>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -263,6 +266,9 @@ impl TorrentHandle {
 
     /// The torrent's metadata; `None` for a magnet until
     /// [`Event::MetadataReceived`](crate::Event::MetadataReceived).
+    ///
+    /// Set once: piece layers the torrent builds or fetches later are not
+    /// added to it (the torrent still uses them).
     pub fn metainfo(&self) -> Option<Arc<Metainfo>> {
         self.inner.metainfo.get().cloned()
     }
@@ -698,6 +704,15 @@ impl TorrentHandle {
     #[doc(hidden)]
     pub async fn peer_trust(&self, addr: SocketAddr) -> Result<i32, SessionError> {
         self.call(|tx| Cmd::PeerTrust(addr, tx)).await
+    }
+
+    /// How many BEP 52 piece layers the torrent holds now, those built from
+    /// verified data included (0 before the metadata is known, or once the
+    /// torrent is gone). [`metainfo`](Self::metainfo) keeps the layers
+    /// known when it was first set. For tests.
+    #[doc(hidden)]
+    pub async fn piece_layers_known(&self) -> usize {
+        self.call(Cmd::PieceLayersKnown).await.unwrap_or(0)
     }
 
     /// Asks the actor to stop; the receiver completes once it has.

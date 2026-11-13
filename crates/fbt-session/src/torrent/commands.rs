@@ -160,6 +160,13 @@ impl Actor {
                 let s = self.peer_block_source(addr);
                 let _ = tx.send(self.smartban.trust_of(s));
             }
+            Cmd::PieceLayersKnown(tx) => {
+                let n = self
+                    .loaded
+                    .as_ref()
+                    .map_or(0, |l| l.meta.piece_layers.len());
+                let _ = tx.send(n);
+            }
             Cmd::Shutdown(tx) => {
                 let _ = self.stop(None).await;
                 let _ = tx.send(());
