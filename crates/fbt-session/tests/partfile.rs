@@ -375,6 +375,15 @@ async fn existing_skipped_file_is_used_in_place() {
 /// Milestone 4 deferral: losing a piece no wanted file overlaps does not
 /// make the torrent unfinished, so getting it back emits no second
 /// `TorrentFinished`.
+///
+/// Review note (0.8 deflake; not reproduced: 100 runs at 4 copies, then 100
+/// more at 24 copies with the machine under CPU load): every wait here is a
+/// bounded condition loop on a real condition — the part file's size is polled
+/// until the bytes the test is about to cut away are actually on disk, and both
+/// the read and the `FileError` get `T` — so nothing waits on a fixed sleep. The
+/// one budget under this plan's 5 s floor was the absence check below: 3 s of silence after a
+/// re-download that starts with a fresh dial on a runner of unknown load. An
+/// absence check is only as strong as its window, so it gets 5 s now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lost_skipped_piece_does_not_refinish() {
     let (m, payload) = make_torrent(&FILES, PL);
@@ -422,7 +431,7 @@ async fn lost_skipped_piece_does_not_refinish() {
     let again = next_matching(
         &mut ev,
         |e| matches!(e, Event::TorrentFinished { .. }),
-        Duration::from_secs(3),
+        Duration::from_secs(5),
     )
     .await;
     assert!(again.is_none(), "finished twice");
