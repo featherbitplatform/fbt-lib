@@ -581,6 +581,7 @@ dependencies = [
  "proptest",
  "sha1",
  "sha2",
+ "tempfile",
  "thiserror",
  "unicode-normalization",
 ]

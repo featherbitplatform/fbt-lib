@@ -17,6 +17,10 @@ use fbt::{
     PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
     StorageError, StreamError,
 };
+use fbt::{
+    CreateError, CreateTorrent, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, TorrentVersion, V2Piece,
+    auto_piece_len, validate_layer,
+};
 
 fn names(
     _: Option<AddTorrent>,
@@ -58,6 +62,10 @@ fn names(
     _: Option<Settings>,
     _: Option<TorrentHandle>,
     _: Option<TorrentState>,
+    _: Option<CreateTorrent>,
+    _: Option<CreateError>,
+    _: Option<TorrentVersion>,
+    _: Option<V2Piece>,
     _: Option<TorrentStatus>,
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
@@ -102,6 +110,10 @@ fn peer_connected(e: &Event) -> Option<(std::net::SocketAddr, Transport, bool)> 
 fn surface_compiles() {
     let _: [&str; 3] = DEFAULT_DHT_BOOTSTRAP;
     let _: usize = MAX_METADATA_SIZE;
+    let _: [usize; 2] = [MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES];
+    let _: u32 = auto_piece_len(1);
+    let _: bool = validate_layer(&[0; 32], 1, 16384, &[]);
+    let _ = CreateTorrent::new("x").version(TorrentVersion::V1);
     let _ = [Transport::Tcp, Transport::Utp];
     let s = Settings::default();
     let _: [bool; 4] = [

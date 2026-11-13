@@ -435,7 +435,9 @@ pub use fbt_core::{
     LayoutError, ParseInfoHashError, PeerId, PieceLayout,
 };
 pub use fbt_metainfo::{
-    FileEntry, Info, MAX_WEB_SEEDS, Magnet, MagnetError, Metainfo, MetainfoError, RelPath,
+    CreateError, CreateTorrent, FileEntry, Info, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES,
+    MAX_WEB_SEEDS, Magnet, MagnetError, Metainfo, MetainfoError, RelPath, TorrentVersion, V2Piece,
+    auto_piece_len, validate_layer,
 };
 pub use fbt_session::storage::{FileStamp, FsStorage, MemStorage, Storage};
 pub use fbt_session::{

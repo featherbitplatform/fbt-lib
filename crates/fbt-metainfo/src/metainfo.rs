@@ -20,7 +20,7 @@ pub const MAX_WEB_SEEDS: usize = 16;
 pub(crate) const MAX_URL_LEN: usize = 2048;
 /// Deepest accepted file path, in components (including the root name).
 const MAX_PATH_DEPTH: usize = 256;
-const MAX_PIECE_LEN: i64 = 268_435_456;
+pub(crate) const MAX_PIECE_LEN: i64 = 268_435_456;
 /// Most tracker URLs kept across all tiers; later ones are ignored. The
 /// session applies the same cap to trackers set by hand.
 pub const MAX_TRACKERS: usize = 64;
