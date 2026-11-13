@@ -132,3 +132,52 @@ pub fn error_code(body: &Bytes) -> String {
         .expect("error body has a code")
         .to_owned()
 }
+
+/// `method url` with `body` sent as `content_type` (no `Content-Type`
+/// header when `None`), with the bearer token when one is given.
+pub async fn send_body(
+    method: Method,
+    url: &str,
+    token: Option<&str>,
+    content_type: Option<&str>,
+    body: impl Into<Bytes>,
+) -> (StatusCode, HeaderMap, Bytes) {
+    let mut b = request(method, url, token);
+    if let Some(ct) = content_type {
+        b = b.header(CONTENT_TYPE, ct);
+    }
+    let req = b.body(Full::new(body.into())).expect("request builds");
+    send(req).await
+}
+
+/// `method url` with `body` as JSON, with the bearer token when one is
+/// given.
+pub async fn send_json(
+    method: Method,
+    url: &str,
+    token: Option<&str>,
+    body: &serde_json::Value,
+) -> (StatusCode, HeaderMap, Bytes) {
+    send_body(
+        method,
+        url,
+        token,
+        Some("application/json"),
+        body.to_string(),
+    )
+    .await
+}
+
+/// `s` percent-encoded for a query string: every byte but the RFC 3986
+/// unreserved ones is escaped (Windows paths carry `\` and `:`).
+pub fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}

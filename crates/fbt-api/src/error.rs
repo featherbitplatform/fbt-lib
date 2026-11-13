@@ -243,7 +243,6 @@ impl From<PathRejection> for ApiErrorResponse {
 /// [`axum::Json`] whose rejection is an [`ApiErrorResponse`]. Request DTOs
 /// use `#[serde(deny_unknown_fields)]`.
 #[derive(Debug)]
-#[allow(dead_code, reason = "the request-taking routes use it")]
 pub(crate) struct ApiJson<T>(pub(crate) T);
 
 impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for ApiJson<T> {
@@ -257,7 +256,6 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for ApiJson<T> {
 
 /// [`axum::extract::Query`] whose rejection is an [`ApiErrorResponse`].
 #[derive(Debug)]
-#[allow(dead_code, reason = "the request-taking routes use it")]
 pub(crate) struct ApiQuery<T>(pub(crate) T);
 
 impl<T: DeserializeOwned, S: Send + Sync> FromRequestParts<S> for ApiQuery<T> {
@@ -289,7 +287,6 @@ impl<T: DeserializeOwned + Send, S: Send + Sync> FromRequestParts<S> for ApiPath
 /// rejection is an [`ApiErrorResponse`] (`413 body_too_large` past the
 /// limit).
 #[derive(Debug)]
-#[allow(dead_code, reason = "the request-taking routes use it")]
 pub(crate) struct ApiBytes(pub(crate) Bytes);
 
 impl<S: Send + Sync> FromRequest<S> for ApiBytes {

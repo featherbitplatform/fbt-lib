@@ -36,6 +36,7 @@ use utoipa_axum::routes;
 
 use crate::config::ApiConfig;
 
+pub(crate) mod control;
 pub(crate) mod session;
 pub(crate) mod torrents;
 
@@ -49,7 +50,6 @@ pub(crate) struct AppState {
     pub(crate) config: Arc<ApiConfig>,
     /// [`ApiConfig::allowed_roots`], canonicalised once; `None` allows any
     /// path.
-    #[allow(dead_code, reason = "the path checks of the control routes read it")]
     pub(crate) roots: Option<Arc<[PathBuf]>>,
     /// Permits for open file streams ([`ApiConfig::max_streams`]); a
     /// stream body holds one until it is dropped.
@@ -102,7 +102,7 @@ event routes also take `?token=<token>`. Errors are \
     security(("bearerAuth" = [])),
     tags(
         (name = "session", description = "The session: status and settings."),
-        (name = "torrents", description = "Torrents: list, status, files, peers, trackers, pieces."),
+        (name = "torrents", description = "Torrents: add, remove and control them; list, status, files, peers, trackers, pieces."),
         (name = "meta", description = "This document."),
     ),
 )]
@@ -130,6 +130,7 @@ pub(crate) fn api_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(session::router())
         .merge(torrents::router())
+        .merge(control::router())
         .routes(routes!(openapi_json))
 }
 

@@ -9,14 +9,16 @@
 //! `#[utoipa::path]` (`body = ...`) lands in the document's
 //! `components.schemas` on its own.
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use fbt::{
-    FileStatus, PeerSource, PeerStatus, Priority, Session, TorrentHandle, TorrentState,
+    FileStatus, MoveMode, PeerSource, PeerStatus, Priority, Session, TorrentHandle, TorrentState,
     TorrentStatus, TorrentVersion, TrackerStatus, Transport,
 };
-use serde::Serialize;
-use utoipa::ToSchema;
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::ids::hex;
 
@@ -415,4 +417,189 @@ pub(crate) struct PiecesInfo {
 pub(crate) struct MagnetInfo {
     /// The `magnet:` URI.
     pub(crate) magnet: String,
+}
+
+/// A file's download priority as a request sets it.
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PriorityDto {
+    /// Not downloaded.
+    Skip,
+    /// Downloaded after everything else.
+    Low,
+    /// The default.
+    Normal,
+    /// Downloaded first.
+    High,
+}
+
+impl From<PriorityDto> for Priority {
+    fn from(p: PriorityDto) -> Self {
+        match p {
+            PriorityDto::Skip => Priority::Skip,
+            PriorityDto::Low => Priority::Low,
+            PriorityDto::Normal => Priority::Normal,
+            PriorityDto::High => Priority::High,
+        }
+    }
+}
+
+/// `POST /api/v1/torrents` as JSON: add a magnet link.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AddTorrentRequest {
+    /// The `magnet:` URI.
+    pub(crate) magnet: String,
+    /// The directory the files go below; inside an allowed root when
+    /// roots are configured.
+    #[schema(value_type = String)]
+    pub(crate) save_path: PathBuf,
+    /// Start paused (default false).
+    pub(crate) paused: Option<bool>,
+    /// Under the session's queue (default true).
+    pub(crate) auto_managed: Option<bool>,
+    /// Download pieces in order (default false).
+    pub(crate) sequential: Option<bool>,
+}
+
+/// The query string of `POST /api/v1/torrents` with a `.torrent` body.
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct AddOptions {
+    /// The directory the files go below (only with an
+    /// `application/x-bittorrent` body).
+    #[param(value_type = String)]
+    pub(crate) save_path: PathBuf,
+    /// Start paused (default false).
+    pub(crate) paused: Option<bool>,
+    /// Under the session's queue (default true).
+    pub(crate) auto_managed: Option<bool>,
+    /// Download pieces in order (default false).
+    pub(crate) sequential: Option<bool>,
+}
+
+/// The query string of `POST /api/v1/torrents/resume`.
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct ResumeOptions {
+    /// Replaces the save path stored in the resume data.
+    #[param(value_type = Option<String>)]
+    pub(crate) save_path: Option<PathBuf>,
+}
+
+/// The query string of `DELETE /api/v1/torrents/{id}`.
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct RemoveOptions {
+    /// Delete the torrent's files too (default false).
+    pub(crate) delete_files: Option<bool>,
+}
+
+/// `PUT /api/v1/torrents/{id}/file-priorities`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FilePrioritiesRequest {
+    /// One priority per file, pad files included, in file order.
+    pub(crate) priorities: Vec<PriorityDto>,
+}
+
+/// `PUT /api/v1/torrents/{id}/limits`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LimitsRequest {
+    /// Download limit in bytes per second; null (or 0) is unlimited.
+    pub(crate) download: Option<u64>,
+    /// Upload limit in bytes per second; null (or 0) is unlimited.
+    pub(crate) upload: Option<u64>,
+}
+
+/// `PUT /api/v1/torrents/{id}/queue-position`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QueuePositionRequest {
+    /// The new place in the queue, from 0; past the end is the bottom.
+    pub(crate) position: usize,
+}
+
+/// `PUT /api/v1/torrents/{id}/auto-managed`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AutoManagedRequest {
+    /// Put the torrent under the session's queue, or take it out.
+    pub(crate) auto_managed: bool,
+}
+
+/// What a move does with files already at the target.
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MoveModeDto {
+    /// Move nothing if any target exists.
+    #[default]
+    FailIfExists,
+    /// Overwrite files at the target.
+    ReplaceExisting,
+    /// Keep the files at the target and recheck.
+    KeepExisting,
+}
+
+impl From<MoveModeDto> for MoveMode {
+    fn from(m: MoveModeDto) -> Self {
+        match m {
+            MoveModeDto::FailIfExists => MoveMode::FailIfExists,
+            MoveModeDto::ReplaceExisting => MoveMode::ReplaceExisting,
+            MoveModeDto::KeepExisting => MoveMode::KeepExisting,
+        }
+    }
+}
+
+/// `POST /api/v1/torrents/{id}/move`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveRequest {
+    /// The new save path; inside an allowed root when roots are
+    /// configured.
+    #[schema(value_type = String)]
+    pub(crate) path: PathBuf,
+    /// What to do with files already there (default `fail_if_exists`).
+    #[serde(default)]
+    pub(crate) mode: MoveModeDto,
+}
+
+/// `POST /api/v1/torrents/{id}/rename-file`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RenameFileRequest {
+    /// The file's index (pad files included).
+    pub(crate) index: usize,
+    /// Its new path relative to the save path, `/`-separated.
+    pub(crate) path: String,
+}
+
+/// `POST /api/v1/torrents/{id}/web-seeds`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WebSeedRequest {
+    /// An `http://` or `https://` URL (BEP 19).
+    pub(crate) url: String,
+}
+
+/// The query string of `DELETE /api/v1/torrents/{id}/web-seeds`.
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct WebSeedQuery {
+    /// The web seed to remove.
+    pub(crate) url: String,
+}
+
+/// `POST /api/v1/torrents/{id}/peers`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AddPeerRequest {
+    /// The peer's address, `ip:port` (`[ip]:port` for IPv6).
+    #[schema(value_type = String, example = "192.0.2.1:6881")]
+    pub(crate) addr: SocketAddr,
 }

@@ -27,6 +27,7 @@ mod config;
 mod dto;
 mod error;
 mod ids;
+mod paths;
 mod routes;
 mod server;
 
