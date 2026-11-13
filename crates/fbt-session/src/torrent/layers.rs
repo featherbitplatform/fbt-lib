@@ -1,14 +1,82 @@
 //! BEP 52 piece layers: building a hybrid's missing layers from the
-//! subtree roots of its verified pieces.
+//! subtree roots of its verified pieces, and answering peers' `hash
+//! request`s from the layers we hold.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use fbt_core::merkle::{MERKLE_BLOCK_LEN, MerkleTree, file_tree_height};
 use fbt_metainfo::{MAX_PIECE_LAYER_HASHES, Metainfo, TorrentVersion, validate_layer};
+use fbt_wire::{HashRequest, MAX_HASH_REQUEST_LEN};
 use tokio::time::Instant;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::actor::Actor;
+use super::data::Job;
+use crate::peer::messages::PeerCommand;
+use crate::picker::PeerKey;
+
+/// Most `hash request`s of one peer being served at once; further ones are
+/// rejected.
+pub(super) const MAX_PENDING_HASH_REQUESTS: usize = 64;
+
+/// Why a `hash request` gets no hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ServeError {
+    /// The request breaks BEP 52 (`length` not a power of two in
+    /// `1..=MAX_HASH_REQUEST_LEN`, `index` not a multiple of it, or
+    /// `base layer` at or above the tree height): close the peer.
+    Malformed,
+    /// Valid, but not ours to answer (unknown root, a layer we lack, below
+    /// the piece layer, or a span leaving the padded base layer): send
+    /// `hash reject`.
+    Reject,
+}
+
+/// Answers `req` from `meta`'s piece layers: the `length` base-layer
+/// hashes, then the uncles bottom-up (`min(proof_layers, tree_height -
+/// base - log2(length))` of them), 32 bytes each. The tree height comes
+/// from the file's length, never from the request.
+pub(super) fn serve_hash_request(
+    meta: &Metainfo,
+    req: &HashRequest,
+) -> Result<Vec<u8>, ServeError> {
+    let length = req.length;
+    if !length.is_power_of_two()
+        || length > MAX_HASH_REQUEST_LEN
+        || !req.index.is_multiple_of(length)
+    {
+        return Err(ServeError::Malformed);
+    }
+    let file = meta
+        .info
+        .files
+        .iter()
+        .find(|f| !f.pad && f.pieces_root == Some(req.pieces_root))
+        .ok_or(ServeError::Reject)?;
+    let tree_height = file_tree_height(file.len);
+    if req.base_layer >= tree_height {
+        return Err(ServeError::Malformed);
+    }
+    let piece_height = (meta.info.piece_len / MERKLE_BLOCK_LEN).trailing_zeros();
+    if req.base_layer < piece_height {
+        return Err(ServeError::Reject);
+    }
+    let layer = meta
+        .piece_layers
+        .get(&req.pieces_root)
+        .ok_or(ServeError::Reject)?;
+    let (Ok(index), Ok(len)) = (usize::try_from(req.index), usize::try_from(length)) else {
+        return Err(ServeError::Reject);
+    };
+    let tree =
+        MerkleTree::from_layer(layer, piece_height, tree_height).ok_or(ServeError::Reject)?;
+    let (hashes, uncles) = tree
+        .hashes(req.base_layer, index, len, req.proof_layers)
+        .ok_or(ServeError::Reject)?;
+    Ok(hashes.iter().chain(&uncles).flatten().copied().collect())
+}
 
 /// Least time between two swaps of the actor's metainfo for built layers
 /// (the last one, at completion, excepted).
@@ -182,12 +250,84 @@ impl Actor {
         l.meta = Arc::new((*l.meta).clone().with_piece_layers(layers));
         l.layers_swapped = Some(now);
     }
+
+    /// A v1-only torrent has no hash messages: true (and the peer closed)
+    /// when this is one. Before the metadata the version is unknown.
+    fn close_if_v1_only(&mut self, key: PeerKey) -> bool {
+        let v1 = self
+            .loaded
+            .as_ref()
+            .is_some_and(|l| l.meta.version() == TorrentVersion::V1);
+        if v1 {
+            debug!(key = key.0, "hash message on a v1 torrent; closing");
+            self.close_peer(key);
+        }
+        v1
+    }
+
+    /// A peer's `hash request`: served off the actor from `Loaded.meta`,
+    /// at most [`MAX_PENDING_HASH_REQUESTS`] at once per peer; rejected
+    /// beyond that and before the metadata.
+    pub(super) fn on_hash_request(&mut self, key: PeerKey, req: HashRequest) {
+        if !self.peers.contains_key(&key) || self.close_if_v1_only(key) {
+            return;
+        }
+        let meta = self.loaded.as_ref().map(|l| Arc::clone(&l.meta));
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        let Some(meta) = meta.filter(|_| p.hash_requests < MAX_PENDING_HASH_REQUESTS) else {
+            self.send(key, PeerCommand::RejectHashes(req));
+            return;
+        };
+        p.hash_requests += 1;
+        self.jobs.spawn_blocking(move || Job::HashesServed {
+            key,
+            req,
+            result: serve_hash_request(&meta, &req),
+        });
+    }
+
+    /// A served `hash request` came back: answered, rejected, or the peer
+    /// closed for a malformed request.
+    pub(super) fn on_hashes_served(
+        &mut self,
+        key: PeerKey,
+        req: HashRequest,
+        result: Result<Vec<u8>, ServeError>,
+    ) {
+        let Some(p) = self.peers.get_mut(&key) else {
+            return;
+        };
+        p.hash_requests = p.hash_requests.saturating_sub(1);
+        match result {
+            Ok(hashes) => {
+                let hashes = Bytes::from(hashes);
+                self.send(key, PeerCommand::SendHashes { req, hashes });
+            }
+            Err(ServeError::Reject) => {
+                self.send(key, PeerCommand::RejectHashes(req));
+            }
+            Err(ServeError::Malformed) => {
+                debug!(key = key.0, ?req, "malformed hash request; closing");
+                self.close_peer(key);
+            }
+        }
+    }
+
+    /// A peer's `hashes` or `hash reject`: nothing asks for layers yet, so
+    /// it is dropped (closing the peer on a v1-only torrent).
+    pub(super) fn on_hash_answer(&mut self, key: PeerKey, req: HashRequest, hashes: usize) {
+        if !self.close_if_v1_only(key) {
+            debug!(key = key.0, ?req, hashes, "unrequested hash answer dropped");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fbt_core::merkle::piece_root;
+    use fbt_core::merkle::{file_tree_height, pad_hash, piece_root, verify_hashes};
     use fbt_metainfo::CreateTorrent;
     use std::ops::ControlFlow;
 
@@ -261,5 +401,116 @@ mod tests {
         let root = m.info.files[0].pieces_root.unwrap();
         m = m.with_piece_layers([(root, roots(&data))].into());
         assert!(LayerBuilder::new(&m).is_none());
+    }
+
+    /// The hybrid of [`hybrid_without_layer`] with its layer: one file of
+    /// ten pieces, tree height 5, piece layer at height 1 (16 wide padded).
+    fn hybrid_with_layer() -> (Metainfo, [u8; 32]) {
+        let (m, data) = hybrid_without_layer();
+        let root = m.info.files[0].pieces_root.unwrap();
+        (m.with_piece_layers([(root, roots(&data))].into()), root)
+    }
+
+    const PIECE_HEIGHT: u32 = 1;
+
+    fn req(root: [u8; 32], base: u32, index: u32, length: u32, proof: u32) -> HashRequest {
+        HashRequest {
+            pieces_root: root,
+            base_layer: base,
+            index,
+            length,
+            proof_layers: proof,
+        }
+    }
+
+    #[test]
+    fn serve_answers_piece_layer_spans() {
+        let (m, root) = hybrid_with_layer();
+        let tree_height = file_tree_height(m.info.files[0].len);
+        assert_eq!(tree_height, 5);
+        for index in [0, 4, 8, 12] {
+            let bytes =
+                serve_hash_request(&m, &req(root, PIECE_HEIGHT, index, 4, 10)).expect("served");
+            let all: Vec<[u8; 32]> = bytes.as_chunks::<32>().0.to_vec();
+            assert_eq!(bytes.len(), all.len() * 32);
+            // Four hashes, then uncles from height 3 to the root: 2 of them.
+            assert_eq!(all.len(), 4 + 2);
+            let (hashes, proof) = all.split_at(4);
+            assert!(verify_hashes(
+                &root,
+                tree_height,
+                PIECE_HEIGHT,
+                index as usize,
+                hashes,
+                proof
+            ));
+        }
+        // The base layer itself is the piece layer, padded with pad hashes.
+        let bytes = serve_hash_request(&m, &req(root, PIECE_HEIGHT, 8, 4, 0)).unwrap();
+        let (_, data) = hybrid_without_layer();
+        let r = roots(&data);
+        assert_eq!(&bytes[..64], [r[8], r[9]].concat().as_slice());
+        let pad = pad_hash(PIECE_HEIGHT);
+        assert_eq!(&bytes[64..], [pad, pad].concat().as_slice());
+        // A higher layer serves too.
+        let bytes = serve_hash_request(&m, &req(root, 3, 0, 4, 10)).unwrap();
+        let all: Vec<[u8; 32]> = bytes.as_chunks::<32>().0.to_vec();
+        assert!(verify_hashes(
+            &root,
+            tree_height,
+            3,
+            0,
+            &all[..4],
+            &all[4..]
+        ));
+    }
+
+    #[test]
+    fn requests_we_cannot_serve_are_rejected() {
+        let (m, root) = hybrid_with_layer();
+        let serve = |r: HashRequest| serve_hash_request(&m, &r);
+        // Below the piece layer: we keep no block hashes.
+        assert_eq!(serve(req(root, 0, 0, 4, 0)), Err(ServeError::Reject));
+        // Unknown root.
+        assert_eq!(
+            serve(req([7; 32], PIECE_HEIGHT, 0, 4, 0)),
+            Err(ServeError::Reject)
+        );
+        // A span past the padded layer (16 wide).
+        assert_eq!(
+            serve(req(root, PIECE_HEIGHT, 16, 16, 0)),
+            Err(ServeError::Reject)
+        );
+        // Wider than the layer.
+        assert_eq!(
+            serve(req(root, PIECE_HEIGHT, 0, 32, 0)),
+            Err(ServeError::Reject)
+        );
+        // A layer we lack.
+        let (without, _) = hybrid_without_layer();
+        assert_eq!(
+            serve_hash_request(&without, &req(root, PIECE_HEIGHT, 0, 4, 0)),
+            Err(ServeError::Reject)
+        );
+        // Malformed.
+        assert_eq!(
+            serve(req(root, PIECE_HEIGHT, 0, 3, 0)),
+            Err(ServeError::Malformed)
+        );
+        assert_eq!(
+            serve(req(root, PIECE_HEIGHT, 0, 0, 0)),
+            Err(ServeError::Malformed)
+        );
+        assert_eq!(
+            serve(req(root, PIECE_HEIGHT, 0, 16_384, 0)),
+            Err(ServeError::Malformed)
+        );
+        assert_eq!(
+            serve(req(root, PIECE_HEIGHT, 5, 4, 0)),
+            Err(ServeError::Malformed)
+        );
+        for base in [5, 9, u32::MAX] {
+            assert_eq!(serve(req(root, base, 0, 1, 0)), Err(ServeError::Malformed));
+        }
     }
 }

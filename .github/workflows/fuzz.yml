@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - "crates/fbt-bencode/**"
+      - "crates/fbt-core/**"
       - "crates/fbt-metainfo/**"
       - "crates/fbt-wire/**"
       - "crates/fbt-tracker/**"
@@ -61,6 +62,7 @@ jobs:
           - scrape
           - web_seed_head
           - resume
+          - hash_proof
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

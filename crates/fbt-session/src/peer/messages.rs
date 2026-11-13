@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use fbt_core::{Bitfield, BlockRef, PeerId, PieceLayout};
-use fbt_wire::{ExtHandshake, HolepunchMsg, MetadataMsg, PexMsg, Reserved};
+use fbt_wire::{ExtHandshake, HashRequest, HolepunchMsg, MetadataMsg, PexMsg, Reserved};
 
 use super::ext::ExtConfig;
 use super::transport::Transport;
@@ -137,6 +137,18 @@ pub(crate) enum PeerEvent {
     Holepunch { key: PeerKey, msg: HolepunchMsg },
     /// The remote's DHT port (BEP 5 `Port`), at most once per connection.
     DhtPort { key: PeerKey, port: u16 },
+    /// A BEP 52 `hash request` (from a remote that set the v2 bit; not
+    /// validated).
+    HashRequest { key: PeerKey, req: HashRequest },
+    /// BEP 52 `hashes` (from a remote that set the v2 bit; a whole number
+    /// of 32-byte hashes, unverified).
+    Hashes {
+        key: PeerKey,
+        req: HashRequest,
+        hashes: Bytes,
+    },
+    /// A BEP 52 `hash reject` (from a remote that set the v2 bit).
+    HashReject { key: PeerKey, req: HashRequest },
     /// The connection ended; `outstanding` lists requests never satisfied.
     Disconnected {
         key: PeerKey,
@@ -185,6 +197,11 @@ pub(crate) enum PeerCommand {
     /// advertise now (our `metadata_size`, and `ut_pex` off for a private
     /// torrent): a remote speaking BEP 10 gets a repeated handshake.
     MetadataReady { layout: PieceLayout, ext: ExtConfig },
+    /// Answer a `hash request` with `hashes` (base layer, then uncles;
+    /// a whole number of 32-byte hashes).
+    SendHashes { req: HashRequest, hashes: Bytes },
+    /// Refuse a `hash request`.
+    RejectHashes(HashRequest),
     /// Send a `ut_metadata` message (dropped if the remote lacks it).
     SendMetadata(MetadataMsg),
     /// Send a `ut_pex` message (dropped if the remote lacks it).

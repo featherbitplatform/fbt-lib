@@ -117,6 +117,11 @@ impl Actor {
             PeerEvent::Pex { key, msg } => self.on_pex(key, msg),
             PeerEvent::Holepunch { key, msg } => self.on_holepunch(key, msg),
             PeerEvent::DhtPort { key, port } => self.on_dht_port(key, port),
+            PeerEvent::HashRequest { key, req } => self.on_hash_request(key, req),
+            PeerEvent::Hashes { key, req, hashes } => {
+                self.on_hash_answer(key, req, hashes.len() / 32);
+            }
+            PeerEvent::HashReject { key, req } => self.on_hash_answer(key, req, 0),
             PeerEvent::Disconnected {
                 key,
                 reason,

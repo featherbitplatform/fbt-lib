@@ -9,11 +9,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef};
 use fbt_metainfo::{Metainfo, MetainfoError};
+use fbt_wire::HashRequest;
 use tokio::time::Instant;
 use tracing::debug;
 
 use super::ReaderId;
 use super::actor::{Actor, Phase};
+use super::layers::ServeError;
 use super::readers::Answer;
 use super::smartban::BlockSource;
 use super::swarm::BanTarget;
@@ -99,6 +101,12 @@ pub(crate) enum Job {
         tx: Answer,
         result: io::Result<Vec<u8>>,
     },
+    /// A peer's `hash request` was served from the layers.
+    HashesServed {
+        key: PeerKey,
+        req: HashRequest,
+        result: Result<Vec<u8>, ServeError>,
+    },
     /// The storage operation (move or rename) returned.
     StorageOp { result: io::Result<()> },
     /// A web seed's request for `blocks`, issued under `generation`,
@@ -141,6 +149,7 @@ impl Actor {
                 generation,
                 trusted,
             } => self.on_resume_checked(generation, trusted),
+            Job::HashesServed { key, req, result } => self.on_hashes_served(key, req, result),
             Job::Hashed {
                 generation,
                 piece,

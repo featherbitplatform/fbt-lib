@@ -50,8 +50,10 @@ use state::Conn;
 const HANDSHAKE_LEN: u64 = 68;
 
 /// Command queue room beyond `max_incoming_requests`: every queued remote
-/// request may be answered by one command, plus control commands.
-const COMMAND_HEADROOM: usize = 64;
+/// request may be answered by one command, plus control commands and the
+/// answers to the torrent's 64 pending `hash request`s at most
+/// (`MAX_PENDING_HASH_REQUESTS`).
+const COMMAND_HEADROOM: usize = 128;
 
 /// Capacity of a peer task's command channel. A full queue closes the peer
 /// as stalled, so it must hold an answer for every request we accept.

@@ -80,6 +80,9 @@ pub(super) struct Peer {
     /// `ut_metadata` requests it sent (served up to
     /// [`MAX_METADATA_REQUESTS_PER_PEER`](super::metadata::MAX_METADATA_REQUESTS_PER_PEER)).
     pub metadata_requests: u32,
+    /// Its `hash request`s being served (at most
+    /// [`MAX_PENDING_HASH_REQUESTS`](super::layers::MAX_PENDING_HASH_REQUESTS)).
+    pub hash_requests: usize,
     /// PEX state; `Some` while PEX runs with this peer (it advertised
     /// `ut_pex`, the setting is on and the torrent is not private).
     pub pex: Option<PexPeer>,
@@ -136,6 +139,7 @@ impl Peer {
             transport,
             connected_at: None,
             metadata_requests: 0,
+            hash_requests: 0,
             pex: None,
             upload_only: false,
             reported: None,

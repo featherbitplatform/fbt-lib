@@ -311,3 +311,101 @@ async fn v2_magnet_registers_the_revealed_v1_hash() {
     leecher.shutdown().await;
     seeder.shutdown().await;
 }
+
+fn hash_request(root: [u8; 32], base_layer: u32, index: u32, length: u32) -> fbt_wire::HashRequest {
+    fbt_wire::HashRequest {
+        pieces_root: root,
+        base_layer,
+        index,
+        length,
+        proof_layers: 10,
+    }
+}
+
+fn v2_reserved() -> fbt_wire::Reserved {
+    let mut r = fbt_wire::Reserved::default();
+    r.set_fast();
+    r.set_v2();
+    r
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seed_answers_hash_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::V2, PIECE);
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let c = m.info.files.iter().find(|f| f.len == 300_000).unwrap();
+    let root = c.pieces_root.unwrap();
+    let tree_height = fbt_core::merkle::file_tree_height(c.len);
+    let (s, _h) = seed(&bytes, dir.path()).await;
+    let wire = m.info_hashes.wire_hash();
+
+    let mut peer = ScriptedPeer::connect_with(s.local_addr(), wire, v2_reserved()).await;
+    assert!(peer.remote.reserved.supports_v2());
+    // A piece-layer span with its proof; then refusals for what we lack.
+    peer.send(Message::HashRequest(hash_request(root, 1, 8, 8)))
+        .await;
+    peer.send(Message::HashRequest(hash_request(root, 0, 0, 8)))
+        .await;
+    peer.send(Message::HashRequest(hash_request([3; 32], 1, 0, 8)))
+        .await;
+    // Served off the actor in parallel: the answers come in any order.
+    let mut rejects = Vec::new();
+    let mut answer = None;
+    while answer.is_none() || rejects.len() < 2 {
+        match peer
+            .next_matching(|m| matches!(m, Message::Hashes { .. } | Message::HashReject(_)))
+            .await
+        {
+            Some(Message::Hashes { req, hashes }) => answer = Some((req, hashes)),
+            Some(Message::HashReject(req)) => rejects.push(req),
+            other => panic!("expected hash answers, got {other:?}"),
+        }
+    }
+    let (req, hashes) = answer.unwrap();
+    assert_eq!(req, hash_request(root, 1, 8, 8));
+    let all: Vec<[u8; 32]> = hashes.as_chunks::<32>().0.to_vec();
+    let (span, proof) = all.split_at(8);
+    assert!(fbt_core::merkle::verify_hashes(
+        &root,
+        tree_height,
+        1,
+        8,
+        span,
+        proof
+    ));
+    rejects.sort_by_key(|r| r.base_layer);
+    assert_eq!(
+        rejects,
+        [hash_request(root, 0, 0, 8), hash_request([3; 32], 1, 0, 8)]
+    );
+    // A malformed request closes the connection.
+    peer.send(Message::HashRequest(hash_request(root, 1, 0, 3)))
+        .await;
+    assert_eq!(peer.wait_closed(T).await, PeerEnd::Closed);
+
+    // Hash messages from a peer without the v2 bit close it.
+    let mut peer = ScriptedPeer::connect_fast(s.local_addr(), wire).await;
+    peer.send(Message::HashRequest(hash_request(root, 1, 0, 8)))
+        .await;
+    assert_eq!(peer.wait_closed(T).await, PeerEnd::Closed);
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_messages_on_a_v1_torrent_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = create_torrent(&write_v2_payload(dir.path()), TorrentVersion::V1, PIECE);
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let (s, _h) = seed(&bytes, dir.path()).await;
+    let wire = m.info_hashes.wire_hash();
+    for msg in [
+        Message::HashRequest(hash_request([1; 32], 1, 0, 8)),
+        Message::HashReject(hash_request([1; 32], 1, 0, 8)),
+    ] {
+        let mut peer = ScriptedPeer::connect_with(s.local_addr(), wire, v2_reserved()).await;
+        peer.send(msg).await;
+        assert_eq!(peer.wait_closed(T).await, PeerEnd::Closed);
+    }
+    s.shutdown().await;
+}
