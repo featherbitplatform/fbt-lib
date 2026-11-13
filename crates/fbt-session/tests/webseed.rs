@@ -565,3 +565,75 @@ async fn remove_during_a_request() {
     l.finish(&payload, T).await;
     l.session.shutdown().await;
 }
+
+/// A peer sends one block of a two-block piece and leaves: the piece stays
+/// partial with nobody holding its free block. A web seed added afterwards
+/// still finishes it (and the torrent), and a reader waiting on it gets its
+/// data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn web_seed_finishes_a_piece_a_peer_left_partial() {
+    use bytes::Bytes;
+    use fbt_wire::{Message, Reserved};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let piece = 32_768usize;
+    let (m, payload) = make_single("f.bin", 8 * piece, piece as u32);
+    let (_dir, srv) = server(&m, &payload, Behaviour::Normal).await;
+    let mut st = dial_tcp(test_settings());
+    st.encryption = fbt_session::EncryptionPolicy::Disabled;
+    let l = leecher(st, &m, payload.len()).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.handle
+        .add_peer(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let mut peer = ScriptedPeer::accept_with(&listener, Reserved::default()).await;
+    drop(listener);
+    peer.send(Message::Bitfield(Bytes::from(vec![0xff]))).await;
+    peer.send(Message::Unchoke).await;
+    let Some(Message::Request(b)) = peer
+        .next_matching(|m| matches!(m, Message::Request(_)))
+        .await
+    else {
+        panic!("no request");
+    };
+    let at = b.piece as usize * piece + b.offset as usize;
+    peer.send(Message::Piece {
+        piece: b.piece,
+        offset: b.offset,
+        data: Bytes::copy_from_slice(&payload[at..at + b.len as usize]),
+    })
+    .await;
+    assert!(
+        wait_until(|| l.handle.status().total_downloaded > 0, T).await,
+        "{:?}",
+        l.handle.status()
+    );
+    drop(peer);
+    assert!(
+        wait_until(|| l.handle.status().num_peers == 0, T).await,
+        "the peer is still connected"
+    );
+
+    // A reader waits on the partial piece.
+    let mut reader = l.handle.open_file(0).await.unwrap();
+    let start = b.piece as usize * piece;
+    let want = payload[start..start + piece].to_vec();
+    let read = tokio::spawn(async move {
+        reader.seek(std::io::SeekFrom::Start(start as u64)).await?;
+        let mut got = vec![0u8; piece];
+        reader.read_exact(&mut got).await?;
+        Ok::<_, std::io::Error>(got)
+    });
+
+    l.handle.add_web_seed(srv.url()).await.unwrap();
+    l.finish(&payload, Duration::from_secs(20)).await;
+    let got = tokio::time::timeout(T, read)
+        .await
+        .expect("the reader never got its piece")
+        .unwrap()
+        .unwrap();
+    assert!(got == want, "the reader's data differs");
+    l.session.shutdown().await;
+}

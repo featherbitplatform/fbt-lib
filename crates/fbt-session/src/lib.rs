@@ -93,9 +93,11 @@ pub use bans::BlockReason;
 pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::{SessionError, StreamError};
 pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
-pub use fbt_dht::{DhtSamples, DhtScrape, DhtStats, MutableItem, NodeId, NodeInfo};
+pub use fbt_dht::{DhtError, DhtSamples, DhtScrape, DhtStats, MutableItem, NodeId, NodeInfo};
 pub use fbt_net::ipfilter::IpFilter;
-pub use fbt_net::proxy::{ProxyConfig, ProxyKind};
+/// The most rules an [`IpFilter`] holds (`fbt_net::ipfilter::MAX_RANGES`).
+pub use fbt_net::ipfilter::MAX_RANGES as MAX_IP_FILTER_RANGES;
+pub use fbt_net::proxy::{ProxyConfig, ProxyError, ProxyKind};
 pub use fbt_net::{MapMethod, MapProtocol};
 pub use net::ListenError;
 pub use peer::{DisconnectReason, Transport};

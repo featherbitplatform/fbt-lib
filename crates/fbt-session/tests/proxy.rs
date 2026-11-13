@@ -253,7 +253,7 @@ async fn failed_association_fails_session_new() {
     let mut st = settings();
     st.proxy = proxy(ProxyKind::Socks5, fake.addr());
     match Session::new(st).await {
-        Err(SessionError::Proxy(_)) => {}
+        Err(SessionError::Proxy(fbt_session::ProxyError::Refused(1))) => {}
         other => panic!("expected SessionError::Proxy, got {:?}", other.map(|_| ())),
     }
 }
@@ -266,6 +266,20 @@ async fn invalid_proxy_settings_are_refused() {
         Err(SessionError::InvalidSettings(msg)) => assert!(msg.contains("proxy"), "{msg}"),
         other => panic!("expected InvalidSettings, got {:?}", other.map(|_| ())),
     }
+    // SOCKS5 credentials of 1 to 255 bytes each, checked before any dial.
+    for (user, pass) in [("", "pw"), ("user", ""), ("user", &*"p".repeat(256))] {
+        let mut st = settings();
+        st.proxy = proxy(ProxyKind::Socks5, "127.0.0.1:9".parse().unwrap());
+        st.proxy.username = Some(user.to_owned());
+        st.proxy.password = Some(pass.to_owned());
+        match Session::new(st).await {
+            Err(SessionError::InvalidSettings(msg)) => assert!(msg.contains("proxy"), "{msg}"),
+            other => panic!(
+                "{user:?}/{pass:?}: expected InvalidSettings, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -274,12 +288,28 @@ async fn lost_relay_stops_the_socket() {
     let mut st = settings();
     st.proxy = proxy(ProxyKind::Socks5, fake.addr());
     let s = Session::new(st).await.unwrap();
+    let mut events = s.subscribe(EventMask::STATUS);
     assert!(!s.demux_stats()[0].1.relay_lost);
     // Dropping the fake closes the association's control connection.
     drop(fake);
     assert!(
         wait_until(|| s.demux_stats()[0].1.relay_lost, T).await,
         "relay loss not seen"
+    );
+    // The session says so, once.
+    match next_matching(&mut events, |e| matches!(e, Event::ProxyError { .. }), T).await {
+        Some(Event::ProxyError { message }) => assert!(message.contains("UDP"), "{message}"),
+        other => panic!("no ProxyError: {other:?}"),
+    }
+    assert!(
+        next_matching(
+            &mut events,
+            |e| matches!(e, Event::ProxyError { .. }),
+            Duration::from_millis(500)
+        )
+        .await
+        .is_none(),
+        "a second ProxyError"
     );
     s.shutdown().await;
 }

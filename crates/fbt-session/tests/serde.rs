@@ -5,8 +5,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use fbt_session::{
-    ChokingAlgorithm, EncryptionPolicy, MixedMode, MoveMode, PeerClassLimits, Priority, RateLimit,
-    ReadAhead, RemoveMode, SeedChokingAlgorithm, Settings,
+    ChokingAlgorithm, EncryptionPolicy, MixedMode, MoveMode, PeerClassLimits, Priority, ProxyKind,
+    RateLimit, ReadAhead, RemoveMode, SeedChokingAlgorithm, Settings,
 };
 
 fn changed() -> Settings {
@@ -15,8 +15,6 @@ fn changed() -> Settings {
     s.max_peers_per_torrent = 11;
     s.max_peers_global = 22;
     s.max_peers_per_ip = 2;
-    s.per_ip_exempt_loopback = false;
-    s.ban_endpoints = true;
     s.max_half_open = 3;
     s.unchoke_slots = 7;
     s.choking_algorithm = ChokingAlgorithm::RateBased;
@@ -89,6 +87,25 @@ fn changed() -> Settings {
     s.rate_limit_local_peers = true;
     s.mixed_mode = MixedMode::PreferTcp;
     s.read_ahead = ReadAhead::new(1 << 20, Duration::from_secs(3), Some(500));
+    // Milestone 5.
+    s.proxy.kind = ProxyKind::Socks5;
+    s.proxy.host = "proxy.example".to_owned();
+    s.proxy.port = 1081;
+    s.proxy.username = Some("alice".to_owned());
+    s.proxy.password = Some("hunter2".to_owned());
+    s.proxy.proxy_peers = false;
+    s.proxy.proxy_trackers = false;
+    s.proxy.proxy_hostnames = false;
+    s.queue.active_downloads = Some(2);
+    s.queue.active_seeds = None;
+    s.queue.active_limit = Some(9);
+    s.queue.dont_count_slow_torrents = false;
+    s.queue.inactive_down_rate = 1_234;
+    s.queue.inactive_up_rate = 4_321;
+    s.queue.startup_grace = Duration::from_secs(77);
+    s.queue.interval = Duration::from_secs(13);
+    s.seed_ratio_limit = Some(1.5);
+    s.seed_time_limit = Some(Duration::from_secs(3_600));
     s
 }
 
@@ -99,6 +116,31 @@ fn settings_round_trip_through_json() {
     let back: Settings = serde_json::from_str(&json).unwrap();
     assert_eq!(format!("{s:?}"), format!("{back:?}"));
     assert_ne!(format!("{s:?}"), format!("{:?}", Settings::default()));
+    // `Debug` hides the password: it is written in clear and read back.
+    assert!(json.contains("hunter2"), "{json}");
+    assert_eq!(back.proxy, s.proxy);
+    assert_eq!(back.queue, s.queue);
+    assert_eq!(back.seed_ratio_limit, Some(1.5));
+}
+
+#[test]
+fn test_knobs_are_not_serialised() {
+    let mut s = Settings::default();
+    s.per_ip_exempt_loopback = !s.per_ip_exempt_loopback;
+    s.ban_endpoints = !s.ban_endpoints;
+    let json = serde_json::to_string(&s).unwrap();
+    assert!(!json.contains("per_ip_exempt_loopback"), "{json}");
+    assert!(!json.contains("ban_endpoints"), "{json}");
+    let back: Settings = serde_json::from_str(&json).unwrap();
+    let d = Settings::default();
+    assert_eq!(back.per_ip_exempt_loopback, d.per_ip_exempt_loopback);
+    assert_eq!(back.ban_endpoints, d.ban_endpoints);
+    // A saved file that has them is still read; they keep their defaults.
+    let back: Settings =
+        serde_json::from_str(r#"{"per_ip_exempt_loopback": false, "ban_endpoints": true}"#)
+            .unwrap();
+    assert_eq!(back.per_ip_exempt_loopback, d.per_ip_exempt_loopback);
+    assert_eq!(back.ban_endpoints, d.ban_endpoints);
 }
 
 #[test]

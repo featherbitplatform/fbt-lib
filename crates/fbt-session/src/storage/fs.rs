@@ -247,7 +247,8 @@ impl FsStorage {
     /// Storage for `metainfo`'s files below `save_path`, the files listed
     /// in `renamed` at their given paths (relative to `save_path`, as
     /// [`rename_file`](Storage::rename_file) set them). An index out of
-    /// range or naming a pad file is ignored.
+    /// range or naming a pad file, or a path onto the part file
+    /// ([`part_path`](Self::part_path)), is ignored.
     pub fn with_paths(
         save_path: PathBuf,
         metainfo: &Metainfo,
@@ -261,19 +262,19 @@ impl FsStorage {
                 pad: f.pad,
             })
             .collect();
+        let part_name = super::part_file_name(metainfo);
         let mut rel: Vec<RelPath> = files.iter().map(|f| f.path.clone()).collect();
         for (i, p) in renamed {
-            if let Some(r) = rel
-                .get_mut(*i)
-                .filter(|_| files.get(*i).is_some_and(|f| !f.pad))
-            {
+            if let Some(r) = rel.get_mut(*i).filter(|_| {
+                files.get(*i).is_some_and(|f| !f.pad) && !super::is_part_path(p, &part_name)
+            }) {
                 *r = p.clone();
             }
         }
         let paths = Paths {
             save_path,
             rel,
-            part_name: format!(".{}.parts", metainfo.info_hashes),
+            part_name,
         };
         FsStorage {
             layout: FileLayout::new(entries.iter().map(|e| e.len)),
@@ -293,7 +294,9 @@ impl FsStorage {
     }
 
     /// The part file: `<save_path>/.<info hash>.parts` (the v1 hash in hex
-    /// for v1 and hybrid torrents). It exists only while it holds data.
+    /// for v1 and hybrid torrents; with `.1`, `.2`, ... appended should one
+    /// of the torrent's own files have that path). It exists only while it
+    /// holds data. No file can be renamed onto it.
     pub fn part_path(&self) -> PathBuf {
         self.read_routing().paths.part()
     }
@@ -1090,7 +1093,9 @@ impl Storage for FsStorage {
         let mut guard = self.write_routing();
         let routed = guard.is_routed(index);
         let paths = &mut guard.paths;
-        if self.entries.get(index).is_none_or(|e| e.pad) {
+        if self.entries.get(index).is_none_or(|e| e.pad)
+            || super::is_part_path(path, &paths.part_name)
+        {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let Some(old) = paths.rel.get(index).cloned() else {

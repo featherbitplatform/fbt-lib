@@ -78,13 +78,22 @@ const NODE_V4_LEN: usize = NODE_ID_LEN + COMPACT_V4_LEN;
 /// A compact node entry: id + IPv6 address.
 const NODE_V6_LEN: usize = NODE_ID_LEN + COMPACT_V6_LEN;
 
-/// A node: its id and UDP address.
+/// A node: its id and UDP address. Non-exhaustive (fields may be added):
+/// build one with [`NodeInfo::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NodeInfo {
     /// The node id.
     pub id: NodeId,
     /// The node's UDP address.
     pub addr: SocketAddr,
+}
+
+impl NodeInfo {
+    /// The node `id` at `addr`.
+    pub fn new(id: NodeId, addr: SocketAddr) -> NodeInfo {
+        NodeInfo { id, addr }
+    }
 }
 
 /// BEP 32 `want`: which address families the requester wants nodes for.

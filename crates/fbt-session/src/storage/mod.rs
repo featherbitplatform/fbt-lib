@@ -11,13 +11,53 @@ mod stamp;
 use std::io;
 use std::path::Path;
 
-use fbt_metainfo::RelPath;
+use std::collections::HashSet;
+
+use fbt_metainfo::{FileEntry, Metainfo, RelPath};
 
 pub use cache::CacheStats;
 pub use check::{check_pieces, sha1_piece};
 pub use fs::{FsStorage, StorageError, error_path};
 pub use mem::MemStorage;
 pub use stamp::FileStamp;
+
+/// The name of a torrent's part file inside its save path (see
+/// [`FsStorage::part_path`]): `.<info hash>.parts`, with `.1`, `.2`, ...
+/// appended while one of the torrent's own files (as its metainfo names
+/// them) has that path or lies below it, so the part file never takes a
+/// file's place. Renames are kept off it instead: [`is_part_path`].
+pub(crate) fn part_file_name(metainfo: &Metainfo) -> String {
+    free_part_name(
+        format!(".{}.parts", metainfo.info_hashes),
+        &metainfo.info.files,
+    )
+}
+
+/// `base`, or `base` with the first `.N` suffix no non-pad file of `files`
+/// starts with (compared as collision keys: ignoring case and Unicode
+/// normalisation). Bounded: `files` takes at most `files.len()` names.
+fn free_part_name(base: String, files: &[FileEntry]) -> String {
+    let taken: HashSet<String> = files
+        .iter()
+        .filter(|f| !f.pad)
+        .filter_map(|f| f.path.key().split('/').next().map(str::to_owned))
+        .collect();
+    let free = |name: &String| !taken.contains(&name.to_lowercase());
+    if free(&base) {
+        return base;
+    }
+    (1..=files.len())
+        .map(|n| format!("{base}.{n}"))
+        .find(free)
+        .unwrap_or(base)
+}
+
+/// Whether `path` (relative to the save path) is the part file `part_name`,
+/// or lies below it, ignoring case and Unicode normalisation as
+/// [`fbt_metainfo::collides`] does.
+pub(crate) fn is_part_path(path: &RelPath, part_name: &str) -> bool {
+    path.key().split('/').next() == Some(part_name.to_lowercase().as_str())
+}
 
 /// What [`Storage::move_to`] does with files that already exist at the
 /// target.
@@ -86,7 +126,8 @@ pub trait Storage: Send + Sync + std::fmt::Debug + 'static {
     }
     /// Gives file `index` the path `path`, relative to the save path, with
     /// the same guarantees as [`move_to`](Self::move_to). The session has
-    /// checked that `path` collides with no other file. The default fails
+    /// checked that `path` collides with no other file and is not
+    /// [`FsStorage`]'s part file (nor below it). The default fails
     /// with [`io::ErrorKind::Unsupported`].
     fn rename_file(&self, index: usize, path: &RelPath) -> io::Result<()> {
         let _ = (index, path);
@@ -157,6 +198,47 @@ mod tests {
             ],
             4,
         )
+    }
+
+    fn file_at(parts: &[&str]) -> fbt_metainfo::FileEntry {
+        fbt_metainfo::FileEntry {
+            path: fbt_metainfo::sanitize_path(parts.iter().map(|p| p.as_bytes())).unwrap(),
+            len: 1,
+            pad: false,
+        }
+    }
+
+    /// The part file never takes a path the torrent's own files use (or a
+    /// directory of theirs): `.1`, `.2`, ... are appended. A real torrent
+    /// cannot name a file after its own info hash, so the files are made up.
+    #[test]
+    fn part_name_avoids_the_torrents_files() {
+        let m = three_files();
+        let base = format!(".{}.parts", m.info_hashes);
+        assert_eq!(part_file_name(&m), base);
+        assert_eq!(free_part_name(base.clone(), &m.info.files), base);
+        let one = format!("{base}.1");
+        let files = vec![
+            file_at(&["a"]),
+            file_at(&[base.to_uppercase().as_str()]),
+            file_at(&[one.as_str(), "x"]),
+        ];
+        assert_eq!(free_part_name(base.clone(), &files), format!("{base}.2"));
+        // A pad file never lands on disk: it takes nothing.
+        let mut pad = file_at(&[base.as_str()]);
+        pad.pad = true;
+        assert_eq!(free_part_name(base.clone(), &[pad]), base);
+        // The name and anything below it are the part file's.
+        let part = fbt_metainfo::sanitize_path([base.as_bytes()]).unwrap();
+        assert!(is_part_path(&part, &base));
+        let upper = base.to_uppercase();
+        let below = fbt_metainfo::sanitize_path([upper.as_bytes(), b"x".as_slice()]).unwrap();
+        assert!(is_part_path(&below, &base));
+        let other = fbt_metainfo::sanitize_path([b"x".as_slice(), base.as_bytes()]).unwrap();
+        assert!(!is_part_path(&other, &base));
+        let longer = format!("{base}x");
+        let longer = fbt_metainfo::sanitize_path([longer.as_bytes()]).unwrap();
+        assert!(!is_part_path(&longer, &base));
     }
 
     #[test]

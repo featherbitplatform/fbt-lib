@@ -609,3 +609,36 @@ async fn public_magnet_announces_before_metadata() {
     leecher.shutdown().await;
     boot.shutdown().await;
 }
+
+/// A node's KRPC error reaches the caller as the typed DHT error, its code
+/// intact: here `204`, a node without BEP 51.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dht_remote_error_code_reaches_the_caller() {
+    let node = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let node_addr = node.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        while let Ok((n, from)) = node.recv_from(&mut buf).await {
+            let Ok(v) = fbt_bencode::decode(&buf[..n]) else {
+                continue;
+            };
+            let Some(t) = v
+                .as_dict()
+                .and_then(|d| d.get(b"t"))
+                .and_then(|t| t.as_bytes())
+            else {
+                continue;
+            };
+            let mut reply = format!("d1:eli204e14:Method Unknowne1:t{}:", t.len()).into_bytes();
+            reply.extend_from_slice(t);
+            reply.extend_from_slice(b"1:y1:ee");
+            let _ = node.send_to(&reply, from).await;
+        }
+    });
+    let s = Session::new(dht_settings(Vec::new())).await.unwrap();
+    match s.dht_sample_infohashes(node_addr, [1; 20]).await {
+        Err(SessionError::Dht(fbt_session::DhtError::Remote { code: 204 })) => {}
+        other => panic!("expected the remote 204, got {other:?}"),
+    }
+    s.shutdown().await;
+}

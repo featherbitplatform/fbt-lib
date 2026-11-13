@@ -457,18 +457,29 @@ impl TorrentHandle {
     ///
     /// Fails with [`SessionError::Storage`] when the move fails (an
     /// [`io::ErrorKind::AlreadyExists`](std::io::ErrorKind::AlreadyExists)
-    /// error for [`MoveMode::FailIfExists`] with a file at the target) and
-    /// [`SessionError::Unsupported`] for a custom storage that cannot move.
+    /// error for [`MoveMode::FailIfExists`] with a file at the target),
+    /// [`SessionError::Unsupported`] for a custom storage that cannot move,
+    /// and [`SessionError::Busy`] at once while the torrent checks its
+    /// data or waits to ([`TorrentState::CheckingFiles`] or
+    /// [`TorrentState::QueuedForChecking`]): the move would wait for the
+    /// whole check. Ask again once the check is over (a
+    /// [`StateChanged`](crate::Event::StateChanged) event, or
+    /// [`TorrentFinished`](crate::Event::TorrentFinished)).
     ///
     /// While the files move, [`pause`](Self::pause),
     /// [`resume`](Self::resume), [`remove`](Self::remove),
     /// [`force_recheck`](Self::force_recheck),
-    /// [`set_file_priorities`](Self::set_file_priorities), another
+    /// [`set_file_priorities`](Self::set_file_priorities),
+    /// [`save_resume_data`](Self::save_resume_data), another
     /// `move_storage` or [`rename_file`](Self::rename_file), and the
     /// session's shutdown wait for it to finish (a copy across filesystems
     /// can take minutes); they then run in the order they were made. Past
     /// 64 such waiting commands a new one fails at once with
     /// [`SessionError::Busy`]. Other methods, reads included, are not held.
+    ///
+    /// A move across filesystems copies the files and deletes the
+    /// originals; sparse regions of a file (pieces not downloaded yet) are
+    /// allocated at the target, so it can take more disk space there.
     pub async fn move_storage(&self, path: PathBuf, mode: MoveMode) -> Result<(), SessionError> {
         self.call(|tx| Cmd::MoveStorage { path, mode, tx }).await?
     }
@@ -483,13 +494,17 @@ impl TorrentHandle {
     ///
     /// Fails with [`SessionError::InvalidPath`] for a path that is not a
     /// plain relative one (empty, `.`, `..` or empty components, or any
-    /// name the torrent path sanitiser would change) or that collides with
+    /// name the torrent path sanitiser would change), that collides with
     /// another file (the same path ignoring case and Unicode normalisation,
-    /// or one being a directory of the other);
-    /// [`SessionError::InvalidFileIndex`] for an index out of range or
-    /// naming a pad file; [`SessionError::NoMetadata`] before a magnet's
-    /// metadata; [`SessionError::Storage`] when the rename fails (a file
-    /// not ours at the target is never overwritten).
+    /// or one being a directory of the other), or that is the part file's
+    /// ([`FsStorage::part_path`](crate::storage::FsStorage::part_path))
+    /// or below it; [`SessionError::InvalidFileIndex`] for an index out of
+    /// range or naming a pad file; [`SessionError::NoMetadata`] before a
+    /// magnet's metadata; [`SessionError::Busy`] at once while the torrent
+    /// checks its data or waits to, as for
+    /// [`move_storage`](Self::move_storage); [`SessionError::Storage`]
+    /// when the rename fails (a file not ours at the target is never
+    /// overwritten).
     pub async fn rename_file(&self, index: usize, path: &str) -> Result<(), SessionError> {
         let meta = self.metainfo().ok_or(SessionError::NoMetadata)?;
         let files = meta.info.files.len();

@@ -434,16 +434,20 @@ pub use fbt_core::{
     Bitfield, BitfieldError, BlockRef, FileLayout, FileSlice, InfoHashV1, InfoHashV2, InfoHashes,
     LayoutError, ParseInfoHashError, PeerId, PieceLayout,
 };
-pub use fbt_metainfo::{FileEntry, Info, Magnet, MagnetError, Metainfo, MetainfoError, RelPath};
+pub use fbt_metainfo::{
+    FileEntry, Info, MAX_WEB_SEEDS, Magnet, MagnetError, Metainfo, MetainfoError, RelPath,
+};
 pub use fbt_session::storage::{FileStamp, FsStorage, MemStorage, Storage};
 pub use fbt_session::{
-    AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtSamples,
-    DhtScrape, DhtStats, DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream,
-    ExternalIpSource, FileReader, IpFilter, ListenError, MAX_METADATA_SIZE, MapMethod, MapProtocol,
-    MixedMode, MoveMode, MutableItem, NodeId, NodeInfo, PeerClassLimits, PeerSource, Priority,
-    ProxyConfig, ProxyKind, QueueSettings, RateLimit, ReadAhead, RemoveMode, ResumeError,
-    SeedChokingAlgorithm, Session, SessionError, SessionState, Settings, StorageError, StreamError,
-    TorrentHandle, TorrentSource, TorrentState, TorrentStatus, Transport,
+    AddTorrent, BlockReason, CacheStats, ChokingAlgorithm, DEFAULT_DHT_BOOTSTRAP, DhtError,
+    DhtSamples, DhtScrape, DhtStats, DisconnectReason, EncryptionPolicy, Event, EventMask,
+    EventStream, ExternalIpSource, FileReader, IpFilter, ListenError, MAX_IP_FILTER_RANGES,
+    MAX_METADATA_SIZE, MAX_RESUME_BYTES, MAX_RESUME_ITEMS, MAX_RESUME_PEERS, MAX_SESSION_TORRENTS,
+    MapMethod, MapProtocol, MixedMode, MoveMode, MutableItem, NodeId, NodeInfo, PeerClassLimits,
+    PeerSource, Priority, ProxyConfig, ProxyError, ProxyKind, QueueSettings, RateLimit, ReadAhead,
+    RemoveMode, ResumeError, SeedChokingAlgorithm, Session, SessionError, SessionState, Settings,
+    StorageError, StreamError, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
+    Transport,
 };
 pub use fbt_tracker::{TrackerConfig, TrackerError};
 

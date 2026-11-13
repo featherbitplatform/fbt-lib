@@ -58,9 +58,10 @@ pub enum SessionError {
     #[error("too many open file readers")]
     TooManyReaders,
     /// The SOCKS5 UDP association [`Settings::proxy`](crate::Settings::proxy)
-    /// needs could not be made; the message is the proxy error.
+    /// needs could not be made, or the socket relayed through it could not
+    /// be bound ([`ProxyError::Io`](crate::ProxyError::Io)).
     #[error("proxy error: {0}")]
-    Proxy(String),
+    Proxy(#[source] crate::ProxyError),
     /// A path given to
     /// [`TorrentHandle::rename_file`](crate::TorrentHandle::rename_file) is
     /// not a plain relative path (empty, with `.`/`..` or empty components,
@@ -74,8 +75,11 @@ pub enum SessionError {
     #[error("the storage does not support this operation")]
     Unsupported,
     /// The torrent's storage is moving and 64 commands already wait for
-    /// it (see [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage)).
-    #[error("too many commands wait for the storage move")]
+    /// it, or a move or rename was asked for while the torrent checks its
+    /// data (or waits to); see
+    /// [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage).
+    /// Ask again later.
+    #[error("the torrent's storage is busy")]
     Busy,
     /// A web seed URL given to
     /// [`TorrentHandle::add_web_seed`](crate::TorrentHandle::add_web_seed)
@@ -95,10 +99,17 @@ pub enum SessionError {
     /// off.
     #[error("the DHT is disabled")]
     DhtDisabled,
-    /// A DHT operation failed (the queried node did not answer, answered
-    /// with an error, or the DHT shut down); the message is the DHT error.
+    /// A DHT operation failed: the queried node did not answer
+    /// ([`DhtError::Timeout`](crate::DhtError::Timeout)), answered with a
+    /// KRPC error ([`DhtError::Remote`](crate::DhtError::Remote), whose
+    /// `code` says why: `204` for a method it does not know, `301`/`302`
+    /// for a BEP 44 `cas` or `seq` conflict), no node is known yet
+    /// ([`DhtError::NoNodes`](crate::DhtError::NoNodes)), or the item is
+    /// invalid ([`DhtError::InvalidValue`](crate::DhtError::InvalidValue)).
+    /// A DHT shut down with the session is [`SessionError::Shutdown`]
+    /// instead.
     #[error("DHT error: {0}")]
-    Dht(String),
+    Dht(#[source] crate::DhtError),
 }
 
 /// Why a [`FileReader`](crate::FileReader) read failed. It comes inside the

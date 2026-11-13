@@ -455,26 +455,29 @@ impl PiecePicker {
         out
     }
 
-    /// For a web seed: every block of consecutive unstarted pieces, from
-    /// the first one at or after `first_free`, each taken whole through
-    /// [`pick_piece`](Self::pick_piece) and recorded as outstanding from
-    /// `peer`. The run stops before a piece that is started (by anyone),
-    /// passed, pending its hash or skipped (priority 0), at the end of the
-    /// torrent, or once it holds `max_bytes`; it never stops before its
-    /// first piece, so a piece larger than `max_bytes` is still fetched.
-    /// The pieces are so one byte range, and only `peer` holds their
-    /// blocks: a run never joins a piece another peer started, reserved
-    /// ones (parole) included. Empty when nothing from `first_free` on is
-    /// unstarted.
+    /// For a web seed: the free blocks of consecutive pieces nobody is
+    /// downloading, from the first one at or after `first_free`, each
+    /// taken through [`pick_piece`](Self::pick_piece) and recorded as
+    /// outstanding from `peer`. Such a piece is unstarted, or partial with
+    /// no block outstanding from anyone and not reserved for a peer on
+    /// parole: the blocks some peer delivered before it left (or was
+    /// choked) stay, and the run fetches only the rest. The run stops
+    /// before a piece someone downloads, one passed, pending its hash or
+    /// skipped (priority 0), at the end of the torrent, or once it holds
+    /// `max_bytes`; it never stops before its first piece, so a piece
+    /// larger than `max_bytes` is still fetched. The pieces are so one
+    /// byte range (the blocks already received inside it are fetched too
+    /// and dropped), and only `peer` has requests on their blocks. Empty
+    /// when nothing from `first_free` on can be taken.
     pub fn pick_run(&mut self, peer: PeerKey, first_free: u32, max_bytes: u64) -> Vec<BlockRef> {
         let n = self.layout.num_pieces();
         let mut out = Vec::new();
-        let Some(start) = (first_free..n).find(|&i| self.unstarted_wanted(i)) else {
+        let Some(start) = (first_free..n).find(|&i| self.web_seed_may_take(i)) else {
             return out;
         };
         let mut bytes = 0u64;
         for piece in start..n {
-            if !self.unstarted_wanted(piece) {
+            if !self.web_seed_may_take(piece) {
                 break;
             }
             let size = u64::from(self.layout.piece_size(piece));
@@ -495,9 +498,19 @@ impl PiecePicker {
         out
     }
 
-    /// A wanted piece nobody has started.
-    fn unstarted_wanted(&self, piece: u32) -> bool {
-        self.state_of(piece) == PieceState::Unrequested && self.prio_of(piece) > 0
+    /// A wanted piece nobody downloads: unstarted, or partial with a free
+    /// block, no block outstanding from anyone and no parole reservation.
+    fn web_seed_may_take(&self, piece: u32) -> bool {
+        if self.prio_of(piece) == 0 {
+            return false;
+        }
+        match self.state_of(piece) {
+            PieceState::Unrequested => true,
+            PieceState::Partial => self.downloading.get(&piece).is_some_and(|d| {
+                d.free > 0 && d.exclusive.is_none() && d.blocks.iter().all(|b| b.owners.is_empty())
+            }),
+            PieceState::PendingHash | PieceState::Have => false,
+        }
     }
 
     /// Download progress of `piece`: its free blocks and the peers holding

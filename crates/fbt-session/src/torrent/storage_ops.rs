@@ -21,7 +21,7 @@ use super::data::Job;
 use crate::error::SessionError;
 use crate::event::Event;
 use crate::storage::cache::FlushReason;
-use crate::storage::{MoveMode, Storage};
+use crate::storage::{MoveMode, Storage, is_part_path, part_file_name};
 
 /// Commands held while the storage is busy; further ones fail with
 /// [`SessionError::Busy`] (the session's `Shutdown` is always held).
@@ -132,6 +132,10 @@ impl Actor {
             self.moved(path, tx);
             return;
         }
+        if self.checking() {
+            let _ = tx.send(Err(SessionError::Busy));
+            return;
+        }
         self.begin_storage_op(OpKind::Move { path, mode }, tx).await;
     }
 
@@ -154,12 +158,26 @@ impl Actor {
                 f.path = p.clone();
             }
         }
-        if collides(&files, index, &path) {
+        if collides(&files, index, &path) || is_part_path(&path, &part_file_name(&l.meta)) {
             let _ = tx.send(Err(SessionError::InvalidPath(path.to_string())));
+            return;
+        }
+        if self.checking() {
+            let _ = tx.send(Err(SessionError::Busy));
             return;
         }
         self.begin_storage_op(OpKind::Rename { index, path }, tx)
             .await;
+    }
+
+    /// The data is being checked, or waits to be: a move or rename would
+    /// wait for the whole check, holding every storage command (pause,
+    /// shutdown) behind it, so it is refused instead.
+    fn checking(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Checking { .. } | Phase::QueuedForCheck { .. } | Phase::Resuming
+        )
     }
 
     /// Writes every verified piece, then holds the storage for `kind`; its
@@ -179,10 +197,7 @@ impl Actor {
     /// runs, no check reads the data and no flush runs. Called after every
     /// job result.
     pub(super) fn try_start_storage_job(&mut self) {
-        let checking = matches!(
-            self.phase,
-            Phase::Checking { .. } | Phase::QueuedForCheck { .. } | Phase::Resuming
-        );
+        let checking = self.checking();
         let idle = self.reads_in_flight == 0
             && !self.cache.writes_in_flight()
             && !self.finish_flush

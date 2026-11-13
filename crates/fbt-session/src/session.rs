@@ -15,7 +15,7 @@ use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::PortMapper;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
 use fbt_net::ipfilter::IpFilter;
-use fbt_net::proxy::{ProxyKind, udp_associate};
+use fbt_net::proxy::{ProxyError, ProxyKind, udp_associate};
 use fbt_tracker::TrackerClient;
 use fbt_utp::UtpSocket;
 use fbt_wire::req2_hash;
@@ -681,6 +681,14 @@ impl Session {
             }
             settings.enable_outgoing_utp = false;
         }
+        for feature in settings.proxy_bypasses() {
+            warn!(
+                feature,
+                "a proxy is configured, but {feature} does not go through it: \
+                 it sends from this host's own address (turn it off to keep \
+                 all traffic on the proxy)"
+            );
+        }
         let (endpoints, listen_errors) = bind_all(&settings, !relay_udp).await?;
         let local_addrs: Vec<SocketAddr> = endpoints.iter().map(|e| e.addr).collect();
         let udp: Vec<SharedUdpSocket> = if relay_udp {
@@ -767,6 +775,11 @@ impl Session {
         if let Some(dht) = &shared.dht {
             watch_bootstrap(dht, Arc::downgrade(&shared));
             watch_dht_external_ip(dht, Arc::downgrade(&shared));
+        }
+        if relay_udp {
+            for u in &udp {
+                watch_relay_lost(u, Arc::downgrade(&shared));
+            }
         }
         let inner = Arc::new(SessionInner {
             shared: Arc::clone(&shared),
@@ -1026,7 +1039,7 @@ impl Session {
 
     /// A copy of the session's IP filter (allow everything by default).
     /// The copy is deep: a filter near
-    /// [`MAX_RANGES`](fbt_net::ipfilter::MAX_RANGES) costs tens of MB, so
+    /// [`MAX_IP_FILTER_RANGES`](crate::MAX_IP_FILTER_RANGES) costs tens of MB, so
     /// read it when needed rather than polling it.
     pub fn ip_filter(&self) -> IpFilter {
         let f = self
@@ -1266,9 +1279,14 @@ impl Session {
     /// what they write afterwards makes their resume data untrusted on
     /// restart (a full check), unless they were paused first; see
     /// [`shutdown_and_save`](Self::shutdown_and_save). A torrent removed
-    /// meanwhile is left out silently; one whose save fails (for instance
-    /// [`SessionError::Busy`] during a storage move) is left out, logged,
-    /// and returned with its error, the others still saved.
+    /// meanwhile is left out silently; one whose save fails is left out,
+    /// logged, and returned with its error, the others still saved.
+    ///
+    /// The torrents are asked one after the other, and a torrent whose
+    /// storage is moving ([`TorrentHandle::move_storage`]) answers only
+    /// once the move is done: one long move (a copy across filesystems)
+    /// delays the whole save. It fails with [`SessionError::Busy`] only
+    /// when 64 other commands already wait for that move.
     ///
     /// Fails with [`SessionError::Shutdown`] once the session has shut
     /// down.
@@ -1470,7 +1488,7 @@ async fn bind_relay(
 ) -> Result<SharedUdpSocket, SessionError> {
     let assoc = udp_associate(&settings.proxy, settings.connect_timeout)
         .await
-        .map_err(|e| SessionError::Proxy(e.to_string()))?;
+        .map_err(SessionError::Proxy)?;
     let v4 = assoc.relay().is_ipv4();
     let ip = local_addrs.iter().find(|a| a.is_ipv4() == v4).map_or(
         if v4 {
@@ -1481,7 +1499,7 @@ async fn bind_relay(
         SocketAddr::ip,
     );
     SharedUdpSocket::bind_relayed(SocketAddr::new(ip, 0), assoc)
-        .map_err(|e| SessionError::Proxy(format!("cannot bind the relayed UDP socket: {e}")))
+        .map_err(|e| SessionError::Proxy(ProxyError::Io(e)))
 }
 
 /// A UDP socket on a free port for each address family that has a
@@ -1567,8 +1585,32 @@ async fn start_dht(settings: &Settings, udp: &[SharedUdpSocket]) -> Option<Dht> 
 fn dht_error(e: DhtError) -> SessionError {
     match e {
         DhtError::Shutdown => SessionError::Shutdown,
-        e => SessionError::Dht(e.to_string()),
+        e => SessionError::Dht(e),
     }
+}
+
+/// Warns and emits [`Event::ProxyError`] once when the relayed UDP socket
+/// `u` loses its SOCKS5 association (the proxy closed the control
+/// connection): from then on the DHT, uTP and UDP trackers fail until the
+/// session restarts. Ends with the socket or the session.
+fn watch_relay_lost(u: &SharedUdpSocket, shared: std::sync::Weak<Shared>) {
+    let mut lost = u.relay_lost();
+    tokio::spawn(async move {
+        if lost.wait_for(|l| *l).await.is_err() {
+            return;
+        }
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        if shared.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let message = "the SOCKS5 proxy closed the UDP association: the DHT, uTP and \
+                       UDP trackers stop working until the session restarts"
+            .to_owned();
+        warn!("{message}");
+        shared.emit(Event::ProxyError { message });
+    });
 }
 
 /// Emits [`Event::DhtBootstrapped`] the first time the DHT's routing table

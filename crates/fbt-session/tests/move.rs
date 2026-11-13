@@ -440,6 +440,9 @@ async fn rename_file_then_serve() {
     let (m, payload) = make_torrent(&FILES, PL);
     let dir = tempfile::tempdir().unwrap();
     let (s, h, mut ev) = disk_seed(&m, &payload, dir.path()).await;
+    let part = format!(".{}.parts", m.info_hashes);
+    let part_upper = part.to_uppercase();
+    let part_dir = format!("{part}/x");
     h.rename_file(1, "t/sub/x.bin").await.unwrap();
     let e = next_matching(&mut ev, |e| matches!(e, Event::FileRenamed { .. }), T)
         .await
@@ -465,6 +468,10 @@ async fn rename_file_then_serve() {
         "C:x",
         "CON",
         "a\0b",
+        // The part file's name, whatever the case, and a directory of it.
+        part.as_str(),
+        part_upper.as_str(),
+        part_dir.as_str(),
     ] {
         let e = h.rename_file(1, bad).await.unwrap_err();
         assert!(matches!(e, SessionError::InvalidPath(_)), "{bad:?}: {e:?}");
@@ -501,4 +508,66 @@ async fn rename_file_then_serve() {
     assert_eq!(h.status().state, TorrentState::Seeding);
     leech.shutdown().await;
     s.shutdown().await;
+}
+
+/// A move or rename asked for while the torrent checks (or waits to) is
+/// refused with `Busy` at once, and never holds a pause or the session's
+/// shutdown until the check ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn move_during_a_check_is_busy() {
+    let mut st = test_settings();
+    st.max_active_checks = 1;
+    let s = Session::new(st).await.unwrap();
+    // Every read of a check takes 200 ms: 25 pieces, about 5 s.
+    let slow = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let add = |m: Metainfo, payload: Vec<u8>| {
+        let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+        p.storage = Some(Arc::new(ToggleStorage::new(
+            payload,
+            Duration::from_millis(200),
+            Arc::clone(&slow),
+        )));
+        s.add_torrent(p)
+    };
+    let (m, payload) = make_torrent(&FILES, PL);
+    let checking = add(m, payload).await.unwrap();
+    assert!(
+        wait_state(
+            &checking,
+            |st| matches!(st, TorrentState::CheckingFiles { .. }),
+            T
+        )
+        .await,
+        "{:?}",
+        checking.status().state
+    );
+    let (m, payload) = make_torrent(&FILES, PL);
+    let queued = add(m, payload).await.unwrap();
+    assert!(
+        wait_state(&queued, |st| *st == TorrentState::QueuedForChecking, T).await,
+        "{:?}",
+        queued.status().state
+    );
+    let quick = Duration::from_secs(2);
+    for h in [&queued, &checking] {
+        let r = tokio::time::timeout(
+            quick,
+            h.move_storage(PathBuf::from("elsewhere"), MoveMode::FailIfExists),
+        )
+        .await
+        .expect("the move waited for the check");
+        assert!(matches!(r, Err(SessionError::Busy)), "{r:?}");
+        let r = tokio::time::timeout(quick, h.rename_file(0, "renamed"))
+            .await
+            .expect("the rename waited for the check");
+        assert!(matches!(r, Err(SessionError::Busy)), "{r:?}");
+        assert_eq!(h.status().save_path, PathBuf::from("unused"));
+    }
+    tokio::time::timeout(quick, queued.pause())
+        .await
+        .expect("the pause waited for the check")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), s.shutdown())
+        .await
+        .expect("the shutdown waited for the check");
 }

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use fbt_net::lsd::{LSD_V4, LSD_V6};
 use fbt_net::natpmp::NATPMP_PORT;
-use fbt_net::proxy::ProxyConfig;
+use fbt_net::proxy::{ProxyConfig, ProxyKind};
 use fbt_net::upnp::SSDP_V4;
 use fbt_tracker::TrackerConfig;
 
@@ -93,6 +93,7 @@ pub struct Settings {
     /// Loopback peers are exempt from `max_peers_per_ip`, so clients on the
     /// same host (and test suites) can connect to each other.
     #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub per_ip_exempt_loopback: bool,
     /// Bans name one endpoint (address and port) instead of the whole IP,
     /// so loopback tests can ban one of several peers on `127.0.0.1`. An
@@ -100,6 +101,7 @@ pub struct Settings {
     /// peer gets back in by reconnecting from another port: endpoint bans
     /// hold only against peers we dial.
     #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub ban_endpoints: bool,
     /// Outgoing connections still connecting or handshaking.
     pub max_half_open: usize,
@@ -387,6 +389,15 @@ pub struct Settings {
     ///   direct on the local network.
     ///
     /// Listening is unchanged: incoming connections never use the proxy.
+    /// [`Session::new`](crate::Session::new) logs a warning for each
+    /// enabled feature that bypasses the proxy (with an HTTP proxy the
+    /// DHT, which names every torrent's info hash, and uTP; with any proxy
+    /// LSD, UPnP and NAT-PMP): turn them off for a session whose traffic
+    /// should all go through the proxy. There is no single proxy-only
+    /// switch yet.
+    ///
+    /// Serialising the settings (the `serde` feature) writes the proxy
+    /// password in clear text.
     pub proxy: ProxyConfig,
     /// How many auto-managed torrents run at once; the rest wait as
     /// [`TorrentState::Queued`](crate::TorrentState::Queued). Changed at
@@ -506,6 +517,43 @@ impl Settings {
         self.proxy.validate().map_err(|e| format!("proxy: {e}"))?;
         self.read_ahead.validate()
     }
+
+    /// The enabled features that send from the real address whatever
+    /// [`proxy`](Self::proxy) says; empty without a proxy. Under an HTTP
+    /// proxy (or a SOCKS5 one that carries neither peers nor trackers, so
+    /// relays no UDP): the DHT, outgoing uTP (unless `proxy_peers` turns
+    /// it off) and incoming uTP. Under any proxy: LSD, UPnP and NAT-PMP.
+    /// [`Session::new`](crate::Session::new) logs a warning for each.
+    pub(crate) fn proxy_bypasses(&self) -> Vec<&'static str> {
+        let p = &self.proxy;
+        let mut out = Vec::new();
+        if p.kind == ProxyKind::None {
+            return out;
+        }
+        let relays_udp = p.kind == ProxyKind::Socks5 && (p.proxy_peers || p.proxy_trackers);
+        if !relays_udp {
+            if self.dht_enabled {
+                out.push("the DHT");
+            }
+            // An HTTP proxy carrying peers turns outgoing uTP off.
+            if self.enable_outgoing_utp && !(p.kind == ProxyKind::Http && p.proxy_peers) {
+                out.push("outgoing uTP");
+            }
+            if self.enable_incoming_utp {
+                out.push("incoming uTP");
+            }
+        }
+        for (on, name) in [
+            (self.enable_lsd, "LSD"),
+            (self.enable_upnp, "UPnP"),
+            (self.enable_natpmp, "NAT-PMP"),
+        ] {
+            if on {
+                out.push(name);
+            }
+        }
+        out
+    }
 }
 
 /// `host:port` with a non-empty host and a `u16` port, no whitespace; a
@@ -611,6 +659,42 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn features_bypassing_the_proxy_are_listed() {
+        let mut s = Settings::default();
+        assert!(s.proxy_bypasses().is_empty(), "no proxy");
+        s.proxy.kind = ProxyKind::Http;
+        s.proxy.host = "proxy.example".to_owned();
+        assert_eq!(
+            s.proxy_bypasses(),
+            ["the DHT", "incoming uTP", "LSD", "UPnP", "NAT-PMP"]
+        );
+        s.proxy.proxy_peers = false;
+        assert_eq!(
+            s.proxy_bypasses(),
+            [
+                "the DHT",
+                "outgoing uTP",
+                "incoming uTP",
+                "LSD",
+                "UPnP",
+                "NAT-PMP"
+            ]
+        );
+        // SOCKS5 relays every UDP packet: only the local-network ones stay.
+        s.proxy.kind = ProxyKind::Socks5;
+        assert_eq!(s.proxy_bypasses(), ["LSD", "UPnP", "NAT-PMP"]);
+        s.enable_lsd = false;
+        s.enable_upnp = false;
+        s.enable_natpmp = false;
+        assert!(s.proxy_bypasses().is_empty());
+        // SOCKS5 carrying neither peers nor trackers relays no UDP.
+        s.proxy.proxy_trackers = false;
+        s.dht_enabled = false;
+        s.enable_incoming_utp = false;
+        assert_eq!(s.proxy_bypasses(), ["outgoing uTP"]);
+    }
 
     #[test]
     fn zero_read_ahead_time_is_invalid() {

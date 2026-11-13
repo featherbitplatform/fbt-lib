@@ -297,6 +297,15 @@ pub enum Event {
         /// Who reported it.
         source: ExternalIpSource,
     },
+    /// The proxy ([`Settings::proxy`](crate::Settings::proxy)) failed in a
+    /// way that affects the whole session. Emitted once when the SOCKS5
+    /// proxy closes the UDP association: the relayed UDP socket stops, so
+    /// the DHT, uTP and UDP trackers fail (closed, never direct) until the
+    /// session is restarted.
+    ProxyError {
+        /// What happened.
+        message: String,
+    },
     /// The subscriber fell behind and `missed` events were dropped.
     Lagged {
         /// Number of events dropped.
@@ -309,7 +318,7 @@ bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct EventMask: u32 {
         /// Torrent added/removed, state changes, metadata received, torrent
-        /// finished, seed limit reached.
+        /// finished, seed limit reached, session-wide proxy failures.
         const STATUS = 1;
         /// Piece finished, hash failed.
         const PIECE = 1 << 1;
@@ -344,7 +353,8 @@ impl Event {
             | Event::StateChanged { .. }
             | Event::MetadataReceived { .. }
             | Event::TorrentFinished { .. }
-            | Event::SeedLimitReached { .. } => EventMask::STATUS,
+            | Event::SeedLimitReached { .. }
+            | Event::ProxyError { .. } => EventMask::STATUS,
             Event::PieceFinished { .. } | Event::HashFailed { .. } => EventMask::PIECE,
             Event::TrackerReply { .. }
             | Event::TrackerError { .. }

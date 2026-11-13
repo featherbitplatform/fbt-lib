@@ -364,7 +364,8 @@ fn priorities(d: &Dict<'_>, num_files: usize) -> Result<Vec<Priority>, ResumeErr
 
 /// The renamed files: each index in range and not a pad file, each index
 /// once, each path one that `rename_file` would accept (sanitising leaves
-/// it unchanged, and it collides with no other file).
+/// it unchanged, it collides with no other file, and it is not the part
+/// file's path nor below it).
 fn renamed(d: &Dict<'_>, meta: Option<&Metainfo>) -> Result<Vec<(usize, RelPath)>, ResumeError> {
     let bad = || ResumeError::Invalid("renamed");
     let items = list(d, "renamed")?;
@@ -405,7 +406,12 @@ fn renamed(d: &Dict<'_>, meta: Option<&Metainfo>) -> Result<Vec<(usize, RelPath)
         }
         out.push((index, rel));
     }
-    if renames_collide(files, &out) {
+    let part = crate::storage::part_file_name(meta.ok_or_else(bad)?);
+    if renames_collide(files, &out)
+        || out
+            .iter()
+            .any(|(_, p)| crate::storage::is_part_path(p, &part))
+    {
         return Err(bad());
     }
     Ok(out)
@@ -1124,6 +1130,7 @@ mod tests {
         let m = three();
         let ok = renamed_input(&m, vec![entry(0, &["x", "y"])]).unwrap();
         assert_eq!(ok.state.renamed[0].1.components(), ["x", "y"]);
+        let part = format!(".{}.parts", m.info_hashes);
         let bad = [
             vec![entry(0, &["..", "etc"])],
             vec![entry(0, &["a", ""])],
@@ -1142,6 +1149,10 @@ mod tests {
             vec![entry(0, &["q"]), entry(2, &["Q"])],
             vec![OwnedValue::List(vec![0.into()])],
             vec![0.into()],
+            // The part file's name, whatever the case, or a directory of it.
+            vec![entry(0, &[part.as_str()])],
+            vec![entry(0, &[part.to_uppercase().as_str()])],
+            vec![entry(0, &[part.as_str(), "x"])],
         ];
         for b in bad {
             assert!(

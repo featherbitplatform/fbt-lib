@@ -115,6 +115,20 @@ fn surface_compiles() {
     let _: (ProxyKind, String, u16, Option<String>, Option<String>) =
         (p.kind, p.host, p.port, p.username, p.password);
     let _: (bool, bool, bool) = (p.proxy_peers, p.proxy_trackers, p.proxy_hostnames);
+    let _: Result<(), String> = ProxyConfig::default().validate();
+    let e = fbt::ProxyError::Refused(1);
+    let _ = [
+        SessionError::Proxy(e),
+        SessionError::Proxy(fbt::ProxyError::Timeout),
+    ];
+    let _: [usize; 6] = [
+        fbt::MAX_RESUME_BYTES,
+        fbt::MAX_RESUME_ITEMS,
+        fbt::MAX_RESUME_PEERS,
+        fbt::MAX_SESSION_TORRENTS,
+        fbt::MAX_IP_FILTER_RANGES,
+        fbt::MAX_WEB_SEEDS,
+    ];
     let _: usize = Settings::default().max_peers_per_ip;
     let _ = [
         BlockReason::IpFilter,
@@ -160,6 +174,44 @@ async fn storage_methods(h: &TorrentHandle) {
         SessionError::Unsupported,
         SessionError::Busy,
     ];
+}
+
+/// The storage operations a custom storage may implement, and the file
+/// storage's paths.
+fn storage_trait(st: &dyn Storage, m: &Metainfo, r: RelPath) {
+    let _: std::io::Result<()> = st.set_file_priorities(&[true]);
+    let _: std::io::Result<()> = st.move_to(std::path::Path::new("x"), MoveMode::default());
+    let _: std::io::Result<()> = st.rename_file(0, &r);
+    let fs = FsStorage::with_paths(std::path::PathBuf::new(), m, &[(0, r)]);
+    let _: std::path::PathBuf = fs.part_path();
+}
+
+/// Tracker scrapes.
+async fn scrape_methods(h: &TorrentHandle, e: &Event) {
+    let _: Result<(), SessionError> = h.scrape_trackers().await;
+    match e {
+        Event::ScrapeReply {
+            torrent,
+            url,
+            complete,
+            incomplete,
+            downloaded,
+        } => {
+            let _: (&InfoHashes, &String, [&u32; 3]) =
+                (torrent, url, [complete, incomplete, downloaded]);
+        }
+        Event::ScrapeFailed {
+            torrent,
+            url,
+            message,
+        } => {
+            let _: (&InfoHashes, &String, &String) = (torrent, url, message);
+        }
+        Event::ProxyError { message } => {
+            let _: &String = message;
+        }
+        _ => {}
+    }
 }
 
 /// The fields the storage events carry.
@@ -302,12 +354,19 @@ async fn dht_methods(s: &Session, addr: std::net::SocketAddr) {
         let _: Vec<(std::net::SocketAddr, [u8; 20])> =
             d.nodes.iter().map(|n| (n.addr, n.id.0)).collect();
     }
-    let _ = [SessionError::DhtDisabled, SessionError::Dht(String::new())];
-    let info: Option<fbt::NodeInfo> = None;
-    if let Some(fbt::NodeInfo { id, addr }) = info {
-        let _: (fbt::NodeId, std::net::SocketAddr) = (id, addr);
-        let _: [u8; 20] = id.0;
+    let _ = [
+        SessionError::DhtDisabled,
+        SessionError::Dht(fbt::DhtError::Remote { code: 204 }),
+        SessionError::Dht(fbt::DhtError::Timeout),
+    ];
+    if let Err(SessionError::Dht(fbt::DhtError::Remote { code })) =
+        s.dht_sample_infohashes(addr, [0; 20]).await
+    {
+        let _: i64 = code;
     }
+    let info = fbt::NodeInfo::new(fbt::NodeId([0; 20]), addr);
+    let _: (fbt::NodeId, std::net::SocketAddr) = (info.id, info.addr);
+    let _: [u8; 20] = info.id.0;
     // BEP 44 items
     let r: Result<Option<Vec<u8>>, SessionError> = s.dht_get_immutable([0; 20]).await;
     let _ = r;
