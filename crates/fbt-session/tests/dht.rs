@@ -368,6 +368,84 @@ async fn dht_disabled_means_none() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_dht_scrape() {
+    let boot = loopback_dht(Vec::new()).await;
+    let (m, payload) = make_torrent(&[("a", 100_000)], 16_384);
+    let ih = m.info_hashes.v1.unwrap().0;
+    let mut ss = dht_settings(vec![addr_of(&boot)]);
+    ss.dht_announce_interval = Duration::from_secs(1);
+    let seeder = Session::new(ss).await.unwrap();
+    let sh = seed_in(&seeder, &m, &payload).await;
+    assert!(wait_until(|| sh.status().is_seed, T).await);
+    let asker = Session::new(dht_settings(vec![addr_of(&boot)]))
+        .await
+        .unwrap();
+    assert!(wait_until(|| asker.dht_stats().is_some_and(|s| s.nodes_v4 > 0), T).await);
+    // The seeder announces with `seed` once it seeds: one seed, no leecher
+    // (an announce made while it still checked is replaced by the next).
+    let scraped = tokio::time::timeout(T, async {
+        loop {
+            let s = asker.dht_scrape(ih).await.unwrap();
+            if s.seeds == 1 && s.peers == 0 {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    assert!(scraped.is_ok(), "no seed seen through the DHT");
+    // BEP 51 against the bootstrap node, which stores the announce.
+    let samples = asker
+        .dht_sample_infohashes(boot.local_addrs()[0], [0x11; 20])
+        .await
+        .unwrap();
+    assert_eq!(samples.samples, vec![ih]);
+    assert_eq!(samples.num, 1);
+    asker.shutdown().await;
+    seeder.shutdown().await;
+    boot.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dht_methods_without_dht_are_disabled() {
+    let session = Session::new(test_settings()).await.unwrap();
+    assert!(matches!(
+        session.dht_scrape([1; 20]).await,
+        Err(SessionError::DhtDisabled)
+    ));
+    let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    assert!(matches!(
+        session.dht_sample_infohashes(addr, [1; 20]).await,
+        Err(SessionError::DhtDisabled)
+    ));
+    session.shutdown().await;
+    // With the DHT on, a node that never answers is a DHT error.
+    let on = Session::new(dht_settings(Vec::new())).await.unwrap();
+    let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    assert!(matches!(
+        on.dht_sample_infohashes(dead_addr, [1; 20]).await,
+        Err(SessionError::Dht(_))
+    ));
+    // No node known yet: nobody to ask is an error, not zero seeds.
+    assert!(matches!(
+        on.dht_scrape([1; 20]).await,
+        Err(SessionError::Dht(_))
+    ));
+    on.shutdown().await;
+    // After shutdown, as `dht_state` does.
+    assert!(matches!(
+        on.dht_scrape([1; 20]).await,
+        Err(SessionError::Shutdown)
+    ));
+    assert!(matches!(
+        on.dht_sample_infohashes(dead_addr, [1; 20]).await,
+        Err(SessionError::Shutdown)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dht_bootstrapped_event_once() {
     // A bootstrap node that already knows more than K (8) nodes.
     let boot = loopback_dht(Vec::new()).await;
@@ -530,4 +608,37 @@ async fn public_magnet_announces_before_metadata() {
     assert!(wait_until(|| stored(&boot) >= 1, T).await);
     leecher.shutdown().await;
     boot.shutdown().await;
+}
+
+/// A node's KRPC error reaches the caller as the typed DHT error, its code
+/// intact: here `204`, a node without BEP 51.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dht_remote_error_code_reaches_the_caller() {
+    let node = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let node_addr = node.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        while let Ok((n, from)) = node.recv_from(&mut buf).await {
+            let Ok(v) = fbt_bencode::decode(&buf[..n]) else {
+                continue;
+            };
+            let Some(t) = v
+                .as_dict()
+                .and_then(|d| d.get(b"t"))
+                .and_then(|t| t.as_bytes())
+            else {
+                continue;
+            };
+            let mut reply = format!("d1:eli204e14:Method Unknowne1:t{}:", t.len()).into_bytes();
+            reply.extend_from_slice(t);
+            reply.extend_from_slice(b"1:y1:ee");
+            let _ = node.send_to(&reply, from).await;
+        }
+    });
+    let s = Session::new(dht_settings(Vec::new())).await.unwrap();
+    match s.dht_sample_infohashes(node_addr, [1; 20]).await {
+        Err(SessionError::Dht(fbt_session::DhtError::Remote { code: 204 })) => {}
+        other => panic!("expected the remote 204, got {other:?}"),
+    }
+    s.shutdown().await;
 }

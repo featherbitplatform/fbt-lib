@@ -1,5 +1,8 @@
 //! Plain-data torrent status snapshots.
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use fbt_core::InfoHashes;
 
 /// What a torrent is doing.
@@ -26,6 +29,11 @@ pub enum TorrentState {
     Seeding,
     /// Stopped by the user: no peers, no announces.
     Paused,
+    /// Auto-managed and waiting for a slot of the session's queue
+    /// ([`Settings::queue`](crate::Settings::queue)): stopped like
+    /// [`Paused`](Self::Paused) until the queue starts it. A torrent both
+    /// paused and queued shows as `Paused`.
+    Queued,
     /// Stopped by a storage error or invalid metadata; see
     /// [`TorrentStatus::error`].
     Error,
@@ -65,8 +73,44 @@ pub struct TorrentStatus {
     pub num_peers: u32,
     /// Connected peers that have every piece.
     pub num_seeds: u32,
+    /// Web seeds (BEP 19) in use: those not retired. See
+    /// [`TorrentHandle::web_seeds`](crate::TorrentHandle::web_seeds).
+    pub num_web_seeds: u32,
     /// The storage or metadata error that stopped the torrent.
     pub error: Option<String>,
+    /// The directory the torrent's files are below, as added and changed
+    /// by [`TorrentHandle::move_storage`](crate::TorrentHandle::move_storage).
+    pub save_path: PathBuf,
+    /// Its place in the session's queue, from 0 (runs first); dense over
+    /// the session's torrents.
+    pub queue_position: usize,
+    /// Under the queue's control
+    /// ([`AddTorrent::auto_managed`](crate::AddTorrent::auto_managed)).
+    pub auto_managed: bool,
+    /// Time spent announced and open to peers since it was added: past
+    /// its check (a magnet's check right after its metadata counts) and
+    /// neither paused, queued nor in error.
+    pub active_time: Duration,
+    /// Time spent running as a seed since it was added.
+    pub seeding_time: Duration,
+    /// Something resume data records changed since the last
+    /// [`save_resume_data`](crate::TorrentHandle::save_resume_data): a
+    /// piece written, a file priority, a rename, a move, a pause or resume,
+    /// a rate limit or the queue. True for a torrent added without resume
+    /// data until its first save.
+    pub need_save_resume: bool,
+    /// For a torrent added from resume data
+    /// ([`AddTorrent::from_resume`](crate::AddTorrent::from_resume)):
+    /// `Some(true)` once its pieces were trusted without a check, `Some(false)`
+    /// once a full check ran instead (a file changed since the save). `None`
+    /// without resume data, while the stamps are being compared, and for a
+    /// magnet saved before its metadata arrived (it has no pieces to trust).
+    pub resume_trusted: Option<bool>,
+    /// Every piece of the torrent is verified, skipped files included
+    /// (libtorrent's `is_seed`). [`TorrentState::Seeding`] only needs the
+    /// wanted pieces; a torrent announces itself to the DHT as a seed
+    /// (BEP 33) only when this is set.
+    pub is_seed: bool,
 }
 
 impl TorrentStatus {
@@ -92,7 +136,16 @@ impl TorrentStatus {
             upload_rate: 0,
             num_peers: 0,
             num_seeds: 0,
+            num_web_seeds: 0,
             error: None,
+            save_path: PathBuf::new(),
+            queue_position: 0,
+            auto_managed: false,
+            active_time: Duration::ZERO,
+            seeding_time: Duration::ZERO,
+            need_save_resume: false,
+            resume_trusted: None,
+            is_seed: false,
         }
     }
 }

@@ -216,24 +216,17 @@ async fn skipped_file_is_not_downloaded() {
     let dir = leech_dir.path().join("torrent");
     assert!(std::fs::read(dir.join("a")).unwrap() == payload[..400_000]);
     assert!(std::fs::read(dir.join("c")).unwrap() == payload[1_100_000..]);
-    // Pieces lying wholly inside "b" were never fetched: wherever the file
-    // exists (a boundary piece may have created it), those bytes are zero.
+    // The skipped file is never created (its bytes in the boundary pieces
+    // live in the part file), and pieces lying wholly inside it were never
+    // fetched.
+    assert!(!dir.join("b").exists(), "skipped file created");
     let (b_start, b_end) = (400_000usize, 1_100_000usize);
     let first = b_start.div_ceil(piece_len);
     let last = b_end / piece_len; // exclusive
     assert!(last > first + 5, "the test needs interior pieces");
     let have = lh.pieces().await.unwrap();
-    let b = std::fs::read(dir.join("b")).unwrap_or_default();
     for piece in first..last {
         assert!(!have.get(piece as u32), "interior piece {piece} downloaded");
-        let lo = piece * piece_len - b_start;
-        let hi = (lo + piece_len).min(b.len());
-        if lo < hi {
-            assert!(
-                b[lo..hi].iter().all(|&x| x == 0),
-                "interior piece {piece} written"
-            );
-        }
     }
     let st = lh.status();
     assert_eq!(st.progress, 1.0);
@@ -812,6 +805,20 @@ async fn seeding_round_robin_serves_every_leecher() {
     for (_, lh, _) in &leechers {
         lh.add_peer(s.local_addr()).await.unwrap();
     }
+    // Start timing only once every leecher is connected to the seeder (and
+    // has had time to say it is interested): on a loaded runner the
+    // connection setup would otherwise eat the first turns, and the first
+    // leechers to arrive could finish before the late ones were served.
+    let connected = tokio::time::Instant::now() + T;
+    while h.status().num_peers < 6 {
+        assert!(
+            tokio::time::Instant::now() < connected,
+            "only {} of 6 leechers connected",
+            h.status().num_peers
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let deadline = tokio::time::Instant::now() + T;
     let served = loop {
         let statuses: Vec<_> = leechers.iter().map(|(_, lh, _)| lh.status()).collect();

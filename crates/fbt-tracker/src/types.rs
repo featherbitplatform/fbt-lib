@@ -139,12 +139,51 @@ pub enum TrackerError {
     /// An I/O or transport error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The proxy could not be reached or refused the tunnel.
+    #[error("proxy error: {0}")]
+    Proxy(String),
+    /// A UDP tracker while trackers go through an HTTP proxy, which cannot
+    /// carry UDP.
+    #[error("UDP trackers cannot go through an HTTP proxy")]
+    ProxyUnsupported,
+    /// The HTTP tracker has no scrape URL: the last segment of its announce
+    /// path does not start with `announce` (BEP 48).
+    #[error("tracker does not support scrape")]
+    ScrapeUnsupported,
+    /// A scrape of more than [`MAX_SCRAPE_HASHES`](crate::MAX_SCRAPE_HASHES)
+    /// info hashes; nothing was sent.
+    #[error("too many info hashes in one scrape")]
+    TooManyHashes,
+    /// A range fetch (a web seed) averaged less than
+    /// 4 KiB/s once it had run for 30 s.
+    #[error("the server sends slower than the minimum rate")]
+    TooSlow,
+}
+
+/// Most info hashes in one scrape: what fits a UDP scrape request in a
+/// 1500-byte datagram (BEP 15), and the HTTP limit too.
+pub const MAX_SCRAPE_HASHES: usize = 74;
+
+/// One torrent's counts from a scrape (BEP 48, BEP 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScrapeInfo {
+    /// The torrent's info hash.
+    pub info_hash: [u8; 20],
+    /// Seeds.
+    pub complete: u32,
+    /// Completed downloads the tracker has seen.
+    pub downloaded: u32,
+    /// Leechers.
+    pub incomplete: u32,
 }
 
 /// Tracker client configuration.
 ///
 /// Build with [`TrackerConfig::default`] and assign the fields to change.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct TrackerConfig {
     /// `User-Agent` header value.

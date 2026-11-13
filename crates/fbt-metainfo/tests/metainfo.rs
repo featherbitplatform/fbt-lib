@@ -235,38 +235,191 @@ fn rejects_negative_length() {
     ));
 }
 
-#[test]
-fn rejects_duplicate_and_prefix_paths() {
-    let info = multi_info(vec![file(10, &["a", "b"]), file(10, &["a", "b"])], 20);
-    assert!(matches!(
-        Metainfo::from_bytes(&torrent(info, &[])),
-        Err(MetainfoError::DuplicatePath(_))
-    ));
-    let info = multi_info(vec![file(10, &["a"]), file(10, &["a", "b"])], 20);
-    assert!(matches!(
-        Metainfo::from_bytes(&torrent(info, &[])),
-        Err(MetainfoError::DuplicatePath(_))
-    ));
-    // Paths made equal only by sanitization collide too.
-    let info = multi_info(vec![file(10, &["a", "b"]), file(10, &["..", "a", "b"])], 20);
-    assert!(matches!(
-        Metainfo::from_bytes(&torrent(info, &[])),
-        Err(MetainfoError::DuplicatePath(_))
-    ));
+/// The paths of a multi-file torrent built from `files`, after parsing.
+fn parsed_paths(files: Vec<OwnedValue>) -> Vec<String> {
+    let total: usize = files.len() * 10;
+    let m = Metainfo::from_bytes(&torrent(multi_info(files, total), &[])).unwrap();
+    m.info.files.iter().map(|f| f.path.to_string()).collect()
 }
 
 #[test]
-fn rejects_case_insensitive_collisions() {
-    let info = multi_info(vec![file(10, &["A.bin"]), file(10, &["a.bin"])], 20);
-    assert!(matches!(
-        Metainfo::from_bytes(&torrent(info, &[])),
-        Err(MetainfoError::DuplicatePath(_))
+fn duplicate_and_prefix_paths_are_renamed() {
+    let got = parsed_paths(vec![file(10, &["a", "b"]), file(10, &["a", "b"])]);
+    assert_eq!(got, ["root/a/b", "root/a/b.1"]);
+    let got = parsed_paths(vec![file(10, &["a"]), file(10, &["a", "b"])]);
+    assert_eq!(got, ["root/a", "root/a.1/b"]);
+    // Paths made equal only by sanitization collide too.
+    let got = parsed_paths(vec![file(10, &["a", "b"]), file(10, &["..", "a", "b"])]);
+    assert_eq!(got, ["root/a/b", "root/a/b.1"]);
+}
+
+#[test]
+fn case_insensitive_collisions_are_renamed() {
+    let got = parsed_paths(vec![file(10, &["A.bin"]), file(10, &["a.bin"])]);
+    assert_eq!(got, ["root/A.bin", "root/a.1.bin"]);
+    let got = parsed_paths(vec![file(10, &["Dir"]), file(10, &["dir", "x"])]);
+    assert_eq!(got, ["root/Dir", "root/dir.1/x"]);
+}
+
+#[test]
+fn case_collision_is_renamed() {
+    let got = parsed_paths(vec![file(10, &["A.txt"]), file(10, &["a.txt"])]);
+    assert_eq!(got, ["root/A.txt", "root/a.1.txt"]);
+}
+
+#[test]
+fn normalisation_collision_is_renamed() {
+    let got = parsed_paths(vec![file(10, &["caf\u{e9}"]), file(10, &["cafe\u{301}"])]);
+    assert_eq!(got, ["root/caf\u{e9}", "root/cafe\u{301}.1"]);
+}
+
+#[test]
+fn file_and_directory_collide() {
+    let got = parsed_paths(vec![file(10, &["a"]), file(10, &["a", "b"])]);
+    assert_eq!(got, ["root/a", "root/a.1/b"]);
+    // The directory first, then a file of the same name.
+    let got = parsed_paths(vec![file(10, &["a", "b"]), file(10, &["a"])]);
+    assert_eq!(got, ["root/a/b", "root/a.1"]);
+}
+
+#[test]
+fn later_files_follow_a_renamed_directory() {
+    let got = parsed_paths(vec![
+        file(10, &["a"]),
+        file(10, &["a", "b"]),
+        file(10, &["a", "c"]),
+        file(10, &["A", "d", "e"]),
+    ]);
+    assert_eq!(got, ["root/a", "root/a.1/b", "root/a.1/c", "root/a.1/d/e"]);
+}
+
+#[test]
+fn renamed_name_avoids_existing() {
+    let got = parsed_paths(vec![
+        file(10, &["x.txt"]),
+        file(10, &["x.1.txt"]),
+        file(10, &["X.txt"]),
+    ]);
+    assert_eq!(got, ["root/x.txt", "root/x.1.txt", "root/X.2.txt"]);
+    // Dotfiles keep no extension.
+    let got = parsed_paths(vec![file(10, &[".rc"]), file(10, &[".RC"])]);
+    assert_eq!(got, ["root/.rc", "root/.RC.1"]);
+}
+
+#[test]
+fn pad_files_never_renamed() {
+    let info = multi_info(
+        vec![
+            file(10, &["a"]),
+            file_attr(16_374, &[".pad", "16374"], "p"),
+            file(10, &["A"]),
+            file_attr(16_374, &[".pad", "16374"], "p"),
+        ],
+        32_768,
+    );
+    let m = Metainfo::from_bytes(&torrent(info, &[])).unwrap();
+    let paths: Vec<String> = m.info.files.iter().map(|f| f.path.to_string()).collect();
+    assert_eq!(
+        paths,
+        ["root/a", "root/.pad/16374", "root/A.1", "root/.pad/16374"]
+    );
+}
+
+#[test]
+fn long_component_stays_within_the_cap() {
+    let lower = format!("{}.bin", "\u{e9}".repeat(125));
+    let upper = format!("{}.bin", "\u{c9}".repeat(125));
+    assert!(lower.len() > 250);
+    let got = parsed_paths(vec![file(10, &[&lower]), file(10, &[&upper])]);
+    let second = got[1].strip_prefix("root/").unwrap();
+    assert!(second.len() <= 255, "{}", second.len());
+    assert!(second.ends_with(".1.bin"), "{second}");
+    assert_ne!(got[0], got[1]);
+}
+
+#[test]
+fn info_hash_unchanged_by_renames() {
+    let info = multi_info(vec![file(10, &["A"]), file(10, &["a"])], 20);
+    let raw = fbt_bencode::encode(&info);
+    let m = Metainfo::from_bytes(&torrent(info, &[])).unwrap();
+    assert_eq!(m.info.files[1].path.to_string(), "root/a.1");
+    let sha1: [u8; 20] = Sha1::digest(&raw).into();
+    assert_eq!(m.info_hashes.v1.unwrap().0, sha1);
+    assert_eq!(m.raw_info(), raw.as_slice());
+}
+
+#[test]
+fn collides_sees_prefixes() {
+    let info = multi_info(vec![file(10, &["x", "y"]), file(10, &["p", "q"])], 20);
+    let m = Metainfo::from_bytes(&torrent(info, &[])).unwrap();
+    let files = &m.info.files;
+    let with_root = |parts: &[&str]| {
+        let mut v = vec!["root"];
+        v.extend_from_slice(parts);
+        fbt_metainfo::sanitize_path(v.iter().map(|s| s.as_bytes())).unwrap()
+    };
+    // `root/x` is a directory prefix of file 0.
+    assert!(fbt_metainfo::collides(files, 1, &with_root(&["x"])));
+    // `root/x/y/z` lies under file 0, which is a file.
+    assert!(fbt_metainfo::collides(
+        files,
+        1,
+        &with_root(&["x", "y", "z"])
     ));
-    let info = multi_info(vec![file(10, &["Dir"]), file(10, &["dir", "x"])], 20);
-    assert!(matches!(
-        Metainfo::from_bytes(&torrent(info, &[])),
-        Err(MetainfoError::DuplicatePath(_))
-    ));
+    // Case and equality.
+    assert!(fbt_metainfo::collides(files, 1, &with_root(&["X", "Y"])));
+    // The file's own path is not a collision with itself.
+    assert!(!fbt_metainfo::collides(files, 0, &with_root(&["x", "y"])));
+    assert!(!fbt_metainfo::collides(files, 1, &with_root(&["x", "w"])));
+    assert_eq!(with_root(&["X", "Y"]).key(), with_root(&["x", "y"]).key());
+}
+
+#[test]
+fn url_list_as_string_and_list() {
+    let content = data(1, 100);
+    let t = torrent(
+        single_info("a", &content, 16_384),
+        &[("url-list", bytes(b"http://seed.example/a"))],
+    );
+    let m = Metainfo::from_bytes(&t).unwrap();
+    assert_eq!(m.web_seeds, ["http://seed.example/a"]);
+    let t = torrent(
+        single_info("a", &content, 16_384),
+        &[(
+            "url-list",
+            list(vec![
+                bytes(b"https://one.example/"),
+                bytes(b"http://two.example/"),
+                bytes(b"https://one.example/"),
+            ]),
+        )],
+    );
+    let m = Metainfo::from_bytes(&t).unwrap();
+    assert_eq!(m.web_seeds, ["https://one.example/", "http://two.example/"]);
+    let m = Metainfo::from_bytes(&torrent(single_info("a", &content, 16_384), &[])).unwrap();
+    assert!(m.web_seeds.is_empty());
+}
+
+#[test]
+fn url_list_drops_non_http_and_caps() {
+    let content = data(1, 100);
+    let long = format!("http://seed.example/{}", "x".repeat(3000));
+    let mut items = vec![
+        bytes(b"ftp://seed.example/a"),
+        bytes(long.as_bytes()),
+        bytes(b"not a url"),
+        bytes(b"http://"),
+    ];
+    items.extend((0..20).map(|i| bytes(format!("http://s{i}.example/").as_bytes())));
+    let t = torrent(
+        single_info("a", &content, 16_384),
+        &[("url-list", list(items))],
+    );
+    let m = Metainfo::from_bytes(&t).unwrap();
+    assert_eq!(m.web_seeds.len(), fbt_metainfo::MAX_WEB_SEEDS);
+    assert_eq!(m.web_seeds.len(), 16);
+    assert_eq!(m.web_seeds[0], "http://s0.example/");
+    assert!(m.web_seeds.iter().all(|u| u.starts_with("http://s")));
 }
 
 #[test]
@@ -382,4 +535,30 @@ fn trackers_capped_at_64_urls() {
     let sizes: Vec<usize> = m.trackers.iter().map(Vec::len).collect();
     assert_eq!(sizes, vec![30, 30, 4]);
     assert_eq!(m.trackers.concat(), urls[..64].to_vec());
+}
+
+/// Every distinct case variant of one 20-letter name: one key, many files.
+#[test]
+fn case_variant_flood_ends_up_distinct() {
+    let names: Vec<String> = (0..20_000u32)
+        .map(|i| {
+            (0..20u32)
+                .map(|b| {
+                    let c = char::from(b'a' + u8::try_from(b).unwrap());
+                    if (i >> b) & 1 == 1 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let files: Vec<OwnedValue> = names.iter().map(|n| file(1, &[n.as_str()])).collect();
+    let t = torrent(multi_info(files, names.len()), &[]);
+    let m = Metainfo::from_bytes(&t).unwrap();
+    let mut keys: Vec<String> = m.info.files.iter().map(|f| f.path.key()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), 20_000, "every path ends up distinct");
 }

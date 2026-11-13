@@ -15,6 +15,7 @@ workspace = true
 fbt-bencode = { path = "../fbt-bencode" }
 fbt-core = { path = "../fbt-core" }
 thiserror.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

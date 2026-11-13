@@ -17,6 +17,8 @@ use std::time::Duration;
 /// [`bytes`](Self::bytes), or [`time`](Self::time) of playback at
 /// [`bitrate`](Self::bitrate) when that is more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct ReadAhead {
     /// Least window, in bytes (16 MiB).

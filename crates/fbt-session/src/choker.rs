@@ -17,6 +17,7 @@ use crate::settings::Settings;
 
 /// How regular upload slots are opened while downloading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum ChokingAlgorithm {
     /// `unchoke_slots` minus the optimistic slots, to the peers uploading
@@ -33,6 +34,7 @@ pub enum ChokingAlgorithm {
 
 /// How regular upload slots are given while seeding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum SeedChokingAlgorithm {
     /// Every interested peer gets a turn: a peer keeps its slot until it

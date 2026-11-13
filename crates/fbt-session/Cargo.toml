@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 default = []
+serde = ["dep:serde", "fbt-tracker/serde", "fbt-net/serde"]
 tls-ring = ["fbt-tracker/tls-ring"]
 tls-rustcrypto = ["fbt-tracker/tls-rustcrypto"]
 
@@ -24,6 +25,7 @@ fbt-wire = { path = "../fbt-wire" }
 fbt-dht = { path = "../fbt-dht" }
 fbt-net = { path = "../fbt-net" }
 fbt-utp = { path = "../fbt-utp" }
+fbt-bencode = { path = "../fbt-bencode" }
 socket2.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "io-util"] }
@@ -35,8 +37,12 @@ bitflags.workspace = true
 futures-core.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-fbt-bencode = { path = "../fbt-bencode" }
+proptest.workspace = true
+# BEP 44 tests derive the public key of a fixed seed.
+ed25519-dalek.workspace = true
 tempfile.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }

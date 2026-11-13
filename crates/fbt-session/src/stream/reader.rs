@@ -106,6 +106,12 @@ type Fetch = Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send>>;
 /// count against every limit, so a limit below the stream's bitrate makes
 /// reads wait.
 ///
+/// A skipped file can be read too: its pieces are downloaded for the
+/// reader all the same. With [`FsStorage`](crate::storage::FsStorage) a
+/// skipped file that does not exist on disk stays uncreated, and the bytes
+/// streamed fill the torrent's part file instead
+/// ([`FsStorage::part_path`](crate::storage::FsStorage::part_path)).
+///
 /// A read fails only when the torrent is removed, the session shuts down or
 /// the torrent stops with an error; the [`io::Error`] carries a
 /// [`StreamError`]. The reader is not poisoned: after

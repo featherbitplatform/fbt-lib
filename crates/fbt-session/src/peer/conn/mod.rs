@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PeerId, PieceLayout};
+use fbt_net::proxy::{ProxyKind, ProxyTarget, connect_tcp};
 use fbt_utp::{UtpError, UtpSocket};
 use fbt_wire::{
     CryptoMethods, Handshake, HandshakeError, MseStream, Reserved, WireError, initiate,
@@ -159,7 +160,13 @@ pub(crate) fn spawn_outgoing(
     tx
 }
 
-/// Opens the transport to `addr`. TCP waits up to `connect_timeout`; uTP up
+/// Peer TCP dials go through [`Settings::proxy`].
+fn proxied(settings: &Settings) -> bool {
+    settings.proxy.kind != ProxyKind::None && settings.proxy.proxy_peers
+}
+
+/// Opens the transport to `addr`. TCP waits up to `connect_timeout` (through
+/// the proxy when [`Settings::proxy`] covers peers); uTP up
 /// to the socket's connect timeout (`utp_connect_timeout`). Fails with
 /// [`DisconnectReason::Io`] and whether it was a connect failure that the
 /// other transport may get past: every TCP error and timeout, a uTP
@@ -174,6 +181,19 @@ async fn connect(
 ) -> Result<PeerTransport, (DisconnectReason, bool)> {
     let io = |msg: String| DisconnectReason::Io(msg);
     match transport {
+        Transport::Tcp if proxied(settings) => {
+            // The proxy dial, negotiation and reply share the timeout.
+            match connect_tcp(
+                &settings.proxy,
+                ProxyTarget::Addr(addr),
+                settings.connect_timeout,
+            )
+            .await
+            {
+                Ok(s) => Ok(PeerTransport::Tcp(s)),
+                Err(e) => Err((io(e.to_string()), true)),
+            }
+        }
         Transport::Tcp => match timeout(settings.connect_timeout, TcpStream::connect(addr)).await {
             Ok(Ok(s)) => Ok(PeerTransport::Tcp(s)),
             Ok(Err(e)) => Err((io(e.to_string()), true)),

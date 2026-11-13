@@ -2,7 +2,7 @@
 
 A from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent, and an idiomatic async Rust API. It is the engine for featherbittorrent, a future client with a terminal UI, a web UI and media streaming while downloading. It has no UI of its own and runs on macOS, Linux and Windows.
 
-Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 added the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange (v0.2.0). Milestone 3 added uTP, local and NAT reach, rate limits and a write-back cache (v0.3.0). Milestone 4 adds streaming while downloading, a seekable reader over a torrent that is still downloading, and is heading for v0.4.0. Nothing is published to crates.io and the API will change.
+Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 added the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange (v0.2.0). Milestone 3 added uTP, local and NAT reach, rate limits and a write-back cache (v0.3.0). Milestone 4 added streaming while downloading, with a seekable reader over a torrent that is still downloading (v0.4.0). Milestone 5 adds persistence and operations (resume data, queueing, proxies, IP filtering, web seeds and more DHT) and is heading for v0.5.0. Nothing is published to crates.io and the API will change.
 
 ## Features
 
@@ -16,7 +16,15 @@ Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 
 - Global, per-torrent and per-peer-class rate limits; rate-based and seeding choker variants; BEP 21 upload-only and BEP 54 `lt_donthave`
 - Bounded write-back cache that coalesces writes, and a queue for file checks
 - Streaming while downloading: a seekable `FileReader` (tokio `AsyncRead` and `AsyncSeek`) whose position sets deadlines on a read-ahead window, fetched first from the fastest peers; seeks replace the window, and several readers can share a torrent
-- Pure Rust, no `unsafe`; hostile peer, tracker and `.torrent` input is bounded
+- Resume data and session state as bytes (the library writes no state files), trusted on restart without a recheck when the files are unchanged
+- Queueing of auto-managed torrents (3 downloads and 5 seeds at once by default) and optional seed ratio and seed time limits
+- Moving a torrent's storage and renaming its files; skipped files are never created (a part file holds their pieces' shared bytes); colliding paths are renamed
+- SOCKS5 and HTTP `CONNECT` proxies for peers, web seeds, trackers and, through SOCKS5, the DHT and uTP
+- IP filter, one connection per IP per torrent, and smart ban of peers that send bad blocks
+- HTTP and HTTPS web seeds (BEP 19)
+- DHT scrape (BEP 33), `sample_infohashes` (BEP 51) and immutable and mutable items (BEP 44); tracker scrape
+- `serde` for the public config structs (the `serde` feature)
+- Pure Rust, no `unsafe`; hostile peer, tracker, proxy, web seed, resume and `.torrent` input is bounded
 
 ## Usage
 
@@ -124,6 +132,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `RateLimit::new(download, upload)` takes bytes per second. `Settings::cache_size` bounds the memory spent on dirty, clean and partial-piece bytes together; only verified bytes are served or written.
 
+### Resume data and session state
+
+```rust
+use fbt::{AddTorrent, Metainfo, Session, SessionState, Settings};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let metainfo = Metainfo::from_bytes(&std::fs::read("example.torrent")?)?;
+    let session = Session::new(Settings::default()).await?;
+    let torrent = session
+        .add_torrent(AddTorrent::new(metainfo, "downloads".into()))
+        .await?;
+
+    // One torrent: pause first, so nothing is written after the save.
+    torrent.pause().await?;
+    std::fs::write("example.resume", torrent.save_resume_data().await?)?;
+    session.shutdown().await;
+
+    // Next run: the saved pieces are trusted if the files are unchanged.
+    let session = Session::new(Settings::default()).await?;
+    let mut params = AddTorrent::from_resume(&std::fs::read("example.resume")?)?;
+    params.paused = false; // it was saved paused
+    let torrent = session.add_torrent(params).await?;
+    println!("{} added", torrent.status().name);
+
+    // The whole session: every torrent and the DHT state at shutdown.
+    let (state, failed) = session.shutdown_and_save().await;
+    for (info_hash, error) in failed {
+        eprintln!("{info_hash} not saved: {error}");
+    }
+    std::fs::write("session.state", state.to_bytes())?;
+
+    // Next run: one call restores them all.
+    let state = SessionState::from_bytes(&std::fs::read("session.state")?)?;
+    let (session, failed) = Session::restore(Settings::default(), &state).await?;
+    for (index, error) in failed {
+        eprintln!("torrent {index} not restored: {error}");
+    }
+    session.shutdown().await;
+    Ok(())
+}
+```
+
+The library writes no state files: resume data and the session state are bytes for the client to store. A resume file is trusted, and its pieces taken without a check, when every file holding a saved piece (and the part file, when it holds one) has the length and modification time, in whole seconds, it had at the save; otherwise the add runs a full check. `TorrentStatus::resume_trusted` says which happened. A file written after the save no longer matches, so save after `pause` or through `Session::shutdown_and_save`. Resume data is hostile input: bad data fails with a `ResumeError` naming the field.
+
+### Queueing and seed limits
+
+Torrents are auto-managed by default: in queue order, at most 3 downloads and 5 seeds run at once (500 in all), and the others wait as `TorrentState::Queued`. `Settings::queue` (`QueueSettings`) and `Session::set_queue_settings` change the limits; `TorrentHandle::set_queue_position` and `set_auto_managed` change one torrent. A torrent the user paused is never started by the queue. Seed limits (`Settings::seed_ratio_limit`, `seed_time_limit`) are off by default; reaching one pauses the torrent and emits `Event::SeedLimitReached`.
+
+### Proxies
+
+`Settings::proxy` (`ProxyConfig`) sends peer connections, web seeds and trackers through a SOCKS5 or HTTP `CONNECT` proxy; `proxy_peers`, `proxy_trackers` and `proxy_hostnames` (all on) choose what goes through it, and listening is unchanged. The caveats:
+
+- SOCKS5 proxies all UDP or none: with `proxy_peers` or `proxy_trackers`, outgoing uTP, the DHT and UDP trackers all go through one UDP ASSOCIATE. The session then listens on TCP only, the DHT runs over the relay's address family only (IPv4 in practice), and incoming uTP arrives only as the relay forwards it.
+- An HTTP proxy cannot carry UDP: with `proxy_peers` outgoing uTP is off, with `proxy_trackers` UDP trackers fail, and the DHT runs directly unless `dht_enabled` is off.
+- Many HTTP proxies refuse `CONNECT` to port 80, so plain-HTTP trackers may fail through them.
+- UDP tracker and DHT bootstrap host names are resolved locally whatever `proxy_hostnames` says, and LSD, UPnP and NAT-PMP stay direct on the local network.
+
+### IP filter, bans and web seeds
+
+`Session::set_ip_filter` installs an `IpFilter` (block and allow ranges, the last rule wins) for peers from every source, never for trackers, DHT nodes or the proxy. A torrent accepts one connection per IP address by default (`Settings::max_peers_per_ip`; loopback is exempt). Smart ban bans, for the rest of the session, the peer whose blocks made a piece fail its hash check, and never an honest co-contributor; bans live apart from the filter (`Session::banned_peers`). Blocked peers are reported as `Event::PeerBlocked`.
+
+Web seeds (BEP 19) come from a torrent's `url-list`, a magnet's `ws` or `TorrentHandle::add_web_seed`, and are fetched with ranged HTTP(S) requests under the download limits and through the proxy. A failing seed backs off from 30 s to 30 minutes; a 4xx answer other than 408 and 429, or corrupt data, retires it (`Event::WebSeedError`).
+
 ### What goes on your LAN
 
 `Settings::default()` is not quiet on the local network. Each feature has its own switch:
@@ -142,7 +214,7 @@ All three are on by default; set them to `false` to stay off the LAN. Private to
 
 `Settings::encryption` defaults to `EncryptionPolicy::Preferred`: outgoing connections open with an MSE handshake and may fall back to plain text. `Forced` refuses plain text, `Disabled` never encrypts.
 
-`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`, plus `--transport tcp|utp|both`, `--listen ADDR`, `--download-limit` and `--upload-limit`, `--cache-mb`, and `--lsd` and `--nat` (both off in the CLI); `fbt-example stream <torrent> --file N --out DIR` streams file `N` to stdout or a file while it downloads, fetching only what is read plus the read-ahead window, with `--seek`, `--length`, `--bitrate` and `--peer`; `fbt-example dht-node` runs a bare DHT node.
+`fbt-example` is a small command-line downloader and seeder built on the same API. `fbt-example download <torrent-or-magnet> --out DIR` takes a `.torrent` file or a `magnet:` link, with `--encryption forced|preferred|disabled`, `--dht-bootstrap HOST:PORT`, `--no-dht` and `--no-pex`, plus `--transport tcp|utp|both`, `--listen ADDR`, `--download-limit` and `--upload-limit`, `--cache-mb`, and `--lsd` and `--nat` (both off in the CLI); `fbt-example stream <torrent> --file N --out DIR` streams file `N` to stdout or a file while it downloads, fetching only what is read plus the read-ahead window, with `--seek`, `--length`, `--bitrate` and `--peer`; `fbt-example dht-node` runs a bare DHT node. `download` also takes `--resume PATH` (loads the resume data when the file exists, and writes it on exit after pausing; it prints `resume: trusted (<n> pieces)` or `resume: checking`), `--stop-at PERCENT` (pause, save, shut down and exit once that much is done) and `--web-seed URL` (repeatable); `download`, `seed` and `stream` take `--proxy socks5://[user:pass@]host:port` or `http://[user:pass@]host:port`. The CLI prints tracker replies and errors.
 
 ## Feature flags
 
@@ -152,6 +224,7 @@ Set on the `fbt` crate.
 |---|---|---|
 | `tls` | yes | HTTPS trackers over rustls with the `ring` provider (needs a C toolchain to build) |
 | `pure-rust` | no | HTTPS trackers over rustls with the pure-Rust RustCrypto provider: no C or assembly. Depend on `fbt` with `default-features = false, features = ["pure-rust"]`. The provider is a pre-release crate (`rustls-rustcrypto`), so expect churn |
+| `serde` | no | `Serialize` and `Deserialize` for the public config structs and enums (`Settings`, `QueueSettings`, `ProxyConfig`, `TrackerConfig`, `RateLimit`, ...) and `IpFilter` (a list of `{ start, end, blocked }` rules); structs use `#[serde(default)]`, so a saved config missing newer fields still loads |
 
 `bash dev/check-pure-rust.sh` verifies that the `pure-rust` build pulls in neither `ring` nor `cc` (nor any other C-building crate), through normal and build dependencies.
 
@@ -177,13 +250,13 @@ cargo deny --all-features check
 
 ## Interop and fuzzing
 
-Live interop against qBittorrent-nox and Transmission through opentracker, plus magnet via DHT, forced encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent and LSD between two fbt containers on isolated networks with their own DHT node (no public node and no router is contacted), needs Docker (details in [dev/interop/README.md](dev/interop/README.md)):
+Live interop against qBittorrent-nox and Transmission through opentracker, plus magnet via DHT, forced encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent, LSD between two fbt containers, resume without recheck against qBittorrent, a web seed served by nginx, and a download through a SOCKS5 proxy (Dante) on isolated networks with their own DHT node (no public node and no router is contacted), needs Docker (details in [dev/interop/README.md](dev/interop/README.md)):
 
 ```
 bash dev/interop/run.sh
 ```
 
-Fuzzing needs nightly and `cargo install cargo-fuzz --locked`. Targets: `bencode`, `metainfo`, `wire_codec`, `handshake`, `http_announce`, `udp_announce`, `path`, `krpc`, `extension`, `mse`, `magnet`, `utp_packet`, `utp_conn`, `lsd`, `ssdp`, `upnp_xml`, `natpmp`; seeds live in `fuzz/seeds/<target>/`.
+Fuzzing needs nightly and `cargo install cargo-fuzz --locked`. Targets: `bencode`, `metainfo`, `wire_codec`, `handshake`, `http_announce`, `udp_announce`, `path`, `krpc`, `extension`, `mse`, `magnet`, `utp_packet`, `utp_conn`, `lsd`, `ssdp`, `upnp_xml`, `natpmp`, `resume`, `socks5`, `http_connect`, `scrape`, `web_seed_head`; seeds live in `fuzz/seeds/<target>/`.
 
 ```
 mkdir -p fuzz/corpus/<target>

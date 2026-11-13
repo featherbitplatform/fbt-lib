@@ -15,6 +15,7 @@ workspace = true
 fbt-core = { path = "../fbt-core" }
 fbt-bencode = { path = "../fbt-bencode" }
 sha1.workspace = true
+ed25519-dalek.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
