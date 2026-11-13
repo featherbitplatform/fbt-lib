@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `fbt-api`: a new crate, an HTTP/JSON API over an `fbt::Session` built on axum (only this crate depends on a server stack; the core crates stay server-free). `router(session, &ApiConfig)` returns an `axum::Router` to mount in your own server, `router_with_shutdown` does the same and also ends open event and file streams when a future of yours completes (so your server's graceful shutdown does not wait on them), and `ApiServer::start` runs a standalone one. Route groups under `/api/v1`: ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+  - torrents: list, status, `files`, `peers`, `trackers`, `pieces`, `resume-data` and `magnet`
+  - control: add (`.torrent` upload or magnet), add from resume data, remove, pause, resume, recheck, reannounce, scrape, file priorities, per-torrent limits, queue position, auto-managed, move, rename file, web seeds and manual peers
+  - session: settings and state, rate limits, queue settings, IP filter and banned peers
+  - `create-torrent`: torrent creation with at most 2 creations at once
+  - events: a server-sent event stream with category filters, a bounded subscriber queue and a `lagged` notice for a slow client
+  - streaming: `GET` and `HEAD` of a torrent file with single `Range` requests (`206`, `416`, a `Range` the parser cannot serve falls back to a full `200`), fetching only what is read
+  - `GET /api/v1/openapi.json`: the OpenAPI 3.1 document, served without a token and also available as `fbt_api::openapi()`
+- `fbt-api` auth model: `Auth::Token` (bearer token on every request; `?token=` is accepted on the stream and event URLs only, for media elements and `EventSource`) or `Auth::Disabled`, which needs a loopback `bind` and answers `403` to a `Host` that is not `localhost`, `127.0.0.1` or `[::1]` and to an `Origin` not in `cors_origins` (the CSRF and DNS-rebinding guard); optional CORS origins ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+- `fbt-api` limits: `allowed_roots` confines every path a request names (save paths, move targets, creation sources) to directories, with a lexical check before any filesystem access, symlinks resolved and refused when they leave the roots, `403 path_not_allowed` otherwise; request bodies capped (`MAX_BODY_BYTES`, 32 MiB by default, `413`), at most `max_streams` (32) file streams and `max_event_streams` (16) event streams at once (`503`), at most `max_connections` (256) connections served by `ApiServer` at once (further clients wait in the listen backlog), and a named cap on every collection a request carries (create-torrent tracker tiers, URLs and web seeds together at most 256, an empty tier counting as one; file priorities at most 4 194 304), enforced while the body is parsed; file streams are sent with `X-Content-Type-Options: nosniff` ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+- `ApiServer::shutdown` is graceful and bounded: it stops accepting, ends event and file streams and aborts the remaining connections after a deadline ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+- `fbt-session`: `TorrentHandle::files`, `peers` and `trackers` with the new `FileStatus`, `PeerStatus` and `TrackerStatus` types (re-exported by `fbt`) ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+- `fbt-session`: `Session::rate_limit`, `peer_class_limits`, `queue_settings` and `is_shut_down`, the readers for what the session was configured with ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+- `fbt-example`: `--api ADDR --api-token TOKEN` on `download` and `seed` serve the API next to the transfer (either flag alone is a usage error) ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+- Fuzz target `http_range` (the `Range` header parser) with seeds ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+- Interop scenario `api`: `fbt-example download --api` serves the API while it downloads, and curl lists the torrent, streams byte ranges, checks 401 and 416 and follows the event stream ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+
+### Changed
+
+- `PeerSource` gains the variants `Incoming`, `Manual`, `Resume` and `Holepunch`; match it with a wildcard arm. Redials of remembered peers keep the source they were learnt from, and the first source that learnt an address wins ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+- Peer client names are sanitised: control and Unicode format characters are stripped and a name is at most 64 characters. The libtorrent Azureus ids are corrected (`LT` is "libtorrent", `lt` is "libTorrent") ([#20](https://github.com/featherbitplatform/fbt-lib/pull/20))
+
 ## [0.6.0] - 2026-11-13
 
 ### Added

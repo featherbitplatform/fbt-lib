@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**fbt-lib**: a from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent and an idiomatic async API. It is the engine for featherbittorrent (`../featherbittorrent`). Cargo workspace under `crates/`: `fbt-bencode`, `fbt-core`, `fbt-metainfo`, `fbt-wire`, `fbt-tracker`, `fbt-dht`, `fbt-utp`, `fbt-net`, `fbt-session`, `fbt` (public facade) and `fbt-example`.
+**fbt-lib**: a from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent and an idiomatic async API. It is the engine for featherbittorrent (`../featherbittorrent`). Cargo workspace under `crates/`: `fbt-bencode`, `fbt-core`, `fbt-metainfo`, `fbt-wire`, `fbt-tracker`, `fbt-dht`, `fbt-utp`, `fbt-net`, `fbt-session`, `fbt` (public facade), `fbt-api` (HTTP/JSON API, the only crate with a server stack) and `fbt-example`.
 
 Binding design: `docs/superpowers/specs/2026-11-10-fbt-lib-design.md`. Read it before any feature work; it records which decisions are the owner's and which are the builder's calls. Plans live next to it under `docs/superpowers/plans/`.
 
@@ -55,13 +55,13 @@ bash dev/bench.sh
 # Live interop vs qBittorrent-nox and Transmission via opentracker, plus magnet via DHT, forced
 # encryption, PEX, uTP with qBittorrent, streaming with seeks from qBittorrent, LSD between two
 # fbt-example containers, resume without recheck, a web seed (nginx), a SOCKS5 proxy (Dante),
-# and v2 and hybrid torrents (creation hashes, hash requests, `btmh` magnets), on isolated
+# v2 and hybrid torrents (creation hashes, hash requests, `btmh` magnets), and the HTTP API (`api`), on isolated
 # networks with our own dht-node (Docker; see dev/interop/README.md)
 bash dev/interop/run.sh
 
 # Fuzzing (nightly + `cargo install cargo-fuzz --locked`); targets: bencode metainfo wire_codec
 # handshake http_announce udp_announce path krpc extension mse magnet utp_packet utp_conn lsd ssdp
-# upnp_xml natpmp resume socks5 http_connect scrape web_seed_head hash_proof. Seeds live in fuzz/seeds/<target>/.
+# upnp_xml natpmp resume socks5 http_connect scrape web_seed_head hash_proof http_range. Seeds live in fuzz/seeds/<target>/.
 mkdir -p fuzz/corpus/<target>
 cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 ```

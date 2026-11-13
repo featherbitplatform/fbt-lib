@@ -11,7 +11,7 @@ use fbt::{
     SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
     TrackerConfig, TrackerError, Transport,
 };
-use fbt::{BlockReason, IpFilter, MoveMode, QueueSettings};
+use fbt::{BlockReason, FileStatus, IpFilter, MoveMode, PeerStatus, QueueSettings, TrackerStatus};
 use fbt::{
     CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
     PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
@@ -67,6 +67,9 @@ fn names(
     _: Option<TorrentVersion>,
     _: Option<V2Piece>,
     _: Option<TorrentStatus>,
+    _: Option<FileStatus>,
+    _: Option<PeerStatus>,
+    _: Option<TrackerStatus>,
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
     _: Option<Transport>,
@@ -395,4 +398,56 @@ async fn dht_methods(s: &Session, addr: std::net::SocketAddr) {
         .dht_put_mutable([0; 32], Vec::new(), b"i1e".to_vec(), 1, Some(0))
         .await;
     let _ = r;
+}
+
+/// Detail calls and session getters.
+async fn detail_methods(s: &Session, h: &TorrentHandle) {
+    if let Ok(files) = h.files().await {
+        for f in files {
+            let _: (usize, std::path::PathBuf, u64, bool, Priority, u64) =
+                (f.index, f.path, f.len, f.pad, f.priority, f.downloaded);
+        }
+    }
+    let r: Result<Vec<PeerStatus>, SessionError> = h.peers().await;
+    if let Ok(peers) = r {
+        for p in peers {
+            let _: (std::net::SocketAddr, Option<String>, Transport, bool, bool) =
+                (p.addr, p.client, p.transport, p.encrypted, p.incoming);
+            let _: (u64, u64, u64, u64) = (
+                p.download_rate,
+                p.upload_rate,
+                p.total_downloaded,
+                p.total_uploaded,
+            );
+            let _: (bool, bool, bool, bool) = (
+                p.peer_choking,
+                p.peer_interested,
+                p.am_choking,
+                p.am_interested,
+            );
+            let _: (f64, PeerSource) = (p.progress, p.source);
+        }
+    }
+    let _ = [
+        PeerSource::Incoming,
+        PeerSource::Manual,
+        PeerSource::Resume,
+        PeerSource::Holepunch,
+    ];
+    let r: Result<Vec<TrackerStatus>, SessionError> = h.trackers().await;
+    if let Ok(trackers) = r {
+        for t in trackers {
+            let _: (String, usize, [u8; 20], Option<String>) =
+                (t.url, t.tier, t.info_hash, t.last_error);
+            let _: (Option<std::time::SystemTime>, Option<std::time::Duration>) =
+                (t.last_reply, t.next_announce);
+            let _: (Option<u32>, Option<u32>, Option<u32>) =
+                (t.seeders, t.leechers, t.peers_returned);
+        }
+    }
+    let _: Vec<FileStatus> = Vec::new();
+    let _: RateLimit = s.rate_limit();
+    let _: PeerClassLimits = s.peer_class_limits();
+    let _: QueueSettings = s.queue_settings();
+    let _: bool = s.is_shut_down();
 }

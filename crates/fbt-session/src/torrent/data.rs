@@ -656,6 +656,7 @@ pub(super) mod tests {
             actor.generation,
             num_pieces,
             crate::peer::transport::Transport::Tcp,
+            crate::event::PeerSource::Tracker,
         );
         peer.connected = true;
         peer.seed = true;

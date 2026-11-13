@@ -248,7 +248,7 @@ pub(crate) struct Actor {
     pub(super) peers: HashMap<PeerKey, Peer>,
     pub(super) next_key: u64,
     /// Addresses waiting for a connection slot.
-    pub(super) candidates: VecDeque<SocketAddr>,
+    pub(super) candidates: VecDeque<(SocketAddr, PeerSource)>,
     /// Every address given to `add_peer`, reconnected on resume.
     pub(super) known: Known,
     /// Retry schedule and never-retry set of outgoing connections.
@@ -579,7 +579,7 @@ impl Actor {
             .unwrap_or_default();
         for addr in saved {
             if dialable(&addr) && self.shared.blocked(addr).is_none() {
-                self.remember(addr);
+                self.remember(addr, PeerSource::Resume);
             }
         }
         self.start_check();
@@ -600,8 +600,9 @@ impl Actor {
         for addr in hints {
             if dialable(&addr) && !self.refuse_blocked(addr) {
                 count = count.saturating_add(1);
-                if self.remember(addr) {
-                    self.queue_addr(addr);
+                if self.remember(addr, PeerSource::Magnet) {
+                    let source = self.known_source(&addr);
+                    self.queue_addr(addr, source);
                 }
             }
         }
@@ -992,8 +993,9 @@ impl Actor {
                 continue;
             }
             count = count.saturating_add(1);
-            if !self.retries.is_never(&addr) && self.remember(addr) && self.connectable() {
-                self.queue_addr(addr);
+            if !self.retries.is_never(&addr) && self.remember(addr, source) && self.connectable() {
+                let source = self.known_source(&addr);
+                self.queue_addr(addr, source);
             }
         }
         self.peers_found(source, count);
@@ -1133,10 +1135,18 @@ mod tests {
             3,
             4,
             crate::peer::transport::Transport::Tcp,
+            crate::event::PeerSource::Tracker,
         );
         closing.bits.set(0);
         closing.tx = None;
-        let mut stale = Peer::new(addr, tx, 2, 4, crate::peer::transport::Transport::Tcp);
+        let mut stale = Peer::new(
+            addr,
+            tx,
+            2,
+            4,
+            crate::peer::transport::Transport::Tcp,
+            crate::event::PeerSource::Tracker,
+        );
         stale.bits.set(1);
         let peers = HashMap::from([(PeerKey(1), closing), (PeerKey(2), stale)]);
         add_availability(&mut picker, &peers, 3);

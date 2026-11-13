@@ -827,3 +827,70 @@ fn create_bad_piece_size_is_a_clean_error() {
     assert!(stderr.contains("invalid piece length 1000"), "{stderr}");
     assert!(!tmp.path().join("f.torrent").exists());
 }
+
+#[test]
+fn api_flag_serves_the_api() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (torrent_path, seed_dir, hash) = seed_fixture(tmp.path());
+    let mut seed = Kill(
+        Command::new(BIN)
+            .arg("seed")
+            .arg(&torrent_path)
+            .arg("--data")
+            .arg(&seed_dir)
+            .args(["--port", "0", "--no-dht", "--api", "127.0.0.1:0"])
+            .args(["--api-token", "t"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn seed"),
+    );
+    let stdout = seed.0.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = BufReader::new(stdout);
+        let mut line = String::new();
+        while lines.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+            if let Some(addr) = line.trim().strip_prefix("api: listening on ") {
+                let _ = tx.send(addr.to_string());
+            }
+            // Keep draining so the seed never blocks on a full pipe.
+            line.clear();
+        }
+    });
+    let addr = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("seed printed the api listening line");
+
+    let mut conn = std::net::TcpStream::connect(&addr).expect("connect to the api");
+    conn.set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("read timeout");
+    std::io::Write::write_all(
+        &mut conn,
+        format!(
+            "GET /api/v1/torrents HTTP/1.1\r\nHost: {addr}\r\n\
+             Authorization: Bearer t\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .expect("send request");
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut conn, &mut response).expect("read response");
+    let (head, body) = response.split_once("\r\n\r\n").expect("a full response");
+    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
+    let body = body.trim();
+    assert!(body.starts_with('[') && body.ends_with(']'), "{body}");
+    assert_eq!(body.matches("\"info_hash_v1\":").count(), 1, "{body}");
+    assert!(body.contains(&format!("\"id\":\"{hash}\"")), "{body}");
+
+    let out = Command::new(BIN)
+        .arg("seed")
+        .arg(&torrent_path)
+        .arg("--data")
+        .arg(&seed_dir)
+        .args(["--port", "0", "--no-dht", "--api", "127.0.0.1:0"])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--api-token"), "{stderr}");
+}
