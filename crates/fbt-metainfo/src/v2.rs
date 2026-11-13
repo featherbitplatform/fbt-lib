@@ -82,10 +82,12 @@ struct Leaf {
 /// Parses a v2 `file tree` into files in key order, with a synthetic
 /// `.pad/<len>` entry before every non-empty file that would not start on a
 /// piece boundary. The flag is true for a single-file torrent: exactly one
-/// file, at the top level, whose path is then just `name`.
+/// top-level entry, a file whose raw key equals the raw `name` (libtorrent's
+/// rule); its path is then just `name`. Anything else is a directory.
 pub(crate) fn parse_file_tree(
     tree: &Dict<'_>,
     name: &str,
+    raw_name: &[u8],
     piece_len: u32,
 ) -> Result<(Vec<FileEntry>, bool), MetainfoError> {
     if tree.get(b"").is_some() {
@@ -97,7 +99,8 @@ pub(crate) fn parse_file_tree(
     if leaves.is_empty() {
         return Err(invalid("file tree", "empty"));
     }
-    let single = matches!(leaves.as_slice(), [only] if only.depth == 1);
+    let single = matches!(leaves.as_slice(), [only] if only.depth == 1)
+        && tree.iter().next().is_some_and(|(k, _)| k == raw_name);
 
     let mut out = Vec::with_capacity(leaves.len());
     let mut offset: u64 = 0;

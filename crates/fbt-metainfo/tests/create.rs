@@ -303,3 +303,24 @@ fn private_trackers_and_seeds_round_trip() {
     assert_eq!(m.comment.as_deref(), Some("hello"));
     assert_eq!(m.created_by.as_deref(), Some("fbt"));
 }
+
+#[test]
+fn one_file_directory_stays_a_directory() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("content");
+    fs::create_dir(&root).unwrap();
+    let data: Vec<u8> = (0..50_000u32).map(|k| k as u8).collect();
+    fs::write(root.join("a.bin"), &data).unwrap();
+    let bytes = build(&CreateTorrent::new(&root).version(TorrentVersion::V2)).unwrap();
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    assert!(!m.info.single_file);
+    assert_eq!(m.info.files.len(), 1);
+    assert_eq!(m.info.files[0].path.components(), ["content", "a.bin"]);
+    let pl = m.info.piece_len as usize;
+    for p in 0..data.len().div_ceil(pl) {
+        let v2 = m.v2_piece(p as u32).unwrap();
+        let chunk = &data[p * pl..((p + 1) * pl).min(data.len())];
+        let got = piece_root(&chunk[..v2.len as usize], v2.leaves as usize);
+        assert_eq!(Some(got), v2.expected);
+    }
+}

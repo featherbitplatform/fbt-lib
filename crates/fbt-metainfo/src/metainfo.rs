@@ -363,7 +363,7 @@ fn parse_info(info_val: &Value<'_>) -> Result<ParsedInfo, MetainfoError> {
             .ok_or(MetainfoError::MissingField("file tree"))?
             .as_dict()
             .ok_or_else(|| invalid("file tree", "not a dictionary"))?;
-        Some(parse_file_tree(tree, &name, piece_len)?)
+        Some(parse_file_tree(tree, &name, name_bytes, piece_len)?)
     } else {
         None
     };
