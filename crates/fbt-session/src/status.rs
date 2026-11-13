@@ -214,8 +214,8 @@ pub struct PeerStatus {
     pub am_choking: bool,
     /// We are interested in its pieces.
     pub am_interested: bool,
-    /// The share of the torrent's pieces it has, from 0.0 to 1.0 (0.0
-    /// before the metadata).
+    /// The share of the torrent's pieces it has, from 0.0 to 1.0: 1.0 for a
+    /// peer that announced HaveAll; otherwise 0.0 before the metadata.
     pub progress: f64,
     /// Where we learnt of it.
     pub source: PeerSource,

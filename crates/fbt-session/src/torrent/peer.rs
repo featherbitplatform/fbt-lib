@@ -30,11 +30,10 @@ const AZUREUS_CLIENTS: &[(&[u8; 2], &str)] = &[
     (b"FB", "fbt"),
     (b"FD", "Free Download Manager"),
     (b"KT", "KTorrent"),
-    (b"LT", "libTorrent (rakshasa)"),
-    (b"lt", "libtorrent"),
+    (b"LT", "libtorrent"),
+    (b"lt", "libTorrent"),
     (b"PI", "PicoTorrent"),
     (b"qB", "qBittorrent"),
-    (b"RT", "rTorrent"),
     (b"SD", "Thunder"),
     (b"TR", "Transmission"),
     (b"UM", "uTorrent Mac"),
@@ -74,13 +73,43 @@ pub(crate) fn azureus_client(id: &[u8; 20]) -> Option<String> {
     })
 }
 
-/// A client name from a peer, safe to show: control characters dropped,
+/// A Unicode format character (general category Cf): soft hyphen, bidi
+/// marks, embeddings, overrides and isolates, zero-width characters, BOM,
+/// interlinear annotation and tag characters, and the rest of Cf.
+fn is_format(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0xAD | 0x600..=0x605
+            | 0x61C
+            | 0x6DD
+            | 0x70F
+            | 0x890..=0x891
+            | 0x8E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// A client name from a peer, safe to show: control and format (bidi,
+/// zero-width) characters dropped,
 /// surrounding whitespace trimmed, at most [`MAX_CLIENT_CHARS`]
 /// characters; `None` when nothing is left.
 pub(crate) fn sanitise_client(raw: &str) -> Option<String> {
     let clean: String = raw
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_format(*c))
         .collect::<String>()
         .trim()
         .chars()
@@ -347,8 +376,12 @@ mod tests {
             Some("Transmission 4.0.6")
         );
         assert_eq!(
-            azureus_client(&id(b"-lt20A0-")).as_deref(),
+            azureus_client(&id(b"-LT20A0-")).as_deref(),
             Some("libtorrent 2.0.10")
+        );
+        assert_eq!(
+            azureus_client(&id(b"-lt0D80-")).as_deref(),
+            Some("libTorrent 0.13.8")
         );
         assert_eq!(
             azureus_client(&id(b"-DE2112-")).as_deref(),
@@ -374,6 +407,21 @@ mod tests {
             Some("evil[31mname")
         );
         assert_eq!(sanitise_client(" \t\r\n "), None);
+        // Bidi overrides and isolates, zero-width characters, BOM.
+        assert_eq!(
+            sanitise_client("a\u{202E}b\u{202A}c\u{2066}d\u{2069}e").as_deref(),
+            Some("abcde")
+        );
+        assert_eq!(
+            sanitise_client("x\u{200B}y\u{200D}z\u{200F}\u{FEFF}").as_deref(),
+            Some("xyz")
+        );
+        assert_eq!(sanitise_client("\u{202E}\u{200B}"), None);
+        // Other non-ASCII text stays.
+        assert_eq!(
+            sanitise_client("Überclient µ").as_deref(),
+            Some("Überclient µ")
+        );
         let long = "a".repeat(500);
         assert_eq!(
             sanitise_client(&long).map(|s| s.chars().count()),
