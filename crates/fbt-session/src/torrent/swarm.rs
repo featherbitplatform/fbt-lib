@@ -929,12 +929,7 @@ pub(super) mod tests {
     /// yet, a picker, and a cache budget of `cache_size`. Nothing is
     /// connected; peers are added as `pex.rs`'s `actor_with_peers` does.
     pub(in crate::torrent) fn actor_with(files: &[u64], piece_len: u32, cache_size: u64) -> Actor {
-        use fbt_core::Bitfield;
         use fbt_metainfo::Metainfo;
-
-        use crate::picker::PiecePicker;
-        use crate::storage::MemStorage;
-        use crate::torrent::actor::Phase;
 
         let total: u64 = files.iter().sum();
         let pieces = total.div_ceil(u64::from(piece_len)) as usize;
@@ -955,6 +950,20 @@ pub(super) mod tests {
         b.extend(std::iter::repeat_n(0u8, pieces * 20));
         b.extend_from_slice(b"ee");
         let meta = Metainfo::from_bytes(&b).expect("metainfo");
+        actor_over(meta, cache_size)
+    }
+
+    /// An actor over an arbitrary metainfo — a hybrid or a v2-only torrent,
+    /// say — on in-memory storage of the right length, ready with an empty
+    /// picker. [`actor_with`] is this over a hand-built v1 torrent.
+    pub(in crate::torrent) fn actor_over(meta: fbt_metainfo::Metainfo, cache_size: u64) -> Actor {
+        use fbt_core::Bitfield;
+
+        use crate::picker::PiecePicker;
+        use crate::storage::MemStorage;
+        use crate::torrent::actor::Phase;
+
+        let total: u64 = meta.info.files.iter().map(|f| f.len).sum();
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(MemStorage::new(total));
         let mut a = new_actor(meta, Some(storage), cache_size);
         let l = a.loaded.as_mut().expect("loaded");

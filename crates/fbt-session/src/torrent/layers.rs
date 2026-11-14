@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use fbt_core::Bitfield;
 use fbt_core::merkle::{MERKLE_BLOCK_LEN, MerkleTree, file_tree_height, verify_hashes};
 use fbt_metainfo::{MAX_PIECE_LAYER_HASHES, Metainfo, TorrentVersion, validate_layer};
 use fbt_wire::{HashRequest, MAX_HASH_REQUEST_LEN};
@@ -917,6 +918,34 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// The parts of `range` whose pieces are not ours yet: those are the ones a
+/// pass has to read. A piece already verified passed against the hashes we
+/// held then, so reading its bytes again proves nothing.
+fn unread_ranges(have: Option<&Bitfield>, range: Range<u32>) -> Vec<Range<u32>> {
+    let Some(have) = have else {
+        // No picker yet: nothing is known to be ours.
+        return vec![range];
+    };
+    let mut out = Vec::new();
+    let mut free = range.start;
+    for piece in have.iter_ones() {
+        if piece < range.start {
+            continue;
+        }
+        if piece >= range.end {
+            break;
+        }
+        if free < piece {
+            out.push(free..piece);
+        }
+        free = piece.saturating_add(1);
+    }
+    if free < range.end {
+        out.push(free..range.end);
+    }
+    out
+}
+
 impl Actor {
     /// Piece `piece` passed with v2 subtree root `root` (or lost, `None`,
     /// by a recheck): fed to the layer builder; a completed layer waits for
@@ -939,15 +968,15 @@ impl Actor {
     }
 
     /// Merges the layers built or fetched since the last swap into the
-    /// actor's metainfo: at most once per [`LAYER_SWAP_INTERVAL`], or now
-    /// when `force` (a check finished, or the fetch did). Every piece of a
-    /// file whose layer merged can be verified now, so it stops being held
-    /// back; a fetch that just completed goes away with them. A file's pieces
-    /// are only let go after they have been read off disk again: data fetched
-    /// before its layer arrived could not be hashed then, and the pass finds
-    /// it there instead of asking for those bytes a second time (see
-    /// [`Actor::verify_merged_pieces`]). Only `Loaded.meta` changes: the
-    /// handle's `metainfo()` keeps the layers known when it was set.
+    /// actor's metainfo: at most once per [`LAYER_SWAP_INTERVAL`], or now when
+    /// `force` (a check finished, or the fetch did). A file stops having its
+    /// pieces held back only once they have been read off disk again — but a
+    /// second look is owed only where one is due: the pieces of a *fetched*
+    /// layer may already be on disk unverified (data can arrive before the
+    /// hashes do), while a built layer is made of pieces that passed their
+    /// checks, and only a v2-only torrent hides pieces behind a missing layer.
+    /// A fetch that just completed goes away with the merge. Only `Loaded.meta`
+    /// changes: the handle's `metainfo()` keeps the layers known when it was set.
     pub(super) fn swap_layers(&mut self, force: bool) {
         {
             let Some(l) = self.loaded.as_mut() else {
@@ -955,14 +984,14 @@ impl Actor {
             };
             if let Some(fetch) = l.layer_fetch.as_mut() {
                 for (root, layer) in fetch.take_ready() {
-                    l.built_layers.insert(root, layer);
+                    l.fetched_layers.insert(root, layer);
                 }
             }
             let finished = l
                 .layer_fetch
                 .as_ref()
                 .is_some_and(|fetch| fetch.is_complete());
-            if l.built_layers.is_empty() && !finished {
+            if l.built_layers.is_empty() && l.fetched_layers.is_empty() && !finished {
                 return;
             }
             let now = Instant::now();
@@ -973,24 +1002,28 @@ impl Actor {
             {
                 return;
             }
-            // The roots this merge adds: their pieces become verifiable. A
-            // layer `with_piece_layers` would not take (over its cap) is not
-            // in `meta`, so its pieces stay held back — they fail every hash,
-            // so asking for them wastes bytes and bans honest peers.
-            let fresh: Vec<[u8; 32]> = l
-                .built_layers
-                .keys()
-                .filter(|r| !l.meta.piece_layers.contains_key(*r))
-                .copied()
-                .collect();
-            let layers = std::mem::take(&mut l.built_layers);
+            // Which roots a re-read is owed for: fetched layers only. A layer
+            // `with_piece_layers` would not take (over its cap) is not in
+            // `meta`, so its pieces stay held back — they fail every hash, so
+            // asking for them wastes bytes and bans honest peers.
+            let fetched = std::mem::take(&mut l.fetched_layers);
+            let owed: Vec<[u8; 32]> = if l.meta.version() == TorrentVersion::V2 {
+                fetched.keys().copied().collect()
+            } else {
+                // A hybrid's layers are built from pieces that already passed.
+                Vec::new()
+            };
+            let mut layers = std::mem::take(&mut l.built_layers);
+            layers.extend(fetched);
             l.meta = Arc::new((*l.meta).clone().with_piece_layers(layers));
             l.layers_swapped = Some(now);
             let meta = Arc::clone(&l.meta);
-            let ranges: Vec<Range<u32>> = fresh
+            let have = l.picker.as_ref().map(|p| p.have());
+            let ranges: Vec<Range<u32>> = owed
                 .iter()
                 .filter(|r| meta.piece_layers.contains_key(*r))
                 .flat_map(|r| file_piece_ranges(&meta, *r))
+                .flat_map(|range| unread_ranges(have, range))
                 .collect();
             push_ranges(&mut l.pending_verify, ranges);
             if finished {
@@ -1013,12 +1046,15 @@ impl Actor {
         self.verify_merged_pieces();
     }
 
-    /// Reads the pieces whose layer just merged back off disk, on the check
-    /// pool: they could not be hashed when they were downloaded, and this is
-    /// what keeps complete data from being fetched again. One pass per torrent
-    /// at a time; its ranges stay held back until it answers (see
-    /// [`Actor::on_pieces_verified`]). While the files move the pass waits:
-    /// the next status tick or merge runs it.
+    /// Reads the pieces whose layer just merged back off disk, holding a
+    /// `max_active_checks` slot for the pass exactly as [`Actor::start_check`]
+    /// does — `spawn_check` runs outside the disk threads only because its
+    /// caller holds one (see `disk.rs`). The pieces could not be hashed when
+    /// they were downloaded, and this is what keeps complete data from being
+    /// fetched again. One pass per torrent at a time; with no slot free it does
+    /// not queue for one — the next status tick, merge or result runs this
+    /// again, and the ranges stay held back meanwhile (see
+    /// [`Actor::on_pieces_verified`]). While the files move the pass waits too.
     pub(super) fn verify_merged_pieces(&mut self) {
         let Some(l) = self.loaded.as_mut() else {
             return;
@@ -1032,6 +1068,11 @@ impl Actor {
         if self.storage_busy {
             return;
         }
+        // A check's slot, held by the job itself until it returns. None free is
+        // not a reason to hold one waiting: this runs again on the next tick.
+        let Ok(permit) = self.shared.disk.check_permit().try_acquire_owned() else {
+            return;
+        };
         // The queue keeps its ranges while the pass runs: they stay held back
         // until it answers, so a merge that completes meanwhile cannot release
         // them to a download of bytes that are already on disk.
@@ -1041,6 +1082,7 @@ impl Actor {
         let layout = l.layout;
         let generation = self.generation;
         self.shared.disk.spawn_check(&mut self.jobs, move || {
+            let _slot = permit;
             let result = check_pieces_ranges(&*storage, &layout, &meta, &ranges, |_| {
                 ControlFlow::Continue(())
             });
@@ -1056,7 +1098,9 @@ impl Actor {
     /// every hash are ours without being fetched again (`PieceFinished` as for
     /// a download), and the rest of those ranges may be requested now. A pass
     /// that raced a check or a restart is dropped: its ranges go back in the
-    /// queue, which runs again once the picker does.
+    /// queue, which runs again at once where a picker stands ready (a torrent
+    /// with nothing else going on must not wait for a status tick to notice its
+    /// pieces are still held back).
     pub(super) fn on_pieces_verified(
         &mut self,
         generation: u64,
@@ -1070,6 +1114,7 @@ impl Actor {
         l.verifying = false;
         if stale || l.picker.is_none() {
             push_ranges(&mut l.pending_verify, ranges.iter().cloned());
+            self.verify_merged_pieces();
             return;
         }
         let passed = match result {
@@ -1872,6 +1917,149 @@ mod tests {
         assert!(q.is_empty(), "everything was read");
         drop_ranges(&mut q, &[0..1, 2..3]);
         assert!(q.is_empty());
+    }
+
+    /// Only pieces that are not ours yet need reading: a piece that passed
+    /// already proved itself against the hashes we held then.
+    #[test]
+    fn unread_ranges_skips_verified_pieces() {
+        let mut have = Bitfield::new(10);
+        have.set(1);
+        have.set(4);
+        assert_eq!(unread_ranges(Some(&have), 0..8), vec![0..1, 2..4, 5..8]);
+        // Bits outside the range neither split it nor extend it: `9` is ours,
+        // `0..3` is asked for as two runs around the one verified piece.
+        have.set(9);
+        assert_eq!(unread_ranges(Some(&have), 0..3), vec![0..1, 2..3]);
+        // Everything inside already passed: nothing to read.
+        assert!(
+            unread_ranges(Some(&Bitfield::full(8)), 2..6).is_empty(),
+            "every piece of the range verified"
+        );
+        // With no picker nothing is known to be ours, so the whole run stands.
+        let all = unread_ranges(None, 0..3);
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].start, all[0].end), (0, 3), "no picker: read it all");
+        assert!(
+            unread_ranges(Some(&have), 4..4).is_empty(),
+            "an empty range"
+        );
+    }
+
+    /// Answers every span `fetch` asks of source `A` with the hashes `full`
+    /// holds, until the fetch is complete.
+    fn answer_all(fetch: &mut LayerFetch, full: &Metainfo) {
+        let now = Instant::now();
+        let mut sends = fetch.add_source(A, now);
+        while let Some((k, r)) = sends.pop() {
+            match fetch.on_hashes(k, &r, &serve(full, &r), now) {
+                LayerStep::Send(more) => sends.extend(more),
+                LayerStep::Bad(key) => panic!("{key:?} judged bad"),
+            }
+        }
+        assert!(
+            fetch.is_complete(),
+            "every span answered from the torrent itself"
+        );
+    }
+
+    /// A fetched layer's pieces may lie on disk unverified — data arrives
+    /// before the hashes do — so merging one queues a read of them and starts
+    /// it. A hybrid's built layer is made of pieces that already passed their
+    /// checks, so merging it asks for no second look and spawns no job:
+    /// provenance and version are what tell the two apart.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetched_layers_are_reread_and_built_ones_are_not() {
+        use super::super::swarm::tests::actor_over;
+
+        // v2-only, its one multi-piece file lacking its layer: a fetch runs.
+        let (full, stripped) = v2_meta(&[("only", 300_000)]);
+        let mut a = actor_over(stripped, 0);
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            let mut f = l.layer_fetch.take().expect("a fetch for the missing layer");
+            answer_all(&mut f, &full);
+            l.layer_fetch = Some(f);
+        }
+        a.swap_layers(true);
+        {
+            let l = a.loaded.as_ref().expect("loaded");
+            let want = {
+                let mut v = Vec::new();
+                push_ranges(&mut v, [0..6, 6..10]);
+                v
+            };
+            assert_eq!(l.pending_verify, want, "the fetched pieces await a read");
+            assert!(l.verifying, "the pass runs at once");
+        }
+        assert_eq!(a.jobs.len(), 1, "one check job for the re-read");
+
+        // Hybrid without its layer: the same hashes arrive as a *built* layer.
+        let (stripped, data) = hybrid_without_layer();
+        let root = stripped.info.files[0].pieces_root.expect("a v2 root");
+        let mut a = actor_over(stripped, 0);
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            assert!(
+                l.layer_fetch.is_none(),
+                "a hybrid builds, it does not fetch"
+            );
+            l.built_layers.insert(root, roots(&data));
+        }
+        a.swap_layers(true);
+        {
+            let l = a.loaded.as_ref().expect("loaded");
+            assert_eq!(l.meta.piece_layers.len(), 1, "the built layer merged");
+            assert!(
+                l.pending_verify.is_empty(),
+                "its pieces passed with the hashes we already held"
+            );
+            assert!(!l.verifying);
+        }
+        assert_eq!(a.jobs.len(), 0, "no verify pass for a built layer");
+    }
+
+    /// The pass is a check, so it holds one of the `max_active_checks` slots
+    /// for its whole run. With every slot held elsewhere it neither runs nor
+    /// queues for one: the pieces stay held back, the torrent keeps ticking,
+    /// and the next tick, merge or result tries again — which is how
+    /// `spawn_check`'s bound to `max_active_checks` (see `disk.rs`) holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_check_slot_means_no_pass_yet() {
+        use super::super::swarm::tests::actor_over;
+
+        let (full, stripped) = v2_meta(&[("only", 300_000)]);
+        let mut a = actor_over(stripped.clone(), 0);
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            let mut f = l.layer_fetch.take().expect("a fetch for the missing layer");
+            answer_all(&mut f, &full);
+            l.layer_fetch = Some(f);
+        }
+        // Hold every check slot the pool allows. It is one in these helpers;
+        // acquiring until that fails works for any size.
+        let checks = a.shared.disk.check_permit();
+        let mut slots = Vec::new();
+        while let Ok(p) = Arc::clone(&checks).try_acquire_owned() {
+            slots.push(p);
+        }
+        assert!(!slots.is_empty(), "the pool allows at least one check");
+        a.swap_layers(true);
+        {
+            let l = a.loaded.as_ref().expect("loaded");
+            assert_eq!(l.pending_verify.len(), 1, "the pieces stay held back");
+            assert!(!l.verifying, "no pass without a slot");
+            assert!(l.layer_work(), "and the torrent keeps ticking for it");
+        }
+        assert_eq!(a.jobs.len(), 0, "nothing spawned and nothing queued");
+        // A slot coming free lets the next attempt run it.
+        drop(slots);
+        a.verify_merged_pieces();
+        assert!(
+            a.loaded.as_ref().expect("loaded").verifying,
+            "the pass runs once a slot is free"
+        );
+        assert_eq!(a.jobs.len(), 1, "one job for it");
     }
 
     #[test]

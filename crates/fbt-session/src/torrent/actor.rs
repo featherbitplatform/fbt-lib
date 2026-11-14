@@ -132,6 +132,11 @@ pub(super) struct Loaded {
     /// Layers built and not yet merged into `meta` (see
     /// [`Actor::swap_layers`]); bounded by the builder's cap.
     pub built_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    /// Layers the fetch received and has not merged yet, kept apart from
+    /// `built_layers` because of where their pieces came from: a fetched layer
+    /// can cover bytes that were downloaded without ever being hashed, while a
+    /// built one is made of pieces that already passed.
+    pub fetched_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
     /// Pieces whose layer has merged but whose bytes on disk have not been
     /// re-verified since: ranges held back until
     /// [`Actor::verify_merged_pieces`] reads them (see
@@ -206,6 +211,7 @@ impl Loaded {
             layer_builder,
             layer_fetch,
             built_layers: BTreeMap::new(),
+            fetched_layers: BTreeMap::new(),
             pending_verify: Vec::new(),
             verifying: false,
             layers_swapped: None,
@@ -213,27 +219,36 @@ impl Loaded {
         }
     }
 
-    /// Layer work outstanding: a fetch running, or layers built and not yet
-    /// merged. A torrent with any of that is not done seeding yet.
+    /// Layer work outstanding: a fetch running, layers not merged yet, or a
+    /// re-read of pieces whose layer just landed. A torrent with any of that
+    /// is not done seeding yet, and has every reason to keep ticking.
     pub(super) fn layer_work(&self) -> bool {
-        self.layer_fetch.is_some() || !self.built_layers.is_empty()
+        self.layer_fetch.is_some()
+            || !self.built_layers.is_empty()
+            || !self.fetched_layers.is_empty()
+            || self.verifying
+            || !self.pending_verify.is_empty()
     }
 
     /// Layer work owed for files whose pieces are wanted: spans of such a file
-    /// not received, or one of its built layers not merged. Priorities are read
-    /// as they are now, so skipping a file releases seeding at once. A skipped
-    /// file's layer is nobody's download, and a layer that was discarded (its
-    /// root does not match the data) or refused by the merge asks for nothing
-    /// more; this, not [`layer_work`](Self::layer_work), is what holds
-    /// `Seeding` back.
+    /// not received, or one of its unmerged layers. Priorities are read as they
+    /// are now, so skipping a file releases seeding at once. A skipped file's
+    /// layer is nobody's download, and a layer that was discarded (its root
+    /// does not match the data) or refused by the merge asks for nothing more;
+    /// this, not [`layer_work`](Self::layer_work), is what holds `Seeding` back.
     pub(super) fn wanted_layer_work(&self) -> bool {
-        let owed = self
+        let mut owed = self
             .layer_fetch
             .as_ref()
             .into_iter()
-            .flat_map(|f| f.owed_roots());
-        owed.chain(self.built_layers.keys().copied())
-            .any(|r| layers::root_is_wanted(&self.meta, &self.file_prio, r))
+            .flat_map(|f| f.owed_roots())
+            .chain(
+                self.built_layers
+                    .keys()
+                    .chain(self.fetched_layers.keys())
+                    .copied(),
+            );
+        owed.any(|r| layers::root_is_wanted(&self.meta, &self.file_prio, r))
     }
 }
 
