@@ -13,18 +13,30 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 ///
 /// An IPv6 address that only spells an IPv4 one is judged as that IPv4 address, so the
 /// same host is internal whichever family it is written in: `::ffff:127.0.0.1` (mapped),
-/// `::127.0.0.1` (the deprecated IPv4-compatibility form), `64:ff9b::127.0.0.1` and
-/// `64:ff9b:1:...:127.0.0.1` (NAT64, RFC 6052 and RFC 8215) and `2002:7f00:1::` (6to4)
-/// are all `127.0.0.1`. A Teredo address (`2001::/32`, whose low bits hold its endpoint
-/// inverted rather than plain) is not folded, and neither is any other prefix that
-/// carries an IPv4 in bits other than the last 32.
+/// `::127.0.0.1` (the deprecated IPv4-compatibility form), `64:ff9b::127.0.0.1` (NAT64's
+/// well-known prefix) and `2002:7f00:1::` (6to4) are all `127.0.0.1`. The whole NAT64
+/// local-use prefix `64:ff9b:1::/48` (RFC 8215) is internal whatever follows its `/48`:
+/// it is never routed globally, and RFC 6052 lets an embedded IPv4 sit in several
+/// places under it, so no guess at the layout is made. A Teredo address (`2001::/32`,
+/// whose low bits hold its endpoint inverted rather than plain) is not folded, and
+/// neither is any other prefix that carries an IPv4 in bits other than the last 32.
 pub fn is_internal(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => internal_v4(v4),
+        // `64:ff9b:1::/48` (NAT64 local use): inside by definition, before any folding.
+        IpAddr::V6(v6) if nat64_local_use(v6) => true,
         // An address that names an IPv4 host: judge that, not the IPv6 form it is
         // spelled in, which on its own would look like a public one.
         IpAddr::V6(v6) => embedded_v4(v6).map_or_else(|| internal_v6(v6), internal_v4),
     }
+}
+
+/// `64:ff9b:1::/48`: the NAT64 local-use prefix (RFC 8215). Addresses under it are
+/// site-local, so the whole range is internal regardless of what its bits past the
+/// `/48` spell.
+fn nat64_local_use(ip: Ipv6Addr) -> bool {
+    let [first, second, third, ..] = ip.segments();
+    first == 0x0064 && second == 0xff9b && third == 1
 }
 
 /// The IPv4 address an IPv6 address names, when it is one of the forms that hold an IPv4
@@ -44,12 +56,16 @@ fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     {
         return Some(v4_of(low, high));
     }
-    // NAT64: `64:ff9b::/96` (the well-known prefix) and `64:ff9b:1::/48` (local use),
-    // whose translated address sits in the low 32 bits. Any other `64:ff9b:...` is not
-    // a NAT64 address and stays IPv6.
+    // NAT64's well-known prefix `64:ff9b::/96`, whose translated address sits in the
+    // low 32 bits. The local-use `64:ff9b:1::/48` is internal whole-range before any
+    // folding (see `nat64_local_use`). Any other `64:ff9b:...` is not a NAT64 address
+    // and stays IPv6.
     let nat64 = first == 0x0064
         && second == 0xff9b
-        && ((third == 0 && fourth == 0 && fifth == 0 && sixth == 0) || third == 1);
+        && third == 0
+        && fourth == 0
+        && fifth == 0
+        && sixth == 0;
     if nat64 {
         return Some(v4_of(low, high));
     }
@@ -154,6 +170,10 @@ mod tests {
             "64:ff9b::127.0.0.1",
             "64:ff9b:1:2:3:4:10.0.0.1",
             "2002:7f00:1::",
+            // The whole local-use `/48` is internal whatever follows it: RFC 6052
+            // allows layouts where an embedded IPv4 sits somewhere other than the low
+            // 32 bits, and no guess is made — the range is local-use by definition.
+            "64:ff9b:1:7f00:1::",
             "fc00::1",
             // Site-local (`fec0::/10`), up to the end of the range.
             "fec0::1",
@@ -169,8 +189,10 @@ mod tests {
             "8.8.8.8",
             "1.1.1.1",
             "2001:4860::8888",
-            // Just outside CGNAT and just past benchmarking.
+            // Just outside CGNAT (`100.64.0.0/10`, below and above) and just past
+            // benchmarking.
             "100.63.255.255",
+            "100.128.0.1",
             "198.20.0.1",
             "::ffff:8.8.8.8",
             "::8.8.8.8",
