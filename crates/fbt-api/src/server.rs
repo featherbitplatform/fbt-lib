@@ -803,7 +803,9 @@ mod tests {
 
     /// A body with nothing to send for a long stretch is not cut off at once
     /// when its first write sticks: the owed clock starts when the debt does.
-    #[tokio::test]
+    /// The watch reads tokio's clock, so a paused clock and the sleeps below
+    /// advance it exactly — no real-timer slack around the 50 ms window.
+    #[tokio::test(start_paused = true)]
     async fn owed_clock_starts_with_the_debt() {
         let watch = Arc::new(StallWatch::new());
         let mut io = StalledIo {
