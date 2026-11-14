@@ -119,9 +119,15 @@ impl TrackerClient {
     /// proxy when it sets `proxy_peers`, with keep-alive and TLS as for
     /// announces, following at most 3 redirects (never from `https` to
     /// `http`) as `policy` allows. With `policy.allow_internal` false a
-    /// redirect whose target resolves inside the local network is
-    /// [`TrackerError::InternalRedirect`] and nothing is sent to it; the URL
-    /// this is called with is never judged, only where it redirects to.
+    /// redirect to an internal address is [`TrackerError::InternalRedirect`]
+    /// and nothing is sent to it — judged on the addresses the connection
+    /// dials, not on the text of the `Location` header (a host name whose
+    /// answer changes between lookups is caught), and a lookup that fails or
+    /// times out ends the request rather than allowing the target. The URL
+    /// this is called with is never judged, only where it redirects to. A
+    /// proxy that resolves names ([`ProxyConfig::proxy_hostnames`](fbt_net::proxy::ProxyConfig::proxy_hostnames))
+    /// leaves names to the proxy, which decides where they go: there only a
+    /// target spelled as an address is judged.
     ///
     /// The answer must be `206` with a `Content-Range` naming exactly the
     /// range, or `200` only when the range starts at 0 and the

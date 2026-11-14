@@ -120,6 +120,9 @@ pub(crate) enum Job {
         request: u64,
         generation: u64,
         blocks: Vec<BlockRef>,
+        /// Whether the seed's redirects may land on internal addresses, as the run decided
+        /// before it fetched (kept for its next run: see `WebSeed::allow_internal`).
+        allow_internal: bool,
         result: Result<Vec<Bytes>, FetchError>,
     },
 }
@@ -217,8 +220,9 @@ impl Actor {
                 request,
                 generation,
                 blocks,
+                allow_internal,
                 result,
-            } => self.on_web_seed_job(key, request, generation, blocks, result),
+            } => self.on_web_seed_job(key, request, generation, blocks, allow_internal, result),
         }
         // Whatever returned may have been the last thing a storage
         // operation waited for.

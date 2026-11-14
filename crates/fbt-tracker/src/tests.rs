@@ -7,7 +7,17 @@ use fbt_core::{MAX_DISPLAY_CHARS, PeerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::connector::StubResolver;
+use crate::http::HttpClient;
 use crate::*;
+use fbt_net::proxy::{ProxyConfig, ProxyKind};
+
+/// A loopback SOCKS5 proxy that relays CONNECT for real: the same support `fbt-net`'s own
+/// tests drive, included so a tracker test can put its client behind a proxy.
+#[path = "../../fbt-net/tests/support/fake_socks5.rs"]
+mod fake_socks5;
+
+use fake_socks5::{FakeSocks5, Script};
 
 fn dict(f: impl FnOnce(&mut DictBuilder)) -> Vec<u8> {
     let mut b = DictBuilder::new();
@@ -164,6 +174,20 @@ fn redirect(to: &str) -> Vec<u8> {
 
 fn client() -> TrackerClient {
     TrackerClient::new(TrackerConfig::default()).unwrap()
+}
+
+/// A SOCKS5 proxy config carrying web-seed traffic through `addr`, resolving host names either
+/// at the proxy (`proxy_hostnames`) or here. `ProxyConfig` is non-exhaustive, so it is built
+/// from its default and changed field by field.
+fn socks5(addr: SocketAddr, proxy_hostnames: bool) -> ProxyConfig {
+    let mut p = ProxyConfig::default();
+    p.kind = ProxyKind::Socks5;
+    p.host = addr.ip().to_string();
+    p.port = addr.port();
+    p.proxy_peers = true;
+    p.proxy_trackers = false;
+    p.proxy_hostnames = proxy_hostnames;
+    p
 }
 
 #[tokio::test]
@@ -708,6 +732,218 @@ async fn fetch_range_redirect_policy_judges_the_target() {
         .unwrap();
     assert_eq!(&got[..], b"cdef");
     assert_eq!(seen.lock().unwrap().len(), 2, "both requests were made");
+}
+
+/// A name whose answer changes between two lookups — what a record with no TTL does to a check
+/// made before the request — is judged on the answer the connection actually uses: the guard
+/// runs inside that resolution, so it sees the second answer and refuses it, and nothing is
+/// sent to the server behind it. A test cannot reach a public address, so the unguarded first
+/// lookup stands in for the public answer a public seed would get.
+#[tokio::test]
+async fn redirect_rebinding_is_refused_at_connect_time() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, origin_seen) = serve(vec![redirect(&format!(
+        "http://rebound.test:{}/f",
+        target.port()
+    ))])
+    .await;
+
+    let stub = StubResolver::default();
+    // The seed's own name answers with the server it is dialled to; the redirect's name, asked
+    // again for the hop, has turned inward — an internal answer among public ones.
+    stub.push(&["127.0.0.1"]);
+    stub.push(&["127.0.0.1", "93.184.216.34"]);
+    let client =
+        HttpClient::with_stub_resolver(&TrackerConfig::default(), None, stub.clone()).unwrap();
+    let url = format!("http://seed.test:{}/a", origin.port());
+    let err = client
+        .fetch_range(&url, 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::InternalRedirect), "{err:?}");
+    assert_eq!(
+        stub.calls(),
+        ["seed.test".to_owned(), "rebound.test".to_owned()],
+        "one lookup for each hop, and each hop uses its own"
+    );
+    assert_eq!(origin_seen.lock().unwrap().len(), 1, "the seed was asked");
+    assert!(
+        target_seen.lock().unwrap().is_empty(),
+        "the rebound address was never dialled: {:?}",
+        target_seen.lock().unwrap()
+    );
+
+    // The same servers and the same answers, a policy that allows internal targets: the second
+    // answer is dialled and the range comes back.
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, _) = serve(vec![redirect(&format!(
+        "http://rebound.test:{}/f",
+        target.port()
+    ))])
+    .await;
+    let stub = StubResolver::default();
+    stub.push(&["127.0.0.1"]);
+    stub.push(&["127.0.0.1"]);
+    let client =
+        HttpClient::with_stub_resolver(&TrackerConfig::default(), None, stub.clone()).unwrap();
+    let url = format!("http://seed.test:{}/a", origin.port());
+    let got = client
+        .fetch_range(&url, 2..6, None, RedirectPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(&got[..], b"cdef");
+    assert_eq!(target_seen.lock().unwrap().len(), 1);
+}
+
+/// A policy that denies internal targets does not fall back on trusting a name it cannot
+/// resolve: neither a lookup that fails nor one that never answers becomes a request.
+#[tokio::test]
+async fn a_deny_policy_does_not_trust_a_name_it_cannot_resolve() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+
+    // The name does not resolve: the resolver's own failure ends it.
+    let (origin, origin_seen) = serve(vec![redirect("http://rebound.test:8080/f")]).await;
+    let stub = StubResolver::default();
+    stub.fail_next();
+    let client =
+        HttpClient::with_stub_resolver(&TrackerConfig::default(), None, stub.clone()).unwrap();
+    let err = client
+        .fetch_range(&format!("http://{origin}/a"), 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Io(_)), "{err:?}");
+    assert_eq!(stub.calls(), ["rebound.test".to_owned()]);
+    assert_eq!(origin_seen.lock().unwrap().len(), 1);
+
+    // The name never answers: the request's own timeout ends it, still with nothing dialled.
+    let (origin, _) = serve(vec![redirect("http://rebound.test:8080/f")]).await;
+    let stub = StubResolver::default();
+    stub.hang_next();
+    let cfg = TrackerConfig {
+        http_timeout: Duration::from_millis(200),
+        ..TrackerConfig::default()
+    };
+    let client = HttpClient::with_stub_resolver(&cfg, None, stub.clone()).unwrap();
+    let err = client
+        .fetch_range(&format!("http://{origin}/a"), 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Timeout), "{err:?}");
+    assert_eq!(stub.calls(), ["rebound.test".to_owned()]);
+}
+
+/// A SOCKS5 proxy that resolves names (`proxy_hostnames`) decides where a name goes, so a
+/// guarded web-seed fetch looks nothing up locally: the redirect to a name is followed through
+/// the proxy, and only a target spelled as an address is judged — which needs no lookup.
+#[tokio::test]
+async fn a_proxy_that_resolves_names_makes_no_local_lookup() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+    // A redirect to a name: the proxy resolves it and the range comes back.
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, _) = serve(vec![redirect(&format!(
+        "http://localhost:{}/f",
+        target.port()
+    ))])
+    .await;
+    let stub = StubResolver::default();
+    let client = HttpClient::with_stub_resolver(
+        &TrackerConfig::default(),
+        Some(&socks5(fake.addr(), true)),
+        stub.clone(),
+    )
+    .unwrap();
+    let url = format!("http://localhost:{}/a", origin.port());
+    let got = client.fetch_range(&url, 2..6, None, denied).await.unwrap();
+    assert_eq!(&got[..], b"cdef");
+    assert_eq!(target_seen.lock().unwrap().len(), 1);
+    assert!(
+        stub.calls().is_empty(),
+        "the proxy resolved both names: {:?}",
+        stub.calls()
+    );
+
+    // A redirect to an address inside the local network: refused, and still nothing looked up.
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, _) = serve(vec![redirect(&format!(
+        "http://127.0.0.1:{}/f",
+        target.port()
+    ))])
+    .await;
+    let stub = StubResolver::default();
+    let client = HttpClient::with_stub_resolver(
+        &TrackerConfig::default(),
+        Some(&socks5(fake.addr(), true)),
+        stub.clone(),
+    )
+    .unwrap();
+    let url = format!("http://localhost:{}/a", origin.port());
+    let err = client
+        .fetch_range(&url, 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::InternalRedirect), "{err:?}");
+    assert!(
+        target_seen.lock().unwrap().is_empty(),
+        "the internal target is never dialled: {:?}",
+        target_seen.lock().unwrap()
+    );
+    assert!(stub.calls().is_empty(), "{:?}", stub.calls());
+}
+
+/// Without `proxy_hostnames` the client resolves a name itself before asking the proxy to dial
+/// it, so the same judgement applies there: the address handed to the proxy is the one that was
+/// judged, once, and an internal answer never reaches the proxy at all.
+#[tokio::test]
+async fn a_proxy_that_does_not_resolve_names_judges_the_name_it_dials() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, _) = serve(vec![redirect(&format!(
+        "http://localhost:{}/f",
+        target.port()
+    ))])
+    .await;
+    let stub = StubResolver::default();
+    // The answer for the redirect's name: the loopback port the proxy would be told to dial.
+    stub.push(&["127.0.0.1"]);
+    let client = HttpClient::with_stub_resolver(
+        &TrackerConfig::default(),
+        Some(&socks5(fake.addr(), false)),
+        stub.clone(),
+    )
+    .unwrap();
+    let err = client
+        .fetch_range(&format!("http://{origin}/a"), 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::InternalRedirect), "{err:?}");
+    assert_eq!(
+        stub.calls(),
+        ["localhost".to_owned()],
+        "the name is resolved once, where it is dialled"
+    );
+    assert!(
+        target_seen.lock().unwrap().is_empty(),
+        "the refused hop never reached the server: {:?}",
+        target_seen.lock().unwrap()
+    );
+    let asked_of_proxy = fake.connects();
+    assert_eq!(
+        asked_of_proxy,
+        [format!("127.0.0.1:{}", origin.port())],
+        "only the first hop was put to the proxy"
+    );
 }
 
 #[test]
