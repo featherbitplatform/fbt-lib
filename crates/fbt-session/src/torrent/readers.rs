@@ -80,6 +80,19 @@ pub(super) struct Readers {
 }
 
 impl Readers {
+    /// No open reader and no read waiting for a piece: the status tick's
+    /// reader work (`readers_tick`) would have nothing to do.
+    pub(super) fn is_idle(&self) -> bool {
+        self.open.is_empty() && self.waiting.is_empty()
+    }
+
+    /// The piece each open reader sits on, one per reader (so at most
+    /// [`MAX_READERS`] of them): what the layer fetch puts first when a read
+    /// is waiting for a file whose layer is still missing.
+    pub(super) fn reading_pieces(&self) -> impl Iterator<Item = u32> + '_ {
+        self.open.values().filter_map(|r| r.piece)
+    }
+
     fn remove_waiter(&mut self, id: ReaderId) {
         self.waiting.retain(|_, v| {
             v.retain(|w| w.0 != id);

@@ -27,6 +27,9 @@ pub enum Behaviour {
     EndlessBody,
     /// `302` to the same path, every time.
     RedirectLoop,
+    /// `302` to this base URL plus the requested path (the same file on another
+    /// server), every time. The base names a scheme, host and port with no path.
+    RedirectTo(String),
     /// `404` for this path (as requested, percent-encoded), the rest as
     /// [`Normal`](Self::Normal).
     NotFound(String),
@@ -199,6 +202,13 @@ async fn answer(
     }
     if state.behaviour == Behaviour::RedirectLoop {
         let head = format!("HTTP/1.1 302 Found\r\nLocation: {path}\r\nContent-Length: 0\r\n\r\n");
+        stream.write_all(head.as_bytes()).await?;
+        return Ok(true);
+    }
+    if let Behaviour::RedirectTo(base) = &state.behaviour {
+        let base = base.trim_end_matches('/');
+        let head =
+            format!("HTTP/1.1 302 Found\r\nLocation: {base}{path}\r\nContent-Length: 0\r\n\r\n");
         stream.write_all(head.as_bytes()).await?;
         return Ok(true);
     }

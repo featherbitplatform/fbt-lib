@@ -49,6 +49,11 @@ fn blocked(e: &Event) -> bool {
     matches!(e, Event::PeerBlocked { .. })
 }
 
+/// How long something that must not happen is given to happen anyway: the 5 s
+/// floor this plan sets for timing waits, so a loaded runner cannot slip a late
+/// dial or drop past a check that expects silence.
+const ABSENCE: Duration = Duration::from_secs(5);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_seed_is_never_dialled() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -199,6 +204,19 @@ async fn dial_two(
     (s, h, m, [a, b], [pa, pb], [ev, ev2])
 }
 
+/// With `per_ip_exempt_loopback` off one IP gets one connection: the second
+/// handshake to complete is refused (`PeerBlocked` plus a
+/// `Blocked(PerIpLimit)` disconnect), a third address on that IP is not even
+/// dialled, and an incoming connection from it is closed unread.
+///
+/// Review note (0.8 deflake; not reproduced: 100 runs at 4 copies, then 100
+/// more at 24 copies under CPU load): which of `a` and `b` is refused is
+/// decided inside `on_connected`, one completed handshake at a time, so exactly
+/// one can be — the test does not race that. What it did race were two windows
+/// shorter than this plan's 5 s floor for timing waits: 1 s of silence before
+/// "c is not dialled" and 300 ms before "the winner stays". A dial a loaded
+/// runner only starts late lands outside 1 s and passes *unseen*, which is the
+/// wrong way for an absence check to be wrong; both windows are now `ABSENCE`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_connection_from_one_ip_is_refused() {
     let mut st = plain();
@@ -277,9 +295,7 @@ async fn second_connection_from_one_ip_is_refused() {
     // its limit.
     h.add_peer(c).await.unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_secs(1), lc.accept())
-            .await
-            .is_err(),
+        tokio::time::timeout(ABSENCE, lc.accept()).await.is_err(),
         "an IP at its limit is not dialled"
     );
     // An incoming connection from the same IP is refused too, unread.
@@ -311,7 +327,7 @@ async fn second_connection_from_one_ip_is_refused() {
         next_matching(
             &mut ev,
             |e| matches!(e, Event::PeerDisconnected { addr, .. } if *addr == winner),
-            Duration::from_millis(300),
+            ABSENCE,
         )
         .await
         .is_none()

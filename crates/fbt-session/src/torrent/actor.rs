@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -25,7 +26,7 @@ use super::data::Job;
 use super::deadline::Deadlines;
 use super::dht::{self, DhtAnnouncer, DhtParams};
 use super::known::{Known, dialable};
-use super::layers::{HashServing, LayerBuilder, LayerFetch, PendingLayers};
+use super::layers::{self, HashServing, LayerBuilder, LayerFetch};
 use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
 use super::peer::Peer;
@@ -123,9 +124,27 @@ pub(super) struct Loaded {
     pub renamed: BTreeMap<usize, RelPath>,
     /// Builds the piece layers a hybrid lacks from its verified pieces.
     pub layer_builder: Option<LayerBuilder>,
+    /// The layers a v2-only torrent asks its peers for, fetched beside the
+    /// download; `None` once every layer is known. Each one that arrives is
+    /// merged into `meta` and releases the pieces it makes verifiable (see
+    /// [`Actor::swap_layers`]).
+    pub layer_fetch: Option<LayerFetch>,
     /// Layers built and not yet merged into `meta` (see
     /// [`Actor::swap_layers`]); bounded by the builder's cap.
     pub built_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    /// Layers the fetch received and has not merged yet, kept apart from
+    /// `built_layers` because of where their pieces came from: a fetched layer
+    /// can cover bytes that were downloaded without ever being hashed, while a
+    /// built one is made of pieces that already passed.
+    pub fetched_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    /// Pieces whose layer has merged but whose bytes on disk have not been
+    /// re-verified since: ranges held back until
+    /// [`Actor::verify_merged_pieces`] reads them (see
+    /// [`Actor::on_pieces_verified`]). Merged ranges only, so at most one per
+    /// file of the torrent.
+    pub pending_verify: Vec<Range<u32>>,
+    /// A pass over `pending_verify` is on the disk pool.
+    pub verifying: bool,
     /// When `meta` last took built layers.
     pub layers_swapped: Option<Instant>,
     /// Cached Merkle trees and serving jobs for peers' `hash request`s.
@@ -175,6 +194,9 @@ impl Loaded {
         let total_wanted = wanted_bytes(&layout, &piece_prio);
         let wanted = Arc::new(WantedFiles::new(&file_prio));
         let layer_builder = LayerBuilder::new(&meta);
+        // A v2-only torrent missing layers asks peers for them from the
+        // start; the download meanwhile holds back only what cannot verify.
+        let layer_fetch = LayerFetch::new(&meta, &file_prio);
         Loaded {
             meta,
             layout,
@@ -187,10 +209,50 @@ impl Loaded {
             wanted,
             renamed: BTreeMap::new(),
             layer_builder,
+            layer_fetch,
             built_layers: BTreeMap::new(),
+            fetched_layers: BTreeMap::new(),
+            pending_verify: Vec::new(),
+            verifying: false,
             layers_swapped: None,
             hash_serving: HashServing::default(),
         }
+    }
+
+    /// Layer work the tick drives: layers not merged yet, or a re-read of
+    /// pieces whose layer just landed. A running fetch is deliberately not
+    /// in this: [`Actor::is_idle`] already requires no peers, and a fetch
+    /// with none has no source to ask — retire timers act only on sources and
+    /// candidates empty on disconnect — so it cannot progress until a peer
+    /// event ends idleness at once. Unmerged layers and the verify pass *are*
+    /// tick-driven and must keep the fast tick.
+    pub(super) fn merge_or_verify_work(&self) -> bool {
+        !self.built_layers.is_empty()
+            || !self.fetched_layers.is_empty()
+            || self.verifying
+            || !self.pending_verify.is_empty()
+    }
+
+    /// Layer work owed for files whose pieces are wanted: spans of such a file
+    /// not received, or one of its unmerged layers. Priorities are read as they
+    /// are now, so skipping a file releases seeding at once. A skipped file's
+    /// layer is nobody's download, and a layer that was discarded (its root
+    /// does not match the data) or refused by the merge asks for nothing more;
+    /// this, not [`merge_or_verify_work`](Self::merge_or_verify_work), is what
+    /// holds `Seeding` back.
+    pub(super) fn wanted_layer_work(&self) -> bool {
+        let mut owed = self
+            .layer_fetch
+            .as_ref()
+            .into_iter()
+            .flat_map(|f| f.owed_roots())
+            .chain(
+                self.built_layers
+                    .keys()
+                    .chain(self.fetched_layers.keys())
+                    .copied(),
+            );
+        owed.any(|r| layers::root_is_wanted(&self.meta, &self.file_prio, r))
     }
 }
 
@@ -205,10 +267,6 @@ pub(crate) struct Actor {
     pub(super) storage: Option<Arc<dyn Storage>>,
     /// `Some` while a magnet waits for its metadata.
     pub(super) magnet: Option<Box<MagnetState>>,
-    /// `Some` while a v2-only torrent, its metadata known (from any
-    /// source), fetches the piece layers it lacks; `loaded` is `None` and
-    /// the phase `Metadata` meanwhile.
-    pub(super) pending_layers: Option<Box<PendingLayers>>,
     /// The handle's view of the metadata, filled once it is known.
     pub(super) metainfo_cell: Arc<OnceLock<Arc<Metainfo>>>,
     /// The check that follows a magnet's metadata is running: the announcer
@@ -363,6 +421,10 @@ pub(crate) struct Actor {
     /// What web seed downloads are charged to: the torrent's and the
     /// session's download limits.
     pub(super) web_seed_throttle: Throttle,
+    /// How often the status tick ran; read by
+    /// [`TorrentHandle::status_ticks`](crate::TorrentHandle::status_ticks),
+    /// which tests use to watch the tick rate.
+    pub(super) status_ticks: u64,
     #[cfg(test)]
     pub(super) pex_live_builds: u32,
     /// Unit tests: how often `pex_tick` got past its early return.
@@ -386,32 +448,20 @@ impl Actor {
         let resume = params.resume;
         let save_path = params.save_path.clone();
         let web_seed_throttle = shared.bandwidth.web_seed(&rate);
-        let mut storage = storage;
-        let (loaded, magnet, pending_layers, trackers, web_seed_urls) = match params.source {
+        let (loaded, magnet, trackers, web_seed_urls) = match params.source {
             TorrentSource::Metainfo(m) => {
                 let trackers = m.trackers.clone();
                 let urls = m.web_seeds.clone();
-                if let Some(fetch) = LayerFetch::new(&m) {
-                    // Like a magnet's metadata: the storage is built once
-                    // the layers are in (only a custom one is kept).
-                    storage = None;
-                    let pending = PendingLayers {
-                        meta: Arc::new(*m),
-                        fetch,
-                        storage: params.storage,
-                        file_prio: params.file_priorities,
-                        sequential: params.sequential,
-                    };
-                    (None, None, Some(Box::new(pending)), trackers, urls)
-                } else {
-                    let meta = Arc::new(*m);
-                    let _ = metainfo_cell.set(Arc::clone(&meta));
-                    let mut loaded = Loaded::new(meta, params.file_priorities, params.sequential);
-                    if let Some(r) = &resume {
-                        loaded.renamed = r.renamed.iter().cloned().collect();
-                    }
-                    (Some(loaded), None, None, trackers, urls)
+                // The metadata is complete when it is in: layers it lacks are
+                // fetched beside the download (see `Loaded::layer_fetch`), so
+                // the check and the download start now.
+                let meta = Arc::new(*m);
+                let _ = metainfo_cell.set(Arc::clone(&meta));
+                let mut loaded = Loaded::new(meta, params.file_priorities, params.sequential);
+                if let Some(r) = &resume {
+                    loaded.renamed = r.renamed.iter().cloned().collect();
                 }
+                (Some(loaded), None, trackers, urls)
             }
             TorrentSource::Magnet(magnet) => {
                 // One tier per `tr`, in order.
@@ -427,7 +477,7 @@ impl Actor {
                     storage: params.storage,
                     sequential: params.sequential,
                 };
-                (None, Some(Box::new(state)), None, trackers, urls)
+                (None, Some(Box::new(state)), trackers, urls)
             }
         };
         let phase = if loaded.is_some() {
@@ -454,8 +504,7 @@ impl Actor {
         })
         .unzip();
         // A magnet's privacy is unknown yet: it runs one until it is known.
-        let private = loaded.as_ref().is_some_and(|l| l.meta.info.private)
-            || pending_layers.as_ref().is_some_and(|p| p.meta.info.private);
+        let private = loaded.as_ref().is_some_and(|l| l.meta.info.private);
         let (dht_announcer, dht_rx) = shared
             .dht
             .clone()
@@ -478,7 +527,6 @@ impl Actor {
             loaded,
             storage,
             magnet,
-            pending_layers,
             metainfo_cell,
             metadata_check: false,
             check_seq: 0,
@@ -541,6 +589,7 @@ impl Actor {
             smartban: SmartBan::default(),
             web_seeds: WebSeeds::default(),
             web_seed_throttle,
+            status_ticks: 0,
             need_save_resume: resume.is_none(),
             resume_trusted: None,
             last_have: None,
@@ -609,10 +658,15 @@ impl Actor {
         self.peers_found(PeerSource::Magnet, count);
         self.sync_running();
         self.try_connect();
-        let mut tick = tokio::time::interval(self.shared.settings.status_interval);
+        let status_interval = self.shared.settings.status_interval;
+        let idle_interval = self.shared.settings.idle_status_interval;
+        let mut tick = tokio::time::interval(status_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut rechoke = tokio::time::interval(self.shared.settings.rechoke_interval);
         rechoke.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Whether `tick` currently runs at the idle period; the check at the
+        // end of every iteration keeps it in step with [`Actor::is_idle`].
+        let mut tick_idle = false;
         loop {
             if !self.storage_busy {
                 if let Some(queued) = self.queue_pending.take() {
@@ -652,6 +706,7 @@ impl Actor {
                 },
                 Some(r) = self.jobs.join_next(), if !self.jobs.is_empty() => self.on_job_result(r),
                 _ = tick.tick() => {
+                    self.status_ticks += 1;
                     self.flush(FlushReason::Expired);
                     self.release_stale_partials();
                     self.expire_parole_pieces();
@@ -667,9 +722,26 @@ impl Actor {
                     self.account_time();
                     self.check_seed_limits();
                     self.swap_layers(false);
+                    // A pass deferred by a storage move or a check runs when
+                    // it can (see `Actor::verify_merged_pieces`).
+                    self.verify_merged_pieces();
                     self.publish();
                 }
                 _ = rechoke.tick() => self.rechoke(),
+            }
+            // End of every iteration: an idle torrent does not need a
+            // sub-second tick, and any event that ends idleness is noticed
+            // here, so leaving idle waits for no more than one
+            // `status_interval`. Re-evaluating is a few field reads;
+            // re-creating the interval restarts its countdown from now,
+            // which is right in both directions (the iteration that flips
+            // idleness has already published whatever it changed).
+            let idle = self.is_idle();
+            if idle != tick_idle {
+                tick_idle = idle;
+                let period = if idle { idle_interval } else { status_interval };
+                tick = tokio::time::interval_at(Instant::now() + period, period);
+                tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             }
         }
     }
@@ -686,12 +758,9 @@ impl Actor {
         }
     }
 
-    /// The metadata, installed or waiting for its layers.
+    /// The metadata, with every layer fetched or built since it arrived.
     pub(super) fn known_meta(&self) -> Option<&Arc<Metainfo>> {
-        self.loaded
-            .as_ref()
-            .map(|l| &l.meta)
-            .or_else(|| self.pending_layers.as_ref().map(|p| &p.meta))
+        self.loaded.as_ref().map(|l| &l.meta)
     }
 
     /// Sets the metadata and the storage built for it: the one place either
@@ -761,6 +830,28 @@ impl Actor {
                 && !self.stopped())
     }
 
+    /// Whether the status tick may run at `idle_status_interval`: the torrent
+    /// is seeding or paused, and nothing the tick drives has work — no peers,
+    /// open readers, deadline pieces, web seeds in use, background jobs, or
+    /// layers to merge or re-read. A running layer fetch is *not* work here:
+    /// with the peers gone it has no source to ask, and a peer event ends
+    /// idleness at once (see [`Loaded::merge_or_verify_work`]). Commands, peer
+    /// events and job results wake the actor whatever the tick does; only
+    /// tick-driven timers slow down, and [`Actor::run`] switches back at the
+    /// end of the first iteration anything above appears in.
+    pub(super) fn is_idle(&self) -> bool {
+        (self.paused || self.state() == TorrentState::Seeding)
+            && self.peers.is_empty()
+            && self.readers.is_idle()
+            && self.deadlines.is_empty()
+            && self.web_seeds.num_active() == 0
+            && self.jobs.is_empty()
+            && self
+                .loaded
+                .as_ref()
+                .is_none_or(|l| !l.merge_or_verify_work())
+    }
+
     pub(super) fn state(&self) -> TorrentState {
         match &self.phase {
             Phase::Error(_) => TorrentState::Error,
@@ -778,12 +869,16 @@ impl Actor {
                 TorrentState::CheckingFiles { progress }
             }
             Phase::Ready => {
-                if self
-                    .loaded
-                    .as_ref()
-                    .and_then(|l| l.picker.as_ref())
-                    .is_some_and(PiecePicker::is_finished)
-                    && (self.cache.is_idle() || self.finished_emitted)
+                // A file whose pieces are wanted and whose hashes are still on
+                // their way keeps the torrent from calling itself done: it
+                // could not answer hash requests for pieces it may even hold.
+                // A skipped file's layer is no work left to do, and a layer
+                // that was discarded or refused is not coming, so neither holds
+                // seeding back (see `Loaded::wanted_layer_work`).
+                if self.loaded.as_ref().is_some_and(|l| {
+                    l.picker.as_ref().is_some_and(PiecePicker::is_finished)
+                        && !l.wanted_layer_work()
+                }) && (self.cache.is_idle() || self.finished_emitted)
                     && !self.finish_pending
                     && !self.finish_flush
                 {
@@ -831,6 +926,10 @@ impl Actor {
             info_hashes: self.ih,
             name: self.name().to_owned(),
             has_metadata: self.loaded.is_some(),
+            layers_missing: self
+                .loaded
+                .as_ref()
+                .map_or(0, |l| layers::missing_layer_count(&l.meta)),
             state: self.state(),
             progress,
             total_wanted,
@@ -1155,6 +1254,172 @@ mod tests {
         // The disconnect removes exactly what was added.
         picker.remove_peer_pieces(peers[&PeerKey(1)].pieces());
         assert_eq!(picker.availability(0), 0);
+    }
+
+    /// A ready actor whose every piece passed: seeding, with nothing else
+    /// going on.
+    fn seeding_actor() -> Actor {
+        let mut a = super::super::swarm::tests::actor_with(&[3 * 16_384], 16_384, 0);
+        let l = a.loaded.as_mut().expect("loaded");
+        let n = l.layout.num_pieces();
+        let picker = l.picker.as_mut().expect("picker");
+        for piece in 0..n {
+            picker.piece_passed(piece);
+        }
+        assert_eq!(a.state(), TorrentState::Seeding);
+        a
+    }
+
+    /// Seeding with no peers and nothing running is idle; a peer ends that
+    /// at once, even one still dialling.
+    #[test]
+    fn seeding_without_peers_or_jobs_is_idle() {
+        use super::super::swarm::tests::addr;
+        use crate::event::PeerSource;
+        use crate::peer::transport::Transport;
+
+        let mut a = seeding_actor();
+        assert!(a.is_idle(), "seeding with nothing going on");
+        let (tx, _rx) = mpsc::channel(1);
+        let generation = a.generation;
+        let key = a.new_key();
+        a.peers.insert(
+            key,
+            Peer::new(
+                addr(1),
+                tx,
+                generation,
+                1,
+                Transport::Tcp,
+                PeerSource::Tracker,
+            ),
+        );
+        assert!(!a.is_idle(), "a peer is connected or dialling");
+        a.peers.remove(&key).expect("peer");
+        assert!(a.is_idle(), "the peer is gone");
+    }
+
+    /// Everything Review Focus 1 lists as ending idleness keeps the fast
+    /// tick: a download, a job in flight, an open reader and a web seed.
+    /// A pause alone does not: only commands can end it.
+    #[tokio::test]
+    async fn anything_pending_keeps_the_fast_tick() {
+        use tokio::sync::oneshot;
+
+        use super::super::swarm::tests::actor_with;
+        use crate::stream::ReadAhead;
+        use crate::stream::reader::ReaderLink;
+
+        let mut a = actor_with(&[3 * 16_384], 16_384, 0);
+        assert!(!a.is_idle(), "downloading");
+        a.paused = true;
+        assert!(a.is_idle(), "paused with nothing running");
+        a.paused = false;
+
+        let mut a = seeding_actor();
+        a.jobs.spawn(std::future::pending::<Job>());
+        assert!(!a.is_idle(), "a job is running");
+
+        let mut b = seeding_actor();
+        let (tx, mut rx) = oneshot::channel();
+        let link = std::sync::Arc::new(ReaderLink::new(0, ReadAhead::default()));
+        b.on_open_reader(0, link, tx);
+        assert!(rx.try_recv().expect("answered").is_ok(), "reader opened");
+        assert!(!b.is_idle(), "an open reader is tick-driven work");
+
+        let mut c = seeding_actor();
+        c.init_web_seeds(vec!["http://127.0.0.1:8080/torrent/".to_owned()]);
+        assert!(!c.is_idle(), "a web seed in use");
+    }
+
+    /// A layer fetch with no peers is not work the tick drives: a seeding
+    /// v2-only torrent whose only file is skipped — its layer is nobody's
+    /// download, but the fetch runs until every span is in, skipped file
+    /// included — goes idle even with the fetch still out, and a peer event
+    /// ends that at once. An unmerged layer or a held-back re-read *is*
+    /// tick-driven work and keeps the fast tick.
+    #[test]
+    fn peerless_layer_fetch_is_idle_but_unmerged_layers_are_not() {
+        use super::super::layers::tests::v2_meta;
+        use super::super::swarm::tests::actor_over;
+
+        let (_full, stripped) = v2_meta(&[("skipped", 60_000)]);
+        let mut a = actor_over(stripped, 0);
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            assert!(l.layer_fetch.is_some(), "the layer is out");
+            l.file_prio = vec![Priority::Skip];
+            let n = l.layout.num_pieces();
+            let picker = l.picker.as_mut().expect("picker");
+            for piece in 0..n {
+                picker.piece_passed(piece);
+            }
+        }
+        assert_eq!(
+            a.state(),
+            TorrentState::Seeding,
+            "the skipped file's layer is nobody's download"
+        );
+        assert!(a.is_idle(), "no peers: the fetch has no source to ask");
+
+        a.loaded
+            .as_mut()
+            .expect("loaded")
+            .fetched_layers
+            .insert([1; 32], vec![[2; 32]]);
+        assert_eq!(a.state(), TorrentState::Seeding, "still not wanted");
+        assert!(!a.is_idle(), "an unmerged layer is tick-driven work");
+    }
+
+    /// A paused torrent that starts a recheck is not idle while its check
+    /// job runs, and goes idle again only once the result has been handled.
+    #[tokio::test]
+    async fn paused_during_a_check_is_not_idle_until_it_returns() {
+        let mut a = seeding_actor();
+        a.paused = true;
+        assert!(a.is_idle(), "paused with nothing running");
+
+        a.recheck();
+        assert!(
+            matches!(a.phase, Phase::Checking { .. }),
+            "a free check slot starts the check at once"
+        );
+        assert!(!a.is_idle(), "the recheck is in flight");
+
+        let r = a.jobs.join_next().await.expect("the check result");
+        a.on_job_result(r);
+        assert_eq!(a.jobs.len(), 0, "the handled check spawned nothing");
+        assert!(a.is_idle(), "paused with the check back");
+    }
+
+    /// A paused torrent whose storage is being moved is not idle while the
+    /// move's job runs, and goes idle again only once it has returned and
+    /// the caller has been answered.
+    #[tokio::test]
+    async fn paused_during_a_storage_move_is_not_idle_until_it_finishes() {
+        use std::path::PathBuf;
+
+        use tokio::sync::oneshot;
+
+        use crate::storage::MoveMode;
+
+        let mut a = seeding_actor();
+        a.paused = true;
+        assert!(a.is_idle(), "paused with nothing running");
+
+        let (tx, mut rx) = oneshot::channel();
+        a.on_move_storage(PathBuf::from("elsewhere"), MoveMode::FailIfExists, tx)
+            .await;
+        assert!(a.storage_busy);
+        assert_eq!(a.jobs.len(), 1, "the move job started");
+        assert!(!a.is_idle(), "the move is in flight");
+
+        let r = a.jobs.join_next().await.expect("the move result");
+        a.on_job_result(r);
+        assert!(rx.try_recv().is_ok(), "the caller was answered");
+        assert!(!a.storage_busy, "the storage is free again");
+        assert_eq!(a.jobs.len(), 0, "the handled move spawned nothing");
+        assert!(a.is_idle(), "paused with the move back");
     }
 
     #[test]

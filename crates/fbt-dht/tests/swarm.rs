@@ -171,6 +171,21 @@ async fn sample_infohashes_returns_stored_hashes() {
     shutdown(&nodes).await;
 }
 
+/// Ten nodes on `::1`: they converge, they hold no IPv4 nodes at all, and an
+/// announce from one is found by a lookup from another.
+///
+/// Review note (0.8 deflake; not reproduced: 100 runs at 4 copies, then 100
+/// more at 36 copies under CPU load): every wait here is a bounded condition
+/// loop (`wait_until` over 10 s, the lookup under 5 s), so there is no fixed
+/// sleep to replace and no budget under the plan's 5 s floor to raise. Asking
+/// the first wait for more than it needs makes this test fail instead of
+/// tighter: `DhtStats::bootstrapped` means "a routing table reached K", eight
+/// nodes here, and over 300 runs of that stricter gate every failure had nine
+/// nodes done and one sitting at seven of ten — a node with no user traffic
+/// grows its table only on the bootstrap and refresh rounds it runs itself, so
+/// its last two entries arrive last. The gate stays "five known", enough for an
+/// announce from one node and a lookup from another to meet, and the counts now
+/// print when it does run out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ipv6_swarm_converges_when_available() {
     if !has_ipv6() {
@@ -182,7 +197,9 @@ async fn ipv6_swarm_converges_when_available() {
         wait_until(Duration::from_secs(10), || nodes
             .iter()
             .all(|n| n.stats().nodes_v6 >= 5))
-        .await
+        .await,
+        "tables: {:?}",
+        nodes.iter().map(|n| n.stats().nodes_v6).collect::<Vec<_>>()
     );
     assert!(nodes.iter().all(|n| n.stats().nodes_v4 == 0));
     let ih = [0x66; 20];

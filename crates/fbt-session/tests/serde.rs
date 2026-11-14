@@ -128,19 +128,24 @@ fn test_knobs_are_not_serialised() {
     let mut s = Settings::default();
     s.per_ip_exempt_loopback = !s.per_ip_exempt_loopback;
     s.ban_endpoints = !s.ban_endpoints;
+    s.serve_hashes = !s.serve_hashes;
     let json = serde_json::to_string(&s).unwrap();
     assert!(!json.contains("per_ip_exempt_loopback"), "{json}");
     assert!(!json.contains("ban_endpoints"), "{json}");
+    assert!(!json.contains("serve_hashes"), "{json}");
     let back: Settings = serde_json::from_str(&json).unwrap();
     let d = Settings::default();
     assert_eq!(back.per_ip_exempt_loopback, d.per_ip_exempt_loopback);
     assert_eq!(back.ban_endpoints, d.ban_endpoints);
+    assert_eq!(back.serve_hashes, d.serve_hashes, "the default serves");
     // A saved file that has them is still read; they keep their defaults.
-    let back: Settings =
-        serde_json::from_str(r#"{"per_ip_exempt_loopback": false, "ban_endpoints": true}"#)
-            .unwrap();
+    let back: Settings = serde_json::from_str(
+        r#"{"per_ip_exempt_loopback": false, "ban_endpoints": true, "serve_hashes": false}"#,
+    )
+    .unwrap();
     assert_eq!(back.per_ip_exempt_loopback, d.per_ip_exempt_loopback);
     assert_eq!(back.ban_endpoints, d.ban_endpoints);
+    assert_eq!(back.serve_hashes, d.serve_hashes);
 }
 
 #[test]

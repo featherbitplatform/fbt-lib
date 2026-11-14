@@ -90,6 +90,28 @@ connection code.
 The transfer timer polls the torrent state every 20 ms, so a very fast run
 (TCP finishes in about 2 s) is accurate to roughly 1 %.
 
+### Met in 0.8.0: 1,000 idle torrents under 1 % CPU
+
+The "Idle CPU %" column measured 0.82–1.70 in every row since it is recorded, so the
+target has never been met reliably: the one row under 1 %, 0.6.0's 0.82, was not
+reproducible — the rows around it are 1.55 and 1.70. The cost was the per-torrent status
+tick: each seeding torrent republished a snapshot and re-ran its seed-limit checks every
+`status_interval` (500 ms) with nothing to report. A torrent that is seeding or paused
+with nothing going on — no peers, open readers, deadline pieces, web seeds in use,
+running jobs, or piece layers to merge or re-read — now ticks every `Settings::idle_status_interval` (5 s): its rates,
+`active_time` and `seeding_time`, its seed-limit checks, its LSD announces and its
+redial sweeps refresh at that period. Any command, peer event or job result switches
+the fast tick back at the end of the iteration that saw it, so a state change never
+waits on the slow tick, and a paused torrent with a check or a storage move in flight
+is not idle at all.
+
+Three consecutive `dev/bench.sh` runs on the dev machine (Darwin arm64) at 1,000
+seeding torrents: **0.20, 0.18 and 0.20 %** — the target met reliably (three consecutive
+runs) for the first time. The release's own row records one run. Throughput rows did not
+move, so no other interval needed gating: the rechoke tick still runs at
+`rechoke_interval` for every torrent, and the idle change touches only the status tick,
+so this column is the one to read to see the effect.
+
 The stream column is one reader front to back over a 256 MiB file while it
 downloads over loopback TCP (`fbt-example bench --stream`). The seek column is
 the median of ten 64 KiB reads at fixed pseudo-random offsets, taken after the
@@ -104,3 +126,4 @@ from peers.
 | 2026-11-13 | 0.5.0 | Darwin arm64 | 4920 | 5.0 | 630 | 39.2 | 4032 | 0.05 | 1000 | 1.55 | 23.9 KiB | seed and leech in one process |
 | 2026-11-13 | 0.6.0 | Darwin arm64 | 5105 | 5.0 | 621 | 40.4 | 4118 | 0.05 | 1000 | 0.82 | 25.6 KiB | seed and leech in one process |
 | 2026-11-13 | 0.7.0 | Darwin arm64 | 5110 | 5.0 | 641 | 38.8 | 4162 | 0.05 | 1000 | 1.70 | 25.8 KiB | seed and leech in one process |
+| 2026-11-14 | 0.8.0 | Darwin arm64 | 4985 | 5.0 | 637 | 38.9 | 4062 | 0.05 | 1000 | 0.18 | 25.4 KiB | seed and leech in one process |

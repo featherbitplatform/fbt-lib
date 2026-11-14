@@ -7,10 +7,14 @@
 //! stream out.
 //!
 //! A stream holds one of [`AppState::events`]' permits until its body is
-//! dropped (the client hung up). It ends on
+//! dropped (the client hung up, or [`ApiServer`]'s stall guard ended the
+//! connection after
+//! [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout) of
+//! unwritten bytes). It ends on
 //! [`ApiServer::shutdown`](crate::ApiServer::shutdown) and within 1 s of
-//! the session's shutdown: the session's event sender lives as long as
-//! any `Session` clone, this API's included, so the stream polls
+//! the session's shutdown — after delivering everything its subscriber had
+//! already queued: the session's event sender lives as long as any
+//! `Session` clone, this API's included, so the stream polls
 //! [`Session::is_shut_down`] instead of waiting for the channel to close.
 
 use std::convert::Infallible;
@@ -126,8 +130,12 @@ async fn events(
 }
 
 /// `events` as SSE messages. It ends when `events` does, within
-/// [`SHUTDOWN_CHECK`] of the session's shutdown, and when `shutdown`
-/// fires. `permit` is released when the stream is dropped.
+/// [`SHUTDOWN_CHECK`] of the session's shutdown (delivering everything the
+/// subscriber had already queued first), and when `shutdown` fires; under
+/// [`ApiServer`] a client whose socket stops accepting bytes ends it with
+/// the connection — see
+/// [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout). `permit`
+/// is released when the stream is dropped.
 pub(crate) fn sse_stream(
     events: EventStream,
     session: Session,
@@ -162,12 +170,17 @@ impl Stream for SessionEvents {
         let this = self.get_mut();
         // Registers the waker for the next check; drains ticks that are due.
         while this.check.poll_tick(cx).is_ready() {}
-        if this.session.is_shut_down() {
-            return Poll::Ready(None);
+        match this.events.poll_next_unpin(cx) {
+            Poll::Ready(Some(event)) => Poll::Ready(Some(Ok(to_sse(&EventDto::from(&event))))),
+            Poll::Ready(None) => Poll::Ready(None),
+            // The session's event sender lives as long as any `Session`
+            // clone — this stream's own included — so the channel never
+            // closes by itself. Once the session is shut down and this
+            // subscriber's queue is drained there is nothing left to
+            // deliver: end, keeping everything queued before the shutdown.
+            Poll::Pending if this.session.is_shut_down() => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
-        this.events
-            .poll_next_unpin(cx)
-            .map(|event| event.map(|event| Ok(to_sse(&EventDto::from(&event)))))
     }
 }
 
@@ -298,5 +311,83 @@ mod tests {
                 return data.to_vec();
             }
         }
+    }
+
+    /// Every event type `body` carries, until it ends.
+    async fn drain_types(body: &mut Body) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let data = frame.unwrap().into_data().unwrap();
+            for line in String::from_utf8_lossy(&data).lines() {
+                if let Some(payload) = line.strip_prefix("data: ")
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(payload)
+                {
+                    out.push(json["type"].as_str().unwrap_or_default().to_owned());
+                }
+            }
+        }
+        out
+    }
+
+    /// Every event queued before the shutdown is delivered before the stream
+    /// ends: `SessionEvents` drains what its subscriber still holds when the
+    /// session goes instead of stopping on the flag. Nothing polls the stream
+    /// between the pauses and the shutdown, so all six state changes are
+    /// provably still queued at that point — manual polling, no hyper in
+    /// front consuming them early.
+    #[tokio::test]
+    async fn sse_drains_before_ending() {
+        let session = Session::new(test_settings()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.bin");
+        std::fs::write(&file, vec![7u8; 40_000]).unwrap();
+        let bytes = CreateTorrent::new(&file)
+            .piece_len(16384)
+            .build(&mut |_, _| ControlFlow::Continue(()))
+            .unwrap();
+        let handle = session
+            .add_torrent(AddTorrent::new(
+                Metainfo::from_bytes(&bytes).unwrap(),
+                dir.path().to_path_buf(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(handle.status().state, fbt::TorrentState::Seeding) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let stream = sse_stream(
+            session.subscribe(EventMask::ALL),
+            session.clone(),
+            None,
+            CancellationToken::new(),
+        );
+        // Each pause and each resume is one state change, sent before its
+        // command replies, so all six are in the queue before `shutdown`.
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(5), handle.pause())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), handle.resume())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        session.shutdown().await;
+
+        let mut body = Sse::new(stream).into_response().into_body();
+        let types = tokio::time::timeout(Duration::from_secs(10), drain_types(&mut body))
+            .await
+            .expect("the stream ends after draining");
+        let changes = types.iter().filter(|t| *t == "state_changed").count();
+        assert!(
+            changes >= 6,
+            "all six queued state changes arrive before the end: {types:?}"
+        );
     }
 }

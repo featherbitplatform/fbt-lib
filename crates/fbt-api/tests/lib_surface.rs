@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use fbt::Session;
 use fbt_api::range::{RangeOutcome, parse_range};
@@ -54,6 +55,7 @@ fn config_fields(c: &mut ApiConfig) {
     let _: &mut usize = &mut c.max_streams;
     let _: &mut usize = &mut c.max_event_streams;
     let _: &mut usize = &mut c.max_connections;
+    let _: &mut Duration = &mut c.stream_idle_timeout;
 }
 
 fn variants(a: &Auth, e: &ApiError) -> bool {
@@ -64,6 +66,8 @@ fn variants(a: &Auth, e: &ApiError) -> bool {
                 | ApiError::InsecureBind
                 | ApiError::InvalidOrigin
                 | ApiError::InvalidRoot(_)
+                | ApiError::InvalidLimits(..)
+                | ApiError::NoRuntime
                 | ApiError::Bind(_)
         )
 }
@@ -79,5 +83,6 @@ fn defaults() {
     assert_eq!(c.max_streams, 32);
     assert_eq!(c.max_event_streams, 16);
     assert_eq!(c.max_connections, 256);
+    assert_eq!(c.stream_idle_timeout, Duration::from_secs(600));
     assert!(matches!(&ApiConfig::new("t").auth, Auth::Token(t) if t == "t"));
 }

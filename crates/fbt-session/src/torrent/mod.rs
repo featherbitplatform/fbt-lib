@@ -93,6 +93,8 @@ pub(crate) enum Cmd {
     PeerTrust(SocketAddr, oneshot::Sender<i32>),
     /// Tests: how many piece layers the actor's metainfo holds.
     PieceLayersKnown(oneshot::Sender<usize>),
+    /// Tests: how many times the actor's status tick has run.
+    StatusTicks(oneshot::Sender<u64>),
     /// An accepted connection whose handshake names this torrent.
     Incoming {
         /// Boxed: the MSE stream holds two RC4 states.
@@ -206,9 +208,12 @@ pub(crate) fn spawn(
     let ih = params.source.info_hashes();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
     let mut initial = match &params.source {
-        // A v2-only torrent lacking layers has no metadata until they are in.
+        // Its metadata is complete at once; layers it lacks come in beside
+        // the download (see `TorrentStatus::layers_missing`).
         TorrentSource::Metainfo(m) => {
-            TorrentStatus::initial(ih, m.info.name.clone(), !layers::missing_layers(m))
+            let mut status = TorrentStatus::initial(ih, m.info.name.clone(), true);
+            status.layers_missing = layers::missing_layer_count(m);
+            status
         }
         TorrentSource::Magnet(m) => {
             TorrentStatus::initial(ih, m.display_name.clone().unwrap_or_default(), false)
@@ -273,12 +278,13 @@ impl TorrentHandle {
         self.inner.info_hashes
     }
 
-    /// The torrent's metadata; `None` for a magnet, and for a v2-only
-    /// torrent lacking piece layers, until
-    /// [`Event::MetadataReceived`](crate::Event::MetadataReceived).
+    /// The torrent's metadata; `None` for a magnet until its metadata
+    /// arrives ([`Event::MetadataReceived`](crate::Event::MetadataReceived)).
     ///
     /// Set once: piece layers the torrent builds or fetches later are not
-    /// added to it (the torrent still uses them).
+    /// added to it (the torrent still uses them, and
+    /// [`TorrentStatus::layers_missing`](crate::TorrentStatus::layers_missing)
+    /// counts what is still out).
     pub fn metainfo(&self) -> Option<Arc<Metainfo>> {
         self.inner.metainfo.get().cloned()
     }
@@ -318,10 +324,11 @@ impl TorrentHandle {
     /// The v2 piece layers the torrent holds are saved too, those it
     /// fetched or built from verified data included, unless they would
     /// push the data over [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES):
-    /// then they are left out. A v2-only torrent restored without one
-    /// fetches it from peers before it starts; a hybrid builds it from
-    /// data it verifies, so one whose pieces were trusted (nothing
-    /// verified) lacks it until its next check or download of that file.
+    /// then they are left out. A restored v2-only torrent without one
+    /// re-verifies what resume says it has and fetches the layer beside
+    /// its next download; a hybrid builds it from data it verifies, so
+    /// one whose pieces were trusted (nothing verified) lacks it until
+    /// its next check or download of that file.
     pub async fn save_resume_data(&self) -> Result<Vec<u8>, SessionError> {
         self.call(Cmd::SaveResume).await?
     }
@@ -761,6 +768,14 @@ impl TorrentHandle {
     #[doc(hidden)]
     pub async fn piece_layers_known(&self) -> usize {
         self.call(Cmd::PieceLayersKnown).await.unwrap_or(0)
+    }
+
+    /// How many times this torrent's status tick has run; tests watch the
+    /// difference over a window to see the tick rate (an idle torrent ticks
+    /// every [`Settings::idle_status_interval`](crate::Settings::idle_status_interval)). For tests.
+    #[doc(hidden)]
+    pub async fn status_ticks(&self) -> u64 {
+        self.call(Cmd::StatusTicks).await.unwrap_or(0)
     }
 
     /// Asks the actor to stop; the receiver completes once it has.

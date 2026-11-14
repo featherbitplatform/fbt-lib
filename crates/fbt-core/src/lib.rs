@@ -9,12 +9,14 @@ mod layout;
 pub mod merkle;
 mod peer_id;
 pub mod rate;
+pub mod text;
 pub mod udp;
 
 pub use bitfield::{Bitfield, BitfieldError};
 pub use info_hash::{InfoHashV1, InfoHashV2, InfoHashes, ParseInfoHashError};
 pub use layout::{BLOCK_SIZE, BlockRef, FileLayout, FileSlice, LayoutError, PieceLayout};
 pub use peer_id::PeerId;
+pub use text::{MAX_DISPLAY_CHARS, display_safe};
 
 #[cfg(test)]
 mod tests;

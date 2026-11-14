@@ -74,23 +74,32 @@ struct Liar {
     _listeners: (TcpListener, TcpListener),
 }
 
-/// Four one-piece files; the leech wants only the last (piece 3). A
-/// advertises only piece 3 and corrupts its first block once; B, a seed,
-/// joins after A's first request arrived. Piece 3 fails, is retried from
-/// A and B, passes, and A is banned.
+/// Five one-piece files; the leech wants only the last two (pieces 3 and 4).
+/// A advertises only piece 3 and corrupts its first block once; B, which has
+/// pieces 0 to 3, joins after A's first request arrived. Piece 3 fails, is
+/// retried from A and B, passes, and A is banned.
+///
+/// Piece 4 — wanted by us, held by nobody in the swarm — is what keeps the
+/// torrent unfinished after piece 3 passes. Without it the leecher seeds the
+/// moment the ban happens, and `close_if_upload_only` drops B as an
+/// upload-only peer (BEP 21; pinned by `swarm.rs`'s
+/// `seeds_disconnect_from_upload_only_peers`), which is exactly what
+/// `honest_contributor_keeps_its_trust` then raced and called a failure.
 async fn liar_scenario() -> Liar {
     let p = PIECE as usize;
-    let (m, payload) = make_torrent(&[("a", p), ("b", p), ("c", p), ("d", p)], PIECE);
+    let (m, payload) = make_torrent(&[("a", p), ("b", p), ("c", p), ("d", p), ("e", p)], PIECE);
     let (la, a) = listener().await;
     let (lb, b) = listener().await;
     let s = Session::new(plain()).await.unwrap();
     let mut ev = s.subscribe(EventMask::PEER | EventMask::PIECE | EventMask::STATUS);
     let mut add = AddTorrent::new(m.clone(), PathBuf::from("unused"));
     add.storage = Some(Arc::new(MemStorage::new(payload.len() as u64)));
+    // Pieces 0 to 2 are skipped; 3 is the one A lies about and 4 nobody has.
     add.file_priorities = vec![
         Priority::Skip,
         Priority::Skip,
         Priority::Skip,
+        Priority::Normal,
         Priority::Normal,
     ];
     let h = s.add_torrent(add).await.unwrap();
@@ -100,7 +109,7 @@ async fn liar_scenario() -> Liar {
     let log_b: Log = Arc::default();
     h.add_peer(a).await.unwrap();
     let mut pa = ScriptedPeer::accept_with(&la, Reserved::default()).await;
-    // Pieces 0-3: only piece 3 (bit 3 of the first byte).
+    // Five pieces in one byte: A has only piece 3.
     pa.send(Message::Bitfield(Bytes::from_static(&[0x10])))
         .await;
     pa.send(Message::Unchoke).await;
@@ -118,6 +127,8 @@ async fn liar_scenario() -> Liar {
 
     h.add_peer(b).await.unwrap();
     let mut pb = ScriptedPeer::accept_with(&lb, Reserved::default()).await;
+    // B has pieces 0 to 3 and not 4: it holds what we want next, and it is not
+    // a seed of the whole torrent, which an upload-only us would close.
     pb.send(Message::Bitfield(Bytes::from_static(&[0xf0])))
         .await;
     pb.send(Message::Unchoke).await;
@@ -213,6 +224,23 @@ async fn only_the_liar_is_banned() {
     l.s.shutdown().await;
 }
 
+/// The peer that served the good blocks of a failed piece keeps its trust and
+/// its connection: it is not banned, and once the files only it has are wanted
+/// it is asked for blocks again.
+///
+/// Cause of the 0.7 flake (0.8 deflake; reproduced here at 3 in 100 runs with
+/// 36 copies going, 9 in 300 at 72): with four one-piece files the leecher was
+/// finished — every *wanted* file complete — the moment piece 3 passed, so
+/// between `liar_scenario` returning and the priorities widening the actor had
+/// become upload-only and closed B as an upload-only seed (BEP 21). That
+/// `PeerDisconnected { reason: UploadOnly }` sat in the event stream and the
+/// loop below reported it as B being disconnected. Closing a fellow seed while
+/// seeding is correct (pinned by `swarm.rs`'s
+/// `seeds_disconnect_from_upload_only_peers`), so the fix is in the scenario:
+/// `liar_scenario` now wants a piece nobody in the swarm has, which keeps us
+/// downloading across that window and makes "B stays connected" the condition
+/// it was meant to check. After the change: 100 runs at 4 copies, then 100 more
+/// at 72 copies with the machine under CPU load, pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn honest_contributor_keeps_its_trust() {
     let mut l = liar_scenario().await;
@@ -224,9 +252,9 @@ async fn honest_contributor_keeps_its_trust() {
     // retry): its trust is back where it was.
     let trust = l.h.peer_trust(l.b).await.unwrap();
     assert!((0..=1).contains(&trust), "B's trust is {trust}");
-    // Now the rest is wanted; only B has it.
+    // Now the rest is wanted; only B has any of it (nobody holds piece 4).
     let served_before = l.log_b.lock().unwrap().len();
-    l.h.set_file_priorities(vec![Priority::Normal; 4])
+    l.h.set_file_priorities(vec![Priority::Normal; 5])
         .await
         .unwrap();
     let ih = l.m.info_hashes;
@@ -235,7 +263,7 @@ async fn honest_contributor_keeps_its_trust() {
         let left = end.saturating_duration_since(tokio::time::Instant::now());
         let e = next_matching(&mut l.ev, |_| true, left)
             .await
-            .expect("the torrent finishes from B");
+            .expect("a piece only B has arrives");
         assert!(!disconnected_b(&e), "B was disconnected: {e:?}");
         assert!(banned(&e).is_none_or(|a| a == l.a), "{e:?}");
         // A piece only B has passes (before the finished torrent would

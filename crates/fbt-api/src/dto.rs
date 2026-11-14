@@ -203,6 +203,11 @@ pub(crate) struct TorrentInfo {
     pub(crate) name: String,
     /// The metadata is known.
     pub(crate) has_metadata: bool,
+    /// BEP 52 piece layers the metadata does not hold yet: one per file of
+    /// more than one piece whose layer is still missing (0 for a v1 torrent,
+    /// and once every layer arrived or was built). A v2-only torrent downloads
+    /// what it can verify meanwhile and fetches the rest beside the download.
+    pub(crate) layers_missing: u32,
     /// `downloading_metadata`, `queued_for_checking`, `checking_files`,
     /// `downloading`, `seeding`, `paused`, `queued` or `error`.
     #[schema(example = "seeding")]
@@ -277,6 +282,7 @@ impl From<&TorrentStatus> for TorrentInfo {
             version: None,
             name: s.name.clone(),
             has_metadata: s.has_metadata,
+            layers_missing: s.layers_missing,
             state: state_name(&s.state),
             checking_progress: match s.state {
                 TorrentState::CheckingFiles { progress } => Some(progress),
@@ -1598,5 +1604,47 @@ mod tests {
         let err = serde_json::from_str::<Capped<u8, 3>>("[1,2,3,4]").unwrap_err();
         assert!(err.to_string().contains("at most 3"), "{err}");
         assert!(serde_json::from_str::<Capped<u8, 3>>("null").is_err());
+    }
+
+    /// The bytes of `{"priorities":["low","low",…` — an array that never ends,
+    /// generated as it is parsed so reaching a cap in the millions costs a
+    /// small buffer instead of a body tens of megabytes wide.
+    struct EndlessPriorities(u64);
+
+    const PRIORITIES_PREFIX: &[u8] = b"{\"priorities\":[";
+    const PRIORITY_ITEM: &[u8] = b"\"low\",";
+
+    impl std::io::Read for EndlessPriorities {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            for (k, slot) in buf.iter_mut().enumerate() {
+                let i = self.0 + k as u64;
+                *slot = if let Some(c) = PRIORITIES_PREFIX.get(i as usize) {
+                    *c
+                } else {
+                    let at = (i - PRIORITIES_PREFIX.len() as u64) % PRIORITY_ITEM.len() as u64;
+                    PRIORITY_ITEM[at as usize]
+                };
+            }
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+    }
+
+    /// `FilePrioritiesRequest` carries the cap: one past
+    /// [`MAX_FILE_PRIORITIES`] is refused, and the error names it. The accept
+    /// side of a cap boundary is `capped_refuses_one_past_the_cap`'s; feeding
+    /// four million items twice over here would only cost time.
+    #[test]
+    fn file_priorities_refuse_one_past_the_cap() {
+        let body = std::io::BufReader::with_capacity(1 << 16, EndlessPriorities(0));
+        let got = serde_json::from_reader::<_, FilePrioritiesRequest>(body);
+        let err = match got {
+            Ok(req) => panic!("{} priorities accepted: {:?}", MAX_FILE_PRIORITIES + 1, req),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(&MAX_FILE_PRIORITIES.to_string()),
+            "the cap is not in the error: {err}"
+        );
     }
 }

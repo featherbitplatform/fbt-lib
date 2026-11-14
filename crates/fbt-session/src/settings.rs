@@ -172,6 +172,17 @@ pub struct Settings {
     pub rechoke_interval: Duration,
     /// Time between status updates (non-zero).
     pub status_interval: Duration,
+    /// Time between status updates of a torrent that has nothing to do:
+    /// seeding or paused, with no peers, open readers, deadline pieces,
+    /// web seeds in use, jobs running or piece layers to merge or re-read
+    /// (5 s). A v2-only torrent whose layer fetch is still out counts as
+    /// idle once its peers are gone: the fetch has no source until one
+    /// arrives, and that event ends the idleness at once. While a torrent
+    /// is idle its status snapshot (rates, active and seeding time) and its
+    /// seed-limit checks refresh only at this period. Any command, peer
+    /// event or job result switches back to
+    /// [`status_interval`](Self::status_interval) at once. Non-zero.
+    pub idle_status_interval: Duration,
     /// Capacity of the event queues (1 to [`MAX_EVENT_QUEUE`]).
     pub event_queue: usize,
     /// Peers asked from each tracker announce.
@@ -189,6 +200,14 @@ pub struct Settings {
     /// stable API.
     #[doc(hidden)]
     pub metadata_peer_grace: Duration,
+    /// A web seed whose URL resolves to loopback counts as a public origin, so its
+    /// redirects are guarded as a public seed's are (see
+    /// [`TrackerClient::fetch_range`](fbt_tracker::TrackerClient::fetch_range)).
+    /// Internal tunable: tests cannot reach a public address, so this marks their
+    /// loopback seed public to exercise the guard. Not part of the stable API.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub web_seed_treat_loopback_as_public: bool,
     /// Largest info dictionary a magnet torrent fetches from peers (BEP 9),
     /// in bytes; peers advertising more are disconnected. 16 KiB to
     /// [`MAX_METADATA_SIZE`].
@@ -415,6 +434,13 @@ pub struct Settings {
     /// ([`TorrentStatus::seeding_time`](crate::TorrentStatus::seeding_time))
     /// stops likewise (`None`, the default: no limit).
     pub seed_time_limit: Option<Duration>,
+    /// Answer peers' BEP 52 `hash request`s (the default, `true`). With it
+    /// off this session refuses every incoming one with `hash reject`, even
+    /// where it holds the hashes: a test knob for a peer that cannot serve
+    /// layers. It says nothing about requests this torrent *sends*.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub serve_hashes: bool,
 }
 
 impl Settings {
@@ -427,6 +453,7 @@ impl Settings {
             ("request_timeout", self.request_timeout),
             ("rechoke_interval", self.rechoke_interval),
             ("status_interval", self.status_interval),
+            ("idle_status_interval", self.idle_status_interval),
             ("tracker_retry_base", self.tracker_retry_base),
             ("dht_announce_interval", self.dht_announce_interval),
             ("dht_query_timeout", self.dht_query_timeout),
@@ -607,11 +634,13 @@ impl Default for Settings {
             peer_retry_delay: Duration::from_secs(60),
             rechoke_interval: Duration::from_secs(10),
             status_interval: Duration::from_millis(500),
+            idle_status_interval: Duration::from_secs(5),
             event_queue: 4096,
             num_want: 50,
             tracker: TrackerConfig::default(),
             tracker_retry_base: Duration::from_secs(60),
             metadata_peer_grace: Duration::from_secs(30),
+            web_seed_treat_loopback_as_public: false,
             max_metadata_size: 16 * 1024 * 1024,
             dht_enabled: true,
             dht_bootstrap_nodes: DEFAULT_DHT_BOOTSTRAP.map(str::to_owned).to_vec(),
@@ -652,6 +681,7 @@ impl Default for Settings {
             queue: QueueSettings::default(),
             seed_ratio_limit: None,
             seed_time_limit: None,
+            serve_hashes: true,
         }
     }
 }
@@ -713,6 +743,19 @@ mod tests {
         );
         s.read_ahead = ReadAhead::new(16 << 20, Duration::from_secs(10), Some(1));
         assert!(s.validate().is_ok());
+    }
+
+    /// The idle tick exists and is validated like every other timer.
+    #[test]
+    fn idle_status_interval_defaults_and_validates() {
+        let mut s = Settings::default();
+        assert_eq!(s.idle_status_interval, Duration::from_secs(5));
+        assert!(s.validate().is_ok());
+        s.idle_status_interval = Duration::ZERO;
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "idle_status_interval must be greater than zero"
+        );
     }
 
     #[test]

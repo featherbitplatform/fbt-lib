@@ -74,6 +74,17 @@ trc() { dc exec -T -u abc transmission "$@"; }
 
 fail() {
     echo "interop: FAIL: $*" >&2
+    # The .torrent files are the containers' /interop, which is $INTEROP_DIR on
+    # the host. Keep copies under logs/torrents/, which CI uploads as part of
+    # target/interop/logs/, so a failure can be reproduced against the very
+    # files the run used.
+    local torrent_file
+    mkdir -p "$logs/torrents" || true
+    shopt -s nullglob
+    for torrent_file in "$INTEROP_DIR"/*.torrent; do
+        cp "$torrent_file" "$logs/torrents/" 2>/dev/null || true
+    done
+    shopt -u nullglob
     exit 1
 }
 
@@ -197,6 +208,18 @@ info_hash() {
 # info_hash_v2 <torrent>: its full v2 info hash (64 hex), if it has one.
 info_hash_v2() {
     fbt fbt-example info "$1" | sed -n 's/^info hash v2: //p'
+}
+
+# expect_info <torrent> <expected line>: fbt-example info for <torrent>, with its
+# full output saved as $logs/info-<basename>.txt (CI uploads logs/) and a failure
+# that inlines that output when <expected line> is not one of its lines.
+expect_info() {
+    local log="$logs/info-${1##*/}.txt"
+    fbt fbt-example info "$1" >"$log" 2>&1 ||
+        fail "fbt-example info failed on $1 (see $log)"
+    grep -qxF -- "$2" "$log" ||
+        fail "$1 has no line '$2' (its full info output, saved at $log):
+$(cat "$log")"
 }
 
 # qbt_id <torrent>: qBittorrent's id for it (its `hash` in torrents/info):
@@ -900,8 +923,7 @@ make_v2_payload /interop/payload-v2/v2data
 qbt_create /interop/payload-v2/v2data v2 /interop/qbt-v2.torrent
 qbt_v2=$(qbt_id /interop/qbt-v2.torrent)
 [ -n "$qbt_v2" ] || fail "could not read qBittorrent's v2 torrent"
-fbt fbt-example info /interop/qbt-v2.torrent | grep -qx 'version: v2' ||
-    fail "qBittorrent's v2 torrent does not read as v2"
+expect_info /interop/qbt-v2.torrent 'version: v2'
 wait_for "qBittorrent to seed its v2 torrent" 120 qbt_seeding "$qbt_v2"
 
 echo "interop: fbt-example downloads qBittorrent's v2 torrent (timeout 300s)"
@@ -972,8 +994,7 @@ make_v2_payload /interop/payload-hyb/hybdata
 qbt_create /interop/payload-hyb/hybdata hybrid /interop/qbt-hybrid.torrent
 qbt_hyb=$(qbt_id /interop/qbt-hybrid.torrent)
 [ -n "$qbt_hyb" ] || fail "could not read qBittorrent's hybrid torrent"
-fbt fbt-example info /interop/qbt-hybrid.torrent | grep -qx 'version: hybrid' ||
-    fail "qBittorrent's hybrid torrent does not read as hybrid"
+expect_info /interop/qbt-hybrid.torrent 'version: hybrid'
 wait_for "qBittorrent to seed its hybrid torrent" 120 qbt_seeding "$qbt_hyb"
 
 echo "interop: fbt-example downloads qBittorrent's hybrid torrent (timeout 300s)"

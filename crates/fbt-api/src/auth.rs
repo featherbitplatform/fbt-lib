@@ -1,6 +1,6 @@
 //! The auth layer: bearer token (header, or `?token=` on the streaming
 //! and event routes), the exempt routes, and the [`Auth::Disabled`]
-//! Host/Origin guard.
+//! loopback-peer, Host and Origin guard.
 //!
 //! It is added with `Router::layer`, so each matched route's
 //! [`MatchedPath`] is set when it runs. Routes are recognised by the
@@ -12,14 +12,15 @@
 //! this one, answers them itself. With CORS off an `OPTIONS` request is
 //! like any other and needs the token.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{MatchedPath, Request, State};
+use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use crate::config::Auth;
+use crate::config::{Auth, is_loopback};
 use crate::error::ApiErrorResponse;
 
 /// Routes that need no token, as `(method, matched path suffix)`.
@@ -149,10 +150,20 @@ fn ct_eq(given: &[u8], expected: &[u8]) -> bool {
     diff == 0
 }
 
-/// [`Auth::Disabled`]'s guard against CSRF and DNS rebinding: the `Host`
-/// must be `localhost`, `127.0.0.1` or `[::1]` (any port), and an
-/// `Origin`, when sent, must be one of `origins`.
+/// [`Auth::Disabled`]'s guard against CSRF and DNS rebinding: the peer, when
+/// the request carries axum's `ConnectInfo` (every `ApiServer` request does),
+/// must be loopback; the `Host` must be `localhost`, `127.0.0.1` or `[::1]`
+/// (any port); and an `Origin`, when sent, must be one of `origins`. A router
+/// mounted without that extension is guarded by the Host and Origin rules
+/// alone.
 fn guard_disabled(origins: &[HeaderValue], req: &Request) -> Result<(), ApiErrorResponse> {
+    if let Some(&ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>()
+        && !is_loopback(peer.ip())
+    {
+        return Err(ApiErrorResponse::forbidden(
+            "with authentication disabled, the peer address must be loopback",
+        ));
+    }
     let host = req
         .headers()
         .get(header::HOST)

@@ -14,9 +14,12 @@ use hyper::{Request, Uri, header};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
+use fbt_net::addr::is_internal;
 use fbt_net::proxy::{ProxyConfig, ProxyError, ProxyKind};
 
-use crate::connector::ProxyConnector;
+#[cfg(test)]
+use crate::connector::StubResolver;
+use crate::connector::{ProxyConnector, Refused, Resolution, without_brackets};
 use crate::tls::{self, Connector};
 use crate::types::{MAX_TRACKER_ID_BYTES, MIN_INTERVAL, bounded_text};
 use crate::urlencode::url_encode_bytes;
@@ -69,6 +72,51 @@ pub(crate) fn too_slow(bytes: u64, active: Duration) -> bool {
         && u128::from(bytes) * 1000 < u128::from(MIN_RANGE_RATE) * active.as_millis()
 }
 
+/// Whether a fetch may be redirected to an address inside the local network.
+///
+/// A `Location` header moves a URL wherever the server likes, so a public web seed can point
+/// us at a host on the user's own network — a LAN service, or a router's metadata endpoint at
+/// `169.254.169.254` — and read back whatever that answers. With `allow_internal` false such a
+/// target is refused before anything is sent to it: the connector that dials it resolves the
+/// host, judges every address its answer holds before dialling any of them, and refuses the
+/// whole target if any of them is inside the local network, so what decides is what would have
+/// been dialled and not the text of the `Location` header. A target spelled as an address is
+/// judged as that address. Nothing is trusted from a lookup that fails or never answers: under
+/// this policy it ends the request too, rather than letting an internal target through. See
+/// [`TrackerClient::fetch_range`](crate::TrackerClient::fetch_range) and
+/// [`fbt_net::addr::is_internal`].
+///
+/// **Through a proxy that resolves names** ([`ProxyConfig::proxy_hostnames`] is true, and web
+/// seeds go through the proxy with `proxy_peers`) nothing here is looked up locally: only a
+/// target spelled as an address is judged, because a host name is resolved — and dialled — by
+/// the proxy, which decides where it goes. A proxy that does not resolve names ([`ProxyConfig::proxy_hostnames`]
+/// false) resolves them itself, so there the same judgement applies to names as to addresses.
+///
+/// A non-exhaustive struct cannot be written out field by field in another crate, so build the
+/// default and change what you need:
+///
+/// ```
+/// let mut policy = fbt_tracker::RedirectPolicy::default();
+/// policy.allow_internal = false;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RedirectPolicy {
+    /// Whether a redirect target may be dialled at an internal address: loopback, RFC 1918,
+    /// IPv6 unique-local or link-local, CGNAT, the unspecified address, multicast or broadcast.
+    /// `true` by default, which is how announces have always followed redirects and how a web
+    /// seed configured on a private address keeps working.
+    pub allow_internal: bool,
+}
+
+impl Default for RedirectPolicy {
+    fn default() -> RedirectPolicy {
+        RedirectPolicy {
+            allow_internal: true,
+        }
+    }
+}
+
 /// An HTTP client with its pooled connections.
 type HttpPool = Client<Connector, Empty<Bytes>>;
 
@@ -77,6 +125,11 @@ pub(crate) struct HttpClient {
     trackers: HttpPool,
     /// For web seeds: through the proxy with `proxy_peers`.
     web_seeds: HttpPool,
+    /// The redirect hops of a web-seed fetch whose policy denies internal targets: every
+    /// address this client's connector resolves is judged before it dials it. A second client
+    /// rather than one with a per-request flag, because the choice belongs to the whole
+    /// connection and connections are shared between requests.
+    web_seeds_guarded: HttpPool,
     user_agent: String,
     timeout: Duration,
     max_bytes: usize,
@@ -89,21 +142,49 @@ impl std::fmt::Debug for HttpClient {
 }
 
 impl HttpClient {
-    /// Two clients over the same TLS setup: announces go through `proxy`
-    /// when it sets `proxy_trackers`, web seeds when it sets `proxy_peers`.
+    /// Three clients over the same TLS setup: announces go through `proxy` when it sets
+    /// `proxy_trackers`, web seeds and their guarded redirect hops when it sets `proxy_peers`.
     /// Proxy round trips are bounded by `cfg.http_timeout`.
     pub(crate) fn new(
         cfg: &TrackerConfig,
         proxy: Option<&ProxyConfig>,
     ) -> Result<HttpClient, TrackerError> {
+        Self::build(cfg, proxy, Resolution::System)
+    }
+
+    /// A client whose own host lookups go to `stub` instead of the system resolver (tests):
+    /// what a name resolves to is queued in advance, so a test can show that a redirect is
+    /// refused on the address the connection would dial — and that a policy which allows
+    /// internal targets looked nothing up locally.
+    #[cfg(test)]
+    pub(crate) fn with_stub_resolver(
+        cfg: &TrackerConfig,
+        proxy: Option<&ProxyConfig>,
+        stub: StubResolver,
+    ) -> Result<HttpClient, TrackerError> {
+        Self::build(cfg, proxy, stub.resolution())
+    }
+
+    fn build(
+        cfg: &TrackerConfig,
+        proxy: Option<&ProxyConfig>,
+        where_to_look: Resolution,
+    ) -> Result<HttpClient, TrackerError> {
         let active = proxy.filter(|p| p.kind != ProxyKind::None);
-        let client = |use_proxy: bool| -> Result<_, TrackerError> {
-            let c = ProxyConnector::new(active.filter(|_| use_proxy), cfg.http_timeout);
+        let client = |use_proxy: bool, deny_internal: bool| -> Result<_, TrackerError> {
+            let c = ProxyConnector::new(
+                active.filter(|_| use_proxy),
+                cfg.http_timeout,
+                deny_internal,
+                where_to_look.clone(),
+            );
             Ok(Client::builder(TokioExecutor::new()).build(tls::build_connector(c)?))
         };
+        let seeds_proxied = active.is_some_and(|p| p.proxy_peers);
         Ok(HttpClient {
-            trackers: client(active.is_some_and(|p| p.proxy_trackers))?,
-            web_seeds: client(active.is_some_and(|p| p.proxy_peers))?,
+            trackers: client(active.is_some_and(|p| p.proxy_trackers), false)?,
+            web_seeds: client(seeds_proxied, false)?,
+            web_seeds_guarded: client(seeds_proxied, true)?,
             user_agent: cfg.user_agent.clone(),
             timeout: cfg.http_timeout,
             max_bytes: cfg.max_response_bytes,
@@ -136,7 +217,9 @@ impl HttpClient {
     }
 
     async fn fetch(&self, url: String) -> Result<Vec<u8>, TrackerError> {
-        let resp = self.follow(&self.trackers, url, None).await?;
+        let resp = self
+            .follow(&self.trackers, None, url, None, RedirectPolicy::default())
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(TrackerError::HttpStatus(status.as_u16()));
@@ -144,16 +227,20 @@ impl HttpClient {
         self.read_capped(resp.into_body()).await
     }
 
-    /// GETs `url` through `client` (with `range` as its `Range` header),
-    /// following at most [`MAX_REDIRECTS`] redirects (never from `https`
-    /// to `http`), and returns the final response, whatever its status.
-    /// Each request waits at most the configured timeout for its response
-    /// head.
+    /// GETs `url` through `first` (with `range` as its `Range` header), following at most
+    /// [`MAX_REDIRECTS`] redirects (never from `https` to `http`) as `policy` allows, and
+    /// returns the final response, whatever its status. The URL the caller asked for is its own
+    /// choice and always goes through `first`; a redirect hop under a policy that denies
+    /// internal targets goes through `guarded`, whose connector refuses to dial an address
+    /// inside the local network. Each request waits at most the configured timeout for its
+    /// response head.
     async fn follow(
         &self,
-        client: &HttpPool,
+        first: &HttpPool,
+        guarded: Option<&HttpPool>,
         mut url: String,
         range: Option<&str>,
+        policy: RedirectPolicy,
     ) -> Result<hyper::Response<hyper::body::Incoming>, TrackerError> {
         let mut redirects = 0;
         loop {
@@ -166,6 +253,11 @@ impl HttpClient {
             let request = builder
                 .body(Empty::<Bytes>::new())
                 .map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
+            let guard_hops = redirects > 0 && !policy.allow_internal;
+            let client = match (guard_hops, guarded) {
+                (true, Some(pool)) => pool,
+                _ => first,
+            };
             let resp = tokio::time::timeout(self.timeout, client.request(request))
                 .await
                 .map_err(|_| TrackerError::Timeout)?
@@ -186,17 +278,25 @@ impl HttpClient {
             if uri.scheme_str() == Some("https") && next.starts_with("http://") {
                 return Err(TrackerError::InvalidResponse("insecure redirect"));
             }
+            // Only a target is judged: the URL the caller asked for is its own choice. A name
+            // is left to whoever dials it, which judges what it resolves to; a literal is
+            // dialled as written, so it is judged here.
+            if !policy.allow_internal {
+                check_redirect_target(&next)?;
+            }
             url = next;
         }
     }
 
     /// The bytes `range` of `url` (a web seed's file), through the web
-    /// seed client. See [`TrackerClient::fetch_range`](crate::TrackerClient::fetch_range).
+    /// seed client, following redirects as `policy` allows. See
+    /// [`TrackerClient::fetch_range`](crate::TrackerClient::fetch_range).
     pub(crate) async fn fetch_range(
         &self,
         url: &str,
         range: Range<u64>,
         pace: Option<&dyn RangePace>,
+        policy: RedirectPolicy,
     ) -> Result<Bytes, TrackerError> {
         let pace = pace.unwrap_or(&Unpaced);
         let started = tokio::time::Instant::now();
@@ -207,7 +307,13 @@ impl HttpClient {
         let last = range.end - 1;
         let header = format!("bytes={}-{last}", range.start);
         let resp = self
-            .follow(&self.web_seeds, url.to_owned(), Some(&header))
+            .follow(
+                &self.web_seeds,
+                Some(&self.web_seeds_guarded),
+                url.to_owned(),
+                Some(&header),
+                policy,
+            )
             .await?;
         let status = resp.status();
         match status.as_u16() {
@@ -338,11 +444,15 @@ fn decimal(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
-/// A failed request: [`TrackerError::Proxy`] when the proxy failed (a
+/// A failed request: [`TrackerError::InternalRedirect`] when a connector refused to dial an
+/// address inside the local network, [`TrackerError::Proxy`] when the proxy failed (a
 /// [`ProxyError`] in the source chain), else [`TrackerError::Io`].
 fn request_error(e: hyper_util::client::legacy::Error) -> TrackerError {
     let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
     while let Some(s) = source {
+        if s.downcast_ref::<Refused>().is_some() {
+            return TrackerError::InternalRedirect;
+        }
         if let Some(p) = s.downcast_ref::<ProxyError>() {
             return TrackerError::Proxy(p.to_string());
         }
@@ -381,6 +491,26 @@ fn resolve_location(base: &Uri, location: &str) -> Result<String, TrackerError> 
         return Ok(format!("{scheme}://{auth}{location}"));
     }
     Err(TrackerError::InvalidResponse("unsupported redirect target"))
+}
+
+/// Whether a redirect to `url` may be asked at all under a policy that denies internal
+/// targets, judged on how the target is spelled: an address inside the local network refuses
+/// it, because that is the address the connection dials. A host name is not judged here — the
+/// connector that dials it judges what its lookup returns, and a proxy that resolves names
+/// decides where they go ([`RedirectPolicy`]). The refusal carries no address: the session
+/// reports it with the seed's own URL, which is what a user recognises.
+fn check_redirect_target(url: &str) -> Result<(), TrackerError> {
+    let uri = check_uri(url)?;
+    let host = uri
+        .host()
+        .map(without_brackets)
+        .ok_or_else(|| TrackerError::InvalidUrl("missing host".to_owned()))?;
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_internal(ip)
+    {
+        return Err(TrackerError::InternalRedirect);
+    }
+    Ok(())
 }
 
 fn event_str(e: AnnounceEvent) -> Option<&'static str> {

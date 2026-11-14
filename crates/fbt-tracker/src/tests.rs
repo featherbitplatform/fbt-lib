@@ -3,11 +3,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fbt_bencode::{DictBuilder, OwnedValue, encode};
-use fbt_core::PeerId;
+use fbt_core::{MAX_DISPLAY_CHARS, PeerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::connector::StubResolver;
+use crate::http::HttpClient;
 use crate::*;
+use fbt_net::proxy::{ProxyConfig, ProxyKind};
+
+/// A loopback SOCKS5 proxy that relays CONNECT for real: the same support `fbt-net`'s own
+/// tests drive, included so a tracker test can put its client behind a proxy.
+#[path = "../../fbt-net/tests/support/fake_socks5.rs"]
+mod fake_socks5;
+
+use fake_socks5::{FakeSocks5, Script};
 
 fn dict(f: impl FnOnce(&mut DictBuilder)) -> Vec<u8> {
     let mut b = DictBuilder::new();
@@ -166,6 +176,20 @@ fn client() -> TrackerClient {
     TrackerClient::new(TrackerConfig::default()).unwrap()
 }
 
+/// A SOCKS5 proxy config carrying web-seed traffic through `addr`, resolving host names either
+/// at the proxy (`proxy_hostnames`) or here. `ProxyConfig` is non-exhaustive, so it is built
+/// from its default and changed field by field.
+fn socks5(addr: SocketAddr, proxy_hostnames: bool) -> ProxyConfig {
+    let mut p = ProxyConfig::default();
+    p.kind = ProxyKind::Socks5;
+    p.host = addr.ip().to_string();
+    p.port = addr.port();
+    p.proxy_peers = true;
+    p.proxy_trackers = false;
+    p.proxy_hostnames = proxy_hostnames;
+    p
+}
+
 #[tokio::test]
 async fn announce_against_local_http_server() {
     let body = dict(|b| {
@@ -249,16 +273,48 @@ async fn https_without_tls_feature() {
     assert!(matches!(err, TrackerError::TlsDisabled), "{err:?}");
 }
 
+/// A failure reason carrying a bidi override and 5 000 characters arrives
+/// clean and no longer than the display cap.
+#[test]
+fn tracker_failure_reason_is_display_safe() {
+    let long = format!("not\u{202E} found\n{}", "é".repeat(5_000));
+    let body = dict(|b| {
+        b.insert(b"failure reason", long.as_str());
+    });
+    match parse_http_announce(&body) {
+        Err(TrackerError::Failure(m)) => {
+            assert_eq!(m.chars().count(), MAX_DISPLAY_CHARS, "{}", m.len());
+            assert!(!m.contains('\u{202E}'), "{m:?}");
+            assert!(!m.chars().any(|c| c.is_control()), "{m:?}");
+            assert!(
+                m.starts_with("not found "),
+                "the override is gone and the newline became a space: {m:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // A warning message goes through the same rules.
+    let body = dict(|b| {
+        b.insert(b"interval", 900);
+        b.insert(b"warning message", "\u{2066}try\u{1b} again\u{200B}");
+    });
+    assert_eq!(
+        parse_http_announce(&body).unwrap().warning.as_deref(),
+        Some("try again")
+    );
+}
+
 #[test]
 fn tracker_strings_are_bounded() {
-    // Failure reasons are cut to 1 KiB on a character boundary.
+    // Failure reasons are display-safe and at most `MAX_DISPLAY_CHARS`
+    // characters, cut on a character boundary.
     let long = "é".repeat(5000);
     let body = dict(|b| {
         b.insert(b"failure reason", long.as_str());
     });
     match parse_http_announce(&body) {
         Err(TrackerError::Failure(m)) => {
-            assert!(m.len() <= 1024 && m.len() >= 1020, "{}", m.len());
+            assert_eq!(m.chars().count(), MAX_DISPLAY_CHARS, "{}", m.len());
             assert!(m.chars().all(|c| c == 'é'));
         }
         other => panic!("{other:?}"),
@@ -270,7 +326,10 @@ fn tracker_strings_are_bounded() {
         b.insert(b"tracker id", vec![b'i'; 257]);
     });
     let r = parse_http_announce(&body).unwrap();
-    assert_eq!(r.warning.map(|w| w.len()), Some(1024));
+    assert_eq!(
+        r.warning.map(|w| w.chars().count()),
+        Some(MAX_DISPLAY_CHARS)
+    );
     assert_eq!(r.tracker_id, None);
     let body = dict(|b| {
         b.insert(b"interval", 900);
@@ -287,7 +346,7 @@ fn tracker_strings_are_bounded() {
     let mut dgram = vec![0, 0, 0, 3, 0, 0, 0, 7];
     dgram.extend(std::iter::repeat_n(b'x', 60_000));
     match parse_udp_announce(&dgram, 7, false) {
-        Err(TrackerError::Failure(m)) => assert_eq!(m.len(), 1024),
+        Err(TrackerError::Failure(m)) => assert_eq!(m.chars().count(), MAX_DISPLAY_CHARS),
         other => panic!("{other:?}"),
     }
 }
@@ -552,7 +611,12 @@ async fn fetch_range_accepts_a_matching_206() {
     let (addr, _) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
     let pace = Counting(Mutex::new((0, 0)));
     let got = client()
-        .fetch_range_paced(&format!("http://{addr}/f"), 2..6, &pace)
+        .fetch_range_paced(
+            &format!("http://{addr}/f"),
+            2..6,
+            &pace,
+            RedirectPolicy::default(),
+        )
         .await
         .unwrap();
     assert_eq!(&got[..], b"cdef");
@@ -566,12 +630,17 @@ async fn fetch_range_takes_a_200_only_for_the_whole_file_from_0() {
     let (addr, _) = serve(vec![http_ok(b"0123456789"), http_ok(b"0123456789")]).await;
     let url = format!("http://{addr}/f");
     assert_eq!(
-        &client().fetch_range(&url, 0..10).await.unwrap()[..],
+        &client()
+            .fetch_range(&url, 0..10, RedirectPolicy::default())
+            .await
+            .unwrap()[..],
         b"0123456789"
     );
     // Asked for part of it: the server ignored the range.
     assert!(matches!(
-        client().fetch_range(&url, 0..5).await,
+        client()
+            .fetch_range(&url, 0..5, RedirectPolicy::default())
+            .await,
         Err(TrackerError::InvalidResponse(_))
     ));
 }
@@ -586,7 +655,9 @@ async fn fetch_range_refuses_a_wrong_content_range() {
     let url = format!("http://{addr}/f");
     for _ in 0..2 {
         assert!(matches!(
-            client().fetch_range(&url, 2..6).await,
+            client()
+                .fetch_range(&url, 2..6, RedirectPolicy::default())
+                .await,
             Err(TrackerError::InvalidResponse(_))
         ));
     }
@@ -607,23 +678,272 @@ async fn fetch_range_refuses_a_body_too_long_or_short() {
     let url = format!("http://{addr}/f");
     let c = client();
     assert!(matches!(
-        c.fetch_range(&url, 2..6).await,
+        c.fetch_range(&url, 2..6, RedirectPolicy::default()).await,
         Err(TrackerError::ResponseTooLarge)
     ));
     assert!(matches!(
-        c.fetch_range(&url, 2..6).await,
+        c.fetch_range(&url, 2..6, RedirectPolicy::default()).await,
         Err(TrackerError::ResponseTooLarge)
     ));
     assert!(matches!(
-        c.fetch_range(&url, 2..6).await,
+        c.fetch_range(&url, 2..6, RedirectPolicy::default()).await,
         Err(TrackerError::InvalidResponse(_))
     ));
     assert!(matches!(
-        c.fetch_range(&url, 2..6).await,
+        c.fetch_range(&url, 2..6, RedirectPolicy::default()).await,
         Err(TrackerError::HttpStatus(404))
     ));
     // An empty range asks nothing.
-    assert!(c.fetch_range(&url, 6..6).await.unwrap().is_empty());
+    assert!(
+        c.fetch_range(&url, 6..6, RedirectPolicy::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A redirect to a host that resolves inside the local network: refused by a policy that
+/// denies internal targets — before anything is sent to the target — and followed as
+/// before by the default one. The origin itself is never judged: only where it redirects
+/// to is, which is why the first request reaches the loopback server either way.
+#[tokio::test]
+async fn fetch_range_redirect_policy_judges_the_target() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+    // Origin: a 302 to `/f` on the same (loopback) host; target: the file.
+    let (addr, seen) = serve(vec![redirect("/f"), partial("bytes 2-5/10", b"cdef")]).await;
+    let url = format!("http://{addr}/a");
+    let err = client().fetch_range(&url, 2..6, denied).await.unwrap_err();
+    assert!(matches!(err, TrackerError::InternalRedirect), "{err:?}");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the target is never asked: {:?}",
+        seen.lock().unwrap()
+    );
+
+    // The same server, the same redirect, a policy that allows it.
+    let (addr, seen) = serve(vec![redirect("/f"), partial("bytes 2-5/10", b"cdef")]).await;
+    let url = format!("http://{addr}/a");
+    let got = client()
+        .fetch_range(&url, 2..6, RedirectPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(&got[..], b"cdef");
+    assert_eq!(seen.lock().unwrap().len(), 2, "both requests were made");
+}
+
+/// A name whose answer changes between two lookups — what a record with no TTL does to a check
+/// made before the request — is judged on the answer the connection actually uses: the guard
+/// runs inside that resolution, so it sees the second answer and refuses it, and nothing is
+/// sent to the server behind it. A test cannot reach a public address, so the unguarded first
+/// lookup stands in for the public answer a public seed would get.
+#[tokio::test]
+async fn redirect_rebinding_is_refused_at_connect_time() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, origin_seen) = serve(vec![redirect(&format!(
+        "http://rebound.test:{}/f",
+        target.port()
+    ))])
+    .await;
+
+    let stub = StubResolver::default();
+    // The seed's own name answers with the server it is dialled to; the redirect's name, asked
+    // again for the hop, has turned inward — an internal answer among public ones.
+    stub.push(&["127.0.0.1"]);
+    stub.push(&["127.0.0.1", "93.184.216.34"]);
+    let client =
+        HttpClient::with_stub_resolver(&TrackerConfig::default(), None, stub.clone()).unwrap();
+    let url = format!("http://seed.test:{}/a", origin.port());
+    let err = client
+        .fetch_range(&url, 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::InternalRedirect), "{err:?}");
+    assert_eq!(
+        stub.calls(),
+        ["seed.test".to_owned(), "rebound.test".to_owned()],
+        "one lookup for each hop, and each hop uses its own"
+    );
+    assert_eq!(origin_seen.lock().unwrap().len(), 1, "the seed was asked");
+    assert!(
+        target_seen.lock().unwrap().is_empty(),
+        "the rebound address was never dialled: {:?}",
+        target_seen.lock().unwrap()
+    );
+
+    // The same servers and the same answers, a policy that allows internal targets: the second
+    // answer is dialled and the range comes back.
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, _) = serve(vec![redirect(&format!(
+        "http://rebound.test:{}/f",
+        target.port()
+    ))])
+    .await;
+    let stub = StubResolver::default();
+    stub.push(&["127.0.0.1"]);
+    stub.push(&["127.0.0.1"]);
+    let client =
+        HttpClient::with_stub_resolver(&TrackerConfig::default(), None, stub.clone()).unwrap();
+    let url = format!("http://seed.test:{}/a", origin.port());
+    let got = client
+        .fetch_range(&url, 2..6, None, RedirectPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(&got[..], b"cdef");
+    assert_eq!(target_seen.lock().unwrap().len(), 1);
+}
+
+/// A policy that denies internal targets does not fall back on trusting a name it cannot
+/// resolve: neither a lookup that fails nor one that never answers becomes a request.
+#[tokio::test]
+async fn a_deny_policy_does_not_trust_a_name_it_cannot_resolve() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+
+    // The name does not resolve: the resolver's own failure ends it.
+    let (origin, origin_seen) = serve(vec![redirect("http://rebound.test:8080/f")]).await;
+    let stub = StubResolver::default();
+    stub.fail_next();
+    let client =
+        HttpClient::with_stub_resolver(&TrackerConfig::default(), None, stub.clone()).unwrap();
+    let err = client
+        .fetch_range(&format!("http://{origin}/a"), 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Io(_)), "{err:?}");
+    assert_eq!(stub.calls(), ["rebound.test".to_owned()]);
+    assert_eq!(origin_seen.lock().unwrap().len(), 1);
+
+    // The name never answers: the request's own timeout ends it, still with nothing dialled.
+    let (origin, _) = serve(vec![redirect("http://rebound.test:8080/f")]).await;
+    let stub = StubResolver::default();
+    stub.hang_next();
+    let cfg = TrackerConfig {
+        http_timeout: Duration::from_millis(200),
+        ..TrackerConfig::default()
+    };
+    let client = HttpClient::with_stub_resolver(&cfg, None, stub.clone()).unwrap();
+    let err = client
+        .fetch_range(&format!("http://{origin}/a"), 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Timeout), "{err:?}");
+    assert_eq!(stub.calls(), ["rebound.test".to_owned()]);
+}
+
+/// A SOCKS5 proxy that resolves names (`proxy_hostnames`) decides where a name goes, so a
+/// guarded web-seed fetch looks nothing up locally: the redirect to a name is followed through
+/// the proxy, and only a target spelled as an address is judged — which needs no lookup.
+#[tokio::test]
+async fn a_proxy_that_resolves_names_makes_no_local_lookup() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+    // A redirect to a name: the proxy resolves it and the range comes back.
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, _) = serve(vec![redirect(&format!(
+        "http://localhost:{}/f",
+        target.port()
+    ))])
+    .await;
+    let stub = StubResolver::default();
+    let client = HttpClient::with_stub_resolver(
+        &TrackerConfig::default(),
+        Some(&socks5(fake.addr(), true)),
+        stub.clone(),
+    )
+    .unwrap();
+    let url = format!("http://localhost:{}/a", origin.port());
+    let got = client.fetch_range(&url, 2..6, None, denied).await.unwrap();
+    assert_eq!(&got[..], b"cdef");
+    assert_eq!(target_seen.lock().unwrap().len(), 1);
+    assert!(
+        stub.calls().is_empty(),
+        "the proxy resolved both names: {:?}",
+        stub.calls()
+    );
+
+    // A redirect to an address inside the local network: refused, and still nothing looked up.
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, _) = serve(vec![redirect(&format!(
+        "http://127.0.0.1:{}/f",
+        target.port()
+    ))])
+    .await;
+    let stub = StubResolver::default();
+    let client = HttpClient::with_stub_resolver(
+        &TrackerConfig::default(),
+        Some(&socks5(fake.addr(), true)),
+        stub.clone(),
+    )
+    .unwrap();
+    let url = format!("http://localhost:{}/a", origin.port());
+    let err = client
+        .fetch_range(&url, 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::InternalRedirect), "{err:?}");
+    assert!(
+        target_seen.lock().unwrap().is_empty(),
+        "the internal target is never dialled: {:?}",
+        target_seen.lock().unwrap()
+    );
+    assert!(stub.calls().is_empty(), "{:?}", stub.calls());
+}
+
+/// Without `proxy_hostnames` the client resolves a name itself before asking the proxy to dial
+/// it, so the same judgement applies there: the address handed to the proxy is the one that was
+/// judged, once, and an internal answer never reaches the proxy at all.
+#[tokio::test]
+async fn a_proxy_that_does_not_resolve_names_judges_the_name_it_dials() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let (target, target_seen) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
+    let (origin, _) = serve(vec![redirect(&format!(
+        "http://localhost:{}/f",
+        target.port()
+    ))])
+    .await;
+    let stub = StubResolver::default();
+    // The answer for the redirect's name: the loopback port the proxy would be told to dial.
+    stub.push(&["127.0.0.1"]);
+    let client = HttpClient::with_stub_resolver(
+        &TrackerConfig::default(),
+        Some(&socks5(fake.addr(), false)),
+        stub.clone(),
+    )
+    .unwrap();
+    let err = client
+        .fetch_range(&format!("http://{origin}/a"), 2..6, None, denied)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::InternalRedirect), "{err:?}");
+    assert_eq!(
+        stub.calls(),
+        ["localhost".to_owned()],
+        "the name is resolved once, where it is dialled"
+    );
+    assert!(
+        target_seen.lock().unwrap().is_empty(),
+        "the refused hop never reached the server: {:?}",
+        target_seen.lock().unwrap()
+    );
+    let asked_of_proxy = fake.connects();
+    assert_eq!(
+        asked_of_proxy,
+        [format!("127.0.0.1:{}", origin.port())],
+        "only the first hop was put to the proxy"
+    );
 }
 
 #[test]

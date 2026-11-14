@@ -117,11 +117,7 @@ impl Actor {
         if self.loaded.is_none() {
             // A magnet without metadata has no files yet: only the place
             // they will be created at changes.
-            let custom = self.magnet.as_ref().is_some_and(|m| m.storage.is_some())
-                || self
-                    .pending_layers
-                    .as_ref()
-                    .is_some_and(|p| p.storage.is_some());
+            let custom = self.magnet.as_ref().is_some_and(|m| m.storage.is_some());
             if custom {
                 self.move_failed(SessionError::Unsupported, tx);
                 return;
@@ -198,14 +194,18 @@ impl Actor {
     }
 
     /// Starts the operation's disk job once no write is in flight, no read
-    /// runs, no check reads the data and no flush runs. Called after every
-    /// job result.
+    /// runs, no check reads the data, no pass over freshly merged layers does,
+    /// and no flush runs. Called after every job result.
     pub(super) fn try_start_storage_job(&mut self) {
         let checking = self.checking();
+        // A verify pass reads the same files off the check pool: it waits for
+        // this move, so the move waits for it (see `Actor::verify_merged_pieces`).
+        let verifying = self.loaded.as_ref().is_some_and(|l| l.verifying);
         let idle = self.reads_in_flight == 0
             && !self.cache.writes_in_flight()
             && !self.finish_flush
-            && !checking;
+            && !checking
+            && !verifying;
         let Some(op) = self.storage_op.as_mut().filter(|op| !op.spawned) else {
             return;
         };
