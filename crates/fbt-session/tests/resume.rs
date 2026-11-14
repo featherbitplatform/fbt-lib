@@ -1051,7 +1051,8 @@ async fn hybrid_resume_keeps_built_layers() {
 /// torrent downloads what it can verify meanwhile and fetches that layer
 /// from a peer, as one added without it does. Its saved `have` is checked
 /// rather than trusted, because none of that file's pieces could be hashed
-/// while the layer was out.
+/// while the layer was out; once the layer arrives they are read off disk
+/// again, so complete data is not fetched a second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_layer_in_resume_is_dropped() {
     let seed_dir = tempfile::tempdir().unwrap();
@@ -1099,11 +1100,17 @@ async fn bad_layer_in_resume_is_dropped() {
     // The handle keeps the metadata it was added with; the actor holds both.
     assert_eq!(h.metainfo().unwrap().piece_layers.len(), 1);
     assert_eq!(h.piece_layers_known().await, 2);
-    // Its data could not be hash-verified while the layer was out, so it was
-    // checked rather than trusted and is fetched again once the layer is in.
+    // Its data could not be hash-verified while the layer was out, so a full
+    // check ran instead of trusting the saved `have`. Once the layer is in,
+    // those pieces are read off disk and pass: nothing is fetched again.
     assert!(!trusted(&h).await, "a full check ran instead");
     assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
     assert!(h.pieces().await.unwrap().is_full());
+    assert_eq!(
+        h.status().total_downloaded,
+        0,
+        "the pieces were found on disk"
+    );
     s.shutdown().await;
     seed.shutdown().await;
 }

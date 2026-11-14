@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use fbt_metainfo::{FileEntry, Metainfo, RelPath};
 
 pub use cache::CacheStats;
-pub(crate) use check::{PieceCheck, verify_piece};
+pub(crate) use check::{PieceCheck, check_pieces_ranges, verify_piece};
 pub use check::{check_pieces, sha1_piece};
 pub use fs::{FsStorage, StorageError, error_path};
 pub use mem::MemStorage;
@@ -355,6 +355,61 @@ mod tests {
         assert!(roots.is_empty(), "no v2 roots for a v1 torrent");
         assert_eq!(bf.iter_ones().collect::<Vec<_>>(), vec![0, 2]);
         assert_eq!(seen, vec![0, 1, 2, 3]);
+    }
+
+    /// The range pass is the full pass over fewer pieces: it reads only what
+    /// it is asked for, agrees with `check_pieces` on those pieces, clamps
+    /// each range to the piece count, and reports v1 pieces without a root.
+    #[test]
+    fn check_pieces_ranges_reads_only_what_it_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = torrent("t", &[(&["a"], 40, false), (&["b"], 24, false)], 16);
+        let s = FsStorage::new(dir.path().to_path_buf(), &m);
+        let data: Vec<u8> = (0..64u8)
+            .map(|b| b.wrapping_mul(7).wrapping_add(1))
+            .collect();
+        let mut m = m;
+        m.info.pieces = piece_hashes(&data, 16);
+        let layout = PieceLayout::new(64, 16).unwrap();
+        s.write(0, data.get(0..16).unwrap()).unwrap();
+        s.write(32, data.get(32..48).unwrap()).unwrap();
+        // Pieces 0 and 2 are the ones with bytes on disk. The pass over `2..3`
+        // and `3..7` clamps to pieces 2 and 3, so it reads those two and finds
+        // only 2.
+        let mut seen = Vec::new();
+        let passed = check_pieces_ranges(&s, &layout, &m, &[2..3, 3..7], |i| {
+            seen.push(i);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(passed, vec![(2, None)], "no v2 root for a v1 torrent");
+        assert_eq!(seen, vec![2, 3], "nothing outside the ranges is read");
+        // Every piece at once agrees with the full check.
+        let (bf, _) = check_pieces(&s, &layout, &m, |_| ControlFlow::Continue(())).unwrap();
+        let all = check_pieces_ranges(
+            &s,
+            &layout,
+            &m,
+            &[0..2, 2..4],
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        assert_eq!(
+            all.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            bf.iter_ones().collect::<Vec<_>>()
+        );
+        // Spans wholly past the piece count read nothing.
+        assert!(
+            check_pieces_ranges(
+                &s,
+                &layout,
+                &m,
+                &[6..9, 8..9],
+                |_| ControlFlow::Continue(())
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

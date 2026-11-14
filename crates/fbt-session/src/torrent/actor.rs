@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -131,6 +132,14 @@ pub(super) struct Loaded {
     /// Layers built and not yet merged into `meta` (see
     /// [`Actor::swap_layers`]); bounded by the builder's cap.
     pub built_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    /// Pieces whose layer has merged but whose bytes on disk have not been
+    /// re-verified since: ranges held back until
+    /// [`Actor::verify_merged_pieces`] reads them (see
+    /// [`Actor::on_pieces_verified`]). Merged ranges only, so at most one per
+    /// file of the torrent.
+    pub pending_verify: Vec<Range<u32>>,
+    /// A pass over `pending_verify` is on the disk pool.
+    pub verifying: bool,
     /// When `meta` last took built layers.
     pub layers_swapped: Option<Instant>,
     /// Cached Merkle trees and serving jobs for peers' `hash request`s.
@@ -182,7 +191,7 @@ impl Loaded {
         let layer_builder = LayerBuilder::new(&meta);
         // A v2-only torrent missing layers asks peers for them from the
         // start; the download meanwhile holds back only what cannot verify.
-        let layer_fetch = LayerFetch::new(&meta);
+        let layer_fetch = LayerFetch::new(&meta, &file_prio);
         Loaded {
             meta,
             layout,
@@ -197,6 +206,8 @@ impl Loaded {
             layer_builder,
             layer_fetch,
             built_layers: BTreeMap::new(),
+            pending_verify: Vec::new(),
+            verifying: false,
             layers_swapped: None,
             hash_serving: HashServing::default(),
         }
@@ -206,6 +217,23 @@ impl Loaded {
     /// merged. A torrent with any of that is not done seeding yet.
     pub(super) fn layer_work(&self) -> bool {
         self.layer_fetch.is_some() || !self.built_layers.is_empty()
+    }
+
+    /// Layer work owed for files whose pieces are wanted: spans of such a file
+    /// not received, or one of its built layers not merged. Priorities are read
+    /// as they are now, so skipping a file releases seeding at once. A skipped
+    /// file's layer is nobody's download, and a layer that was discarded (its
+    /// root does not match the data) or refused by the merge asks for nothing
+    /// more; this, not [`layer_work`](Self::layer_work), is what holds
+    /// `Seeding` back.
+    pub(super) fn wanted_layer_work(&self) -> bool {
+        let owed = self
+            .layer_fetch
+            .as_ref()
+            .into_iter()
+            .flat_map(|f| f.owed_roots());
+        owed.chain(self.built_layers.keys().copied())
+            .any(|r| layers::root_is_wanted(&self.meta, &self.file_prio, r))
     }
 }
 
@@ -675,6 +703,9 @@ impl Actor {
                     self.account_time();
                     self.check_seed_limits();
                     self.swap_layers(false);
+                    // A pass deferred by a storage move or a check runs when
+                    // it can (see `Actor::verify_merged_pieces`).
+                    self.verify_merged_pieces();
                     self.publish();
                 }
                 _ = rechoke.tick() => self.rechoke(),
@@ -814,11 +845,15 @@ impl Actor {
                 TorrentState::CheckingFiles { progress }
             }
             Phase::Ready => {
-                // Layers still fetched or not yet merged keep the torrent
-                // from calling itself done: it could not answer hash
-                // requests for the files those layers describe.
+                // A file whose pieces are wanted and whose hashes are still on
+                // their way keeps the torrent from calling itself done: it
+                // could not answer hash requests for pieces it may even hold.
+                // A skipped file's layer is no work left to do, and a layer
+                // that was discarded or refused is not coming, so neither holds
+                // seeding back (see `Loaded::wanted_layer_work`).
                 if self.loaded.as_ref().is_some_and(|l| {
-                    l.picker.as_ref().is_some_and(PiecePicker::is_finished) && !l.layer_work()
+                    l.picker.as_ref().is_some_and(PiecePicker::is_finished)
+                        && !l.wanted_layer_work()
                 }) && (self.cache.is_idle() || self.finished_emitted)
                     && !self.finish_pending
                     && !self.finish_flush

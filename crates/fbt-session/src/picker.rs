@@ -174,6 +174,12 @@ pub struct PiecePicker {
     outstanding: HashMap<PeerKey, HashSet<(u32, u32)>>,
     wanted_left_pieces: u32,
     wanted_left_bytes: u64,
+    /// Wanted pieces not yet passed that are held back; see [`set_pickable`].
+    /// They wait for a layer rather than for blocks, so the end-game does not
+    /// count them. Never more than `wanted_left_pieces`.
+    ///
+    /// [`set_pickable`]: Self::set_pickable
+    held_wanted_pieces: u32,
     /// Peers on parole (connected ones only: a departed peer is dropped).
     parole: HashSet<PeerKey>,
     /// Pieces whose parole download was given up, for the owner of their
@@ -224,6 +230,7 @@ impl PiecePicker {
             outstanding: HashMap::new(),
             wanted_left_pieces: 0,
             wanted_left_bytes: 0,
+            held_wanted_pieces: 0,
             parole: HashSet::new(),
             forfeited: Vec::new(),
         };
@@ -277,14 +284,21 @@ impl PiecePicker {
             if !self.unpickable.get(piece) == pickable {
                 continue;
             }
+            let wanted_left = self.prio_of(piece) > 0 && !self.have.get(piece);
             if pickable {
                 self.unpickable.clear(piece);
+                if wanted_left {
+                    self.held_wanted_pieces = self.held_wanted_pieces.saturating_sub(1);
+                }
                 self.enqueue(piece);
                 self.partial_sync(piece);
             } else {
                 self.dequeue(piece);
                 self.partial_remove(piece);
                 self.unpickable.set(piece);
+                if wanted_left {
+                    self.held_wanted_pieces = self.held_wanted_pieces.saturating_add(1);
+                }
             }
         }
     }
@@ -710,6 +724,9 @@ impl PiecePicker {
             self.wanted_left_bytes = self
                 .wanted_left_bytes
                 .saturating_sub(u64::from(self.layout.piece_size(piece)));
+            if !self.pickable(piece) {
+                self.held_wanted_pieces = self.held_wanted_pieces.saturating_sub(1);
+            }
         }
     }
 
@@ -738,6 +755,9 @@ impl PiecePicker {
             self.wanted_left_bytes = self
                 .wanted_left_bytes
                 .saturating_add(u64::from(self.layout.piece_size(piece)));
+            if !self.pickable(piece) {
+                self.held_wanted_pieces = self.held_wanted_pieces.saturating_add(1);
+            }
         }
         self.enqueue(piece);
     }
@@ -747,9 +767,17 @@ impl PiecePicker {
         &self.have
     }
 
-    /// Every block of every wanted, unfinished piece is requested or received.
+    /// Every block of every wanted piece that may be picked is requested or
+    /// received. Pieces held back by [`set_pickable`] are left out: they wait
+    /// for a BEP 52 layer, not for blocks, so they do not open an end-game.
+    ///
+    /// [`set_pickable`]: Self::set_pickable
     pub fn is_endgame(&self) -> bool {
-        self.wanted_left_pieces > 0 && self.buckets.is_empty() && self.partial.is_empty()
+        self.wanted_left_pieces
+            .saturating_sub(self.held_wanted_pieces)
+            > 0
+            && self.buckets.is_empty()
+            && self.partial.is_empty()
     }
 
     /// Bytes of wanted pieces not yet passed.
@@ -801,10 +829,14 @@ impl PiecePicker {
     fn recount_wanted(&mut self) {
         self.wanted_left_pieces = 0;
         self.wanted_left_bytes = 0;
+        self.held_wanted_pieces = 0;
         for i in 0..self.layout.num_pieces() {
             if self.prio_of(i) > 0 && !self.have.get(i) {
                 self.wanted_left_pieces += 1;
                 self.wanted_left_bytes += u64::from(self.layout.piece_size(i));
+                if !self.pickable(i) {
+                    self.held_wanted_pieces += 1;
+                }
             }
         }
     }
@@ -1361,6 +1393,39 @@ mod tests {
         );
     }
 
+    /// Pieces waiting for a layer are not an end-game: nothing is queued
+    /// because nothing may be picked, so the picker waits for hashes rather
+    /// than finishing off pieces whose blocks are all outstanding.
+    #[test]
+    fn held_pieces_alone_are_not_the_endgame() {
+        let mut p = picker(3, 1);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_pickable(0..3, false);
+        assert!(
+            p.pick(PeerKey(1), PeerPieces::All, 8, &mut rng())
+                .is_empty(),
+            "no piece may be picked"
+        );
+        assert!(!p.is_endgame(), "all three wait for hashes");
+        // One layer arrives: the piece is queued (work to do, so still no
+        // end-game), and asking it leaves every wanted piece with its blocks
+        // outstanding, which is the end-game.
+        p.set_pickable(2..3, true);
+        assert!(!p.is_endgame(), "piece 2 is queued again");
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 8, &mut rng()),
+            vec![blk(2, 0)],
+            "the piece let go is picked"
+        );
+        assert!(p.is_endgame());
+        // Nothing wanted left: finished, and no end-game either.
+        for piece in 0..3 {
+            p.piece_passed(piece);
+        }
+        assert!(!p.is_endgame());
+        assert!(p.is_finished());
+    }
+
     #[test]
     fn sequential_picks_lowest_index() {
         let mut p = picker(4, 1);
@@ -1660,6 +1725,7 @@ mod tests {
         assert_eq!(p.avail, avail, "availability");
         let mut left_pieces = 0u32;
         let mut left_bytes = 0u64;
+        let mut held_pieces = 0u32;
         for i in 0..n {
             let st = p.state_of(i);
             let prio = p.prio_of(i);
@@ -1671,6 +1737,9 @@ mod tests {
             if prio > 0 && st != PieceState::Have {
                 left_pieces += 1;
                 left_bytes += u64::from(p.layout.piece_size(i));
+                if !p.pickable(i) {
+                    held_pieces += 1;
+                }
             }
             // Queued exactly when wanted, unrequested and pickable: no piece
             // is lost, nothing else is offered.
@@ -1764,6 +1833,7 @@ mod tests {
         }
         assert_eq!(p.wanted_left_pieces, left_pieces, "wanted_left_pieces");
         assert_eq!(p.wanted_left_bytes, left_bytes, "wanted_left_bytes");
+        assert_eq!(p.held_wanted_pieces, held_pieces, "held_wanted_pieces");
     }
 
     /// A simulated remote peer: its pieces and whether they are counted.

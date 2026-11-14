@@ -14,7 +14,8 @@ use crate::session::Priority;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum TorrentState {
-    /// A magnet torrent is fetching its metadata from peers (BEP 52 ut_metadata).
+    /// A magnet torrent is fetching its metadata from peers (BEP 9
+    /// `ut_metadata`).
     DownloadingMetadata,
     /// Waiting for one of the session's
     /// [`max_active_checks`](crate::Settings::max_active_checks) slots to
@@ -63,7 +64,10 @@ pub struct TorrentStatus {
     /// once every layer arrived or was built). A v2-only torrent downloads
     /// what it can verify meanwhile — its one-piece files, whose `pieces
     /// root` needs no layer — and fetches the rest from v2 peers beside the
-    /// download.
+    /// download. Only a file with wanted pieces holds `Seeding` back: a
+    /// skipped file's layer is nobody's download. Data already on disk for a
+    /// layer that arrives late is found by reading it again, not fetched a
+    /// second time.
     pub layers_missing: u32,
     /// Current state.
     pub state: TorrentState,
@@ -117,10 +121,11 @@ pub struct TorrentStatus {
     /// ([`AddTorrent::from_resume`](crate::AddTorrent::from_resume)):
     /// `Some(true)` once its pieces were trusted without a check, `Some(false)`
     /// once a full check ran instead (a file changed since the save, or piece
-    /// layers still missing, which no saved `have` can be trusted against).
-    /// `None` without resume data, while the stamps are being compared, and
-    /// for a magnet saved before its metadata arrived (it has no pieces to
-    /// trust).
+    /// layers still missing: no saved `have` could be hash-verified then, and
+    /// trusting it would call the torrent seeding while it still needs hashes
+    /// from its peers). `None` without resume data, while the stamps are being
+    /// compared, and for a magnet saved before its metadata arrived (it has no
+    /// pieces to trust).
     pub resume_trusted: Option<bool>,
     /// Every piece of the torrent is verified, skipped files included
     /// (libtorrent's `is_seed`). [`TorrentState::Seeding`] only needs the

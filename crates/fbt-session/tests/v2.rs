@@ -19,8 +19,8 @@ use fbt_core::InfoHashes;
 use fbt_metainfo::{Magnet, Metainfo, TorrentVersion};
 use fbt_session::storage::{MemStorage, check_pieces};
 use fbt_session::{
-    AddTorrent, Event, EventMask, FileReader, Session, SessionError, TorrentHandle, TorrentState,
-    decode_resume,
+    AddTorrent, Event, EventMask, FileReader, Priority, Session, SessionError, TorrentHandle,
+    TorrentState, decode_resume,
 };
 use fbt_wire::Message;
 use rand::RngExt;
@@ -738,6 +738,115 @@ async fn one_piece_files_download_before_layers() {
     seeder.shutdown().await;
 }
 
+/// A v2-only `.torrent` without its layers, added over data that is already
+/// complete on disk. Nothing could be hashed before the layers arrived, so the
+/// check finds no piece and none is asked for; when a peer supplies the layers
+/// their pieces are read off disk again, pass, and the torrent seeds without
+/// fetching a single payload byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn complete_data_seeds_when_its_layers_arrive() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let root = write_v2_payload(seed_dir.path());
+    let bytes = create_torrent(&root, TorrentVersion::V2, PIECE);
+    let m = Metainfo::from_bytes(&strip_layers(&bytes)).unwrap();
+    // The whole payload is already below the leech's save path.
+    copy_payload(&root, leech_dir.path(), "payload");
+    let (seeder, _sh) = seed(&bytes, seed_dir.path()).await;
+    let leecher = Session::new(test_settings()).await.unwrap();
+    let mut ev = leecher.subscribe(EventMask::ALL);
+    let lh = leecher
+        .add_torrent(AddTorrent::new(m.clone(), leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&lh, |s| *s == TorrentState::Downloading, T).await);
+    let before = lh.status();
+    assert_eq!(before.layers_missing, 2);
+    // Every piece of a multi-piece file fails its hash check without the
+    // layer, so the check on complete data verifies nothing and asks for
+    // nothing: `wanted_done` says so, and no byte is on its way.
+    assert_eq!(before.wanted_done, 0, "nothing verifiable yet");
+    assert_eq!(before.total_downloaded, 0, "the pieces are not asked for");
+    lh.add_peer(seeder.local_addr()).await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    assert!(wait_state(&lh, |s| *s == TorrentState::Seeding, T).await);
+    let st = lh.status();
+    assert_eq!(st.layers_missing, 0);
+    // The layers made the bytes that were already there verifiable: they came
+    // off disk. Hash answers are metadata, so no payload was downloaded.
+    assert_eq!(st.total_downloaded, 0, "the data was fetched a second time");
+    assert!(st.is_seed, "every piece passed");
+    assert_eq!(lh.piece_layers_known().await, 2);
+    let (a, c) = (file_of(&m, 100_000), file_of(&m, 300_000));
+    let got = file_bytes(&lh).await;
+    assert_eq!(got.get(a).copied(), Some(100_000));
+    assert_eq!(got.get(c).copied(), Some(300_000));
+    assert!(
+        payload_of(&m, leech_dir.path()) == payload_of(&m, seed_dir.path()),
+        "data differs"
+    );
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+/// A torrent whose wanted pieces are all done while a *skipped* file still
+/// waits for its layer is seeding: the layer of a file nobody downloads is no
+/// work left, so `TorrentFinished` finds the state already `Seeding`. The seed
+/// here refuses every hash request, so that layer never arrives and the skipped
+/// file's pieces are never verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeding_ignores_a_skipped_files_layer() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let root = write_two_file_payload(seed_dir.path());
+    let bytes = create_torrent(&root, TorrentVersion::V2, PIECE);
+    let m = Metainfo::from_bytes(&strip_layers(&bytes)).unwrap();
+    let (small, big) = (file_of(&m, 20_000), file_of(&m, 300_000));
+    let (seeder, _sh) = seed_serving(&bytes, seed_dir.path(), false).await;
+    let leecher = Session::new(test_settings()).await.unwrap();
+    let mut ev = leecher.subscribe(EventMask::ALL);
+    let lh = leecher
+        .add_torrent(AddTorrent::new(m.clone(), leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    let mut prio = vec![Priority::Normal; m.info.files.len()];
+    prio[big] = Priority::Skip;
+    lh.set_file_priorities(prio).await.expect("priorities");
+    assert!(wait_state(&lh, |s| *s == TorrentState::Downloading, T).await);
+    assert_eq!(
+        lh.status().layers_missing,
+        1,
+        "the skipped file lacks its layer"
+    );
+    lh.add_peer(seeder.local_addr()).await.unwrap();
+    // The one-piece file needs no layer: it downloads and finishes the torrent.
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    let st = lh.status();
+    assert_eq!(
+        st.state,
+        TorrentState::Seeding,
+        "the wanted pieces are all done"
+    );
+    // The skipped file is still waiting for hashes it never asked for first:
+    // seeding does not mean every piece of the torrent passed.
+    assert_eq!(st.layers_missing, 1);
+    assert!(!st.is_seed, "the skipped file is unverified");
+    assert_eq!(st.total_downloaded, 20_000, "only the wanted file moved");
+    let got = file_bytes(&lh).await;
+    assert_eq!(got.get(small).copied(), Some(20_000));
+    assert_eq!(
+        got.get(big).copied(),
+        Some(0),
+        "its pieces were not asked for"
+    );
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
 /// A reader on a file whose layer is missing waits for it, as it waits for a
 /// missing piece: the read hangs while the only source refuses hash requests
 /// and is served with the right bytes once a seed that answers them joins.
@@ -786,9 +895,12 @@ async fn reader_waits_for_its_layer() {
     hasher.shutdown().await;
 }
 
-/// The only source of the layers goes while they are still missing, and a
-/// second one joins later: what was asked for is asked of the new source and
-/// the torrent finishes.
+/// The first source answers a span and goes while the fetch still has spans
+/// outstanding: what it answered survives, the rest is asked of the next
+/// source, and the torrent finishes. The answering peer is scripted — it
+/// replays hashes a real seed gave it for that very request — so when it
+/// leaves is fixed rather than raced: `layers_missing` falls to one before the
+/// close, and the other file's span is still in flight with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_survives_source_churn() {
     let seed_dir = tempfile::tempdir().unwrap();
@@ -797,24 +909,117 @@ async fn fetch_survives_source_churn() {
     let root = write_v2_payload(seed_dir.path());
     let bytes = create_torrent(&root, TorrentVersion::V2, PIECE);
     let m = Metainfo::from_bytes(&strip_layers(&bytes)).unwrap();
-    let (first, _sh) = seed_serving(&bytes, seed_dir.path(), false).await;
+    let wire = m.info_hashes.wire_hash();
+    // A seed holding the layers: the scripted source replays its answers, so
+    // every hash it sends is the torrent's own.
+    let (helper, _h) = seed(&bytes, seed_dir.path()).await;
+
     let leecher = Session::new(test_settings()).await.unwrap();
     let mut ev = leecher.subscribe(EventMask::ALL);
     let lh = leecher
         .add_torrent(AddTorrent::new(m.clone(), leech_dir.path().to_path_buf()))
         .await
         .unwrap();
-    lh.add_peer(first.local_addr()).await.unwrap();
     assert!(wait_state(&lh, |s| *s == TorrentState::Downloading, T).await);
-    // Mid-fetch: every span is still outstanding (this seed refuses hash
-    // requests), and it is the torrent's only v2 source.
     assert_eq!(lh.status().layers_missing, 2);
-    first.shutdown().await;
+
+    // The first source: a v2 peer that answers exactly one of the requests it
+    // is given. `HaveNone` keeps the download off it: it carries hashes only.
+    let mut source = ScriptedPeer::connect_with(leecher.local_addr(), wire, v2_reserved()).await;
+    source.send(Message::HaveNone).await;
+    let asked = source
+        .next_matching_within(T, |m| matches!(m, Message::HashRequest(_)))
+        .await
+        .expect("the fetch asked the first source for hashes");
+    let Message::HashRequest(req) = asked else {
+        unreachable!()
+    };
+    // Its answer, taken from a seed that holds the layers.
+    let mut ask = ScriptedPeer::connect_with(helper.local_addr(), wire, v2_reserved()).await;
+    ask.send(Message::HashRequest(req)).await;
+    let hashes = match ask
+        .next_matching_within(T, |m| {
+            matches!(m, Message::Hashes { .. } | Message::HashReject(_))
+        })
+        .await
+    {
+        Some(Message::Hashes { req: echo, hashes }) => {
+            assert_eq!(echo, req, "the seed answered the request we asked it");
+            hashes
+        }
+        other => panic!("no answer for {req:?}: {other:?}"),
+    };
+    source.send(Message::Hashes { req, hashes }).await;
+    // Mid-fetch: that file's layer merged, while the span this source was also
+    // asked for is outstanding and it never answers it.
+    assert!(
+        wait_until(|| lh.status().layers_missing == 1, T).await,
+        "the answered layer merged"
+    );
+    drop(source);
+    assert_eq!(
+        lh.piece_layers_known().await,
+        1,
+        "answered spans survive their source"
+    );
+    assert_eq!(lh.status().layers_missing, 1);
+
+    // The second source finishes what the first left.
+    copy_payload(&root, second_dir.path(), "payload");
+    let (second, _h) = seed(&bytes, second_dir.path()).await;
+    lh.add_peer(second.local_addr()).await.unwrap();
+    next_matching(&mut ev, |e| matches!(e, Event::TorrentFinished { .. }), T)
+        .await
+        .expect("TorrentFinished");
+    assert!(wait_state(&lh, |s| *s == TorrentState::Seeding, T).await);
+    assert_eq!(lh.status().layers_missing, 0);
+    assert_eq!(lh.piece_layers_known().await, 2);
+    assert!(
+        payload_of(&m, leech_dir.path()) == payload_of(&m, seed_dir.path()),
+        "data differs"
+    );
+    drop(ask);
+    leecher.shutdown().await;
+    helper.shutdown().await;
+    second.shutdown().await;
+}
+
+/// The torrent pauses while its layer fetch is running and resumes: the spans
+/// outstanding when it paused are given back to the queue, asked of the source
+/// that arrives after the resume, and the torrent finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_resume_mid_fetch() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let root = write_v2_payload(seed_dir.path());
+    let bytes = create_torrent(&root, TorrentVersion::V2, PIECE);
+    let m = Metainfo::from_bytes(&strip_layers(&bytes)).unwrap();
+    // The only source refuses hash requests: the fetch runs and nothing lands.
+    let (slow, _sh) = seed_serving(&bytes, seed_dir.path(), false).await;
+    let leecher = Session::new(test_settings()).await.unwrap();
+    let mut ev = leecher.subscribe(EventMask::ALL);
+    let lh = leecher
+        .add_torrent(AddTorrent::new(m.clone(), leech_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    lh.add_peer(slow.local_addr()).await.unwrap();
+    assert!(wait_state(&lh, |s| *s == TorrentState::Downloading, T).await);
     assert_eq!(
         lh.status().layers_missing,
         2,
-        "the source left with the fetch running"
+        "spans are outstanding with the only source"
     );
+    lh.pause().await.expect("pause");
+    assert!(wait_state(&lh, |s| *s == TorrentState::Paused, T).await);
+    assert_eq!(
+        lh.status().layers_missing,
+        2,
+        "the fetch paused with the torrent"
+    );
+    lh.resume().await.expect("resume");
+    assert!(wait_state(&lh, |s| *s == TorrentState::Downloading, T).await);
+    // A source that answers them joins after the resume.
     copy_payload(&root, second_dir.path(), "payload");
     let (second, _h) = seed(&bytes, second_dir.path()).await;
     lh.add_peer(second.local_addr()).await.unwrap();
@@ -829,6 +1034,7 @@ async fn fetch_survives_source_churn() {
         "data differs"
     );
     leecher.shutdown().await;
+    slow.shutdown().await;
     second.shutdown().await;
 }
 

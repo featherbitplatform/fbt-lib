@@ -4,6 +4,7 @@
 //! and written later through the session's disk pool, in contiguous runs.
 
 use std::io;
+use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -46,6 +47,15 @@ pub(crate) enum Job {
     ResumeChecked {
         generation: u64,
         trusted: Option<Bitfield>,
+    },
+    /// The pieces of `ranges` were read again after their BEP 52 layer
+    /// arrived: those passing every hash the metadata has (each with its
+    /// subtree root; `None` for a v1 torrent). Data downloaded before the
+    /// layer could not be hashed then, and this is what finds it on disk.
+    LayersVerified {
+        generation: u64,
+        ranges: Vec<Range<u32>>,
+        result: io::Result<Vec<(u32, Option<[u8; 32]>)>>,
     },
     /// A downloaded piece was hashed; `data` comes back for the write.
     Hashed {
@@ -155,6 +165,11 @@ impl Actor {
                 generation,
                 trusted,
             } => self.on_resume_checked(generation, trusted),
+            Job::LayersVerified {
+                generation,
+                ranges,
+                result,
+            } => self.on_pieces_verified(generation, &ranges, result),
             Job::HashesServed {
                 key,
                 req,

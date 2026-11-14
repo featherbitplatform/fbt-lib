@@ -131,6 +131,12 @@ impl Actor {
             return;
         }
         let trusted = match trusted {
+            // Layers out means hashes out: no saved `have` for a multi-piece
+            // file could have been verified against anything, and trusting it
+            // would call the torrent seeding, closing the only peers that can
+            // serve the layer. The check fails those pieces now; once the
+            // layer lands they are read off disk again (see
+            // `Actor::verify_merged_pieces`) rather than re-downloaded.
             Some(_)
                 if self
                     .loaded
@@ -237,6 +243,12 @@ impl Actor {
                 // the layer arrives, so no bytes are wasted on pieces that
                 // would fail every hash.
                 layers::apply_layer_mask(&mut picker, &l.meta);
+                // A layer that merged while this check ran makes its file's
+                // pieces verifiable, but the bytes on disk were hashed without
+                // it: they are re-read below before any of them is asked for.
+                for r in &l.pending_verify {
+                    picker.set_pickable(r.clone(), false);
+                }
                 picker.set_piece_priorities(&l.piece_prio);
                 picker.set_sequential(l.sequential);
                 // Peers still connected (a magnet keeps those it fetched
@@ -254,6 +266,9 @@ impl Actor {
                 self.count_web_seeds();
                 self.phase = Phase::Ready;
                 self.metadata_check = false;
+                // Layers that merged while this check ran make their pieces
+                // verifiable: read them off disk before asking for them again.
+                self.verify_merged_pieces();
                 self.maybe_finish();
                 // Windows hold missing pieces only now; reads of pieces
                 // the check found are answered.
