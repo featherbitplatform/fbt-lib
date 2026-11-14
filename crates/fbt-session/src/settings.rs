@@ -174,10 +174,13 @@ pub struct Settings {
     pub status_interval: Duration,
     /// Time between status updates of a torrent that has nothing to do:
     /// seeding or paused, with no peers, open readers, deadline pieces,
-    /// web seeds in use, jobs running or piece layers pending (5 s). While
-    /// a torrent is idle its status snapshot (rates, active and seeding
-    /// time) and its seed-limit checks refresh only at this period. Any
-    /// command, peer event or job result switches back to
+    /// web seeds in use, jobs running or piece layers to merge or re-read
+    /// (5 s). A v2-only torrent whose layer fetch is still out counts as
+    /// idle once its peers are gone: the fetch has no source until one
+    /// arrives, and that event ends the idleness at once. While a torrent
+    /// is idle its status snapshot (rates, active and seeding time) and its
+    /// seed-limit checks refresh only at this period. Any command, peer
+    /// event or job result switches back to
     /// [`status_interval`](Self::status_interval) at once. Non-zero.
     pub idle_status_interval: Duration,
     /// Capacity of the event queues (1 to [`MAX_EVENT_QUEUE`]).

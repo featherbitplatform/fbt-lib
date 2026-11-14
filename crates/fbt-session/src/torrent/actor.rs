@@ -219,12 +219,15 @@ impl Loaded {
         }
     }
 
-    /// Layer work outstanding: a fetch running, layers not merged yet, or a
-    /// re-read of pieces whose layer just landed. A torrent with any of that
-    /// is not done seeding yet, and has every reason to keep ticking.
-    pub(super) fn layer_work(&self) -> bool {
-        self.layer_fetch.is_some()
-            || !self.built_layers.is_empty()
+    /// Layer work the tick drives: layers not merged yet, or a re-read of
+    /// pieces whose layer just landed. A running fetch is deliberately not
+    /// in this: [`Actor::is_idle`] already requires no peers, and a fetch
+    /// with none has no source to ask — retire timers act only on sources and
+    /// candidates empty on disconnect — so it cannot progress until a peer
+    /// event ends idleness at once. Unmerged layers and the verify pass *are*
+    /// tick-driven and must keep the fast tick.
+    pub(super) fn merge_or_verify_work(&self) -> bool {
+        !self.built_layers.is_empty()
             || !self.fetched_layers.is_empty()
             || self.verifying
             || !self.pending_verify.is_empty()
@@ -235,7 +238,8 @@ impl Loaded {
     /// are now, so skipping a file releases seeding at once. A skipped file's
     /// layer is nobody's download, and a layer that was discarded (its root
     /// does not match the data) or refused by the merge asks for nothing more;
-    /// this, not [`layer_work`](Self::layer_work), is what holds `Seeding` back.
+    /// this, not [`merge_or_verify_work`](Self::merge_or_verify_work), is what
+    /// holds `Seeding` back.
     pub(super) fn wanted_layer_work(&self) -> bool {
         let mut owed = self
             .layer_fetch
@@ -828,8 +832,10 @@ impl Actor {
 
     /// Whether the status tick may run at `idle_status_interval`: the torrent
     /// is seeding or paused, and nothing the tick drives has work — no peers,
-    /// open readers, deadline pieces, web seeds in use, background jobs,
-    /// layers to fetch, or built layers waiting for a swap. Commands, peer
+    /// open readers, deadline pieces, web seeds in use, background jobs, or
+    /// layers to merge or re-read. A running layer fetch is *not* work here:
+    /// with the peers gone it has no source to ask, and a peer event ends
+    /// idleness at once (see [`Loaded::merge_or_verify_work`]). Commands, peer
     /// events and job results wake the actor whatever the tick does; only
     /// tick-driven timers slow down, and [`Actor::run`] switches back at the
     /// end of the first iteration anything above appears in.
@@ -840,7 +846,10 @@ impl Actor {
             && self.deadlines.is_empty()
             && self.web_seeds.num_active() == 0
             && self.jobs.is_empty()
-            && self.loaded.as_ref().is_none_or(|l| !l.layer_work())
+            && self
+                .loaded
+                .as_ref()
+                .is_none_or(|l| !l.merge_or_verify_work())
     }
 
     pub(super) fn state(&self) -> TorrentState {
@@ -1321,6 +1330,45 @@ mod tests {
         let mut c = seeding_actor();
         c.init_web_seeds(vec!["http://127.0.0.1:8080/torrent/".to_owned()]);
         assert!(!c.is_idle(), "a web seed in use");
+    }
+
+    /// A layer fetch with no peers is not work the tick drives: a seeding
+    /// v2-only torrent whose only file is skipped — its layer is nobody's
+    /// download, but the fetch runs until every span is in, skipped file
+    /// included — goes idle even with the fetch still out, and a peer event
+    /// ends that at once. An unmerged layer or a held-back re-read *is*
+    /// tick-driven work and keeps the fast tick.
+    #[test]
+    fn peerless_layer_fetch_is_idle_but_unmerged_layers_are_not() {
+        use super::super::layers::tests::v2_meta;
+        use super::super::swarm::tests::actor_over;
+
+        let (_full, stripped) = v2_meta(&[("skipped", 60_000)]);
+        let mut a = actor_over(stripped, 0);
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            assert!(l.layer_fetch.is_some(), "the layer is out");
+            l.file_prio = vec![Priority::Skip];
+            let n = l.layout.num_pieces();
+            let picker = l.picker.as_mut().expect("picker");
+            for piece in 0..n {
+                picker.piece_passed(piece);
+            }
+        }
+        assert_eq!(
+            a.state(),
+            TorrentState::Seeding,
+            "the skipped file's layer is nobody's download"
+        );
+        assert!(a.is_idle(), "no peers: the fetch has no source to ask");
+
+        a.loaded
+            .as_mut()
+            .expect("loaded")
+            .fetched_layers
+            .insert([1; 32], vec![[2; 32]]);
+        assert_eq!(a.state(), TorrentState::Seeding, "still not wanted");
+        assert!(!a.is_idle(), "an unmerged layer is tick-driven work");
     }
 
     /// A paused torrent that starts a recheck is not idle while its check

@@ -1444,7 +1444,7 @@ fn reader_roots(readers: &Readers, meta: &Metainfo) -> Vec<[u8; 32]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use fbt_core::merkle::{file_tree_height, pad_hash, piece_root, verify_hashes};
     use fbt_metainfo::CreateTorrent;
@@ -1678,7 +1678,7 @@ mod tests {
 
     /// A v2 torrent of `files` (name, length) with 32 KiB pieces, with its
     /// layers, and the same without them.
-    fn v2_meta(files: &[(&str, usize)]) -> (Metainfo, Metainfo) {
+    pub(in crate::torrent) fn v2_meta(files: &[(&str, usize)]) -> (Metainfo, Metainfo) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("payload");
         std::fs::create_dir(&root).unwrap();
@@ -2049,7 +2049,10 @@ mod tests {
             let l = a.loaded.as_ref().expect("loaded");
             assert_eq!(l.pending_verify.len(), 1, "the pieces stay held back");
             assert!(!l.verifying, "no pass without a slot");
-            assert!(l.layer_work(), "and the torrent keeps ticking for it");
+            assert!(
+                l.merge_or_verify_work(),
+                "and the torrent keeps ticking for it"
+            );
         }
         assert_eq!(a.jobs.len(), 0, "nothing spawned and nothing queued");
         // A slot coming free lets the next attempt run it.
