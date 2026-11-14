@@ -562,7 +562,14 @@ async fn stalled_stream_is_ended() {
     assert!(served.is_ok(), "the permit is free within 10 s");
 
     // The stalled connection is closed: reading it now (it was never hung
-    // up) ends in EOF or a reset, never a hang.
+    // up) ends in EOF or a reset, never a hang. This client's receive buffer
+    // is left at the platform default on purpose: a close that queues data
+    // behind its own FIN only reaches EOF after that queue drains, and with
+    // a default-sized window an active reader drains it at application speed
+    // on every platform (measured on Linux, where the kernel happily grows
+    // the send buffer to megabytes; the SSE test clamps its client's receive
+    // buffer to make the stall fire there, which turns the same drain into
+    // persist-timer trickle — that test proves closure by the freed slot).
     let closed = tokio::time::timeout(Duration::from_secs(8), async {
         let mut buf = [0u8; 64];
         loop {

@@ -306,9 +306,17 @@ async fn stalled_sse_is_ended() {
     let (session, _server, base, token) = api_with(|c| {
         c.stream_idle_timeout = Duration::from_secs(1);
         c.max_event_streams = 1;
+        // Tighten every cap so that at proof time both connection slots are
+        // necessarily held — one by the stalled client, one by the second
+        // stream — and a fresh request waits for the killed task to return.
+        // `validate` requires max_connections to exceed max_streams plus
+        // max_event_streams; this test opens no file streams, so 2 is the
+        // smallest legal value.
+        c.max_streams = 0;
+        c.max_connections = 2;
     })
     .await;
-    let (mut conn, head) = raw_open(&base, "").await;
+    let (conn, head) = raw_open(&base, "").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     // Clamp the stalled client's receive buffer: the socket pair that stops
     // accepting bytes stays small, so the flood overtakes it early and on
@@ -376,21 +384,30 @@ async fn stalled_sse_is_ended() {
         Err(_) => panic!("the stalled stream's slot is not free within 10 s"),
     };
 
-    // The stalled connection is closed: reading it (only now — reading
-    // keeps a live client off the stall watch) ends in EOF or a reset.
-    let closed = tokio::time::timeout(Duration::from_secs(8), async {
-        let mut buf = [0u8; 64];
-        loop {
-            match conn.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    })
-    .await;
-    assert!(
-        closed.is_ok(),
-        "the stalled connection is closed within 8 s"
+    // The stalled connection is gone from the server's side. Both slots of
+    // `max_connections` were held — by it and by the second stream — so this
+    // fresh request is accepted only once some connection task has returned,
+    // and no other task can end here; a connection slot releases exactly
+    // when hyper drops the socket, which is the closure being claimed. (The
+    // probe above proves the event permit freed, which also happens if a
+    // body merely ends while its connection lives — this one cannot.)
+    // Proving closure by draining the stalled client instead would test the
+    // kernel's buffering, not the server: at kill time Linux has grown the
+    // send buffer and queued megabytes of the flood behind the FIN it closes
+    // with, and delivers that queue to a client whose receive buffer is
+    // clamped small — needed for the stall to fire there at all — at
+    // persist-timer pace, so EOF arrives long after 8 s. macOS and Windows
+    // drop or drain the queued bytes promptly; the freed slot is what every
+    // platform agrees on.
+    let answered = tokio::time::timeout(Duration::from_secs(8), get(&url, Some(token))).await;
+    let (status, _, _) = answered.expect(
+        "a fresh request is served within 8 s: the stalled connection's task \
+         returned, closing its socket",
+    );
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the second stream still holds the event slot"
     );
     drop(conn);
 
