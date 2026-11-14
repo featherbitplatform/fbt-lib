@@ -208,9 +208,12 @@ pub(crate) fn spawn(
     let ih = params.source.info_hashes();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
     let mut initial = match &params.source {
-        // A v2-only torrent lacking layers has no metadata until they are in.
+        // Its metadata is complete at once; layers it lacks come in beside
+        // the download (see `TorrentStatus::layers_missing`).
         TorrentSource::Metainfo(m) => {
-            TorrentStatus::initial(ih, m.info.name.clone(), !layers::missing_layers(m))
+            let mut status = TorrentStatus::initial(ih, m.info.name.clone(), true);
+            status.layers_missing = layers::missing_layer_count(m);
+            status
         }
         TorrentSource::Magnet(m) => {
             TorrentStatus::initial(ih, m.display_name.clone().unwrap_or_default(), false)
@@ -275,12 +278,13 @@ impl TorrentHandle {
         self.inner.info_hashes
     }
 
-    /// The torrent's metadata; `None` for a magnet, and for a v2-only
-    /// torrent lacking piece layers, until
-    /// [`Event::MetadataReceived`](crate::Event::MetadataReceived).
+    /// The torrent's metadata; `None` for a magnet until its metadata
+    /// arrives ([`Event::MetadataReceived`](crate::Event::MetadataReceived)).
     ///
     /// Set once: piece layers the torrent builds or fetches later are not
-    /// added to it (the torrent still uses them).
+    /// added to it (the torrent still uses them, and
+    /// [`TorrentStatus::layers_missing`](crate::TorrentStatus::layers_missing)
+    /// counts what is still out).
     pub fn metainfo(&self) -> Option<Arc<Metainfo>> {
         self.inner.metainfo.get().cloned()
     }
@@ -320,10 +324,11 @@ impl TorrentHandle {
     /// The v2 piece layers the torrent holds are saved too, those it
     /// fetched or built from verified data included, unless they would
     /// push the data over [`MAX_RESUME_BYTES`](crate::MAX_RESUME_BYTES):
-    /// then they are left out. A v2-only torrent restored without one
-    /// fetches it from peers before it starts; a hybrid builds it from
-    /// data it verifies, so one whose pieces were trusted (nothing
-    /// verified) lacks it until its next check or download of that file.
+    /// then they are left out. A restored v2-only torrent without one
+    /// re-verifies what resume says it has and fetches the layer beside
+    /// its next download; a hybrid builds it from data it verifies, so
+    /// one whose pieces were trusted (nothing verified) lacks it until
+    /// its next check or download of that file.
     pub async fn save_resume_data(&self) -> Result<Vec<u8>, SessionError> {
         self.call(Cmd::SaveResume).await?
     }

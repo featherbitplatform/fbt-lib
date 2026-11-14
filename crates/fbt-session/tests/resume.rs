@@ -1048,7 +1048,10 @@ async fn hybrid_resume_keeps_built_layers() {
 }
 
 /// A corrupted layer in resume data is dropped, not fatal: the v2-only
-/// torrent waits for it as one added without it, and fetches it.
+/// torrent downloads what it can verify meanwhile and fetches that layer
+/// from a peer, as one added without it does. Its saved `have` is checked
+/// rather than trusted, because none of that file's pieces could be hashed
+/// while the layer was out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_layer_in_resume_is_dropped() {
     let seed_dir = tempfile::tempdir().unwrap();
@@ -1080,19 +1083,26 @@ async fn bad_layer_in_resume_is_dropped() {
     assert_eq!(got.piece_layers.len(), 1);
 
     let s = Session::new(settings()).await.unwrap();
-    let mut ev = s.subscribe(EventMask::ALL);
     let h = s.add_torrent(p).await.unwrap();
-    // Held until the dropped layer is in, as one added without it.
+    // The metadata is known at once and the download runs while the dropped
+    // layer is fetched, as for a `.torrent` added without it.
     let st = h.status();
-    assert!(!st.has_metadata);
-    assert_eq!(st.state, TorrentState::DownloadingMetadata);
+    assert!(st.has_metadata);
+    assert_eq!(st.layers_missing, 1, "the corrupted layer was dropped");
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
     let (seed, _sh) = fs_seed(&bytes, seed_dir.path()).await;
     h.add_peer(seed.local_addr()).await.unwrap();
-    next_matching(&mut ev, |e| matches!(e, Event::MetadataReceived { .. }), T)
-        .await
-        .expect("MetadataReceived");
-    assert_eq!(h.metainfo().unwrap().piece_layers, m.piece_layers);
-    assert!(trusted(&h).await);
+    assert!(
+        wait_until(|| h.status().layers_missing == 0, T).await,
+        "the layer was fetched"
+    );
+    // The handle keeps the metadata it was added with; the actor holds both.
+    assert_eq!(h.metainfo().unwrap().piece_layers.len(), 1);
+    assert_eq!(h.piece_layers_known().await, 2);
+    // Its data could not be hash-verified while the layer was out, so it was
+    // checked rather than trusted and is fetched again once the layer is in.
+    assert!(!trusted(&h).await, "a full check ran instead");
+    assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
     assert!(h.pieces().await.unwrap().is_full());
     s.shutdown().await;
     seed.shutdown().await;

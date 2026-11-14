@@ -10,6 +10,7 @@ use fbt_core::Bitfield;
 
 use super::actor::{Actor, Phase};
 use super::data::Job;
+use super::layers;
 use super::peer::Peer;
 use crate::picker::{PeerKey, PiecePicker};
 use crate::resume::stamps_match;
@@ -120,11 +121,30 @@ impl Actor {
     }
 
     /// The stamp comparison returned: the saved pieces are the check's
-    /// result (`Some`), or a full check runs.
+    /// result (`Some`), or a full check runs. A v2-only torrent that lacks
+    /// its piece layers is checked rather than trusted: without them none of
+    /// a multi-piece file's pieces can be hash-verified, so the saved claim
+    /// is not ours to accept, and `Seeding` (and the peer pruning that comes
+    /// with it) must not start on it.
     pub(super) fn on_resume_checked(&mut self, generation: u64, trusted: Option<Bitfield>) {
         if generation != self.generation || !matches!(self.phase, Phase::Resuming) {
             return;
         }
+        let trusted = match trusted {
+            Some(_)
+                if self
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|l| layers::missing_layers(&l.meta)) =>
+            {
+                debug!(
+                    torrent = %self.name(),
+                    "piece layers still missing; checking instead of trusting the resume data"
+                );
+                None
+            }
+            t => t,
+        };
         self.resume = None;
         self.resume_trusted = Some(trusted.is_some());
         match trusted {
@@ -212,6 +232,11 @@ impl Actor {
                 };
                 self.last_have = None;
                 let mut picker = PiecePicker::new(l.layout, &have);
+                // A v2-only torrent that lacks its layers cannot verify any
+                // piece of a multi-piece file: those are not asked for until
+                // the layer arrives, so no bytes are wasted on pieces that
+                // would fail every hash.
+                layers::apply_layer_mask(&mut picker, &l.meta);
                 picker.set_piece_priorities(&l.piece_prio);
                 picker.set_sequential(l.sequential);
                 // Peers still connected (a magnet keeps those it fetched

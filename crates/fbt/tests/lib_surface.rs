@@ -153,6 +153,8 @@ fn surface_compiles() {
         fbt::MAX_WEB_SEEDS,
     ];
     let _: usize = Settings::default().max_peers_per_ip;
+    // The hidden test knob that refuses incoming BEP 52 `hash request`s.
+    let _: bool = Settings::default().serve_hashes;
     let _ = [
         BlockReason::IpFilter,
         BlockReason::Banned,
@@ -345,6 +347,8 @@ async fn resume_methods(s: &Session, h: &TorrentHandle, st: &dyn Storage) {
     let _: Result<AddTorrent, ResumeError> = AddTorrent::from_resume(b"");
     let _: (bool, Option<bool>) = (h.status().need_save_resume, h.status().resume_trusted);
     let _: bool = h.status().is_seed;
+    // The piece layers a v2 torrent is still fetching beside its download.
+    let _: u32 = h.status().layers_missing;
     let _: Result<(SessionState, Vec<(InfoHashes, SessionError)>), SessionError> =
         s.save_state().await;
     let (state, _): (SessionState, Vec<(InfoHashes, SessionError)>) = s.shutdown_and_save().await;

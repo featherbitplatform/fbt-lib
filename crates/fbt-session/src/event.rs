@@ -87,9 +87,11 @@ pub enum Event {
         /// Piece index.
         piece: u32,
     },
-    /// A magnet torrent received and verified its metadata; for a v2-only
-    /// torrent, once the piece layers it lacked are fetched too (a v2
-    /// `.torrent` without them included).
+    /// A magnet torrent received and verified its metadata. The piece layers
+    /// a v2-only torrent still lacks are not part of it: they arrive beside
+    /// the download, and
+    /// [`TorrentStatus::layers_missing`](crate::TorrentStatus::layers_missing)
+    /// counts those still out.
     MetadataReceived {
         /// The torrent.
         torrent: InfoHashes,

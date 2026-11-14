@@ -431,6 +431,13 @@ pub struct Settings {
     /// ([`TorrentStatus::seeding_time`](crate::TorrentStatus::seeding_time))
     /// stops likewise (`None`, the default: no limit).
     pub seed_time_limit: Option<Duration>,
+    /// Answer peers' BEP 52 `hash request`s (the default, `true`). With it
+    /// off this session refuses every incoming one with `hash reject`, even
+    /// where it holds the hashes: a test knob for a peer that cannot serve
+    /// layers. It says nothing about requests this torrent *sends*.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub serve_hashes: bool,
 }
 
 impl Settings {
@@ -671,6 +678,7 @@ impl Default for Settings {
             queue: QueueSettings::default(),
             seed_ratio_limit: None,
             seed_time_limit: None,
+            serve_hashes: true,
         }
     }
 }

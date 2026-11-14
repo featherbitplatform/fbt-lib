@@ -25,7 +25,7 @@ use super::data::Job;
 use super::deadline::Deadlines;
 use super::dht::{self, DhtAnnouncer, DhtParams};
 use super::known::{Known, dialable};
-use super::layers::{HashServing, LayerBuilder, LayerFetch, PendingLayers};
+use super::layers::{self, HashServing, LayerBuilder, LayerFetch};
 use super::magnet::MagnetState;
 use super::metadata::MetadataFetch;
 use super::peer::Peer;
@@ -123,6 +123,11 @@ pub(super) struct Loaded {
     pub renamed: BTreeMap<usize, RelPath>,
     /// Builds the piece layers a hybrid lacks from its verified pieces.
     pub layer_builder: Option<LayerBuilder>,
+    /// The layers a v2-only torrent asks its peers for, fetched beside the
+    /// download; `None` once every layer is known. Each one that arrives is
+    /// merged into `meta` and releases the pieces it makes verifiable (see
+    /// [`Actor::swap_layers`]).
+    pub layer_fetch: Option<LayerFetch>,
     /// Layers built and not yet merged into `meta` (see
     /// [`Actor::swap_layers`]); bounded by the builder's cap.
     pub built_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
@@ -175,6 +180,9 @@ impl Loaded {
         let total_wanted = wanted_bytes(&layout, &piece_prio);
         let wanted = Arc::new(WantedFiles::new(&file_prio));
         let layer_builder = LayerBuilder::new(&meta);
+        // A v2-only torrent missing layers asks peers for them from the
+        // start; the download meanwhile holds back only what cannot verify.
+        let layer_fetch = LayerFetch::new(&meta);
         Loaded {
             meta,
             layout,
@@ -187,10 +195,17 @@ impl Loaded {
             wanted,
             renamed: BTreeMap::new(),
             layer_builder,
+            layer_fetch,
             built_layers: BTreeMap::new(),
             layers_swapped: None,
             hash_serving: HashServing::default(),
         }
+    }
+
+    /// Layer work outstanding: a fetch running, or layers built and not yet
+    /// merged. A torrent with any of that is not done seeding yet.
+    pub(super) fn layer_work(&self) -> bool {
+        self.layer_fetch.is_some() || !self.built_layers.is_empty()
     }
 }
 
@@ -205,10 +220,6 @@ pub(crate) struct Actor {
     pub(super) storage: Option<Arc<dyn Storage>>,
     /// `Some` while a magnet waits for its metadata.
     pub(super) magnet: Option<Box<MagnetState>>,
-    /// `Some` while a v2-only torrent, its metadata known (from any
-    /// source), fetches the piece layers it lacks; `loaded` is `None` and
-    /// the phase `Metadata` meanwhile.
-    pub(super) pending_layers: Option<Box<PendingLayers>>,
     /// The handle's view of the metadata, filled once it is known.
     pub(super) metainfo_cell: Arc<OnceLock<Arc<Metainfo>>>,
     /// The check that follows a magnet's metadata is running: the announcer
@@ -390,32 +401,20 @@ impl Actor {
         let resume = params.resume;
         let save_path = params.save_path.clone();
         let web_seed_throttle = shared.bandwidth.web_seed(&rate);
-        let mut storage = storage;
-        let (loaded, magnet, pending_layers, trackers, web_seed_urls) = match params.source {
+        let (loaded, magnet, trackers, web_seed_urls) = match params.source {
             TorrentSource::Metainfo(m) => {
                 let trackers = m.trackers.clone();
                 let urls = m.web_seeds.clone();
-                if let Some(fetch) = LayerFetch::new(&m) {
-                    // Like a magnet's metadata: the storage is built once
-                    // the layers are in (only a custom one is kept).
-                    storage = None;
-                    let pending = PendingLayers {
-                        meta: Arc::new(*m),
-                        fetch,
-                        storage: params.storage,
-                        file_prio: params.file_priorities,
-                        sequential: params.sequential,
-                    };
-                    (None, None, Some(Box::new(pending)), trackers, urls)
-                } else {
-                    let meta = Arc::new(*m);
-                    let _ = metainfo_cell.set(Arc::clone(&meta));
-                    let mut loaded = Loaded::new(meta, params.file_priorities, params.sequential);
-                    if let Some(r) = &resume {
-                        loaded.renamed = r.renamed.iter().cloned().collect();
-                    }
-                    (Some(loaded), None, None, trackers, urls)
+                // The metadata is complete when it is in: layers it lacks are
+                // fetched beside the download (see `Loaded::layer_fetch`), so
+                // the check and the download start now.
+                let meta = Arc::new(*m);
+                let _ = metainfo_cell.set(Arc::clone(&meta));
+                let mut loaded = Loaded::new(meta, params.file_priorities, params.sequential);
+                if let Some(r) = &resume {
+                    loaded.renamed = r.renamed.iter().cloned().collect();
                 }
+                (Some(loaded), None, trackers, urls)
             }
             TorrentSource::Magnet(magnet) => {
                 // One tier per `tr`, in order.
@@ -431,7 +430,7 @@ impl Actor {
                     storage: params.storage,
                     sequential: params.sequential,
                 };
-                (None, Some(Box::new(state)), None, trackers, urls)
+                (None, Some(Box::new(state)), trackers, urls)
             }
         };
         let phase = if loaded.is_some() {
@@ -458,8 +457,7 @@ impl Actor {
         })
         .unzip();
         // A magnet's privacy is unknown yet: it runs one until it is known.
-        let private = loaded.as_ref().is_some_and(|l| l.meta.info.private)
-            || pending_layers.as_ref().is_some_and(|p| p.meta.info.private);
+        let private = loaded.as_ref().is_some_and(|l| l.meta.info.private);
         let (dht_announcer, dht_rx) = shared
             .dht
             .clone()
@@ -482,7 +480,6 @@ impl Actor {
             loaded,
             storage,
             magnet,
-            pending_layers,
             metainfo_cell,
             metadata_check: false,
             check_seq: 0,
@@ -711,12 +708,9 @@ impl Actor {
         }
     }
 
-    /// The metadata, installed or waiting for its layers.
+    /// The metadata, with every layer fetched or built since it arrived.
     pub(super) fn known_meta(&self) -> Option<&Arc<Metainfo>> {
-        self.loaded
-            .as_ref()
-            .map(|l| &l.meta)
-            .or_else(|| self.pending_layers.as_ref().map(|p| &p.meta))
+        self.loaded.as_ref().map(|l| &l.meta)
     }
 
     /// Sets the metadata and the storage built for it: the one place either
@@ -800,11 +794,7 @@ impl Actor {
             && self.deadlines.is_empty()
             && self.web_seeds.num_active() == 0
             && self.jobs.is_empty()
-            && self.pending_layers.is_none()
-            && self
-                .loaded
-                .as_ref()
-                .is_none_or(|l| l.built_layers.is_empty())
+            && self.loaded.as_ref().is_none_or(|l| !l.layer_work())
     }
 
     pub(super) fn state(&self) -> TorrentState {
@@ -824,12 +814,12 @@ impl Actor {
                 TorrentState::CheckingFiles { progress }
             }
             Phase::Ready => {
-                if self
-                    .loaded
-                    .as_ref()
-                    .and_then(|l| l.picker.as_ref())
-                    .is_some_and(PiecePicker::is_finished)
-                    && (self.cache.is_idle() || self.finished_emitted)
+                // Layers still fetched or not yet merged keep the torrent
+                // from calling itself done: it could not answer hash
+                // requests for the files those layers describe.
+                if self.loaded.as_ref().is_some_and(|l| {
+                    l.picker.as_ref().is_some_and(PiecePicker::is_finished) && !l.layer_work()
+                }) && (self.cache.is_idle() || self.finished_emitted)
                     && !self.finish_pending
                     && !self.finish_flush
                 {
@@ -877,6 +867,10 @@ impl Actor {
             info_hashes: self.ih,
             name: self.name().to_owned(),
             has_metadata: self.loaded.is_some(),
+            layers_missing: self
+                .loaded
+                .as_ref()
+                .map_or(0, |l| layers::missing_layer_count(&l.meta)),
             state: self.state(),
             progress,
             total_wanted,

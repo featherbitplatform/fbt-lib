@@ -14,9 +14,7 @@ use crate::session::Priority;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum TorrentState {
-    /// A magnet torrent is fetching its metadata from peers, or a v2-only
-    /// torrent the piece layers it lacks (BEP 52 `hash request`s to peers
-    /// that set the v2 bit).
+    /// A magnet torrent is fetching its metadata from peers (BEP 52 ut_metadata).
     DownloadingMetadata,
     /// Waiting for one of the session's
     /// [`max_active_checks`](crate::Settings::max_active_checks) slots to
@@ -55,10 +53,18 @@ pub struct TorrentStatus {
     /// The torrent's name; for a magnet without metadata, its `dn` (or
     /// empty).
     pub name: String,
-    /// The metadata is known (for a `.torrent` at once, unless it is a v2
-    /// one lacking piece layers; for a magnet, and such a `.torrent`, once
-    /// [`Event::MetadataReceived`](crate::Event::MetadataReceived) is out).
+    /// The metadata is known: for a `.torrent` at once (its layers may still
+    /// arrive later; see [`layers_missing`](Self::layers_missing)), for a
+    /// magnet once
+    /// [`Event::MetadataReceived`](crate::Event::MetadataReceived) is out.
     pub has_metadata: bool,
+    /// BEP 52 piece layers the metadata does not hold yet: one per file of
+    /// more than one piece whose layer is missing (0 for a v1 torrent, and
+    /// once every layer arrived or was built). A v2-only torrent downloads
+    /// what it can verify meanwhile — its one-piece files, whose `pieces
+    /// root` needs no layer — and fetches the rest from v2 peers beside the
+    /// download.
+    pub layers_missing: u32,
     /// Current state.
     pub state: TorrentState,
     /// `wanted_done / total_wanted`, in `0.0..=1.0`.
@@ -110,9 +116,11 @@ pub struct TorrentStatus {
     /// For a torrent added from resume data
     /// ([`AddTorrent::from_resume`](crate::AddTorrent::from_resume)):
     /// `Some(true)` once its pieces were trusted without a check, `Some(false)`
-    /// once a full check ran instead (a file changed since the save). `None`
-    /// without resume data, while the stamps are being compared, and for a
-    /// magnet saved before its metadata arrived (it has no pieces to trust).
+    /// once a full check ran instead (a file changed since the save, or piece
+    /// layers still missing, which no saved `have` can be trusted against).
+    /// `None` without resume data, while the stamps are being compared, and
+    /// for a magnet saved before its metadata arrived (it has no pieces to
+    /// trust).
     pub resume_trusted: Option<bool>,
     /// Every piece of the torrent is verified, skipped files included
     /// (libtorrent's `is_seed`). [`TorrentState::Seeding`] only needs the
@@ -127,6 +135,9 @@ impl TorrentStatus {
             info_hashes,
             name,
             has_metadata,
+            // A `.torrent` whose layers are known (the usual case) starts at
+            // 0; the actor's first publish counts what is not.
+            layers_missing: 0,
             // The actor's first publish says `CheckingFiles` once it has
             // a check slot.
             state: if has_metadata {
