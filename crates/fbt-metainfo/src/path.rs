@@ -2,9 +2,14 @@
 //!
 //! The rules are identical on every OS so a torrent saves to the same
 //! relative layout everywhere, and no component can ever escape the save path.
+//! Each component is made display-safe first ([`display_safe`]: control and
+//! Unicode format characters gone, whitespace collapsed), which is what stops a
+//! bidi override from spelling a `.png` file as a `.jpg` one on disk.
 
 use std::fmt;
 use std::path::PathBuf;
+
+use fbt_core::{MAX_DISPLAY_CHARS, display_safe};
 
 /// Longest component, in bytes, that is kept as is.
 pub(crate) const MAX_COMPONENT_BYTES: usize = 255;
@@ -132,15 +137,21 @@ pub(crate) fn truncate_at_boundary(s: &str, max: usize) -> &str {
     s.get(..end).unwrap_or("")
 }
 
-/// Cleans one already-split piece. `None` when nothing usable remains.
+/// Cleans one already-split piece: [`display_safe`] first, so control and
+/// format characters are gone and a run of whitespace is one space; then the
+/// characters a file name may not hold become `_`; then the long-standing
+/// rules: no trailing dot or space, at most [`MAX_COMPONENT_BYTES`] bytes with
+/// the extension kept, and no reserved device stem. `None` when nothing usable
+/// remains.
 fn clean_piece(piece: &str) -> Option<String> {
     if piece.is_empty() || piece == "." || piece == ".." {
         return None;
     }
-    let replaced: String = piece
+    let flat = display_safe(piece, MAX_DISPLAY_CHARS);
+    let replaced: String = flat
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+            if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
                 '_'
             } else {
                 c
@@ -265,7 +276,11 @@ mod tests {
         assert_eq!(p(&["LPT⁴"]), "LPT⁴");
         assert_eq!(p(&["CONSOLE"]), "CONSOLE");
         assert_eq!(p(&["a<b>:c?.d "]), "a_b__c_.d");
-        assert_eq!(p(&["x\u{0}y"]), "x_y");
+        // Display-safe first: a control character is gone rather than `_`, and
+        // a bidi override cannot make an extension read backwards on disk.
+        assert_eq!(p(&["x\u{0}y"]), "xy");
+        assert_eq!(p(&["exe\u{202E}gpj.png"]), "exegpj.png");
+        assert_eq!(p(&["a  b"]), "a b");
     }
 
     #[test]

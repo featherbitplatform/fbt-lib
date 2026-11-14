@@ -6,10 +6,10 @@ use fbt::{
     AddTorrent, Bitfield, BitfieldError, BlockRef, DEFAULT_DHT_BOOTSTRAP, DecodeError, DhtStats,
     DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, FileEntry, FileLayout,
     FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2, InfoHashes, LayoutError, ListenError,
-    MAX_METADATA_SIZE, Magnet, MagnetError, MemStorage, Metainfo, MetainfoError,
+    MAX_DISPLAY_CHARS, MAX_METADATA_SIZE, Magnet, MagnetError, MemStorage, Metainfo, MetainfoError,
     ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority, RelPath, RemoveMode, Session,
     SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
-    TrackerConfig, TrackerError, Transport,
+    TrackerConfig, TrackerError, Transport, display_safe,
 };
 use fbt::{BlockReason, FileStatus, IpFilter, MoveMode, PeerStatus, QueueSettings, TrackerStatus};
 use fbt::{
@@ -113,6 +113,8 @@ fn peer_connected(e: &Event) -> Option<(std::net::SocketAddr, Transport, bool)> 
 fn surface_compiles() {
     let _: [&str; 3] = DEFAULT_DHT_BOOTSTRAP;
     let _: usize = MAX_METADATA_SIZE;
+    let _: usize = MAX_DISPLAY_CHARS;
+    let _: String = display_safe("a\u{202E}  b", 8);
     let _: [usize; 3] = [MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES];
     let _: u32 = auto_piece_len(1);
     let _: bool = validate_layer(&[0; 32], 1, 16384, &[]);

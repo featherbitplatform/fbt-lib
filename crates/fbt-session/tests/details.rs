@@ -13,6 +13,7 @@ use fbt_session::{
     AddTorrent, Event, EventMask, PeerClassLimits, PeerSource, PeerStatus, QueueSettings,
     RateLimit, Session, SessionError, Settings, TorrentHandle, TorrentState, Transport,
 };
+use fbt_wire::ExtHandshake;
 use support::*;
 
 const T: Duration = Duration::from_secs(30);
@@ -167,6 +168,42 @@ async fn peers_report_the_seed() {
         .expect("the seed closed after the finish");
     leecher.shutdown().await;
     seeder.shutdown().await;
+}
+
+/// A peer's `v` string reaches [`PeerStatus::client`] display-safe: the bidi
+/// override, the zero-width character and the control characters are gone, so
+/// nothing in a client list can spoof what the user reads or break the line.
+#[tokio::test]
+async fn peer_client_names_are_display_safe() {
+    let (m, _) = make_torrent(&[("a", 64 * 1024)], 16 * 1024);
+    let session = Session::new(settings()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let h = session
+        .add_torrent(AddTorrent::new(m.clone(), dir.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert!(wait_state(&h, |s| *s == TorrentState::Downloading, T).await);
+
+    let mut peer = ScriptedPeer::connect(session.local_addr(), m.info_hashes.wire_hash()).await;
+    let theirs = ExtHandshake {
+        listen_port: Some(7000),
+        client: Some("qB\u{202E} 4.6\u{200B}\nx".to_owned()),
+        ..ExtHandshake::default()
+    };
+    peer.send_ext_handshake(&theirs).await;
+
+    let peers = wait_peers(&h, |ps| ps.iter().any(|p| p.client.is_some()))
+        .await
+        .expect("the scripted peer with a client name");
+    let got = peers
+        .iter()
+        .find_map(|p| p.client.as_deref())
+        .expect("a client name");
+    assert_eq!(got, "qB 4.6 x", "format characters gone, separators kept");
+    assert!(!got.chars().any(|c| c.is_control()), "{got:?}");
+    assert!(got.chars().count() <= 64, "{got:?}");
+
+    session.shutdown().await;
 }
 
 fn is_reply(e: &Event, url: &str) -> bool {

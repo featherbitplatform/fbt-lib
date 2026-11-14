@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fbt_bencode::{DictBuilder, OwnedValue, encode};
-use fbt_core::PeerId;
+use fbt_core::{MAX_DISPLAY_CHARS, PeerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -249,16 +249,48 @@ async fn https_without_tls_feature() {
     assert!(matches!(err, TrackerError::TlsDisabled), "{err:?}");
 }
 
+/// A failure reason carrying a bidi override and 5 000 characters arrives
+/// clean and no longer than the display cap.
+#[test]
+fn tracker_failure_reason_is_display_safe() {
+    let long = format!("not\u{202E} found\n{}", "é".repeat(5_000));
+    let body = dict(|b| {
+        b.insert(b"failure reason", long.as_str());
+    });
+    match parse_http_announce(&body) {
+        Err(TrackerError::Failure(m)) => {
+            assert_eq!(m.chars().count(), MAX_DISPLAY_CHARS, "{}", m.len());
+            assert!(!m.contains('\u{202E}'), "{m:?}");
+            assert!(!m.chars().any(|c| c.is_control()), "{m:?}");
+            assert!(
+                m.starts_with("not found "),
+                "the override is gone and the newline became a space: {m:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // A warning message goes through the same rules.
+    let body = dict(|b| {
+        b.insert(b"interval", 900);
+        b.insert(b"warning message", "\u{2066}try\u{1b} again\u{200B}");
+    });
+    assert_eq!(
+        parse_http_announce(&body).unwrap().warning.as_deref(),
+        Some("try again")
+    );
+}
+
 #[test]
 fn tracker_strings_are_bounded() {
-    // Failure reasons are cut to 1 KiB on a character boundary.
+    // Failure reasons are display-safe and at most `MAX_DISPLAY_CHARS`
+    // characters, cut on a character boundary.
     let long = "é".repeat(5000);
     let body = dict(|b| {
         b.insert(b"failure reason", long.as_str());
     });
     match parse_http_announce(&body) {
         Err(TrackerError::Failure(m)) => {
-            assert!(m.len() <= 1024 && m.len() >= 1020, "{}", m.len());
+            assert_eq!(m.chars().count(), MAX_DISPLAY_CHARS, "{}", m.len());
             assert!(m.chars().all(|c| c == 'é'));
         }
         other => panic!("{other:?}"),
@@ -270,7 +302,10 @@ fn tracker_strings_are_bounded() {
         b.insert(b"tracker id", vec![b'i'; 257]);
     });
     let r = parse_http_announce(&body).unwrap();
-    assert_eq!(r.warning.map(|w| w.len()), Some(1024));
+    assert_eq!(
+        r.warning.map(|w| w.chars().count()),
+        Some(MAX_DISPLAY_CHARS)
+    );
     assert_eq!(r.tracker_id, None);
     let body = dict(|b| {
         b.insert(b"interval", 900);
@@ -287,7 +322,7 @@ fn tracker_strings_are_bounded() {
     let mut dgram = vec![0, 0, 0, 3, 0, 0, 0, 7];
     dgram.extend(std::iter::repeat_n(b'x', 60_000));
     match parse_udp_announce(&dgram, 7, false) {
-        Err(TrackerError::Failure(m)) => assert_eq!(m.len(), 1024),
+        Err(TrackerError::Failure(m)) => assert_eq!(m.chars().count(), MAX_DISPLAY_CHARS),
         other => panic!("{other:?}"),
     }
 }

@@ -458,7 +458,7 @@
 pub use fbt_bencode::DecodeError;
 pub use fbt_core::{
     Bitfield, BitfieldError, BlockRef, FileLayout, FileSlice, InfoHashV1, InfoHashV2, InfoHashes,
-    LayoutError, ParseInfoHashError, PeerId, PieceLayout,
+    LayoutError, MAX_DISPLAY_CHARS, ParseInfoHashError, PeerId, PieceLayout, display_safe,
 };
 pub use fbt_metainfo::{
     CreateError, CreateTorrent, FileEntry, Info, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES,

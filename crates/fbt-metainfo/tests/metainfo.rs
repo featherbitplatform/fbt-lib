@@ -477,6 +477,69 @@ fn hostile_name_is_sanitized_or_hex() {
     assert_eq!(m.info.name, m.info_hashes.v1.unwrap().to_string());
 }
 
+/// A bidi override (U+202E) that made a `.png` name read as a `.jpg` one is
+/// dropped before the name is used, so the file on disk is the one its
+/// characters say.
+#[test]
+fn spoofed_extension_is_flattened_on_disk() {
+    let content = data(1, 10);
+    let m = Metainfo::from_bytes(&torrent(
+        single_info("exe\u{202E}gpj.png", &content, 16_384),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(m.info.name, "exegpj.png");
+    assert_eq!(m.info.files[0].path.components(), ["exegpj.png"]);
+    assert_eq!(m.info.files[0].path.to_string(), "exegpj.png");
+
+    // The same inside a file path, under the torrent's root directory.
+    let info = multi_info(vec![file(10, &["exe\u{202E}gpj.png"])], 10);
+    let m = Metainfo::from_bytes(&torrent(info, &[])).unwrap();
+    assert_eq!(m.info.files[0].path.components(), ["root", "exegpj.png"]);
+}
+
+/// `name`, `comment` and `created by` are all cleaned; the info dictionary is
+/// hashed as it arrived, so the hashes do not move.
+#[test]
+fn metainfo_strings_are_display_safe() {
+    let content = data(2, 10);
+    let raw_name = "na\u{200B}me\u{202E}";
+    let m = Metainfo::from_bytes(&torrent(
+        single_info(raw_name, &content, 16_384),
+        &[
+            (
+                "comment",
+                bytes("c\u{202E}omment\n\twith\u{1b}controls".as_bytes()),
+            ),
+            (
+                "created by",
+                bytes("\u{FEFF}by\u{2066}line   break".as_bytes()),
+            ),
+        ],
+    ))
+    .unwrap();
+    assert_eq!(m.info.name, "name");
+    // The newline-and-tab run becomes one space; the escape character leaves
+    // nothing behind, not even a separator.
+    assert_eq!(m.comment.as_deref(), Some("comment withcontrols"));
+    assert_eq!(m.created_by.as_deref(), Some("byline break"));
+
+    // Cleaning is for display: the bytes that were hashed are kept as they came.
+    let raw = raw_name.as_bytes();
+    assert!(
+        m.raw_info().windows(raw.len()).any(|w| w == raw),
+        "the info dictionary keeps the name it was sent"
+    );
+
+    // A comment of nothing but format characters reads as no comment at all.
+    let m = Metainfo::from_bytes(&torrent(
+        single_info("n", &content, 16_384),
+        &[("comment", bytes("\u{200B}\u{202E}".as_bytes()))],
+    ))
+    .unwrap();
+    assert_eq!(m.comment, None);
+}
+
 #[test]
 fn garbage_is_an_error_not_a_panic() {
     assert!(matches!(

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
-use fbt_core::{Bitfield, BlockRef, PeerId};
+use fbt_core::{Bitfield, BlockRef, PeerId, display_safe};
 use fbt_wire::{ExtHandshake, UT_HOLEPUNCH};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -73,48 +73,12 @@ pub(crate) fn azureus_client(id: &[u8; 20]) -> Option<String> {
     })
 }
 
-/// A Unicode format character (general category Cf): soft hyphen, bidi
-/// marks, embeddings, overrides and isolates, zero-width characters, BOM,
-/// interlinear annotation and tag characters, and the rest of Cf.
-fn is_format(c: char) -> bool {
-    matches!(
-        u32::from(c),
-        0xAD | 0x600..=0x605
-            | 0x61C
-            | 0x6DD
-            | 0x70F
-            | 0x890..=0x891
-            | 0x8E2
-            | 0x180E
-            | 0x200B..=0x200F
-            | 0x202A..=0x202E
-            | 0x2060..=0x2064
-            | 0x2066..=0x206F
-            | 0xFEFF
-            | 0xFFF9..=0xFFFB
-            | 0x110BD
-            | 0x110CD
-            | 0x13430..=0x1343F
-            | 0x1BCA0..=0x1BCA3
-            | 0x1D173..=0x1D17A
-            | 0xE0001
-            | 0xE0020..=0xE007F
-    )
-}
-
-/// A client name from a peer, safe to show: control and format (bidi,
-/// zero-width) characters dropped,
-/// surrounding whitespace trimmed, at most [`MAX_CLIENT_CHARS`]
-/// characters; `None` when nothing is left.
+/// A client name from a peer, safe to show: [`display_safe`] at
+/// [`MAX_CLIENT_CHARS`] characters, so control and format (bidi, zero-width)
+/// characters are gone, separators are single spaces and the name is short;
+/// `None` when nothing is left.
 pub(crate) fn sanitise_client(raw: &str) -> Option<String> {
-    let clean: String = raw
-        .chars()
-        .filter(|c| !c.is_control() && !is_format(*c))
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(MAX_CLIENT_CHARS)
-        .collect();
+    let clean = display_safe(raw, MAX_CLIENT_CHARS);
     (!clean.is_empty()).then_some(clean)
 }
 
@@ -402,9 +366,12 @@ mod tests {
 
     #[test]
     fn client_names_are_sanitised() {
+        // `display_safe` at `MAX_CLIENT_CHARS`: control and format characters
+        // go, and a separator (here `\n`) becomes one space rather than gluing
+        // the words together.
         assert_eq!(
             sanitise_client("evil\u{1b}[31m\nname\u{7f}").as_deref(),
-            Some("evil[31mname")
+            Some("evil[31m name")
         );
         assert_eq!(sanitise_client(" \t\r\n "), None);
         // Bidi overrides and isolates, zero-width characters, BOM.

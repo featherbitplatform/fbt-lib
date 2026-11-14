@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use fbt_bencode::{Limits, decode_with};
-use fbt_core::{BlockRef, FileLayout, PieceLayout};
+use fbt_core::{BlockRef, FileLayout, MAX_DISPLAY_CHARS, PieceLayout, display_safe};
 use fbt_metainfo::Metainfo;
 use fbt_tracker::{RangePace, TrackerClient, TrackerError, url_encode_bytes};
 use tokio::sync::oneshot;
@@ -154,7 +154,10 @@ impl FetchError {
             _ => false,
         };
         FetchError {
-            message: e.to_string(),
+            // The text can carry the tracker's own words, the seed's URL or a
+            // resolver's message: all of it remote, so display-safe and capped
+            // before it reaches an event.
+            message: display_safe(&e.to_string(), MAX_DISPLAY_CHARS),
             retire,
             cancelled: false,
         }
@@ -954,6 +957,29 @@ mod tests {
         assert!(!retire(408) && !retire(429) && !retire(500) && !retire(503));
         assert!(!FetchError::from_tracker(&TrackerError::TooManyRedirects).retire);
         assert!(!FetchError::from_tracker(&TrackerError::Timeout).retire);
+    }
+
+    /// The text a web-seed failure reports is display-safe and capped: it can
+    /// carry the tracker's own words, a URL from the torrent or a resolver's
+    /// message, all of them remote.
+    #[test]
+    fn failure_text_is_display_safe() {
+        let e = FetchError::from_tracker(&TrackerError::Failure(format!(
+            "nope\u{202E} here\n{}",
+            "x".repeat(5_000)
+        )));
+        let head = e.message.get(..40).unwrap_or(&e.message);
+        assert!(
+            e.message.starts_with("tracker failure: nope here "),
+            "starts with: {head:?}"
+        );
+        assert!(!e.message.contains('\u{202E}'), "head: {head:?}");
+        assert!(!e.message.chars().any(char::is_control), "head: {head:?}");
+        assert!(
+            e.message.chars().count() <= MAX_DISPLAY_CHARS,
+            "{} characters kept",
+            e.message.chars().count()
+        );
     }
 
     #[test]
