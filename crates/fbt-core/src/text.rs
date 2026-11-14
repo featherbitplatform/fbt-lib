@@ -25,7 +25,8 @@ pub const MAX_DISPLAY_CHARS: usize = 256;
 
 /// A Unicode format character (general category Cf): soft hyphen, bidi marks,
 /// embeddings, overrides and isolates, zero-width characters, BOM, interlinear
-/// annotation and tag characters, and the rest of Cf.
+/// annotation and tag characters, and the rest of Cf. The same hand-written
+/// table `fbt-metainfo`'s path filter keeps — keep the two in step.
 fn is_format(c: char) -> bool {
     matches!(
         u32::from(c),

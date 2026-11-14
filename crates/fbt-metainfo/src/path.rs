@@ -2,14 +2,15 @@
 //!
 //! The rules are identical on every OS so a torrent saves to the same
 //! relative layout everywhere, and no component can ever escape the save path.
-//! Each component is made display-safe first ([`display_safe`]: control and
-//! Unicode format characters gone, whitespace collapsed), which is what stops a
-//! bidi override from spelling a `.png` file as a `.jpg` one on disk.
+//! Each component first drops what cannot be seen ([`drop_invisible`]: control
+//! and Unicode format characters gone, whitespace kept exactly as the torrent
+//! gave it), which is what stops a bidi override from spelling a `.png` file
+//! as a `.jpg` one on disk. The collapsing and trimming of
+//! [`fbt_core::display_safe`] are for displayed text only: an ordinary double
+//! space or a non-ASCII space must not move a file on disk.
 
 use std::fmt;
 use std::path::PathBuf;
-
-use fbt_core::display_safe;
 
 /// Longest component, in bytes, that is kept as is.
 pub(crate) const MAX_COMPONENT_BYTES: usize = 255;
@@ -137,22 +138,69 @@ pub(crate) fn truncate_at_boundary(s: &str, max: usize) -> &str {
     s.get(..end).unwrap_or("")
 }
 
-/// Cleans one already-split piece: [`display_safe`] first, so control and
-/// format characters are gone and a run of whitespace is one space; then the
-/// characters a file name may not hold become `_`; then the long-standing
-/// rules: no trailing dot or space, at most [`MAX_COMPONENT_BYTES`] bytes with
-/// the extension kept, and no reserved device stem. `None` when nothing usable
-/// remains.
+/// A Unicode format character (general category Cf): soft hyphen, bidi marks,
+/// embeddings, overrides and isolates, zero-width characters, BOM,
+/// interlinear annotation and tag characters, and the rest of Cf. The same
+/// hand-written table `fbt-core`'s `display_safe` uses — keep the two in step.
+fn is_format(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0xAD | 0x600..=0x605
+            | 0x61C
+            | 0x6DD
+            | 0x70F
+            | 0x890..=0x891
+            | 0x8E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// `s` with the characters that spoof a name invisibly gone: Unicode control
+/// (Cc) and format (Cf) characters are dropped — a bidi override cannot
+/// reorder what follows it, a zero-width character hides nothing. Everything
+/// else stays exactly as the torrent gave it, whitespace included: only
+/// hostile characters change a name on disk, never an ordinary double space or
+/// a non-ASCII one (`display_safe`'s collapse is for displayed text). The
+/// output is bounded by the input.
+fn drop_invisible(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() || is_format(c) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Cleans one already-split piece: [`drop_invisible`] first, so control and
+/// format characters are gone and whitespace survives exactly as the torrent
+/// gave it; then the characters a file name may not hold become `_`; then the
+/// long-standing rules: no trailing dot or space, at most
+/// [`MAX_COMPONENT_BYTES`] bytes with the extension kept, and no reserved
+/// device stem. `None` when nothing usable remains.
 ///
-/// The length filter is left to the byte rule on purpose, and `display_safe` is
-/// called uncapped (`usize::MAX`, so its output is bounded by the input): a
-/// character cap here would cut a long name before that rule could, and it would
-/// cut off the extension that rule exists to keep.
+/// The length filter is left to the byte rule on purpose: a character cap
+/// here would cut a long name before that rule could, and it would cut off
+/// the extension that rule exists to keep.
 fn clean_piece(piece: &str) -> Option<String> {
     if piece.is_empty() || piece == "." || piece == ".." {
         return None;
     }
-    let flat = display_safe(piece, usize::MAX);
+    let flat = drop_invisible(piece);
     let replaced: String = flat
         .chars()
         .map(|c| {
@@ -281,11 +329,35 @@ mod tests {
         assert_eq!(p(&["LPT⁴"]), "LPT⁴");
         assert_eq!(p(&["CONSOLE"]), "CONSOLE");
         assert_eq!(p(&["a<b>:c?.d "]), "a_b__c_.d");
-        // Display-safe first: a control character is gone rather than `_`, and
-        // a bidi override cannot make an extension read backwards on disk.
+        // Hostile characters first: a control character is gone rather than
+        // `_`, and a bidi override cannot make an extension read backwards on
+        // disk. Whitespace is not hostile and stays (see
+        // `whitespace_survives_in_names`).
         assert_eq!(p(&["x\u{0}y"]), "xy");
         assert_eq!(p(&["exe\u{202E}gpj.png"]), "exegpj.png");
-        assert_eq!(p(&["a  b"]), "a b");
+        assert_eq!(p(&["a\u{200B}b.txt"]), "ab.txt");
+        assert_eq!(p(&["a  b"]), "a  b");
+    }
+
+    /// On-disk names keep their whitespace exactly as the torrent gives it —
+    /// the collapse and trim of `display_safe` are for displayed text. Only
+    /// control and format characters change a name, and the existing rules
+    /// still hold: no trailing dot or space, and a tab (a control character)
+    /// is dropped rather than kept.
+    #[test]
+    fn whitespace_survives_in_names() {
+        assert_eq!(p(&["a  b.txt"]), "a  b.txt");
+        assert_eq!(p(&["a\u{00A0}b.txt"]), "a\u{00A0}b.txt");
+        assert_eq!(p(&[" lead.txt"]), " lead.txt");
+        assert_eq!(p(&["a\u{3000}b.txt"]), "a\u{3000}b.txt");
+        assert_eq!(p(&["Artist  -  Title.flac"]), "Artist  -  Title.flac");
+        // Existing rules still apply: a trailing space or dot goes, leading
+        // whitespace is not trimmed.
+        assert_eq!(p(&["name.mkv."]), "name.mkv");
+        assert_eq!(p(&["name.mkv "]), "name.mkv");
+        assert_eq!(p(&[" name.mkv "]), " name.mkv");
+        // A control character (whitespace or not) is dropped, never kept.
+        assert_eq!(p(&["a\tb.txt"]), "ab.txt");
     }
 
     #[test]
