@@ -4,7 +4,7 @@ use fbt_core::{Bitfield, PieceLayout};
 use fbt_metainfo::{Metainfo, TorrentVersion};
 use sha1::{Digest, Sha1};
 use std::io;
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 
 /// SHA-1 of one piece.
 pub fn sha1_piece(data: &[u8]) -> [u8; 20] {
@@ -94,18 +94,73 @@ pub fn check_pieces(
     } else {
         vec![None; n as usize]
     };
+    verify_pass(storage, layout, meta, 0..n, &mut on_piece, |piece, root| {
+        have.set(piece);
+        if let Some(slot) = roots.get_mut(piece as usize) {
+            *slot = root;
+        }
+    })?;
+    Ok((have, roots))
+}
+
+/// Reads the pieces of `ranges` (each clamped to the torrent's piece count)
+/// and returns those passing every hash `meta` has for them, each with its
+/// BEP 52 subtree root (`None` for a v1 torrent): what a piece layer arriving
+/// late needs to re-verify the data already on disk, without reading the
+/// whole torrent again.
+///
+/// One piece-sized buffer is reused. A `NotFound` piece counts as missing; any
+/// other error propagates. `on_piece(i)` runs after each piece is processed;
+/// returning [`ControlFlow::Break`] stops the pass with
+/// [`io::ErrorKind::Interrupted`].
+pub(crate) fn check_pieces_ranges(
+    storage: &dyn Storage,
+    layout: &PieceLayout,
+    meta: &Metainfo,
+    ranges: &[Range<u32>],
+    mut on_piece: impl FnMut(u32) -> ControlFlow<()>,
+) -> io::Result<Vec<(u32, Option<[u8; 32]>)>> {
+    let n = layout.num_pieces();
+    let mut passed = Vec::new();
+    for r in ranges {
+        let (start, end) = (r.start, r.end.min(n));
+        if start >= end {
+            continue;
+        }
+        verify_pass(
+            storage,
+            layout,
+            meta,
+            start..end,
+            &mut on_piece,
+            |piece, root| passed.push((piece, root)),
+        )?;
+    }
+    Ok(passed)
+}
+
+/// Reads `pieces` through `storage` one piece buffer at a time and hands every
+/// one that passes `meta`'s hashes to `found`, with its BEP 52 subtree root.
+/// `on_piece(i)` runs after each piece; breaking it stops the pass with
+/// [`io::ErrorKind::Interrupted`]. A `NotFound` piece counts as missing; any
+/// other read error ends the pass.
+fn verify_pass(
+    storage: &dyn Storage,
+    layout: &PieceLayout,
+    meta: &Metainfo,
+    pieces: impl Iterator<Item = u32>,
+    on_piece: &mut impl FnMut(u32) -> ControlFlow<()>,
+    mut found: impl FnMut(u32, Option<[u8; 32]>),
+) -> io::Result<()> {
     let mut buf = vec![0u8; layout.piece_len() as usize];
-    for i in 0..n {
+    for i in pieces {
         let size = layout.piece_size(i) as usize;
         if let Some(slice) = buf.get_mut(..size) {
             match storage.read(layout.piece_offset(i), slice) {
                 Ok(()) => {
                     let check = verify_piece(meta, i, slice);
                     if check.ok {
-                        have.set(i);
-                        if let Some(slot) = roots.get_mut(i as usize) {
-                            *slot = check.v2_root;
-                        }
+                        found(i, check.v2_root);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -119,5 +174,5 @@ pub fn check_pieces(
             ));
         }
     }
-    Ok((have, roots))
+    Ok(())
 }

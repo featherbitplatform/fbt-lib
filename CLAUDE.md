@@ -18,6 +18,7 @@ Binding design: `docs/superpowers/specs/2026-11-10-fbt-lib-design.md`. Read it b
 - **Logging and errors:** `tracing` for logs (the library never installs a subscriber), `thiserror` for errors. Public enums and config structs of `fbt-session` and `fbt` are `#[non_exhaustive]`; config structs implement `Default`.
 - **Dependencies** are declared once in the root `[workspace.dependencies]`; crates inherit them, never pin their own versions. All crates are `publish = false` for now.
 - **Tests never contact the public internet, the public DHT, a real router or a real proxy.** `test_settings()` disables the DHT, LSD, UPnP and NAT-PMP; tests that need a DHT run their own nodes on loopback, NAT tests use the fakes in `crates/fbt-net/tests/support/`, proxy tests use the SOCKS5 and HTTP proxy fakes there (`fake_socks5.rs`, `fake_http_proxy.rs`), and web seed tests use the in-repo HTTP server `crates/fbt-session/tests/support/web_seed.rs`. `Settings::default()` bootstraps from the public routers and turns LSD, UPnP and NAT-PMP on, so never build a session from it in a test.
+- **Idle torrents tick slowly.** A torrent that is seeding or paused with nothing going on (no peers, open readers, deadline pieces, web seeds in use, running jobs or piece layers to merge or re-read — a layer fetch whose torrent has no peers does not count, it has no source to ask) publishes its status snapshot and runs its seed-limit checks every `Settings::idle_status_interval` (5 s) instead of every `status_interval`; a command, peer event or job result switches back at once. `test_settings()` pins the two to 50 ms so existing tests keep the fast cadence — only `crates/fbt-session/tests/idle.rs` asks for the slow tick, and a test that waits on an idle torrent's status through any other helper should not assume 5 s snapshots.
 - **Cross-platform.** Builds and tests must pass on macOS, Linux and Windows.
 
 ## Conventions
@@ -40,6 +41,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo deny --all-features check
 bash dev/check-pure-rust.sh   # pure-rust build has no ring, cc or other C-building crate
+
+# Reproduce and deflake an intermittent test (Unix only). Builds one test target through cargo's JSON,
+# runs <test-name> <runs> times 4 at a time (STRESS_PARALLEL), kills a repetition past STRESS_TIMEOUT
+# seconds along with everything it forked, prints `stress: N/N passed` and keeps every log in
+# target/stress/. A filter that matches no test is a failure, not a pass.
+bash dev/stress.sh fbt-session swarm rechoke_chokes_peer_that_lost_its_slot 100
 
 # Release plumbing: tag check + changelog extraction (tested with fake refs)
 bash dev/test-release-version.sh

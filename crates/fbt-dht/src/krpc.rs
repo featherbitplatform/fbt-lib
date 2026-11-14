@@ -31,6 +31,10 @@ pub const MAX_VALUES: usize = 100;
 /// Nodes kept from each of `nodes` and `nodes6`; extra entries are cut.
 pub const MAX_NODES: usize = 32;
 /// Bytes of `v` (client version) kept.
+///
+/// These bytes are raw and never shown to a user here; if that ever changes,
+/// render them with [`fbt_core::display_safe`] rather than printing them as they
+/// are.
 pub const MAX_VERSION_LEN: usize = 8;
 /// Bytes of an unknown method name kept.
 pub const MAX_METHOD_LEN: usize = 32;

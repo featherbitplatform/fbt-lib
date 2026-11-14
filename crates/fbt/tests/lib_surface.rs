@@ -6,10 +6,10 @@ use fbt::{
     AddTorrent, Bitfield, BitfieldError, BlockRef, DEFAULT_DHT_BOOTSTRAP, DecodeError, DhtStats,
     DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, FileEntry, FileLayout,
     FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2, InfoHashes, LayoutError, ListenError,
-    MAX_METADATA_SIZE, Magnet, MagnetError, MemStorage, Metainfo, MetainfoError,
-    ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority, RelPath, RemoveMode, Session,
-    SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
-    TrackerConfig, TrackerError, Transport,
+    MAX_DISPLAY_CHARS, MAX_METADATA_SIZE, Magnet, MagnetError, MemStorage, Metainfo, MetainfoError,
+    ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority, RedirectPolicy, RelPath,
+    RemoveMode, Session, SessionError, Settings, Storage, TorrentHandle, TorrentSource,
+    TorrentState, TorrentStatus, TrackerConfig, TrackerError, Transport, display_safe,
 };
 use fbt::{BlockReason, FileStatus, IpFilter, MoveMode, PeerStatus, QueueSettings, TrackerStatus};
 use fbt::{
@@ -72,6 +72,7 @@ fn names(
     _: Option<TrackerStatus>,
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
+    _: Option<RedirectPolicy>,
     _: Option<Transport>,
     _: Option<StorageError>,
     _: Option<RateLimit>,
@@ -113,6 +114,8 @@ fn peer_connected(e: &Event) -> Option<(std::net::SocketAddr, Transport, bool)> 
 fn surface_compiles() {
     let _: [&str; 3] = DEFAULT_DHT_BOOTSTRAP;
     let _: usize = MAX_METADATA_SIZE;
+    let _: usize = MAX_DISPLAY_CHARS;
+    let _: String = display_safe("a\u{202E}  b", 8);
     let _: [usize; 3] = [MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES];
     let _: u32 = auto_piece_len(1);
     let _: bool = validate_layer(&[0; 32], 1, 16384, &[]);
@@ -131,6 +134,11 @@ fn surface_compiles() {
         (p.kind, p.host, p.port, p.username, p.password);
     let _: (bool, bool, bool) = (p.proxy_peers, p.proxy_trackers, p.proxy_hostnames);
     let _: Result<(), String> = ProxyConfig::default().validate();
+    // Where a redirect may take a fetch: the default follows as it always did; a web seed
+    // on a public address sets `allow_internal` false.
+    let p = fbt::RedirectPolicy::default();
+    let _: bool = p.allow_internal;
+    assert!(p.allow_internal, "announces keep their redirects");
     let e = fbt::ProxyError::Refused(1);
     let _ = [
         SessionError::Proxy(e),
@@ -145,6 +153,8 @@ fn surface_compiles() {
         fbt::MAX_WEB_SEEDS,
     ];
     let _: usize = Settings::default().max_peers_per_ip;
+    // The hidden test knob that refuses incoming BEP 52 `hash request`s.
+    let _: bool = Settings::default().serve_hashes;
     let _ = [
         BlockReason::IpFilter,
         BlockReason::Banned,
@@ -185,6 +195,8 @@ async fn storage_methods(h: &TorrentHandle) {
     let _: Result<(), SessionError> = h.rename_file(0, "x").await;
     // Hidden from the docs: a test hook, the piece layers the torrent holds.
     let _: usize = h.piece_layers_known().await;
+    // Hidden from the docs: a test hook, how often the status tick ran.
+    let _: u64 = h.status_ticks().await;
     let _: std::path::PathBuf = h.status().save_path;
     let _ = [
         SessionError::InvalidPath(String::new()),
@@ -335,6 +347,8 @@ async fn resume_methods(s: &Session, h: &TorrentHandle, st: &dyn Storage) {
     let _: Result<AddTorrent, ResumeError> = AddTorrent::from_resume(b"");
     let _: (bool, Option<bool>) = (h.status().need_save_resume, h.status().resume_trusted);
     let _: bool = h.status().is_seed;
+    // The piece layers a v2 torrent is still fetching beside its download.
+    let _: u32 = h.status().layers_missing;
     let _: Result<(SessionState, Vec<(InfoHashes, SessionError)>), SessionError> =
         s.save_state().await;
     let (state, _): (SessionState, Vec<(InfoHashes, SessionError)>) = s.shutdown_and_save().await;

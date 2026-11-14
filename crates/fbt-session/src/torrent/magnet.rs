@@ -9,7 +9,6 @@ use tokio::time::Instant;
 
 use super::actor::{Actor, Loaded, Phase};
 use super::commands::selected_priorities;
-use super::layers::{LayerFetch, PendingLayers};
 use super::metadata::MetadataFetch;
 use super::swarm::BanTarget;
 use crate::event::Event;
@@ -69,8 +68,9 @@ impl Actor {
         }
     }
 
-    /// The verified metadata: a v2-only torrent lacking layers waits for
-    /// them (see [`Actor::await_layers`]); otherwise it is installed.
+    /// The verified metadata: installed at once, whatever layers it holds. A
+    /// v2-only torrent lacking them starts fetching them beside the download
+    /// (see [`Loaded::layer_fetch`]).
     pub(super) fn install_metadata(&mut self, meta: Metainfo) {
         let Some(m) = self.magnet.take() else {
             return;
@@ -78,20 +78,7 @@ impl Actor {
         let m = *m;
         let file_prio = selected_priorities(meta.info.files.len(), m.magnet.select_only.as_deref());
         self.register_revealed_hashes(&meta.info_hashes);
-        match LayerFetch::new(&meta) {
-            Some(fetch) => {
-                self.await_layers(PendingLayers {
-                    meta: Arc::new(meta),
-                    fetch,
-                    storage: m.storage,
-                    file_prio,
-                    sequential: m.sequential,
-                });
-                // Off the DHT and PEX at once if it says private.
-                self.leave_public_discovery();
-            }
-            None => self.install_loaded(meta, m.storage, file_prio, m.sequential),
-        }
+        self.install_loaded(meta, m.storage, file_prio, m.sequential);
     }
 
     /// The metadata, complete: build `Loaded` and the storage, tell the
@@ -122,6 +109,9 @@ impl Actor {
         let layout = loaded.layout;
         let total_wanted = loaded.total_wanted;
         self.install(loaded, storage);
+        // Peers that connected while the metadata was still arriving can
+        // serve its layers: they become sources at once.
+        self.sync_layer_sources();
         let _ = self.metainfo_cell.set(meta);
         // Whoever reacts to the event sees `has_metadata` already.
         self.publish();

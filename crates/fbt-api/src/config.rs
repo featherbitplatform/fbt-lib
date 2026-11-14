@@ -4,6 +4,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::HeaderValue;
 
@@ -25,9 +26,12 @@ pub enum Auth {
     Token(String),
     /// No authentication. Allowed only with a loopback
     /// [`bind`](ApiConfig::bind); requests whose `Host` is not
-    /// `localhost`, `127.0.0.1` or `[::1]`, or whose `Origin` is not in
-    /// [`cors_origins`](ApiConfig::cors_origins), get `403` (the guard
-    /// against CSRF and DNS rebinding).
+    /// `localhost`, `127.0.0.1` or `[::1]`, whose `Origin` is not in
+    /// [`cors_origins`](ApiConfig::cors_origins), or whose peer address (as
+    /// axum's `ConnectInfo`, which [`ApiServer`](crate::ApiServer) attaches
+    /// to every request) is not loopback, get `403` (the guard against CSRF
+    /// and DNS rebinding). A router mounted without that extension keeps the
+    /// Host and Origin guard alone.
     Disabled,
 }
 
@@ -69,16 +73,45 @@ pub struct ApiConfig {
     /// The largest request body; larger ones get `413`. Default
     /// [`MAX_BODY_BYTES`].
     pub max_body_bytes: usize,
-    /// File streams served at once; more get `503`. Default 32.
+    /// File streams served at once; more get `503`. Default 32. A stalled
+    /// client keeps its slot only until [`ApiServer`](crate::ApiServer) ends
+    /// the connection — see [`stream_idle_timeout`].
+    ///
+    /// [`stream_idle_timeout`]: ApiConfig::stream_idle_timeout
     pub max_streams: usize,
-    /// Event streams served at once; more get `503`. Default 16.
+    /// Event streams served at once; more get `503`. Default 16. A stalled
+    /// client keeps its slot only until [`ApiServer`](crate::ApiServer) ends
+    /// the connection — see [`stream_idle_timeout`].
+    ///
+    /// [`stream_idle_timeout`]: ApiConfig::stream_idle_timeout
     pub max_event_streams: usize,
     /// Connections [`ApiServer`](crate::ApiServer) serves at once,
     /// authenticated or not. It accepts no more until one closes: further
     /// clients wait in the listener's backlog instead of taking file
     /// descriptors from the session. Default 256; 0 counts as 1. A client
-    /// mounting [`router`](crate::router) applies its own limit.
+    /// mounting [`router`](crate::router) applies its own limit. Validation
+    /// requires it to exceed [`max_streams`](Self::max_streams) plus
+    /// [`max_event_streams`](Self::max_event_streams): every stream holder
+    /// must leave room for a client that holds its connection without
+    /// taking a stream, or the refusal an over-cap client gets could never
+    /// be served.
     pub max_connections: usize,
+    /// Stall timeout of connections [`ApiServer`](crate::ApiServer) serves:
+    /// while a connection still owes bytes to the client and the kernel has
+    /// accepted none for this long, the client has stopped reading and the
+    /// whole connection is ended — the body it was serving goes with it,
+    /// freeing its [`max_streams`](Self::max_streams) or
+    /// [`max_event_streams`](Self::max_event_streams) permit and its reader,
+    /// and the client sees a short read. Progress means write progress: a
+    /// client that keeps draining bytes, however slowly, is never cut off;
+    /// an idle keep-alive connection owes nothing and stays open; and a body
+    /// merely waiting for pieces to write (a starved download) has nothing
+    /// pending and is left alone too. A stalled SSE stream is caught the
+    /// same way as a stalled file: only when bytes it cannot deliver pile
+    /// up. [`Duration::ZERO`] turns the guard off. Routers mounted outside
+    /// `ApiServer` get no stall protection at all — whoever serves them owns
+    /// its writers, and only hang-ups free the caps. Default 10 minutes.
+    pub stream_idle_timeout: Duration,
 }
 
 impl Default for ApiConfig {
@@ -92,6 +125,7 @@ impl Default for ApiConfig {
             max_streams: 32,
             max_event_streams: 16,
             max_connections: 256,
+            stream_idle_timeout: Duration::from_secs(600),
         }
     }
 }
@@ -113,6 +147,13 @@ impl ApiConfig {
                 return Err(ApiError::InsecureBind);
             }
             _ => {}
+        }
+        if self.max_connections <= self.max_streams.saturating_add(self.max_event_streams) {
+            return Err(ApiError::InvalidLimits(
+                self.max_connections,
+                self.max_streams,
+                self.max_event_streams,
+            ));
         }
         let origins = self
             .cors_origins
@@ -149,7 +190,7 @@ pub(crate) struct Validated {
 }
 
 /// A loopback address, IPv4-mapped IPv6 (`::ffff:127.0.0.0/104`) included.
-fn is_loopback(ip: IpAddr) -> bool {
+pub(crate) fn is_loopback(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => {

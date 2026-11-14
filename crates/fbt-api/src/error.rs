@@ -42,6 +42,16 @@ pub enum ApiError {
     /// exist or cannot be canonicalised.
     #[error("allowed root {} cannot be used", .0.display())]
     InvalidRoot(PathBuf),
+    /// [`max_connections`](crate::ApiConfig::max_connections) does not exceed
+    /// [`max_streams`](crate::ApiConfig::max_streams) plus
+    /// [`max_event_streams`](crate::ApiConfig::max_event_streams).
+    #[error("max_connections must exceed max_streams + max_event_streams, got {0} <= {1} + {2}")]
+    InvalidLimits(usize, usize, usize),
+    /// [`router_with_shutdown`](crate::router_with_shutdown) was called
+    /// outside a Tokio runtime: it spawns its shutdown waiter on the current
+    /// one.
+    #[error("router_with_shutdown needs a Tokio runtime")]
+    NoRuntime,
     /// The listener could not bind [`bind`](crate::ApiConfig::bind).
     #[error("cannot bind the API listener: {0}")]
     Bind(#[source] io::Error),

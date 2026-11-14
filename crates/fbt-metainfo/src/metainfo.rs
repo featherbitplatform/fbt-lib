@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, HashSet};
 
 use fbt_bencode::{DecodeError, Dict, Limits, Value, decode_with};
-use fbt_core::{FileLayout, InfoHashV1, InfoHashV2, InfoHashes, PieceLayout};
+use fbt_core::{
+    FileLayout, InfoHashV1, InfoHashV2, InfoHashes, MAX_DISPLAY_CHARS, PieceLayout, display_safe,
+};
 
 use crate::collide::resolve_collisions;
 use crate::magnet::Magnet;
@@ -99,7 +101,8 @@ pub struct FileEntry {
 /// The v1 `info` dictionary, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Info {
-    /// Sanitized torrent name.
+    /// Sanitized torrent name: one safe path component, display-safe (control
+    /// and Unicode format characters gone, whitespace collapsed).
     pub name: String,
     /// Piece length in bytes.
     pub piece_len: u32,
@@ -126,9 +129,11 @@ pub struct Metainfo {
     /// BEP 19 `url-list` web seeds: `http` and `https` URLs only,
     /// de-duplicated, at most [`MAX_WEB_SEEDS`], each at most 2048 bytes.
     pub web_seeds: Vec<String>,
-    /// Free-form comment.
+    /// Free-form comment, display-safe and at most [`MAX_DISPLAY_CHARS`]
+    /// characters; `None` when absent or when nothing readable is left.
     pub comment: Option<String>,
-    /// Creating program.
+    /// Creating program, display-safe and at most [`MAX_DISPLAY_CHARS`]
+    /// characters; `None` when absent or when nothing readable is left.
     pub created_by: Option<String>,
     /// Creation time, seconds since the Unix epoch.
     pub creation_date: Option<i64>,
@@ -532,10 +537,14 @@ fn parse_web_seeds(root: &Dict<'_>) -> Vec<String> {
     }
 }
 
+/// A root-level text key: lossy UTF-8, then [`display_safe`] at
+/// [`MAX_DISPLAY_CHARS`] characters. `None` when the key is absent or nothing
+/// usable is left after cleaning.
 fn lossy(root: &Dict<'_>, key: &[u8]) -> Option<String> {
-    root.get(key)
-        .and_then(Value::as_bytes)
-        .map(|b| String::from_utf8_lossy(b).into_owned())
+    let raw = root.get(key).and_then(Value::as_bytes)?;
+    let text = String::from_utf8_lossy(raw);
+    let clean = display_safe(&text, MAX_DISPLAY_CHARS);
+    (!clean.is_empty()).then_some(clean)
 }
 
 fn parse_trackers(root: &Dict<'_>) -> Vec<Vec<String>> {

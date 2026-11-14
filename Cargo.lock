@@ -587,6 +587,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -615,6 +616,7 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]

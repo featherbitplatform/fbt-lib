@@ -27,6 +27,7 @@ use bytes::Bytes;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_net::proxy::ProxyConfig;
 
+pub use http::RedirectPolicy;
 #[doc(hidden)]
 pub use http::{RangePace, parse_content_range, parse_http_announce};
 #[doc(hidden)]
@@ -117,7 +118,16 @@ impl TrackerClient {
     /// a `Range: bytes=a-b` header, over the web seed client: through the
     /// proxy when it sets `proxy_peers`, with keep-alive and TLS as for
     /// announces, following at most 3 redirects (never from `https` to
-    /// `http`).
+    /// `http`) as `policy` allows. With `policy.allow_internal` false a
+    /// redirect to an internal address is [`TrackerError::InternalRedirect`]
+    /// and nothing is sent to it — judged on the addresses the connection
+    /// dials, not on the text of the `Location` header (a host name whose
+    /// answer changes between lookups is caught), and a lookup that fails or
+    /// times out ends the request rather than allowing the target. The URL
+    /// this is called with is never judged, only where it redirects to. A
+    /// proxy that resolves names ([`ProxyConfig::proxy_hostnames`](fbt_net::proxy::ProxyConfig::proxy_hostnames))
+    /// leaves names to the proxy, which decides where they go: there only a
+    /// target spelled as an address is judged.
     ///
     /// The answer must be `206` with a `Content-Range` naming exactly the
     /// range, or `200` only when the range starts at 0 and the
@@ -134,8 +144,13 @@ impl TrackerClient {
     /// cut; past 30 s a body averaging less than 4 KiB/s fails with
     /// [`TrackerError::TooSlow`]. An empty
     /// range returns no bytes without a request.
-    pub async fn fetch_range(&self, url: &str, range: Range<u64>) -> Result<Bytes, TrackerError> {
-        self.inner.http.fetch_range(url, range, None).await
+    pub async fn fetch_range(
+        &self,
+        url: &str,
+        range: Range<u64>,
+        policy: RedirectPolicy,
+    ) -> Result<Bytes, TrackerError> {
+        self.inner.http.fetch_range(url, range, None, policy).await
     }
 
     /// [`fetch_range`](Self::fetch_range) with the body paced by `pace`
@@ -147,8 +162,12 @@ impl TrackerClient {
         url: &str,
         range: Range<u64>,
         pace: &dyn RangePace,
+        policy: RedirectPolicy,
     ) -> Result<Bytes, TrackerError> {
-        self.inner.http.fetch_range(url, range, Some(pace)).await
+        self.inner
+            .http
+            .fetch_range(url, range, Some(pace), policy)
+            .await
     }
 
     /// Scrapes `url` for `hashes` (BEP 48 over HTTP, BEP 15 action 2 over

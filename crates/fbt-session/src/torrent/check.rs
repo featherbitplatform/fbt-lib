@@ -10,6 +10,7 @@ use fbt_core::Bitfield;
 
 use super::actor::{Actor, Phase};
 use super::data::Job;
+use super::layers;
 use super::peer::Peer;
 use crate::picker::{PeerKey, PiecePicker};
 use crate::resume::stamps_match;
@@ -120,11 +121,36 @@ impl Actor {
     }
 
     /// The stamp comparison returned: the saved pieces are the check's
-    /// result (`Some`), or a full check runs.
+    /// result (`Some`), or a full check runs. A v2-only torrent that lacks
+    /// its piece layers is checked rather than trusted: without them none of
+    /// a multi-piece file's pieces can be hash-verified, so the saved claim
+    /// is not ours to accept, and `Seeding` (and the peer pruning that comes
+    /// with it) must not start on it.
     pub(super) fn on_resume_checked(&mut self, generation: u64, trusted: Option<Bitfield>) {
         if generation != self.generation || !matches!(self.phase, Phase::Resuming) {
             return;
         }
+        let trusted = match trusted {
+            // Layers out means hashes out: no saved `have` for a multi-piece
+            // file could have been verified against anything, and trusting it
+            // would call the torrent seeding, closing the only peers that can
+            // serve the layer. The check fails those pieces now; once the
+            // layer lands they are read off disk again (see
+            // `Actor::verify_merged_pieces`) rather than re-downloaded.
+            Some(_)
+                if self
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|l| layers::missing_layers(&l.meta)) =>
+            {
+                debug!(
+                    torrent = %self.name(),
+                    "piece layers still missing; checking instead of trusting the resume data"
+                );
+                None
+            }
+            t => t,
+        };
         self.resume = None;
         self.resume_trusted = Some(trusted.is_some());
         match trusted {
@@ -212,6 +238,17 @@ impl Actor {
                 };
                 self.last_have = None;
                 let mut picker = PiecePicker::new(l.layout, &have);
+                // A v2-only torrent that lacks its layers cannot verify any
+                // piece of a multi-piece file: those are not asked for until
+                // the layer arrives, so no bytes are wasted on pieces that
+                // would fail every hash.
+                layers::apply_layer_mask(&mut picker, &l.meta);
+                // A layer that merged while this check ran makes its file's
+                // pieces verifiable, but the bytes on disk were hashed without
+                // it: they are re-read below before any of them is asked for.
+                for r in &l.pending_verify {
+                    picker.set_pickable(r.clone(), false);
+                }
                 picker.set_piece_priorities(&l.piece_prio);
                 picker.set_sequential(l.sequential);
                 // Peers still connected (a magnet keeps those it fetched
@@ -229,6 +266,9 @@ impl Actor {
                 self.count_web_seeds();
                 self.phase = Phase::Ready;
                 self.metadata_check = false;
+                // Layers that merged while this check ran make their pieces
+                // verifiable: read them off disk before asking for them again.
+                self.verify_merged_pieces();
                 self.maybe_finish();
                 // Windows hold missing pieces only now; reads of pieces
                 // the check found are answered.

@@ -310,6 +310,21 @@ fn download_from_seed_process() {
     assert_eq!(got, want);
 }
 
+/// Seed and leecher as two processes, uTP only on both sides.
+///
+/// Review note (0.8 deflake; not reproduced: 100 runs at 4 copies, then 100
+/// more at 16 copies with the machine under CPU load): no fixed sleep is
+/// involved — `wait_exit` polls `try_wait` every 50 ms against a 60 s budget and
+/// the seed's listening line gets a 60 s `recv_timeout`, both far above this
+/// plan's 5 s floor for timing waits. The race here is the port, not the clock:
+/// `--transport utp` turns incoming TCP off, so with `--port 0` each side binds
+/// TCP only to pick an ephemeral port, closes it, and re-binds UDP on that same
+/// number. Another test's seed can take that number in the gap, and 16 copies
+/// of this test picking ports at once is how that would show up. fbt-session's
+/// bind loop retries both sockets on a fresh port up to eight times, so what
+/// settles is what the listening line reports, which is what the leecher
+/// dials; nothing failed here. A run that lost every attempt would have no UDP
+/// socket at all and would end as a failed download, not as a flaky assertion.
 #[test]
 fn download_over_utp_from_seed_process() {
     let tmp = tempfile::tempdir().expect("tempdir");

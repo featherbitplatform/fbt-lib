@@ -3,30 +3,25 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use fbt_core::PeerId;
+use fbt_core::{MAX_DISPLAY_CHARS, PeerId, display_safe};
 
 /// Floor applied to every tracker-supplied announce interval.
 pub(crate) const MIN_INTERVAL: Duration = Duration::from_secs(60);
-/// Longest tracker-supplied text kept (failure reasons, warnings, UDP error
-/// messages), in bytes.
+/// Longest tracker-supplied text read (failure reasons, warnings, UDP error
+/// messages) before it is made display-safe, in bytes. The cap a user sees is
+/// [`MAX_DISPLAY_CHARS`] characters; this one only bounds the lossy decode of a
+/// hostile reply.
 pub(crate) const MAX_TEXT_BYTES: usize = 1024;
 /// Longest `tracker id` kept; longer ones are dropped.
 pub(crate) const MAX_TRACKER_ID_BYTES: usize = 256;
 
-/// Tracker-supplied text as a string of at most [`MAX_TEXT_BYTES`] bytes,
-/// cut on a character boundary.
+/// Tracker-supplied text as a display-safe string: the raw bytes are cut to
+/// [`MAX_TEXT_BYTES`] and decoded lossily, then [`display_safe`] drops control
+/// and Unicode format characters, collapses whitespace and cuts the result to
+/// [`MAX_DISPLAY_CHARS`] characters.
 pub(crate) fn bounded_text(raw: &[u8]) -> String {
     let head = raw.get(..MAX_TEXT_BYTES).unwrap_or(raw);
-    let mut s = String::from_utf8_lossy(head).into_owned();
-    if s.len() > MAX_TEXT_BYTES {
-        // Replacement characters can make the lossy text longer.
-        let mut end = MAX_TEXT_BYTES;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
-    }
-    s
+    display_safe(&String::from_utf8_lossy(head), MAX_DISPLAY_CHARS)
 }
 
 /// The `event` of an announce.
@@ -83,8 +78,9 @@ impl AnnounceRequest {
     }
 }
 
-/// What the tracker tells us. Tracker-supplied text is cut to 1 KiB and a
-/// tracker id longer than 256 bytes is dropped.
+/// What the tracker tells us. Tracker-supplied text is display-safe and at most
+/// [`MAX_DISPLAY_CHARS`] characters, and a tracker id longer than 256 bytes is
+/// dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnounceResponse {
     /// Seconds until the next announce (at least 60 s).
@@ -118,7 +114,8 @@ pub enum TrackerError {
     /// An `https` URL was used but no TLS feature is enabled.
     #[error("https tracker but no TLS feature enabled")]
     TlsDisabled,
-    /// The tracker answered with a `failure reason` (cut to 1 KiB).
+    /// The tracker answered with a `failure reason`: display-safe and at most
+    /// [`MAX_DISPLAY_CHARS`] characters.
     #[error("tracker failure: {0}")]
     Failure(String),
     /// A non-success HTTP status.
@@ -127,6 +124,12 @@ pub enum TrackerError {
     /// More than 3 redirects.
     #[error("too many redirects")]
     TooManyRedirects,
+    /// A redirect target was refused because it is, or answers with, an address inside the
+    /// local network while the policy denied that ([`RedirectPolicy::allow_internal`](crate::RedirectPolicy)
+    /// is false): nothing was sent to it. Only a range fetch (a web seed) reports this;
+    /// announces keep the behaviour they always had.
+    #[error("redirect to an internal address")]
+    InternalRedirect,
     /// The response body exceeded the configured cap.
     #[error("response too large")]
     ResponseTooLarge,

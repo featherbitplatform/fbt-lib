@@ -84,6 +84,12 @@ pub struct ProxyConfig {
     /// Route tracker requests through the proxy.
     pub proxy_trackers: bool,
     /// Let the proxy resolve host names instead of resolving them locally.
+    ///
+    /// A web seed's redirect guard follows suit: with this true, a redirect target that is a
+    /// host name is not looked up or judged locally at all — the proxy resolves it and decides
+    /// where it goes — and only a target spelled as an address is refused for being inside the
+    /// local network. With it false, names are resolved here and judged then (see
+    /// `RedirectPolicy` in the `fbt-tracker` crate).
     pub proxy_hostnames: bool,
 }
 

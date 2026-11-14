@@ -170,6 +170,9 @@ impl Actor {
                     .map_or(0, |l| l.meta.piece_layers.len());
                 let _ = tx.send(n);
             }
+            Cmd::StatusTicks(tx) => {
+                let _ = tx.send(self.status_ticks);
+            }
             Cmd::Shutdown(tx) => {
                 let _ = self.stop(None).await;
                 let _ = tx.send(());
@@ -489,11 +492,10 @@ impl Actor {
                 (have, Vec::new())
             }
         };
-        let (magnet, sequential) = match (&self.loaded, &self.magnet, &self.pending_layers) {
-            (Some(l), _, _) => (None, l.sequential),
-            (None, Some(m), _) => (Some(m.magnet.to_uri()), m.sequential),
-            (None, None, Some(p)) => (None, p.sequential),
-            (None, None, None) => (None, false),
+        let (magnet, sequential) = match (&self.loaded, &self.magnet) {
+            (Some(l), _) => (None, l.sequential),
+            (None, Some(m)) => (Some(m.magnet.to_uri()), m.sequential),
+            (None, None) => (None, false),
         };
         let save_path = match &self.magnet {
             // A magnet's save path is moved with it until the metadata.
@@ -507,7 +509,8 @@ impl Actor {
                 .loaded
                 .as_ref()
                 .map(|l| l.renamed.iter().map(|(i, p)| (*i, p.clone())).collect())
-                // Waiting for its layers: the renames it was added with.
+                // A magnet saved before its metadata: the renames it was
+                // added with, which name no file yet.
                 .or_else(|| self.resume.as_ref().map(|r| r.renamed.clone()))
                 .unwrap_or_default(),
             web_seeds: self.web_seeds.urls(),
@@ -530,10 +533,9 @@ impl Actor {
             }
             (None, None) => &no_trackers,
         };
-        let file_priorities = match (&self.loaded, &self.pending_layers) {
-            (Some(l), _) => &l.file_prio[..],
-            (None, Some(p)) => &p.file_prio[..],
-            (None, None) => &[][..],
+        let file_priorities: &[Priority] = match &self.loaded {
+            Some(l) => &l.file_prio[..],
+            None => &[],
         };
         // The key's hashes, with any the metadata revealed (a magnet's
         // `info` is checked against both on load).
@@ -704,31 +706,24 @@ impl Actor {
         }
     }
 
-    /// Every file of the torrent with its verified bytes (none while the
-    /// files are checked or a v2 torrent's layers are fetched);
-    /// [`SessionError::NoMetadata`] before a magnet's metadata.
+    /// Every file of the torrent with its verified bytes (none while its
+    /// data is checked); [`SessionError::NoMetadata`] before a magnet's
+    /// metadata. A v2 torrent whose layers are still arriving reports what
+    /// its one-piece files hold.
     fn file_statuses(&self) -> Result<Vec<FileStatus>, SessionError> {
-        let (meta, prio, renamed, have) = match (&self.loaded, &self.pending_layers) {
-            (Some(l), _) => (
-                &l.meta,
-                &l.file_prio[..],
-                l.renamed
-                    .iter()
-                    .map(|(i, p)| (*i, p))
-                    .collect::<BTreeMap<_, _>>(),
-                l.picker.as_ref().map(|p| p.have()),
-            ),
-            (None, Some(p)) => (
-                &p.meta,
-                &p.file_prio[..],
-                self.resume
-                    .iter()
-                    .flat_map(|r| r.renamed.iter().map(|(i, p)| (*i, p)))
-                    .collect(),
-                None,
-            ),
-            (None, None) => return Err(SessionError::NoMetadata),
+        let Some(l) = self.loaded.as_ref() else {
+            return Err(SessionError::NoMetadata);
         };
+        let (meta, prio, have) = (
+            &l.meta,
+            &l.file_prio[..],
+            l.picker.as_ref().map(|p| p.have()),
+        );
+        let renamed = l
+            .renamed
+            .iter()
+            .map(|(i, p)| (*i, p))
+            .collect::<BTreeMap<_, _>>();
         let mut downloaded = vec![0u64; meta.info.files.len()];
         if let Some(have) = have {
             let layout = meta.piece_layout();

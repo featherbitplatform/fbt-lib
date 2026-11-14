@@ -3,10 +3,13 @@
 //! request`s from the layers we hold.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io;
+use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use fbt_core::Bitfield;
 use fbt_core::merkle::{MERKLE_BLOCK_LEN, MerkleTree, file_tree_height, verify_hashes};
 use fbt_metainfo::{MAX_PIECE_LAYER_HASHES, Metainfo, TorrentVersion, validate_layer};
 use fbt_wire::{HashRequest, MAX_HASH_REQUEST_LEN};
@@ -15,10 +18,12 @@ use tracing::{debug, warn};
 
 use super::actor::Actor;
 use super::data::Job;
+use super::readers::Readers;
+use crate::event::Event;
 use crate::peer::messages::PeerCommand;
-use crate::picker::PeerKey;
+use crate::picker::{PeerKey, PiecePicker};
 use crate::session::Priority;
-use crate::storage::Storage;
+use crate::storage::check_pieces_ranges;
 
 /// Most `hash request`s of one peer being served at once; further ones are
 /// rejected.
@@ -282,9 +287,9 @@ const SPANS_PER_SOURCE: usize = 4;
 const MAX_LAYER_CANDIDATES: usize = 1024;
 
 /// True when `meta` is v2-only and a file of more than one piece lacks its
-/// layer: the torrent must fetch layers before its download starts. The
-/// status's `has_metadata` and [`LayerFetch::new`] both use this predicate,
-/// so a torrent waits for a fetch exactly when there is one.
+/// layer, so there is something to fetch: [`LayerFetch::new`] returns a
+/// fetch exactly when this holds. The download does not wait for that fetch
+/// (see [`TorrentStatus::layers_missing`](crate::TorrentStatus::layers_missing)).
 pub(super) fn missing_layers(meta: &Metainfo) -> bool {
     meta.version() == TorrentVersion::V2 && fetch_targets(meta).next().is_some()
 }
@@ -292,11 +297,17 @@ pub(super) fn missing_layers(meta: &Metainfo) -> bool {
 /// A multi-piece file whose layer is missing, with its fetch geometry.
 struct Target {
     root: [u8; 32],
+    /// Index into `Info::files`, so priorities can say whether it matters.
+    file: usize,
     tree_height: u32,
     /// Log2 of the padded layer width (1 to 31).
     w_log: u32,
     /// Hashes in the layer: the file's piece count.
     count: usize,
+    /// Global index of the file's first piece. Every non-empty file starts
+    /// on a piece boundary (the parser pads the file before it), so its
+    /// pieces are `first_piece .. first_piece + count`.
+    first_piece: u32,
 }
 
 /// The multi-piece files of `meta` whose layer is missing. Every such file
@@ -305,25 +316,155 @@ struct Target {
 fn fetch_targets(meta: &Metainfo) -> impl Iterator<Item = Target> + '_ {
     let pl = u64::from(meta.info.piece_len);
     let piece_height = (meta.info.piece_len / MERKLE_BLOCK_LEN).trailing_zeros();
-    meta.info.files.iter().filter_map(move |f| {
-        if f.pad || f.len <= pl {
-            return None;
-        }
-        let root = f
-            .pieces_root
-            .filter(|r| !meta.piece_layers.contains_key(r))?;
-        let tree_height = file_tree_height(f.len);
-        let w_log = tree_height
-            .checked_sub(piece_height)
-            .filter(|w| (1..32).contains(w))?;
-        let count = usize::try_from(f.len.div_ceil(pl)).ok()?;
-        Some(Target {
-            root,
-            tree_height,
-            w_log,
-            count,
+    let mut offset: u64 = 0;
+    meta.info
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(move |(i, f)| {
+            // The offset moves on for every file, pads and one-piece files
+            // included, or the piece ranges would not match the layout.
+            let start = offset;
+            offset = offset.saturating_add(f.len);
+            if f.pad || f.len <= pl {
+                return None;
+            }
+            let root = f
+                .pieces_root
+                .filter(|r| !meta.piece_layers.contains_key(r))?;
+            let tree_height = file_tree_height(f.len);
+            let w_log = tree_height
+                .checked_sub(piece_height)
+                .filter(|w| (1..32).contains(w))?;
+            let count = usize::try_from(f.len.div_ceil(pl)).ok()?;
+            let first_piece = u32::try_from(start.checked_div(pl)?).ok()?;
+            Some(Target {
+                root,
+                file: i,
+                tree_height,
+                w_log,
+                count,
+                first_piece,
+            })
         })
-    })
+}
+
+/// Whether a file's pieces are wanted: empty `file_prio` means every file is
+/// `Normal`, as elsewhere in the actor.
+fn file_wanted(file_prio: &[Priority], file: usize) -> bool {
+    file_prio.get(file).is_none_or(|p| *p != Priority::Skip)
+}
+
+/// Whether some file of `meta` whose pieces are wanted has this `pieces root`.
+pub(super) fn root_is_wanted(meta: &Metainfo, file_prio: &[Priority], root: [u8; 32]) -> bool {
+    meta.info
+        .files
+        .iter()
+        .enumerate()
+        .any(|(i, f)| !f.pad && f.pieces_root == Some(root) && file_wanted(file_prio, i))
+}
+
+/// Adds `ranges` to `into`, joining overlapping or adjacent runs so the queue
+/// holds one range per stretch of pieces however many layers merged.
+fn push_ranges(into: &mut Vec<Range<u32>>, ranges: impl IntoIterator<Item = Range<u32>>) {
+    let mut all: Vec<Range<u32>> = std::mem::take(into);
+    all.extend(ranges);
+    all.sort_by_key(|r| r.start);
+    let mut out: Vec<Range<u32>> = Vec::with_capacity(all.len());
+    for r in all {
+        if r.start >= r.end {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    *into = out;
+}
+
+/// Takes the pieces of `done` out of `into`: what no answered pass covered
+/// survives, split around the parts that were read.
+fn drop_ranges(into: &mut Vec<Range<u32>>, done: &[Range<u32>]) {
+    let mut out: Vec<Range<u32>> = Vec::new();
+    for r in std::mem::take(into) {
+        let mut parts = vec![r];
+        for d in done {
+            let mut next = Vec::with_capacity(parts.len() + 1);
+            for p in parts {
+                if d.end <= p.start || d.start >= p.end {
+                    next.push(p);
+                    continue;
+                }
+                if p.start < d.start {
+                    next.push(p.start..d.start.min(p.end));
+                }
+                if d.end < p.end {
+                    next.push(d.end.max(p.start)..p.end);
+                }
+            }
+            parts = next;
+        }
+        out.extend(parts.into_iter().filter(|p| p.start < p.end));
+    }
+    *into = out;
+}
+
+/// The BEP 52 piece layers `meta` does not hold: one per multi-piece file
+/// whose layer is missing (`0` for a v1 torrent, whose files name no
+/// `pieces root`; the same for a hybrid torrent until its layers are built).
+pub(super) fn missing_layer_count(meta: &Metainfo) -> u32 {
+    u32::try_from(fetch_targets(meta).count()).unwrap_or(u32::MAX)
+}
+
+/// The pieces of `meta`'s non-pad files whose `pieces root` is `root`: a
+/// layer for `root` makes every piece in these ranges verifiable. Files of
+/// identical content share a root, and each starts on a piece boundary, so
+/// the ranges never overlap.
+pub(super) fn file_piece_ranges(meta: &Metainfo, root: [u8; 32]) -> Vec<Range<u32>> {
+    let pl = u64::from(meta.info.piece_len);
+    let mut out = Vec::new();
+    let mut offset: u64 = 0;
+    for f in &meta.info.files {
+        let start = offset;
+        offset = offset.saturating_add(f.len);
+        if f.pad || f.pieces_root != Some(root) {
+            continue;
+        }
+        let Some(blocks) = start.checked_div(pl) else {
+            continue;
+        };
+        let (Ok(first), Ok(pieces)) = (u32::try_from(blocks), u32::try_from(f.len.div_ceil(pl)))
+        else {
+            continue;
+        };
+        let (Some(end), true) = (first.checked_add(pieces), pieces > 0) else {
+            continue;
+        };
+        out.push(first..end);
+    }
+    out
+}
+
+/// Holds back the pieces a v2-only torrent cannot verify until their file's
+/// layer arrives (see [`PiecePicker::set_pickable`]): asking for them would
+/// download bytes no hash can accept. A hybrid torrent verifies its pieces
+/// from SHA-1 alone and keeps every piece pickable, layers or not. This
+/// runs on a freshly built picker, which holds nothing back yet, so it only
+/// ever sets the mask.
+pub(super) fn apply_layer_mask(picker: &mut PiecePicker, meta: &Metainfo) {
+    if meta.version() != TorrentVersion::V2 {
+        return;
+    }
+    for t in fetch_targets(meta) {
+        let Ok(count) = u32::try_from(t.count) else {
+            continue;
+        };
+        let Some(end) = t.first_piece.checked_add(count) else {
+            continue;
+        };
+        picker.set_pickable(t.first_piece..end, false);
+    }
 }
 
 /// One file whose layer is fetched.
@@ -335,8 +476,14 @@ struct FetchFile {
     length: u32,
     /// Uncles per answer: `tree_height - piece_height - log2(length)`.
     proof_layers: u32,
-    /// The layer, one hash per piece of the file; filled span by span.
+    /// The layer, one hash per piece of the file; filled span by span, and
+    /// taken away whole once every span is in ([`LayerFetch::take_ready`]).
     layer: Vec<[u8; 32]>,
+    /// Spans of this file not received yet; at 0 its layer is ready.
+    left: usize,
+    /// Whether some of this file's pieces are wanted: their layer is asked
+    /// for before a skipped file's (see [`LayerFetch::new`]).
+    wanted: bool,
 }
 
 /// One request's worth of a file's layer.
@@ -367,6 +514,11 @@ pub(super) enum LayerStep {
 /// padding are not asked for: they hold only pad hashes. At most
 /// [`MAX_LAYER_SOURCES`] peers are asked at once, each with at most
 /// `SPANS_PER_SOURCE` spans in flight.
+///
+/// The fetch runs beside the download, not before it:
+/// [`take_ready`](Self::take_ready) hands over a file's layer as soon as
+/// its last span arrives, and that file's pieces stop being held back then
+/// (see [`apply_layer_mask`]).
 #[derive(Debug)]
 pub(super) struct LayerFetch {
     piece_height: u32,
@@ -390,27 +542,31 @@ pub(super) struct LayerFetch {
     asked: HashMap<PeerKey, HashSet<Span>>,
     /// Spans received (at most the fetch's span count).
     done: HashSet<Span>,
+    /// Files whose every span arrived, in file order, not yet handed over by
+    /// [`take_ready`](Self::take_ready): at most one entry per file.
+    ready: Vec<usize>,
 }
 
 impl LayerFetch {
     /// A fetch of the layers `meta` lacks; `None` unless `meta` is v2-only
     /// and a multi-piece file lacks its layer ([`missing_layers`]).
-    pub(super) fn new(meta: &Metainfo) -> Option<Self> {
+    ///
+    /// `file_prio` sets the order spans are asked in: the layers of files
+    /// whose pieces are wanted come first, since those are what the download
+    /// waits for, and skipped files' layers follow. A waiting read pushes its
+    /// own file further ahead ([`prioritise`](Self::prioritise)).
+    pub(super) fn new(meta: &Metainfo, file_prio: &[Priority]) -> Option<Self> {
         if !missing_layers(meta) {
             return None;
         }
         let piece_height = (meta.info.piece_len / MERKLE_BLOCK_LEN).trailing_zeros();
         let mut files = Vec::new();
-        let mut todo = VecDeque::new();
+        // Each file's spans, in index order; `todo` concatenates them wanted
+        // files first, so a skipped file's hashes never delay a wanted one.
+        let mut per_file: Vec<Vec<Span>> = Vec::new();
         let mut total: usize = 0;
-        for Target {
-            root,
-            tree_height,
-            w_log,
-            count,
-        } in fetch_targets(meta)
-        {
-            let length = LAYER_REQUEST_LEN.min(1 << w_log);
+        for t in fetch_targets(meta) {
+            let length = LAYER_REQUEST_LEN.min(1 << t.w_log);
             let Ok(step) = usize::try_from(length) else {
                 continue;
             };
@@ -418,24 +574,36 @@ impl LayerFetch {
             // `MAX_V2_PIECES` (= `MAX_PIECE_LAYER_HASHES`) pieces, and its
             // layers hold one hash per piece, so no file is ever left out
             // (which would leave the download unable to finish).
-            debug_assert!(total.saturating_add(count) <= MAX_PIECE_LAYER_HASHES);
-            if total.saturating_add(count) > MAX_PIECE_LAYER_HASHES {
+            debug_assert!(total.saturating_add(t.count) <= MAX_PIECE_LAYER_HASHES);
+            if total.saturating_add(t.count) > MAX_PIECE_LAYER_HASHES {
                 break;
             }
-            total += count;
+            total += t.count;
             let file = files.len();
-            for index in (0..count).step_by(step) {
+            let mut spans = Vec::new();
+            for index in (0..t.count).step_by(step) {
                 if let Ok(index) = u32::try_from(index) {
-                    todo.push_back(Span { file, index });
+                    spans.push(Span { file, index });
                 }
             }
+            per_file.push(spans);
             files.push(FetchFile {
-                root,
-                tree_height,
+                root: t.root,
+                tree_height: t.tree_height,
                 length,
-                proof_layers: w_log - length.trailing_zeros(),
-                layer: vec![[0; 32]; count],
+                proof_layers: t.w_log - length.trailing_zeros(),
+                layer: vec![[0; 32]; t.count],
+                left: per_file[file].len(),
+                wanted: file_wanted(file_prio, t.file),
             });
+        }
+        let mut todo: VecDeque<Span> = VecDeque::new();
+        for pass in [true, false] {
+            for (i, f) in files.iter().enumerate() {
+                if f.wanted == pass {
+                    todo.extend(per_file[i].iter().copied());
+                }
+            }
         }
         let by_root = files.iter().enumerate().map(|(i, f)| (f.root, i)).collect();
         (!todo.is_empty()).then(|| LayerFetch {
@@ -444,6 +612,7 @@ impl LayerFetch {
             by_root,
             asked: HashMap::new(),
             done: HashSet::new(),
+            ready: Vec::new(),
             spans_left: todo.len(),
             todo,
             sources: BTreeMap::new(),
@@ -511,6 +680,15 @@ impl LayerFetch {
         }
         self.done.insert(span);
         self.spans_left = self.spans_left.saturating_sub(1);
+        // The file's layer is complete once its last span lands: it goes to
+        // the actor without waiting for the others.
+        let ready = self.files.get_mut(span.file).is_some_and(|f| {
+            f.left = f.left.saturating_sub(1);
+            f.left == 0
+        });
+        if ready {
+            self.ready.push(span.file);
+        }
         // A late answer may beat the span's new request: drop that one.
         self.todo.retain(|s| *s != span);
         for spans in self.sources.values_mut() {
@@ -594,10 +772,49 @@ impl LayerFetch {
         self.spans_left == 0
     }
 
-    /// The fetched layers by `pieces root` (complete once
-    /// [`is_complete`](Self::is_complete)).
-    pub(super) fn into_layers(self) -> BTreeMap<[u8; 32], Vec<[u8; 32]>> {
-        self.files.into_iter().map(|f| (f.root, f.layer)).collect()
+    /// The roots whose spans are not all received yet. Whether those hashes
+    /// are wanted is a question for the actor's current priorities (see
+    /// [`root_is_wanted`]), so this says what is outstanding, not what matters.
+    pub(super) fn owed_roots(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.files.iter().filter(|f| f.left > 0).map(|f| f.root)
+    }
+
+    /// The files whose layer arrived whole since the last call, taken once:
+    /// each entry is the file's `pieces root` and its layer, one hash per
+    /// piece of that file. A fetch is complete (see
+    /// [`is_complete`](Self::is_complete)) exactly when this hands over its
+    /// last layer.
+    pub(super) fn take_ready(&mut self) -> Vec<([u8; 32], Vec<[u8; 32]>)> {
+        let mut out = Vec::new();
+        for file in std::mem::take(&mut self.ready) {
+            if let Some(f) = self.files.get_mut(file)
+                && !f.layer.is_empty()
+            {
+                out.push((f.root, std::mem::take(&mut f.layer)));
+            }
+        }
+        out
+    }
+
+    /// Puts the waiting spans of the files with these `pieces root`s ahead
+    /// of the rest: a reader sits on those pieces, so they are what the
+    /// download is blocked on. Order within each group is unchanged; naming
+    /// roots no file has is ignored.
+    pub(super) fn prioritise(&mut self, roots: &[[u8; 32]]) {
+        if self.todo.is_empty() || roots.is_empty() {
+            return;
+        }
+        let first: HashSet<usize> = roots
+            .iter()
+            .filter_map(|r| self.by_root.get(r).copied())
+            .collect();
+        if first.is_empty() {
+            return;
+        }
+        let waiting: Vec<Span> = self.todo.drain(..).collect();
+        let (ahead, later): (Vec<Span>, Vec<Span>) =
+            waiting.into_iter().partition(|s| first.contains(&s.file));
+        self.todo.extend(ahead.into_iter().chain(later));
     }
 
     /// Removes `req` from `key`'s spans in flight.
@@ -701,6 +918,34 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// The parts of `range` whose pieces are not ours yet: those are the ones a
+/// pass has to read. A piece already verified passed against the hashes we
+/// held then, so reading its bytes again proves nothing.
+fn unread_ranges(have: Option<&Bitfield>, range: Range<u32>) -> Vec<Range<u32>> {
+    let Some(have) = have else {
+        // No picker yet: nothing is known to be ours.
+        return vec![range];
+    };
+    let mut out = Vec::new();
+    let mut free = range.start;
+    for piece in have.iter_ones() {
+        if piece < range.start {
+            continue;
+        }
+        if piece >= range.end {
+            break;
+        }
+        if free < piece {
+            out.push(free..piece);
+        }
+        free = piece.saturating_add(1);
+    }
+    if free < range.end {
+        out.push(free..range.end);
+    }
+    out
+}
+
 impl Actor {
     /// Piece `piece` passed with v2 subtree root `root` (or lost, `None`,
     /// by a recheck): fed to the layer builder; a completed layer waits for
@@ -722,27 +967,217 @@ impl Actor {
         }
     }
 
-    /// Merges the built layers into the actor's metainfo: at most once per
-    /// [`LAYER_SWAP_INTERVAL`], or now when `force` (completion). Only
-    /// `Loaded.meta` changes: the handle's `metainfo()` keeps the layers
-    /// known when it was set.
+    /// Merges the layers built or fetched since the last swap into the
+    /// actor's metainfo: at most once per [`LAYER_SWAP_INTERVAL`], or now when
+    /// `force` (a check finished, or the fetch did). A file stops having its
+    /// pieces held back only once they have been read off disk again — but a
+    /// second look is owed only where one is due: the pieces of a *fetched*
+    /// layer may already be on disk unverified (data can arrive before the
+    /// hashes do), while a built layer is made of pieces that passed their
+    /// checks, and only a v2-only torrent hides pieces behind a missing layer.
+    /// A fetch that just completed goes away with the merge. Only `Loaded.meta`
+    /// changes: the handle's `metainfo()` keeps the layers known when it was set.
     pub(super) fn swap_layers(&mut self, force: bool) {
+        {
+            let Some(l) = self.loaded.as_mut() else {
+                return;
+            };
+            if let Some(fetch) = l.layer_fetch.as_mut() {
+                for (root, layer) in fetch.take_ready() {
+                    l.fetched_layers.insert(root, layer);
+                }
+            }
+            let finished = l
+                .layer_fetch
+                .as_ref()
+                .is_some_and(|fetch| fetch.is_complete());
+            if l.built_layers.is_empty() && l.fetched_layers.is_empty() && !finished {
+                return;
+            }
+            let now = Instant::now();
+            if !force
+                && !finished
+                && l.layers_swapped
+                    .is_some_and(|t| now - t < LAYER_SWAP_INTERVAL)
+            {
+                return;
+            }
+            // Which roots a re-read is owed for: fetched layers only. A layer
+            // `with_piece_layers` would not take (over its cap) is not in
+            // `meta`, so its pieces stay held back — they fail every hash, so
+            // asking for them wastes bytes and bans honest peers.
+            let fetched = std::mem::take(&mut l.fetched_layers);
+            let owed: Vec<[u8; 32]> = if l.meta.version() == TorrentVersion::V2 {
+                fetched.keys().copied().collect()
+            } else {
+                // A hybrid's layers are built from pieces that already passed.
+                Vec::new()
+            };
+            let mut layers = std::mem::take(&mut l.built_layers);
+            layers.extend(fetched);
+            l.meta = Arc::new((*l.meta).clone().with_piece_layers(layers));
+            l.layers_swapped = Some(now);
+            let meta = Arc::clone(&l.meta);
+            let have = l.picker.as_ref().map(|p| p.have());
+            let ranges: Vec<Range<u32>> = owed
+                .iter()
+                .filter(|r| meta.piece_layers.contains_key(*r))
+                .flat_map(|r| file_piece_ranges(&meta, *r))
+                .flat_map(|range| unread_ranges(have, range))
+                .collect();
+            push_ranges(&mut l.pending_verify, ranges);
+            if finished {
+                l.layer_fetch = None;
+            }
+            let all_in = finished && missing_layer_count(&meta) == 0;
+            let pending = std::mem::take(&mut l.pending_verify);
+            if let Some(picker) = l.picker.as_mut() {
+                if all_in {
+                    // Every layer is in: nothing the mask covered stays out,
+                    // except the pieces not read off disk yet.
+                    picker.set_pickable(0..l.layout.num_pieces(), true);
+                }
+                for r in &pending {
+                    picker.set_pickable(r.clone(), false);
+                }
+            }
+            l.pending_verify = pending;
+        }
+        self.verify_merged_pieces();
+    }
+
+    /// Reads the pieces whose layer just merged back off disk, holding a
+    /// `max_active_checks` slot for the pass exactly as [`Actor::start_check`]
+    /// does — `spawn_check` runs outside the disk threads only because its
+    /// caller holds one (see `disk.rs`). The pieces could not be hashed when
+    /// they were downloaded, and this is what keeps complete data from being
+    /// fetched again. One pass per torrent at a time; with no slot free it does
+    /// not queue for one — the next status tick, merge or result runs this
+    /// again, and the ranges stay held back meanwhile (see
+    /// [`Actor::on_pieces_verified`]). While the files move the pass waits too.
+    pub(super) fn verify_merged_pieces(&mut self) {
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
-        if l.built_layers.is_empty() {
+        if l.verifying || l.pending_verify.is_empty() || l.picker.is_none() {
             return;
         }
-        let now = Instant::now();
-        if !force
-            && l.layers_swapped
-                .is_some_and(|t| now - t < LAYER_SWAP_INTERVAL)
-        {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        if self.storage_busy {
             return;
         }
-        let layers = std::mem::take(&mut l.built_layers);
-        l.meta = Arc::new((*l.meta).clone().with_piece_layers(layers));
-        l.layers_swapped = Some(now);
+        // A check's slot, held by the job itself until it returns. None free is
+        // not a reason to hold one waiting: this runs again on the next tick.
+        let Ok(permit) = self.shared.disk.check_permit().try_acquire_owned() else {
+            return;
+        };
+        // The queue keeps its ranges while the pass runs: they stay held back
+        // until it answers, so a merge that completes meanwhile cannot release
+        // them to a download of bytes that are already on disk.
+        let ranges = l.pending_verify.clone();
+        l.verifying = true;
+        let meta = Arc::clone(&l.meta);
+        let layout = l.layout;
+        let generation = self.generation;
+        self.shared.disk.spawn_check(&mut self.jobs, move || {
+            let _slot = permit;
+            let result = check_pieces_ranges(&*storage, &layout, &meta, &ranges, |_| {
+                ControlFlow::Continue(())
+            });
+            Job::LayersVerified {
+                generation,
+                ranges,
+                result,
+            }
+        });
+    }
+
+    /// The disk pass over pieces whose layer arrived is back: the ones passing
+    /// every hash are ours without being fetched again (`PieceFinished` as for
+    /// a download), and the rest of those ranges may be requested now. A pass
+    /// that raced a check or a restart is dropped: its ranges go back in the
+    /// queue, which runs again at once where a picker stands ready (a torrent
+    /// with nothing else going on must not wait for a status tick to notice its
+    /// pieces are still held back).
+    pub(super) fn on_pieces_verified(
+        &mut self,
+        generation: u64,
+        ranges: &[Range<u32>],
+        result: io::Result<Vec<(u32, Option<[u8; 32]>)>>,
+    ) {
+        let stale = generation != self.generation;
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        l.verifying = false;
+        if stale || l.picker.is_none() {
+            push_ranges(&mut l.pending_verify, ranges.iter().cloned());
+            self.verify_merged_pieces();
+            return;
+        }
+        let passed = match result {
+            Ok(passed) => passed,
+            Err(e) => {
+                debug!(
+                    torrent = %self.name(),
+                    error = %e,
+                    "re-reading pieces after a layer arrived failed; fetching them instead"
+                );
+                Vec::new()
+            }
+        };
+        for (piece, root) in passed {
+            // A pass re-queued behind a check or a storage move can cover a
+            // piece that check already found: report each piece once.
+            let known = self
+                .loaded
+                .as_ref()
+                .and_then(|l| l.picker.as_ref())
+                .is_some_and(|p| p.have().get(piece));
+            if known {
+                continue;
+            }
+            self.on_piece_root(piece, root);
+            if let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) {
+                picker.piece_passed(piece);
+            }
+            self.deadlines.piece_done(piece);
+            self.lost_pieces.remove(&piece);
+            self.emit(Event::PieceFinished {
+                torrent: self.ih,
+                piece,
+            });
+        }
+        // Those ranges have been read: what is left of them may be requested,
+        // and only the parts no pass has covered stay in the queue.
+        if let Some(l) = self.loaded.as_mut() {
+            drop_ranges(&mut l.pending_verify, ranges);
+        }
+        if let Some(picker) = self.loaded.as_mut().and_then(|l| l.picker.as_mut()) {
+            for r in ranges {
+                picker.set_pickable(r.clone(), true);
+            }
+        }
+        self.need_save_resume = true;
+        let finished = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.picker.as_ref())
+            .is_some_and(crate::picker::PiecePicker::is_finished);
+        if finished && !self.finished_emitted {
+            self.finished_emitted = true;
+            self.finish_pending = true;
+        }
+        // Reads waiting on those pieces are served from disk, and peers learn
+        // what we found without downloading it.
+        self.sync_all_readers();
+        self.serve_waiting_reads();
+        self.catch_up_peers();
+        self.maybe_finish();
+        self.refresh_state();
+        self.verify_merged_pieces();
     }
 
     /// A v1-only torrent has no hash messages: true (and the peer closed)
@@ -762,9 +1197,15 @@ impl Actor {
     /// A peer's `hash request`: served off the actor from `Loaded.meta`
     /// and the file's cached tree, at most [`MAX_PENDING_HASH_REQUESTS`]
     /// at once per peer and [`MAX_SERVING_JOBS`] per torrent; rejected
-    /// beyond either and before the metadata.
+    /// beyond either, before the metadata, and whenever
+    /// [`Settings::serve_hashes`](crate::Settings::serve_hashes) is off.
     pub(super) fn on_hash_request(&mut self, key: PeerKey, req: HashRequest) {
         if !self.peers.contains_key(&key) || self.close_if_v1_only(key) {
+            return;
+        }
+        if !self.shared.settings.serve_hashes {
+            debug!(key = key.0, ?req, "hash serving is off; rejected");
+            self.send(key, PeerCommand::RejectHashes(req));
             return;
         }
         let (Some(l), Some(p)) = (self.loaded.as_mut(), self.peers.get_mut(&key)) else {
@@ -831,7 +1272,9 @@ impl Actor {
     /// A peer's `hashes` (`Some`) or `hash reject` (`None`): fed to the
     /// layer fetch while one runs, dropped otherwise (closing the peer on a
     /// v1-only torrent). Hashes that are unrequested or fail their proof
-    /// ban the peer as bad metadata does.
+    /// ban the peer as bad metadata does; an answer with no fetch running —
+    /// the layers came another way in the meantime — is dropped without
+    /// blame.
     pub(super) fn on_hash_answer(&mut self, key: PeerKey, req: HashRequest, hashes: Option<Bytes>) {
         if self.close_if_v1_only(key) {
             return;
@@ -842,25 +1285,36 @@ impl Actor {
             answered = hashes.is_some(),
             "hash answer"
         );
-        let Some(p) = self.pending_layers.as_mut() else {
-            debug!(key = key.0, ?req, "unrequested hash answer dropped");
+        let now = Instant::now();
+        let Some(step) = self.loaded.as_mut().and_then(|l| {
+            let fetch = l.layer_fetch.as_mut()?;
+            Some(match hashes {
+                None => LayerStep::Send(fetch.on_reject(key, &req, now)),
+                Some(h) => fetch.on_hashes(key, &req, &h, now),
+            })
+        }) else {
+            debug!(
+                key = key.0,
+                ?req,
+                "hash answer with no fetch running; dropped"
+            );
             return;
         };
-        let now = Instant::now();
-        let sends = match hashes {
-            None => p.fetch.on_reject(key, &req, now),
-            Some(h) => match p.fetch.on_hashes(key, &req, &h, now) {
-                LayerStep::Send(sends) => sends,
-                LayerStep::Bad(bad) => {
-                    debug!(key = bad.0, ?req, "bad or unrequested hashes; banning");
-                    let sends = p.fetch.on_disconnect(bad, now);
-                    self.ban(bad);
-                    sends
-                }
-            },
+        let sends = match step {
+            LayerStep::Send(sends) => sends,
+            LayerStep::Bad(bad) => {
+                debug!(key = bad.0, ?req, "bad or unrequested hashes; banning");
+                let sends = self
+                    .loaded
+                    .as_mut()
+                    .and_then(|l| l.layer_fetch.as_mut())
+                    .map(|fetch| fetch.on_disconnect(bad, now))
+                    .unwrap_or_default();
+                self.ban(bad);
+                sends
+            }
         };
         self.send_hash_requests(sends);
-        self.finish_layer_fetch();
     }
 
     /// A peer finished its handshake: it is a layer source if it set the v2
@@ -876,44 +1330,30 @@ impl Actor {
         }
     }
 
+    /// A peer that can serve layers joins the fetch's sources, asked for
+    /// spans as its slot frees. With no fetch running it is a plain peer:
+    /// its hash messages are dropped, not held against it.
     fn add_layer_source(&mut self, key: PeerKey) {
-        let Some(p) = self.pending_layers.as_mut() else {
-            return;
-        };
-        let sends = p.fetch.add_source(key, Instant::now());
+        let sends = self
+            .loaded
+            .as_mut()
+            .and_then(|l| l.layer_fetch.as_mut())
+            .map(|fetch| fetch.add_source(key, Instant::now()))
+            .unwrap_or_default();
         self.send_hash_requests(sends);
     }
 
-    /// A peer is gone: its spans go to the other sources.
-    pub(super) fn layer_source_gone(&mut self, key: PeerKey) {
-        let Some(p) = self.pending_layers.as_mut() else {
+    /// The v2 peers already connected when a `Loaded` with a fetch appears
+    /// (a magnet's metadata arrives while they are up) become sources at
+    /// once.
+    pub(super) fn sync_layer_sources(&mut self) {
+        if !self
+            .loaded
+            .as_ref()
+            .is_some_and(|l| l.layer_fetch.is_some())
+        {
             return;
-        };
-        let sends = p.fetch.on_disconnect(key, Instant::now());
-        self.send_hash_requests(sends);
-    }
-
-    /// Advances the layer fetch's timers.
-    pub(super) fn layer_tick(&mut self) {
-        let Some(p) = self.pending_layers.as_mut() else {
-            return;
-        };
-        let sends = p.fetch.tick(Instant::now());
-        self.send_hash_requests(sends);
-    }
-
-    fn send_hash_requests(&mut self, sends: Vec<(PeerKey, HashRequest)>) {
-        for (key, req) in sends {
-            debug!(key = key.0, ?req, "hash request sent");
-            self.send(key, PeerCommand::RequestHashes(req));
         }
-    }
-
-    /// The metadata of a v2-only torrent lacking layers: held in
-    /// `pending_layers` (in `Phase::Metadata`) while they are fetched from
-    /// the connected v2 peers and those still to come.
-    pub(super) fn await_layers(&mut self, pending: PendingLayers) {
-        self.pending_layers = Some(Box::new(pending));
         let v2: Vec<PeerKey> = self
             .peers
             .iter()
@@ -925,39 +1365,86 @@ impl Actor {
         }
     }
 
-    /// Once every layer is in: the metadata, with them, is installed as a
-    /// magnet's is (storage, check, download).
-    fn finish_layer_fetch(&mut self) {
-        if !self
-            .pending_layers
-            .as_ref()
-            .is_some_and(|p| p.fetch.is_complete())
-        {
-            return;
-        }
-        let Some(p) = self.pending_layers.take() else {
+    /// A peer is gone: its spans go to the other sources.
+    pub(super) fn layer_source_gone(&mut self, key: PeerKey) {
+        let sends = self
+            .loaded
+            .as_mut()
+            .and_then(|l| l.layer_fetch.as_mut())
+            .map(|fetch| fetch.on_disconnect(key, Instant::now()))
+            .unwrap_or_default();
+        self.send_hash_requests(sends);
+    }
+
+    /// Advances the layer fetch's timers, with what the readers are waiting
+    /// for asked before the rest.
+    pub(super) fn layer_tick(&mut self) {
+        self.layer_prioritise();
+        let sends = self
+            .loaded
+            .as_mut()
+            .and_then(|l| l.layer_fetch.as_mut())
+            .map(|fetch| fetch.tick(Instant::now()))
+            .unwrap_or_default();
+        self.send_hash_requests(sends);
+    }
+
+    /// Puts the spans of the files a waiting read sits on ahead of the
+    /// others: without its layer a file's pieces are not even requested, so
+    /// the read is blocked on exactly those hashes.
+    pub(super) fn layer_prioritise(&mut self) {
+        let Some(roots) = self.loaded.as_ref().and_then(|l| {
+            l.layer_fetch
+                .as_ref()
+                .map(|_| reader_roots(&self.readers, &l.meta))
+        }) else {
             return;
         };
-        let p = *p;
-        let meta = Arc::unwrap_or_clone(p.meta).with_piece_layers(p.fetch.into_layers());
-        self.install_loaded(meta, p.storage, p.file_prio, p.sequential);
+        if roots.is_empty() {
+            return;
+        }
+        if let Some(fetch) = self.loaded.as_mut().and_then(|l| l.layer_fetch.as_mut()) {
+            fetch.prioritise(&roots);
+        }
+    }
+
+    fn send_hash_requests(&mut self, sends: Vec<(PeerKey, HashRequest)>) {
+        for (key, req) in sends {
+            debug!(key = key.0, ?req, "hash request sent");
+            self.send(key, PeerCommand::RequestHashes(req));
+        }
     }
 }
 
-/// A v2-only torrent whose metadata is known, waiting for the piece layers
-/// it lacks; what `install_loaded` needs once they are in.
-#[derive(Debug)]
-pub(super) struct PendingLayers {
-    pub meta: Arc<Metainfo>,
-    pub fetch: LayerFetch,
-    /// The custom storage from `AddTorrent`; `None` builds an `FsStorage`.
-    pub storage: Option<Arc<dyn Storage>>,
-    pub file_prio: Vec<Priority>,
-    pub sequential: bool,
+/// The `pieces root`s of the files still being fetched that an open reader
+/// sits on, one per file: `pieces` are sorted and deduplicated by the
+/// caller, so each target costs two binary searches.
+fn reader_roots(readers: &Readers, meta: &Metainfo) -> Vec<[u8; 32]> {
+    let mut pieces: Vec<u32> = readers.reading_pieces().collect();
+    if pieces.is_empty() {
+        return Vec::new();
+    }
+    pieces.sort_unstable();
+    pieces.dedup();
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    for t in fetch_targets(meta) {
+        let Ok(count) = u32::try_from(t.count) else {
+            continue;
+        };
+        let Some(end) = t.first_piece.checked_add(count) else {
+            continue;
+        };
+        let from = pieces.partition_point(|p| *p < t.first_piece);
+        if !pieces.get(from).is_some_and(|p| *p < end) || out.contains(&t.root) {
+            continue;
+        }
+        out.push(t.root);
+    }
+    out
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use fbt_core::merkle::{file_tree_height, pad_hash, piece_root, verify_hashes};
     use fbt_metainfo::CreateTorrent;
@@ -1191,7 +1678,7 @@ mod tests {
 
     /// A v2 torrent of `files` (name, length) with 32 KiB pieces, with its
     /// layers, and the same without them.
-    fn v2_meta(files: &[(&str, usize)]) -> (Metainfo, Metainfo) {
+    pub(in crate::torrent) fn v2_meta(files: &[(&str, usize)]) -> (Metainfo, Metainfo) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("payload");
         std::fs::create_dir(&root).unwrap();
@@ -1230,30 +1717,43 @@ mod tests {
         let file = &stripped.info.files[0];
         let h = file_tree_height(file.len);
         let p = PIECE_HEIGHT;
-        let mut f = LayerFetch::new(&stripped).expect("a layer is missing");
+        let mut f = LayerFetch::new(&stripped, &[]).expect("a layer is missing");
         let sends = f.add_source(A, Instant::now());
         assert_eq!(
             sends,
             [(A, req(file.pieces_root.unwrap(), p, 0, 16, h - p - 4))]
         );
         // Nothing to fetch with the layer, or for a hybrid.
-        assert!(LayerFetch::new(&full).is_none());
+        assert!(LayerFetch::new(&full, &[]).is_none());
         assert!(!missing_layers(&full));
         let (hybrid, _) = hybrid_without_layer();
-        assert!(LayerFetch::new(&hybrid).is_none());
+        assert!(LayerFetch::new(&hybrid, &[]).is_none());
     }
 
+    /// What a fetch is built for and what `TorrentStatus::layers_missing`
+    /// counts come from the same walk of the files.
     #[test]
     fn status_and_fetch_share_one_predicate() {
         let (full, stripped) = v2_meta(&[("a", 300_000), ("b", 100), ("c", 40_000)]);
         let (one_piece_full, one_piece) = v2_meta(&[("a", 100)]);
         let (hybrid, _) = hybrid_without_layer();
         for m in [&full, &stripped, &one_piece_full, &one_piece, &hybrid] {
-            assert_eq!(missing_layers(m), LayerFetch::new(m).is_some());
+            assert_eq!(missing_layers(m), LayerFetch::new(m, &[]).is_some());
+        }
+        // `TorrentStatus::layers_missing` counts what the metadata lacks, hybrid
+        // included; a fetch runs only where a v2-only torrent cannot verify.
+        for (m, want) in [
+            (&full, 0),
+            (&stripped, 2),
+            (&one_piece_full, 0),
+            (&one_piece, 0),
+            (&hybrid, 1),
+        ] {
+            assert_eq!(missing_layer_count(m), want, "{:?}", m.version());
         }
         // Every multi-piece file lacking its layer is fetched: none is left
         // out, so the download can always finish.
-        let f = LayerFetch::new(&stripped).unwrap();
+        let f = LayerFetch::new(&stripped, &[]).unwrap();
         let want: Vec<_> = stripped
             .info
             .files
@@ -1265,10 +1765,9 @@ mod tests {
         assert_eq!(f.files.iter().map(|x| x.root).collect::<Vec<_>>(), want);
     }
 
-    #[test]
-    fn fetch_splits_wide_layers() {
-        // 600 pieces of 16 KiB: a padded layer 1024 wide, in two spans of
-        // 512 (the second one partly padding).
+    /// A v2 torrent of one 600-piece file (16 KiB pieces: a padded layer
+    /// 1024 wide, asked for in two spans of 512), with and without its layer.
+    fn wide_without_layer() -> (Metainfo, Metainfo) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("payload");
         std::fs::create_dir(&root).unwrap();
@@ -1282,8 +1781,15 @@ mod tests {
         let full = Metainfo::from_bytes(&bytes).unwrap();
         let mut stripped = full.clone();
         stripped.piece_layers.clear();
+        (full, stripped)
+    }
+
+    #[test]
+    fn fetch_splits_wide_layers() {
+        // The second span is partly padding.
+        let (full, stripped) = wide_without_layer();
         let pr = full.info.files[0].pieces_root.unwrap();
-        let mut f = LayerFetch::new(&stripped).unwrap();
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
         let now = Instant::now();
         let sends = f.add_source(A, now);
         assert_eq!(
@@ -1295,13 +1801,274 @@ mod tests {
             assert_eq!(step, LayerStep::Send(Vec::new()));
         }
         assert!(f.is_complete());
-        assert_eq!(f.into_layers(), full.piece_layers);
+        let ready = f.take_ready();
+        assert_eq!(ready.len(), 1, "one file, one layer");
+        assert_eq!(full.piece_layers.get(&pr), Some(&ready[0].1));
+        assert!(f.take_ready().is_empty(), "a layer is handed over once");
+    }
+
+    /// Wanted files' layers are asked for first: a skipped file's hashes must
+    /// not delay the layer its download waits for. With every file wanted the
+    /// order is the torrent's own.
+    #[test]
+    fn wanted_layers_are_asked_for_first() {
+        let (_, stripped) = three_files();
+        // `files` holds pad files too, so the targets name their own indices.
+        let targets: Vec<(usize, [u8; 32])> =
+            fetch_targets(&stripped).map(|t| (t.file, t.root)).collect();
+        assert_eq!(targets.len(), 2, "two multi-piece files");
+        let (file_a, pr_a) = targets[0];
+        let (_, pr_b) = targets[1];
+
+        // Every file wanted (empty priorities): the torrent's own order.
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
+        let sends = f.add_source(A, Instant::now());
+        assert_eq!(
+            sends.iter().map(|(_, r)| r.pieces_root).collect::<Vec<_>>(),
+            [pr_a, pr_b],
+            "every layer is wanted"
+        );
+
+        // The first target's file skipped: the other's hashes go out first.
+        let mut prio = vec![Priority::Normal; stripped.info.files.len()];
+        prio[file_a] = Priority::Skip;
+        let mut f = LayerFetch::new(&stripped, &prio).unwrap();
+        assert_eq!(
+            f.files.iter().map(|x| x.wanted).collect::<Vec<_>>(),
+            [false, true],
+            "only the second file is wanted"
+        );
+        let sends = f.add_source(A, Instant::now());
+        assert_eq!(
+            sends.iter().map(|(_, r)| r.pieces_root).collect::<Vec<_>>(),
+            [pr_b, pr_a],
+            "the wanted file's layer is asked for first"
+        );
+    }
+
+    /// Only files with wanted pieces hold `Seeding` back, and only while their
+    /// hashes are still outstanding: a skipped file's layer is nobody's
+    /// download, and a span received asks for nothing.
+    #[test]
+    fn only_wanted_files_hold_seeding_back() {
+        let (full, stripped) = three_files();
+        let targets: Vec<usize> = fetch_targets(&stripped).map(|t| t.file).collect();
+        let roots: Vec<[u8; 32]> = fetch_targets(&stripped).map(|t| t.root).collect();
+        assert_eq!(targets.len(), 2);
+
+        // Empty priorities mean every file is `Normal`, so both roots matter.
+        assert!(
+            roots.iter().all(|r| root_is_wanted(&stripped, &[], *r)),
+            "every file is wanted"
+        );
+
+        // Skip one file: only the other root matters to seeding.
+        let mut skip_one = vec![Priority::Normal; stripped.info.files.len()];
+        skip_one[targets[0]] = Priority::Skip;
+        assert!(!root_is_wanted(&stripped, &skip_one, roots[0]));
+        assert!(
+            root_is_wanted(&stripped, &skip_one, roots[1]),
+            "the other file still wants its layer"
+        );
+
+        // Skip both: nothing outstanding is wanted.
+        let skip_all = vec![Priority::Skip; stripped.info.files.len()];
+        assert!(
+            roots
+                .iter()
+                .all(|r| !root_is_wanted(&stripped, &skip_all, *r)),
+            "a skipped file's layer is nobody's download"
+        );
+
+        // What the metadata holds asks for nothing, and a fetch that received
+        // every span owes no root at all.
+        assert!(roots.iter().all(|r| root_is_wanted(&full, &[], *r)));
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
+        assert_eq!(f.owed_roots().collect::<Vec<_>>(), roots);
+        let now = Instant::now();
+        let mut sends = f.add_source(A, now);
+        while let Some((k, r)) = sends.pop() {
+            match f.on_hashes(k, &r, &serve(&full, &r), now) {
+                LayerStep::Send(more) => sends.extend(more),
+                LayerStep::Bad(k) => panic!("{k:?} judged bad"),
+            }
+        }
+        assert!(f.is_complete());
+        assert_eq!(f.owed_roots().next(), None, "nothing is outstanding");
+    }
+
+    /// The verify queue joins what merges and keeps what has not been read:
+    /// overlapping runs coalesce, and an answered pass leaves behind the parts
+    /// of them it did not cover.
+    #[test]
+    fn verify_ranges_join_and_split() {
+        let mut q: Vec<Range<u32>> = Vec::new();
+        // Apart runs stay apart, sorted; overlapping and adjacent ones join.
+        push_ranges(&mut q, [8..10, 0..4]);
+        assert_eq!(q, vec![0..4, 8..10], "apart runs, in order");
+        push_ranges(&mut q, [3..6, 10..12]);
+        assert_eq!(q, vec![0..6, 8..12], "overlapping and adjacent runs join");
+        // A pass that read `2..4` and `11..12` leaves the ends it did not
+        // cover held back until a pass reaches them.
+        drop_ranges(&mut q, &[2..4, 11..12]);
+        assert_eq!(q, vec![0..2, 4..6, 8..11], "the unread parts survive");
+        // A pass over everything empties the queue; one more changes nothing.
+        drop_ranges(&mut q, &[0..6, 6..32]);
+        assert!(q.is_empty(), "everything was read");
+        drop_ranges(&mut q, &[0..1, 2..3]);
+        assert!(q.is_empty());
+    }
+
+    /// Only pieces that are not ours yet need reading: a piece that passed
+    /// already proved itself against the hashes we held then.
+    #[test]
+    fn unread_ranges_skips_verified_pieces() {
+        let mut have = Bitfield::new(10);
+        have.set(1);
+        have.set(4);
+        assert_eq!(unread_ranges(Some(&have), 0..8), vec![0..1, 2..4, 5..8]);
+        // Bits outside the range neither split it nor extend it: `9` is ours,
+        // `0..3` is asked for as two runs around the one verified piece.
+        have.set(9);
+        assert_eq!(unread_ranges(Some(&have), 0..3), vec![0..1, 2..3]);
+        // Everything inside already passed: nothing to read.
+        assert!(
+            unread_ranges(Some(&Bitfield::full(8)), 2..6).is_empty(),
+            "every piece of the range verified"
+        );
+        // With no picker nothing is known to be ours, so the whole run stands.
+        let all = unread_ranges(None, 0..3);
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].start, all[0].end), (0, 3), "no picker: read it all");
+        assert!(
+            unread_ranges(Some(&have), 4..4).is_empty(),
+            "an empty range"
+        );
+    }
+
+    /// Answers every span `fetch` asks of source `A` with the hashes `full`
+    /// holds, until the fetch is complete.
+    fn answer_all(fetch: &mut LayerFetch, full: &Metainfo) {
+        let now = Instant::now();
+        let mut sends = fetch.add_source(A, now);
+        while let Some((k, r)) = sends.pop() {
+            match fetch.on_hashes(k, &r, &serve(full, &r), now) {
+                LayerStep::Send(more) => sends.extend(more),
+                LayerStep::Bad(key) => panic!("{key:?} judged bad"),
+            }
+        }
+        assert!(
+            fetch.is_complete(),
+            "every span answered from the torrent itself"
+        );
+    }
+
+    /// A fetched layer's pieces may lie on disk unverified — data arrives
+    /// before the hashes do — so merging one queues a read of them and starts
+    /// it. A hybrid's built layer is made of pieces that already passed their
+    /// checks, so merging it asks for no second look and spawns no job:
+    /// provenance and version are what tell the two apart.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetched_layers_are_reread_and_built_ones_are_not() {
+        use super::super::swarm::tests::actor_over;
+
+        // v2-only, its one multi-piece file lacking its layer: a fetch runs.
+        let (full, stripped) = v2_meta(&[("only", 300_000)]);
+        let mut a = actor_over(stripped, 0);
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            let mut f = l.layer_fetch.take().expect("a fetch for the missing layer");
+            answer_all(&mut f, &full);
+            l.layer_fetch = Some(f);
+        }
+        a.swap_layers(true);
+        {
+            let l = a.loaded.as_ref().expect("loaded");
+            let want = {
+                let mut v = Vec::new();
+                push_ranges(&mut v, [0..6, 6..10]);
+                v
+            };
+            assert_eq!(l.pending_verify, want, "the fetched pieces await a read");
+            assert!(l.verifying, "the pass runs at once");
+        }
+        assert_eq!(a.jobs.len(), 1, "one check job for the re-read");
+
+        // Hybrid without its layer: the same hashes arrive as a *built* layer.
+        let (stripped, data) = hybrid_without_layer();
+        let root = stripped.info.files[0].pieces_root.expect("a v2 root");
+        let mut a = actor_over(stripped, 0);
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            assert!(
+                l.layer_fetch.is_none(),
+                "a hybrid builds, it does not fetch"
+            );
+            l.built_layers.insert(root, roots(&data));
+        }
+        a.swap_layers(true);
+        {
+            let l = a.loaded.as_ref().expect("loaded");
+            assert_eq!(l.meta.piece_layers.len(), 1, "the built layer merged");
+            assert!(
+                l.pending_verify.is_empty(),
+                "its pieces passed with the hashes we already held"
+            );
+            assert!(!l.verifying);
+        }
+        assert_eq!(a.jobs.len(), 0, "no verify pass for a built layer");
+    }
+
+    /// The pass is a check, so it holds one of the `max_active_checks` slots
+    /// for its whole run. With every slot held elsewhere it neither runs nor
+    /// queues for one: the pieces stay held back, the torrent keeps ticking,
+    /// and the next tick, merge or result tries again — which is how
+    /// `spawn_check`'s bound to `max_active_checks` (see `disk.rs`) holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_check_slot_means_no_pass_yet() {
+        use super::super::swarm::tests::actor_over;
+
+        let (full, stripped) = v2_meta(&[("only", 300_000)]);
+        let mut a = actor_over(stripped.clone(), 0);
+        {
+            let l = a.loaded.as_mut().expect("loaded");
+            let mut f = l.layer_fetch.take().expect("a fetch for the missing layer");
+            answer_all(&mut f, &full);
+            l.layer_fetch = Some(f);
+        }
+        // Hold every check slot the pool allows. It is one in these helpers;
+        // acquiring until that fails works for any size.
+        let checks = a.shared.disk.check_permit();
+        let mut slots = Vec::new();
+        while let Ok(p) = Arc::clone(&checks).try_acquire_owned() {
+            slots.push(p);
+        }
+        assert!(!slots.is_empty(), "the pool allows at least one check");
+        a.swap_layers(true);
+        {
+            let l = a.loaded.as_ref().expect("loaded");
+            assert_eq!(l.pending_verify.len(), 1, "the pieces stay held back");
+            assert!(!l.verifying, "no pass without a slot");
+            assert!(
+                l.merge_or_verify_work(),
+                "and the torrent keeps ticking for it"
+            );
+        }
+        assert_eq!(a.jobs.len(), 0, "nothing spawned and nothing queued");
+        // A slot coming free lets the next attempt run it.
+        drop(slots);
+        a.verify_merged_pieces();
+        assert!(
+            a.loaded.as_ref().expect("loaded").verifying,
+            "the pass runs once a slot is free"
+        );
+        assert_eq!(a.jobs.len(), 1, "one job for it");
     }
 
     #[test]
     fn fetch_completes_from_one_source() {
         let (full, stripped) = three_files();
-        let mut f = LayerFetch::new(&stripped).expect("layers are missing");
+        let mut f = LayerFetch::new(&stripped, &[]).expect("layers are missing");
         let now = Instant::now();
         let mut sends = f.add_source(A, now);
         assert_eq!(sends.len(), 2, "one span per file");
@@ -1313,15 +2080,101 @@ mod tests {
             }
         }
         assert!(f.is_complete());
-        let layers = f.into_layers();
+        let layers: BTreeMap<_, _> = f.take_ready().into_iter().collect();
         assert_eq!(layers, full.piece_layers);
         assert_eq!(stripped.with_piece_layers(layers).piece_layers.len(), 2);
+    }
+
+    /// One file's layer is complete while the other still owes a span: it
+    /// goes to the actor at once, and only once.
+    #[test]
+    fn a_layer_is_ready_before_the_fetch_is() {
+        let (full, stripped) = three_files();
+        let mut f = LayerFetch::new(&stripped, &[]).expect("layers are missing");
+        let now = Instant::now();
+        let mut sends = f.add_source(A, now);
+        assert_eq!(sends.len(), 2, "one span per file");
+        let (k, r) = sends.pop().unwrap();
+        assert_eq!(
+            f.on_hashes(k, &r, &serve(&full, &r), now),
+            LayerStep::Send(Vec::new())
+        );
+        assert!(!f.is_complete(), "the other file still owes its span");
+        let ready = f.take_ready();
+        assert_eq!(ready.len(), 1, "the answered file is done");
+        assert_eq!(full.piece_layers.get(&ready[0].0), Some(&ready[0].1));
+        assert!(f.take_ready().is_empty(), "a layer is handed over once");
+        // The span still in flight lands: so does the other file.
+        let (k, r) = sends.pop().unwrap();
+        assert_eq!(
+            f.on_hashes(k, &r, &serve(&full, &r), now),
+            LayerStep::Send(Vec::new())
+        );
+        assert!(f.is_complete());
+        assert_eq!(f.take_ready().len(), 1);
+    }
+
+    /// What a source delivered before it died is not asked for again: the
+    /// new source answers only what was missing, and the layer that results
+    /// holds both parts.
+    #[test]
+    fn partial_progress_survives_its_source() {
+        let (full, stripped) = wide_without_layer();
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
+        let now = Instant::now();
+        let mut sends = f.add_source(A, now);
+        assert_eq!(sends.len(), 2);
+        let (k, r) = sends.pop().unwrap();
+        assert_eq!(
+            f.on_hashes(k, &r, &serve(&full, &r), now),
+            LayerStep::Send(Vec::new())
+        );
+        assert!(
+            f.on_disconnect(A, now).is_empty(),
+            "no source left to ask yet"
+        );
+        let sends = f.add_source(B, now);
+        assert_eq!(sends.len(), 1, "only the unanswered span is asked again");
+        let (k, r) = sends[0];
+        assert_eq!(
+            f.on_hashes(k, &r, &serve(&full, &r), now),
+            LayerStep::Send(Vec::new())
+        );
+        assert!(f.is_complete());
+        let ready = f.take_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            full.piece_layers.get(&ready[0].0),
+            Some(&ready[0].1),
+            "the layer holds both spans"
+        );
+    }
+
+    /// A read waiting on a file gets that file's spans asked for first; a
+    /// root no file has changes nothing.
+    #[test]
+    fn waiting_readers_reorder_the_queue() {
+        let (_full, stripped) = three_files();
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
+        let roots: Vec<[u8; 32]> = f.files.iter().map(|x| x.root).collect();
+        assert_eq!(roots.len(), 2);
+        let order = |f: &LayerFetch| f.todo.iter().map(|s| s.file).collect::<Vec<_>>();
+        let before = order(&f);
+        f.prioritise(&[[7; 32]]);
+        assert_eq!(order(&f), before, "a root no file has is ignored");
+        f.prioritise(&[roots[1]]);
+        let sends = f.add_source(A, Instant::now());
+        assert_eq!(
+            sends.first().map(|(_, r)| r.pieces_root),
+            Some(roots[1]),
+            "the waiting file is asked for first"
+        );
     }
 
     #[test]
     fn unsolicited_hashes_retire_the_source() {
         let (full, stripped) = three_files();
-        let mut f = LayerFetch::new(&stripped).unwrap();
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
         let now = Instant::now();
         let sends = f.add_source(A, now);
         let (_, asked) = sends[0];
@@ -1345,7 +2198,7 @@ mod tests {
     #[test]
     fn bad_proof_retires_the_source() {
         let (full, stripped) = three_files();
-        let mut f = LayerFetch::new(&stripped).unwrap();
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
         let now = Instant::now();
         let sends = f.add_source(A, now);
         let (_, r) = sends[0];
@@ -1363,7 +2216,7 @@ mod tests {
     #[test]
     fn reject_moves_the_span() {
         let (full, stripped) = three_files();
-        let mut f = LayerFetch::new(&stripped).unwrap();
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
         let now = Instant::now();
         let sends = f.add_source(A, now);
         assert!(f.add_source(B, now).is_empty(), "A holds every span");
@@ -1385,7 +2238,7 @@ mod tests {
     #[test]
     fn timeout_retires_without_ban() {
         let (full, stripped) = three_files();
-        let mut f = LayerFetch::new(&stripped).unwrap();
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
         let now = Instant::now();
         let first = f.add_source(A, now);
         assert!(f.add_source(B, now).is_empty());
@@ -1412,7 +2265,7 @@ mod tests {
         let names = ["f0", "f1", "f2", "f3", "f4"];
         let files: Vec<(&str, usize)> = names.iter().map(|n| (*n, 40_000)).collect();
         let (full, stripped) = v2_meta(&files);
-        let mut f = LayerFetch::new(&stripped).unwrap();
+        let mut f = LayerFetch::new(&stripped, &[]).unwrap();
         let now = Instant::now();
         let first = f.add_source(A, now);
         assert_eq!(first.len(), SPANS_PER_SOURCE);

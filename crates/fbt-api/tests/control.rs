@@ -191,6 +191,12 @@ async fn pause_resume_recheck() {
     assert_eq!(post_empty(&unknown).await, StatusCode::NOT_FOUND);
 }
 
+/// The `file-priorities` body's own limits: one priority per file, and only
+/// the priorities a response can carry. The array cap (`MAX_FILE_PRIORITIES`,
+/// four million) is refused by the deserializer, which is what turns it into
+/// `400 invalid_request`; the count above 4 194 304 that would prove it over
+/// HTTP is 25 MB of body, so `dto::tests::file_priorities_refuse_one_past_the_cap`
+/// pins the cap at the request type instead.
 #[tokio::test]
 async fn wrong_priority_count_is_400() {
     let (_session, _server, base, _) = api().await;
@@ -228,32 +234,6 @@ async fn wrong_priority_count_is_400() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     wait_for_files(&base, &id, |f| f[0]["priority"] == "high").await;
-}
-
-#[tokio::test]
-async fn too_many_priorities_is_400() {
-    let (_session, _server, base, _) = api().await;
-    let p = payload();
-    let id = add_seeding(&base, &p).await;
-    // One past `MAX_FILE_PRIORITIES` (4 194 304), well under the body limit.
-    let mut body = String::from("{\"priorities\":[");
-    for i in 0..4_194_305 {
-        if i > 0 {
-            body.push(',');
-        }
-        body.push_str("\"low\"");
-    }
-    body.push_str("]}");
-    let (status, _, body) = send_body(
-        Method::PUT,
-        &format!("{base}/api/v1/torrents/{id}/file-priorities"),
-        Some(TOKEN),
-        Some("application/json"),
-        body.into_bytes(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error_code(&body), "invalid_request");
 }
 
 #[tokio::test]

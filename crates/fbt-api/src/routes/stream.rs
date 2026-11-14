@@ -13,8 +13,13 @@
 //! reader's position drives the torrent's piece deadlines. Each request opens its own
 //! reader. The body holds one of [`AppState::streams`]' permits and the
 //! reader until it is dropped (the client hung up, or the response is
-//! done); it ends early when the torrent is removed or
-//! [`ApiServer::shutdown`](crate::ApiServer::shutdown) runs.
+//! done); it ends early when the torrent is removed, when
+//! [`ApiServer::shutdown`](crate::ApiServer::shutdown) runs, and — under
+//! [`ApiServer`] only — when the client stalls: bytes owed but unwritten
+//! for [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout) end
+//! the whole connection, so the short read gives its permit back within
+//! that time. A body merely waiting for a piece has nothing owed and is
+//! left alone however starved it is.
 //!
 //! `HEAD` gets the same status and headers from the metainfo, with no
 //! reader and no permit.

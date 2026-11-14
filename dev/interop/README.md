@@ -349,6 +349,23 @@ to `fbt-download-utp.log`), for example
 script prints the setup time (image builds and pulls, container start, DHT
 join) apart from the scenario time, and the uTP download's own duration.
 
+## Failure diagnostics
+
+Every check reports through one `fail`, which keeps what a reproduction needs
+beside it: besides `logs/containers.log` it copies every `/interop/*.torrent`
+(the containers' mount of `target/interop/`) into `logs/torrents/`. A torrent
+that reads differently than expected is hard to chase once its container is
+gone, so the two `fbt-example info` version checks (`version: v2` and
+`version: hybrid`) go through `expect_info <torrent> <line>`: it saves the
+whole output as `logs/info-<name>.txt`, and when `<line>` is missing it fails
+with that output printed in full. CI uploads all of it, because its
+`interop-logs` artifact takes `target/interop/logs/`, subdirectories included.
+After a failed run:
+
+```
+ls target/interop/logs/torrents target/interop/logs/info-*.txt
+```
+
 ## Images
 
 All pinned by the digest of the multi-arch index (manifest list), so the same

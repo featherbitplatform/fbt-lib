@@ -676,6 +676,17 @@ async fn duplicate_peer_id_is_rejected() {
 
 /// Two sessions dialling each other at once end up with exactly one
 /// connection: both ends keep the one the lower peer id initiated.
+///
+/// Most likely cause of the 0.7 flake (0.8 deflake; not reproduced here — 100
+/// runs at 4 copies, each about 20 s, then 100 more at 12 copies with the
+/// machine under CPU load): the test slept a fixed 3 s and then read
+/// `status()` once. A status is a snapshot the actor publishes on its tick,
+/// and the dial it was waiting for is uTP first with TCP fallback only after
+/// `utp_connect_timeout`, so on a loaded runner three seconds need not be
+/// enough for the connection to exist, let alone be reported: the snapshot
+/// still says 0 peers. The fix waits for the condition instead of for the
+/// clock (bounded by `T`), which is both exact about what it needs and no
+/// longer a race with the tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_dial_leaves_one_connection() {
     let (m, payload) = make_torrent(&[("a", 1 << 20)], 65_536);
@@ -691,9 +702,16 @@ async fn simultaneous_dial_leaves_one_connection() {
     let (ra, rb) = tokio::join!(ha.add_peer(b.local_addr()), hb.add_peer(a.local_addr()));
     ra.unwrap();
     rb.unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!(ha.status().num_peers, 1, "seeder peers");
-    assert_eq!(hb.status().num_peers, 1, "leecher peers");
+    assert!(
+        wait_until(
+            || ha.status().num_peers == 1 && hb.status().num_peers == 1,
+            T
+        )
+        .await,
+        "one connection on each side: seeder {}, leecher {}",
+        ha.status().num_peers,
+        hb.status().num_peers
+    );
     finished(&mut ev).await;
     assert!(stored(&storage, payload.len()) == payload, "data differs");
     b.shutdown().await;
@@ -703,14 +721,38 @@ async fn simultaneous_dial_leaves_one_connection() {
 /// Two upload slots, three interested peers and a leecher: peer A uploads
 /// to us fastest and keeps its slot, while the optimistic slot rotates, so a
 /// peer that was unchoked gets a `Choke`.
+///
+/// Most likely cause of the 0.7 flake (0.8 deflake; it did not reproduce here
+/// — 100 runs at 4 copies and 100 more at 36 under CPU load passed, as did
+/// several hundred before the change): with the default 30 s
+/// `optimistic_unchoke_interval` nothing rotated inside this test, so the only
+/// Choke it could see came from a peer that had taken a free slot between
+/// rechokes and lost it at the first rechoke — which needs all three
+/// `Interested` messages processed within the 200 ms the test then allowed.
+/// When a loaded runner registered the third peer later, nothing was choked at
+/// that rechoke, and the next Choke came from somewhere else: 2 MiB from one
+/// throttled uploader is under two seconds, so the torrent seeded, the
+/// round-robin seeding choker moved its regular slot on after three rechokes
+/// (nothing ever went *to* A, so its quota never fills — pinned by
+/// `choker::tests::round_robin_rotates_after_three_rounds_without_quota`), and
+/// A itself was choked: the assertion below. Shrink the torrent to one piece
+/// and every run fails that way. The fix takes the two timers the test depends
+/// on off the table: the optimistic slot really rotates at every rechoke, and
+/// the torrent is several times what A uploads in that time, so rotations pass
+/// while we are still downloading and A still has the top rate; a second of
+/// rechokes also gives A time to deliver blocks before any rechoke ranks rates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rechoke_chokes_peer_that_lost_its_slot() {
     use futures_util::{SinkExt, StreamExt};
     let piece_len = 32_768u32;
-    let (m, payload) = make_torrent(&[("a", 2 << 20)], piece_len);
+    // A serves one block per 10 ms (about 1.6 MB/s), so this torrent keeps us
+    // downloading for several seconds: the slot rotation we wait for happens
+    // long before seeding could move A's regular slot on.
+    let (m, payload) = make_torrent(&[("a", 8 << 20)], piece_len);
     let mut st = settings();
     st.unchoke_slots = 2;
-    st.rechoke_interval = Duration::from_millis(200);
+    st.rechoke_interval = Duration::from_secs(1);
+    st.optimistic_unchoke_interval = Duration::from_secs(1);
     let (s, _h, _storage) = mem_leecher_with(st, &m, payload.len()).await;
     let pieces = fbt_core::Bitfield::full(m.info.pieces.len() as u32);
 

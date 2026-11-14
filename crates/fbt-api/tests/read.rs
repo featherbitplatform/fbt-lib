@@ -72,6 +72,15 @@ async fn lists_torrents() {
     assert_eq!(list[0]["progress"], 1.0);
     assert!(list[0]["info_hash_v2"].is_string());
     assert!(list[0]["checking_progress"].is_null());
+    // Its layers were built from the verified data and merged, so nothing is
+    // outstanding — and the number is the session's own, mapped through.
+    let layers = list[0]["layers_missing"].as_u64();
+    assert_eq!(
+        layers,
+        Some(u64::from(f.handle.status().layers_missing)),
+        "the field maps the status"
+    );
+    assert_eq!(layers, Some(0), "a seeding hybrid holds its layers");
     drop(f.session);
 }
 

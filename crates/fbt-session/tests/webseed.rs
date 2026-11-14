@@ -301,6 +301,97 @@ async fn redirect_loop_stops() {
     l.session.shutdown().await;
 }
 
+/// A seed on loopback, marked public because a test cannot reach a real public
+/// address, redirecting to another loopback port: refused, and the target is never
+/// asked. The redirect names an IP literal, so no resolver is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redirect_to_loopback_is_refused() {
+    let (mut m, payload) = make_single("f.bin", 100_000, 16_384);
+    let (_dir, target) = server(&m, &payload, Behaviour::Normal).await;
+    let (_dir, origin) = server(
+        &m,
+        &payload,
+        Behaviour::RedirectTo(format!("http://127.0.0.1:{}", target.addr().port())),
+    )
+    .await;
+    m.web_seeds = vec![origin.url()];
+    let mut st = test_settings();
+    st.web_seed_treat_loopback_as_public = true;
+    let mut l = leecher(st, &m, payload.len()).await;
+    let (url, message, retired) = l.web_seed_error().await;
+    assert_eq!(url, origin.url());
+    assert!(
+        retired,
+        "a public seed sent inward is retired, not backed off: {message}"
+    );
+    assert!(message.contains("internal"), "{message}");
+    assert_eq!(l.handle.status().num_web_seeds, 0);
+    assert_eq!(l.handle.status().total_downloaded, 0);
+    // The seed was asked, and answered with the redirect.
+    assert!(!origin.requests().is_empty(), "the seed was never asked");
+    // Nothing was sent to the target: the guard stops it before connecting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        target.requests().is_empty(),
+        "the target got {:?}",
+        target.requests()
+    );
+    l.session.shutdown().await;
+}
+
+/// The same refusal for a redirect to a *name* that resolves to loopback: the check is
+/// on what the resolver answers, not on how the URL is spelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostname_resolving_private_is_refused_after_redirect() {
+    let (mut m, payload) = make_single("f.bin", 100_000, 16_384);
+    let (_dir, target) = server(&m, &payload, Behaviour::Normal).await;
+    let (_dir, origin) = server(
+        &m,
+        &payload,
+        Behaviour::RedirectTo(format!("http://localhost:{}", target.addr().port())),
+    )
+    .await;
+    m.web_seeds = vec![origin.url()];
+    let mut st = test_settings();
+    st.web_seed_treat_loopback_as_public = true;
+    let mut l = leecher(st, &m, payload.len()).await;
+    let (url, message, retired) = l.web_seed_error().await;
+    assert_eq!(url, origin.url());
+    assert!(
+        retired,
+        "localhost resolves inside the local network: {message}"
+    );
+    assert!(message.contains("internal"), "{message}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        target.requests().is_empty(),
+        "the target got {:?}",
+        target.requests()
+    );
+    l.session.shutdown().await;
+}
+
+/// A seed configured on loopback is a LAN seed: without the hook its redirects to
+/// another loopback port are followed, as every other web-seed test here assumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_seed_still_works() {
+    let (mut m, payload) = make_single("f.bin", 100_000, 16_384);
+    let (_dir, target) = server(&m, &payload, Behaviour::Normal).await;
+    let (_dir, origin) = server(
+        &m,
+        &payload,
+        Behaviour::RedirectTo(format!("http://127.0.0.1:{}", target.addr().port())),
+    )
+    .await;
+    m.web_seeds = vec![origin.url()];
+    let l = leecher(test_settings(), &m, payload.len()).await;
+    l.finish(&payload, T).await;
+    // Each request went to the seed and came from the server it pointed at.
+    assert!(!origin.requests().is_empty(), "the seed was never asked");
+    assert_ranges_cover(&target, &[("/f.bin".to_owned(), 100_000)]);
+    l.session.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn missing_file_retires_the_seed() {
     let files = [("a", 50_000), ("b", 50_000)];

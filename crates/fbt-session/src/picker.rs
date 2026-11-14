@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PieceLayout};
@@ -119,6 +120,12 @@ type BucketKey = (Reverse<u8>, u32);
 /// every block of every wanted piece is requested. Single-threaded: owned by
 /// one torrent actor.
 ///
+/// Pieces can also be held back independently of their priority
+/// ([`set_pickable`]): a held-back piece stays wanted (progress, the part
+/// file and `wanted_left_bytes` do not change) but is never picked, so its
+/// blocks are never requested. The torrent actor uses it for the files whose
+/// BEP 52 layer is missing: without the layer a v2 piece cannot be verified.
+///
 /// Parole (as libtorrent's): a peer on parole ([`set_parole`]) downloads
 /// only whole pieces, each its alone, so a piece that fails afterwards
 /// has a single contributor. It never joins another peer's piece or takes
@@ -136,11 +143,17 @@ type BucketKey = (Reverse<u8>, u32);
 /// [`take_forfeited`]: Self::take_forfeited
 /// [`release_peer`]: Self::release_peer
 /// [`expire_exclusive`]: Self::expire_exclusive
+/// [`set_pickable`]: Self::set_pickable
 #[derive(Debug)]
 pub struct PiecePicker {
     layout: PieceLayout,
     have: Bitfield,
     prio: Vec<u8>,
+    /// Pieces no pick may start or continue; see [`set_pickable`]. Cleared
+    /// for every piece by default.
+    ///
+    /// [`set_pickable`]: Self::set_pickable
+    unpickable: Bitfield,
     /// Per-piece count of peers with a bitfield/`Have` for it.
     avail: Vec<u32>,
     /// Peers that have every piece; they add the same to every piece, so
@@ -161,6 +174,12 @@ pub struct PiecePicker {
     outstanding: HashMap<PeerKey, HashSet<(u32, u32)>>,
     wanted_left_pieces: u32,
     wanted_left_bytes: u64,
+    /// Wanted pieces not yet passed that are held back; see [`set_pickable`].
+    /// They wait for a layer rather than for blocks, so the end-game does not
+    /// count them. Never more than `wanted_left_pieces`.
+    ///
+    /// [`set_pickable`]: Self::set_pickable
+    held_wanted_pieces: u32,
     /// Peers on parole (connected ones only: a departed peer is dropped).
     parole: HashSet<PeerKey>,
     /// Pieces whose parole download was given up, for the owner of their
@@ -198,6 +217,7 @@ impl PiecePicker {
             layout,
             have: own,
             prio: vec![DEFAULT_PRIORITY; len],
+            unpickable: Bitfield::new(n),
             avail: vec![0; len],
             seeds: 0,
             state,
@@ -210,6 +230,7 @@ impl PiecePicker {
             outstanding: HashMap::new(),
             wanted_left_pieces: 0,
             wanted_left_bytes: 0,
+            held_wanted_pieces: 0,
             parole: HashSet::new(),
             forfeited: Vec::new(),
         };
@@ -243,6 +264,49 @@ impl PiecePicker {
     /// Sequential mode: new pieces in index order instead of rarest first.
     pub fn set_sequential(&mut self, on: bool) {
         self.sequential = on;
+    }
+
+    /// Holds `pieces` back (`pickable` false) or lets them be picked again.
+    /// A held-back piece is still wanted: its priority, the bytes left to
+    /// fetch and the part file are untouched, but no pick starts or continues
+    /// it, so none of its blocks is ever requested. Out-of-range pieces are
+    /// ignored, and a range already in the requested state costs nothing.
+    ///
+    /// The torrent actor uses this for the files whose BEP 52 layer is
+    /// missing: their pieces cannot be verified until it arrives, and asking
+    /// for them would waste the bytes.
+    pub fn set_pickable(&mut self, pieces: Range<u32>, pickable: bool) {
+        let n = self.layout.num_pieces();
+        for piece in pieces {
+            if piece >= n {
+                break;
+            }
+            if !self.unpickable.get(piece) == pickable {
+                continue;
+            }
+            let wanted_left = self.prio_of(piece) > 0 && !self.have.get(piece);
+            if pickable {
+                self.unpickable.clear(piece);
+                if wanted_left {
+                    self.held_wanted_pieces = self.held_wanted_pieces.saturating_sub(1);
+                }
+                self.enqueue(piece);
+                self.partial_sync(piece);
+            } else {
+                self.dequeue(piece);
+                self.partial_remove(piece);
+                self.unpickable.set(piece);
+                if wanted_left {
+                    self.held_wanted_pieces = self.held_wanted_pieces.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Whether `piece` may be picked: in range and not held back by
+    /// [`set_pickable`](Self::set_pickable).
+    fn pickable(&self, piece: u32) -> bool {
+        piece < self.layout.num_pieces() && !self.unpickable.get(piece)
     }
 
     /// Puts `peer` on parole or takes it off. On parole it gets only whole
@@ -390,7 +454,8 @@ impl PiecePicker {
     /// then blocks whose single owner is in `late` and is not `peer`. An
     /// empty `late` takes no duplicate, and no block gets more than two
     /// owners (the end-game cap). Nothing for a piece we have, one pending
-    /// its hash check, or out of range.
+    /// its hash check, out of range, or held back by
+    /// [`set_pickable`](Self::set_pickable).
     ///
     /// Pieces picked here (reader deadlines) are never reserved for a peer
     /// on parole, and a piece reserved earlier is opened. A peer on parole
@@ -409,7 +474,7 @@ impl PiecePicker {
         late: &[PeerKey],
     ) -> Vec<BlockRef> {
         let mut out = Vec::new();
-        if max_blocks == 0 || piece >= self.layout.num_pieces() {
+        if max_blocks == 0 || piece >= self.layout.num_pieces() || !self.pickable(piece) {
             return out;
         }
         match self.state_of(piece) {
@@ -500,8 +565,10 @@ impl PiecePicker {
 
     /// A wanted piece nobody downloads: unstarted, or partial with a free
     /// block, no block outstanding from anyone and no parole reservation.
+    /// Skipped (priority 0) and held back ([`set_pickable`](Self::set_pickable))
+    /// pieces are never taken.
     fn web_seed_may_take(&self, piece: u32) -> bool {
-        if self.prio_of(piece) == 0 {
+        if self.prio_of(piece) == 0 || !self.pickable(piece) {
             return false;
         }
         match self.state_of(piece) {
@@ -657,6 +724,9 @@ impl PiecePicker {
             self.wanted_left_bytes = self
                 .wanted_left_bytes
                 .saturating_sub(u64::from(self.layout.piece_size(piece)));
+            if !self.pickable(piece) {
+                self.held_wanted_pieces = self.held_wanted_pieces.saturating_sub(1);
+            }
         }
     }
 
@@ -685,6 +755,9 @@ impl PiecePicker {
             self.wanted_left_bytes = self
                 .wanted_left_bytes
                 .saturating_add(u64::from(self.layout.piece_size(piece)));
+            if !self.pickable(piece) {
+                self.held_wanted_pieces = self.held_wanted_pieces.saturating_add(1);
+            }
         }
         self.enqueue(piece);
     }
@@ -694,9 +767,17 @@ impl PiecePicker {
         &self.have
     }
 
-    /// Every block of every wanted, unfinished piece is requested or received.
+    /// Every block of every wanted piece that may be picked is requested or
+    /// received. Pieces held back by [`set_pickable`] are left out: they wait
+    /// for a BEP 52 layer, not for blocks, so they do not open an end-game.
+    ///
+    /// [`set_pickable`]: Self::set_pickable
     pub fn is_endgame(&self) -> bool {
-        self.wanted_left_pieces > 0 && self.buckets.is_empty() && self.partial.is_empty()
+        self.wanted_left_pieces
+            .saturating_sub(self.held_wanted_pieces)
+            > 0
+            && self.buckets.is_empty()
+            && self.partial.is_empty()
     }
 
     /// Bytes of wanted pieces not yet passed.
@@ -748,10 +829,14 @@ impl PiecePicker {
     fn recount_wanted(&mut self) {
         self.wanted_left_pieces = 0;
         self.wanted_left_bytes = 0;
+        self.held_wanted_pieces = 0;
         for i in 0..self.layout.num_pieces() {
             if self.prio_of(i) > 0 && !self.have.get(i) {
                 self.wanted_left_pieces += 1;
                 self.wanted_left_bytes += u64::from(self.layout.piece_size(i));
+                if !self.pickable(i) {
+                    self.held_wanted_pieces += 1;
+                }
             }
         }
     }
@@ -777,7 +862,11 @@ impl PiecePicker {
             .pos
             .get(piece as usize)
             .is_none_or(|&p| p != NOT_QUEUED);
-        if queued || self.prio_of(piece) == 0 || self.state_of(piece) != PieceState::Unrequested {
+        if queued
+            || self.prio_of(piece) == 0
+            || !self.pickable(piece)
+            || self.state_of(piece) != PieceState::Unrequested
+        {
             return;
         }
         let key = self.bucket_key(piece);
@@ -843,12 +932,16 @@ impl PiecePicker {
         self.partial.remove(&(Reverse(self.prio_of(piece)), piece));
     }
 
-    /// Puts a piece in `partial` exactly when it is wanted, `Partial` and has
-    /// free blocks.
+    /// Puts a piece in `partial` exactly when it is wanted, pickable,
+    /// `Partial` and has free blocks.
     fn partial_sync(&mut self, piece: u32) {
         let key = (Reverse(self.prio_of(piece)), piece);
         let free = self.downloading.get(&piece).is_some_and(|d| d.free > 0);
-        if free && key.0.0 > 0 && self.state_of(piece) == PieceState::Partial {
+        if free
+            && key.0.0 > 0
+            && self.pickable(piece)
+            && self.state_of(piece) == PieceState::Partial
+        {
             self.partial.insert(key);
         } else {
             self.partial.remove(&key);
@@ -986,6 +1079,7 @@ impl PiecePicker {
             .copied()
             .filter(|&i| {
                 self.prio_of(i) > 0
+                    && self.pickable(i)
                     && self.state_of(i) == PieceState::Partial
                     && peer_has_piece(has, i)
                     && self.may_join(peer, i)
@@ -1230,6 +1324,106 @@ mod tests {
             p.pick(PeerKey(2), PeerPieces::All, 10, &mut rng())
                 .is_empty()
         );
+    }
+
+    /// A held-back range is picked by no route, changes neither priorities nor
+    /// the bytes left to fetch, and is offered again when it is let go.
+    #[test]
+    fn unpickable_pieces_are_not_picked() {
+        let mut p = picker(6, 1);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_pickable(2..5, false);
+        assert_eq!(p.wanted_left_bytes(), 6 * u64::from(B), "still wanted");
+        assert_eq!(p.prio_of(3), DEFAULT_PRIORITY, "priority untouched");
+        assert!(!p.is_finished());
+        let got = p.pick(PeerKey(1), PeerPieces::All, 10, &mut rng());
+        let mut pieces: Vec<u32> = got.iter().map(|b| b.piece).collect();
+        pieces.sort_unstable();
+        assert_eq!(pieces, vec![0, 1, 5], "only the pickable pieces");
+        // `pick_piece` (a reader's deadline) takes nothing of them either.
+        for piece in 2..5 {
+            assert!(
+                p.pick_piece(PeerKey(2), piece, 4, &[]).is_empty(),
+                "piece {piece} held back"
+            );
+        }
+        // Neither does a web seed's run (a picker of its own: pieces 0, 1 and
+        // 5 above are started already).
+        let mut q = picker(4, 1);
+        q.add_peer_pieces(PeerPieces::All);
+        q.set_pickable(0..2, false);
+        assert_eq!(
+            q.pick_run(PeerKey(9), 0, 4 * u64::from(B)),
+            vec![blk(2, 0), blk(3, 0)]
+        );
+        // Let go: they are picked with the priority they always had.
+        p.set_pickable(2..5, true);
+        let got = p.pick(PeerKey(1), PeerPieces::All, 10, &mut rng());
+        assert_eq!(got.len(), 3, "{got:?}");
+        for piece in 2..5 {
+            assert!(p.is_in_progress(piece), "piece {piece} started");
+        }
+    }
+
+    /// Holding back a piece that is partly downloaded stops its remaining
+    /// blocks being asked for; letting it go offers them again.
+    #[test]
+    fn masking_a_partial_piece_holds_its_free_blocks_back() {
+        let mut p = picker(3, 2);
+        p.add_peer_pieces(PeerPieces::All);
+        // `pick_piece` names the piece, so which one starts is not left to
+        // the rarest-first tie-break. One block asked and received: the
+        // piece is partial with its other block still free.
+        let asked = p.pick_piece(PeerKey(1), 0, 1, &[]);
+        assert_eq!(asked, vec![blk(0, 0)], "piece 0 started");
+        assert!(!p.on_block(PeerKey(1), blk(0, 0)).piece_complete);
+        let only_zero = bf(&[1, 0, 0]);
+        p.set_pickable(0..1, false);
+        assert!(
+            p.pick(PeerKey(2), PeerPieces::Some(&only_zero), 4, &mut rng())
+                .is_empty(),
+            "no block of a held-back piece"
+        );
+        assert!(p.pick_piece(PeerKey(2), 0, 4, &[PeerKey(1)]).is_empty());
+        p.set_pickable(0..1, true);
+        assert_eq!(
+            p.pick(PeerKey(2), PeerPieces::Some(&only_zero), 4, &mut rng()),
+            vec![blk(0, 1)],
+            "its free block is offered again"
+        );
+    }
+
+    /// Pieces waiting for a layer are not an end-game: nothing is queued
+    /// because nothing may be picked, so the picker waits for hashes rather
+    /// than finishing off pieces whose blocks are all outstanding.
+    #[test]
+    fn held_pieces_alone_are_not_the_endgame() {
+        let mut p = picker(3, 1);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_pickable(0..3, false);
+        assert!(
+            p.pick(PeerKey(1), PeerPieces::All, 8, &mut rng())
+                .is_empty(),
+            "no piece may be picked"
+        );
+        assert!(!p.is_endgame(), "all three wait for hashes");
+        // One layer arrives: the piece is queued (work to do, so still no
+        // end-game), and asking it leaves every wanted piece with its blocks
+        // outstanding, which is the end-game.
+        p.set_pickable(2..3, true);
+        assert!(!p.is_endgame(), "piece 2 is queued again");
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 8, &mut rng()),
+            vec![blk(2, 0)],
+            "the piece let go is picked"
+        );
+        assert!(p.is_endgame());
+        // Nothing wanted left: finished, and no end-game either.
+        for piece in 0..3 {
+            p.piece_passed(piece);
+        }
+        assert!(!p.is_endgame());
+        assert!(p.is_finished());
     }
 
     #[test]
@@ -1531,6 +1725,7 @@ mod tests {
         assert_eq!(p.avail, avail, "availability");
         let mut left_pieces = 0u32;
         let mut left_bytes = 0u64;
+        let mut held_pieces = 0u32;
         for i in 0..n {
             let st = p.state_of(i);
             let prio = p.prio_of(i);
@@ -1542,13 +1737,16 @@ mod tests {
             if prio > 0 && st != PieceState::Have {
                 left_pieces += 1;
                 left_bytes += u64::from(p.layout.piece_size(i));
+                if !p.pickable(i) {
+                    held_pieces += 1;
+                }
             }
-            // Queued exactly when wanted and unrequested: no wanted piece is
-            // lost, nothing else is offered.
+            // Queued exactly when wanted, unrequested and pickable: no piece
+            // is lost, nothing else is offered.
             let queued = p.pos[i as usize] != NOT_QUEUED;
             assert_eq!(
                 queued,
-                prio > 0 && st == PieceState::Unrequested,
+                prio > 0 && p.pickable(i) && st == PieceState::Unrequested,
                 "queued piece {i} ({st:?}, prio {prio})"
             );
             if queued {
@@ -1599,7 +1797,8 @@ mod tests {
                         );
                     }
                 }
-                partial_expected = st == PieceState::Partial && prio > 0 && free > 0;
+                partial_expected =
+                    st == PieceState::Partial && prio > 0 && free > 0 && p.pickable(i);
             }
             assert_eq!(
                 p.partial.contains(&(Reverse(prio), i)),
@@ -1634,6 +1833,7 @@ mod tests {
         }
         assert_eq!(p.wanted_left_pieces, left_pieces, "wanted_left_pieces");
         assert_eq!(p.wanted_left_bytes, left_bytes, "wanted_left_bytes");
+        assert_eq!(p.held_wanted_pieces, held_pieces, "held_wanted_pieces");
     }
 
     /// A simulated remote peer: its pieces and whether they are counted.
@@ -1695,7 +1895,7 @@ mod tests {
             for _ in 0..80 {
                 let k = r.random_range(0..peers.len());
                 let key = PeerKey(k as u64);
-                match r.random_range(0..14u32) {
+                match r.random_range(0..15u32) {
                     0 | 1 => {
                         let max = r.random_range(1..=8);
                         let got = p.pick(key, peers[k].pieces(), max, &mut r);
@@ -1743,6 +1943,11 @@ mod tests {
                         p.set_piece_priorities(&prio);
                     }
                     8 => p.set_sequential(r.random_bool(0.5)),
+                    14 => {
+                        // A range of pieces held back or let go again.
+                        let (a, b) = (r.random_range(0..=n), r.random_range(0..=n));
+                        p.set_pickable(a.min(b)..b.max(a), r.random_bool(0.5));
+                    }
                     12 => {
                         let i = r.random_range(0..n + 1);
                         let max = r.random_range(0..=8);
@@ -1847,6 +2052,10 @@ mod tests {
             }
 
             // Drain: every simulated peer leaves, a seed finishes the rest.
+            // Held-back pieces are let go first: the seed has every piece, so
+            // everything left must be finishable.
+            p.set_pickable(0..n, true);
+            check_invariants(&p, &avail, seeds);
             for (k, sp) in peers.iter().enumerate() {
                 p.release_peer(PeerKey(k as u64));
                 if sp.counted {

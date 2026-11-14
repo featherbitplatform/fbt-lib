@@ -15,6 +15,17 @@
 //! flight at a time, only while the torrent is active; the body is read at
 //! the pace of the download limits, each frame charged before it is read.
 //!
+//! A redirect is judged on what its target *is* or *resolves to*, not on the URL the server
+//! sends: a seed whose own address is public may not be sent inside the local network (loopback,
+//! RFC 1918, IPv6 unique-local or link-local, CGNAT, multicast), which
+//! [`fbt_net::addr::is_internal`] says and `TrackerError::InternalRedirect` reports. The judgement
+//! runs where the target is dialled — inside the resolution the connection uses — so a name whose
+//! answer turns inward between lookups is refused too. A seed configured on a private address is a
+//! LAN seed and follows redirects as before; its verdict is decided once per backoff period rather
+//! than per request. Through a proxy that resolves names (`proxy.proxy_hostnames`, with
+//! `proxy_peers`) nothing here is looked up: only a target spelled as an address is judged, because
+//! the proxy decides where a name goes.
+//!
 //! A failed request releases its blocks and backs the seed off, 30 s
 //! doubling to 30 minutes; a 4xx other than 408 and 429 (or a URL that
 //! can never work) retires it, as does smart ban when its data fails a
@@ -30,6 +41,7 @@
 //! bans it as any sender.
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -37,9 +49,10 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use fbt_bencode::{Limits, decode_with};
-use fbt_core::{BlockRef, FileLayout, PieceLayout};
+use fbt_core::{BlockRef, FileLayout, MAX_DISPLAY_CHARS, PieceLayout, display_safe};
 use fbt_metainfo::Metainfo;
-use fbt_tracker::{RangePace, TrackerClient, TrackerError, url_encode_bytes};
+use fbt_net::addr::is_internal;
+use fbt_tracker::{RangePace, RedirectPolicy, TrackerClient, TrackerError, url_encode_bytes};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::debug;
@@ -93,6 +106,11 @@ pub(super) struct WebSeed {
     /// superseded (the seed was retired and revived meanwhile) and is
     /// ignored.
     pub request: u64,
+    /// Whether this seed's redirects may land on internal addresses, once decided (see
+    /// [`SeedOrigin::allows_internal`]): `None` until a run has asked what the seed's own host
+    /// answers with, and cleared whenever the seed backs off, so a LAN seed is resolved once per
+    /// failure cycle instead of once per request.
+    pub allow_internal: Option<bool>,
 }
 
 /// A torrent's web seeds, at most [`fbt_metainfo::MAX_WEB_SEEDS`].
@@ -148,13 +166,19 @@ impl FetchError {
             TrackerError::HttpStatus(code) => {
                 (400..500).contains(code) && *code != 408 && *code != 429
             }
+            // A seed that will never serve this torrent, and one that asked us to fetch
+            // from inside the user's network: asking again changes nothing.
             TrackerError::InvalidUrl(_)
             | TrackerError::UnsupportedScheme(_)
-            | TrackerError::TlsDisabled => true,
+            | TrackerError::TlsDisabled
+            | TrackerError::InternalRedirect => true,
             _ => false,
         };
         FetchError {
-            message: e.to_string(),
+            // The text can carry the tracker's own words, the seed's URL or a
+            // resolver's message: all of it remote, so display-safe and capped
+            // before it reaches an event.
+            message: display_safe(&e.to_string(), MAX_DISPLAY_CHARS),
             retire,
             cancelled: false,
         }
@@ -334,23 +358,152 @@ fn span_of(pieces: &PieceLayout, blocks: &[BlockRef]) -> Option<Range<u64>> {
     (end > start).then_some(start..end)
 }
 
+/// The host and port a seed URL points at: its authority without any userinfo, with the
+/// scheme's default port when it names none. An IPv6 literal keeps no brackets (that is how
+/// a resolver wants it). `None` for a URL whose host cannot be resolved at all, which is
+/// left to the request itself.
+fn seed_host_port(url: &str) -> Option<(&str, u16)> {
+    let (rest, default_port) = if let Some(rest) = strip_scheme(url, "http://") {
+        (rest, 80)
+    } else {
+        // `is_web_url` accepted no other scheme.
+        (strip_scheme(url, "https://")?, 443)
+    };
+    // The authority is what comes before the path, query or fragment.
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // `user:pass@host` asks the host without it.
+    let host_port = authority.rsplit('@').next()?;
+    if let Some(literal) = host_port.strip_prefix('[') {
+        // An IPv6 literal, brackets required: `[::1]` or `[::1]:8080`.
+        let (literal, rest) = literal.split_once(']')?;
+        let port = match rest {
+            "" => default_port,
+            rest => rest.strip_prefix(':')?.parse::<u16>().ok()?,
+        };
+        return (!literal.is_empty()).then_some((literal, port));
+    }
+    // A registered name or an IPv4 address: anything after the last colon is a port.
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (host_port, default_port),
+    };
+    (!host.is_empty()).then_some((host, port))
+}
+
+/// A scheme prefix in any case (`is_web_url` accepted only these two).
+fn strip_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
+    if url
+        .get(..scheme.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    {
+        url.get(scheme.len()..)
+    } else {
+        None
+    }
+}
+
+/// The seed a run of parts is fetched from, which is what its redirects are judged against.
+struct SeedOrigin {
+    /// Its configured URL: the host whose address decides whether an internal redirect target is
+    /// allowed at all.
+    url: String,
+    /// [`Settings::web_seed_treat_loopback_as_public`](crate::Settings::web_seed_treat_loopback_as_public):
+    /// this loopback seed counts as a public origin, so its redirects are guarded. Tests set it
+    /// because no test can reach a real public address.
+    treat_loopback_as_public: bool,
+    /// Whether the proxy — not this client — resolves web-seed host names (`proxy_hostnames`
+    /// with `proxy_peers`), which decides whether a name can be judged locally at all.
+    proxy_resolves_names: bool,
+    /// Bound on the resolver wait (the tracker's `http_timeout`, which bounds the other host-name
+    /// lookups too).
+    dns_timeout: Duration,
+    /// What a previous run decided, if any did: used as it stands, without asking anything.
+    known: Option<bool>,
+}
+
+impl SeedOrigin {
+    /// Whether this seed's redirects may land on an internal address: true when its own address
+    /// is one, so a LAN seed stays a LAN seed, and false for a public seed — including a loopback
+    /// seed the hook counts as public, which is how a test exercises the guard at all.
+    ///
+    /// A name is judged only where it can be: through a proxy that resolves names the origin
+    /// counts as public unless its URL spells an internal address, because the proxy is what
+    /// decides where that name goes. A lookup that fails or comes back late counts as public too
+    /// — the seed's redirects stay guarded — rather than trusting a redirect inward to a resolver
+    /// that said nothing; such a fetch fails on the same resolver anyway.
+    async fn allows_internal(&self) -> bool {
+        if let Some(known) = self.known {
+            return known;
+        }
+        let Some((host, port)) = seed_host_port(&self.url) else {
+            // Nothing to fetch from at all: the request fails on this URL whatever it says.
+            return true;
+        };
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return internal_origin(ip, self.treat_loopback_as_public);
+        }
+        if self.proxy_resolves_names {
+            return false;
+        }
+        let first =
+            match tokio::time::timeout(self.dns_timeout, tokio::net::lookup_host((host, port)))
+                .await
+            {
+                // The first address of the answer: the one the fetch itself dials.
+                Ok(Ok(found)) => found.take(1).next().map(|a| a.ip()),
+                Ok(Err(e)) => {
+                    debug!(url = %self.url, error = %e, "web seed host did not resolve");
+                    None
+                }
+                Err(_) => {
+                    debug!(url = %self.url, "web seed host did not resolve in time");
+                    None
+                }
+            };
+        let Some(first) = first else {
+            // Fail closed: an origin nobody can place gets the guard a public origin gets.
+            return false;
+        };
+        internal_origin(first, self.treat_loopback_as_public)
+    }
+}
+
+/// Whether a seed answering at `ip` is a LAN seed whose redirects may stay on one. The hook only
+/// ever turns a loopback origin into a public one: it can never make an internal origin's
+/// redirects guarded twice over.
+fn internal_origin(ip: IpAddr, treat_loopback_as_public: bool) -> bool {
+    is_internal(ip) && !(treat_loopback_as_public && ip.is_loopback())
+}
+
+/// Whether the proxy resolves web-seed host names, which is what decides whether a name can be
+/// judged locally at all: the same rule the tracker client builds its web-seed connector from
+/// (`proxy_peers` carries web seeds, `proxy_hostnames` lets the proxy resolve them).
+fn names_go_to_the_proxy(proxy: &fbt_net::proxy::ProxyConfig) -> bool {
+    proxy.kind != fbt_net::proxy::ProxyKind::None && proxy.proxy_peers && proxy.proxy_hostnames
+}
+
 /// Fetches `parts` one after the other into one buffer of `total` bytes
 /// and cuts it at `cuts` (offset and length of each block).
 /// The body of each range is read at `pace`'s rate (the torrent's and the
-/// session's download limits), so the limits hold while it arrives.
+/// session's download limits), so the limits hold while it arrives. Where
+/// `allow_internal` is false, a redirect into the local network is refused:
+/// see [`SeedOrigin::allows_internal`].
 async fn fetch(
     tracker: TrackerClient,
     pace: Throttle,
+    allow_internal: bool,
     parts: Vec<Part>,
     total: usize,
     cuts: Vec<(usize, usize)>,
 ) -> Result<Vec<Bytes>, FetchError> {
+    let mut policy = RedirectPolicy::default();
+    policy.allow_internal = allow_internal;
     let mut buf = BytesMut::with_capacity(total);
     for part in parts {
         match part {
             Part::Http { url, range } => {
                 let got = tracker
-                    .fetch_range_paced(&url, range, &pace)
+                    .fetch_range_paced(&url, range, &pace, policy)
                     .await
                     .map_err(|e| FetchError::from_tracker(&e))?;
                 buf.extend_from_slice(&got);
@@ -433,6 +586,7 @@ impl Actor {
             failures: 0,
             cursor: 0,
             request: 0,
+            allow_internal: None,
         });
         self.count_web_seed(key);
         self.web_seed_tick();
@@ -645,10 +799,20 @@ impl Actor {
         };
         seed.request = seed.request.wrapping_add(1);
         let request = seed.request;
+        let settings = &self.shared.settings;
+        let origin = SeedOrigin {
+            url: seed.url.clone(),
+            treat_loopback_as_public: settings.web_seed_treat_loopback_as_public,
+            proxy_resolves_names: names_go_to_the_proxy(&settings.proxy),
+            dns_timeout: settings.tracker.http_timeout,
+            known: seed.allow_internal,
+        };
         debug!(url = %seed.url, first = blocks.first().map(|b| b.piece), bytes = total, "web seed request");
         self.jobs.spawn(async move {
+            // Off the actor loop, and once per failure cycle: a cached verdict asks nothing.
+            let allow_internal = origin.allows_internal().await;
             let result = tokio::select! {
-                r = fetch(tracker, pace, parts, total, cuts) => r,
+                r = fetch(tracker, pace, allow_internal, parts, total, cuts) => r,
                 _ = cancel_rx => Err(FetchError::cancelled()),
             };
             Job::WebSeed {
@@ -656,6 +820,7 @@ impl Actor {
                 request,
                 generation,
                 blocks,
+                allow_internal,
                 result,
             }
         });
@@ -674,6 +839,7 @@ impl Actor {
         request: u64,
         generation: u64,
         blocks: Vec<BlockRef>,
+        allow_internal: bool,
         result: Result<Vec<Bytes>, FetchError>,
     ) {
         let current = generation == self.generation && matches!(self.phase, Phase::Ready);
@@ -691,6 +857,8 @@ impl Actor {
         {
             live = cancel.is_some();
             seed.state = SeedState::Idle;
+            // What this run decided about the seed's own address, kept for its next one.
+            seed.allow_internal = Some(allow_internal);
         }
         let result = match result {
             Ok(data) if data.len() != blocks.len() => Err(FetchError {
@@ -740,6 +908,8 @@ impl Actor {
             return;
         };
         seed.failures = seed.failures.saturating_add(1);
+        // A failure may mean the seed's address changed: ask again when it is next asked.
+        seed.allow_internal = None;
         let wait = backoff(seed.failures);
         seed.state = SeedState::Backoff(Instant::now() + wait);
         let url = seed.url.clone();
@@ -954,6 +1124,33 @@ mod tests {
         assert!(!retire(408) && !retire(429) && !retire(500) && !retire(503));
         assert!(!FetchError::from_tracker(&TrackerError::TooManyRedirects).retire);
         assert!(!FetchError::from_tracker(&TrackerError::Timeout).retire);
+        assert!(
+            FetchError::from_tracker(&TrackerError::InternalRedirect).retire,
+            "a public seed redirected inward is retired"
+        );
+    }
+
+    /// The text a web-seed failure reports is display-safe and capped: it can
+    /// carry the tracker's own words, a URL from the torrent or a resolver's
+    /// message, all of them remote.
+    #[test]
+    fn failure_text_is_display_safe() {
+        let e = FetchError::from_tracker(&TrackerError::Failure(format!(
+            "nope\u{202E} here\n{}",
+            "x".repeat(5_000)
+        )));
+        let head = e.message.get(..40).unwrap_or(&e.message);
+        assert!(
+            e.message.starts_with("tracker failure: nope here "),
+            "starts with: {head:?}"
+        );
+        assert!(!e.message.contains('\u{202E}'), "head: {head:?}");
+        assert!(!e.message.chars().any(char::is_control), "head: {head:?}");
+        assert!(
+            e.message.chars().count() <= MAX_DISPLAY_CHARS,
+            "{} characters kept",
+            e.message.chars().count()
+        );
     }
 
     #[test]
@@ -961,6 +1158,142 @@ mod tests {
         assert!(is_web_url("http://a/") && is_web_url("HTTPS://a"));
         assert!(!is_web_url("ftp://a/") && !is_web_url("http://"));
         assert!(!is_web_url(&format!("http://{}", "a".repeat(MAX_URL_LEN))));
+    }
+
+    /// The host and port a seed URL points at, which is what the redirect guard is judged
+    /// against: without its userinfo, without the brackets around an IPv6 literal, with the
+    /// scheme's default port when none is named. A URL with nothing to resolve is `None`:
+    /// the request fails on it whatever the policy says.
+    #[test]
+    fn seed_hosts_are_read_for_the_redirect_guard() {
+        let at = |u: &str| seed_host_port(u).map(|(h, p)| (h.to_owned(), p));
+        assert_eq!(
+            at("http://127.0.0.1:8080/").unwrap(),
+            ("127.0.0.1".to_owned(), 8080)
+        );
+        assert_eq!(
+            at("http://example.com/a/b").unwrap(),
+            ("example.com".to_owned(), 80)
+        );
+        assert_eq!(
+            at("HTTPS://user:pw@Host.example:8443/a?b=c#d").unwrap(),
+            ("Host.example".to_owned(), 8443)
+        );
+        assert_eq!(at("http://[::1]:6969/f").unwrap(), ("::1".to_owned(), 6969));
+        assert_eq!(at("https://[::1]/f").unwrap(), ("::1".to_owned(), 443));
+        assert!(seed_host_port("ftp://host/").is_none());
+        assert!(seed_host_port("http:///x").is_none());
+        assert!(seed_host_port("http://host:notaport/").is_none());
+    }
+
+    /// Only a public origin has its redirects guarded: a loopback seed is a LAN seed and may stay
+    /// on one, which is what the hidden hook flips so a test can ask about the guard at all. The
+    /// address decides — spelled as a literal or resolved from a name, `localhost` exactly as
+    /// `127.0.0.1`. Through a proxy that resolves names nothing is looked up locally, so only a
+    /// literal says where the seed is and a named origin is guarded; and a verdict another run
+    /// already reached is used without asking anything at all.
+    #[tokio::test]
+    async fn only_a_public_origin_has_its_redirects_guarded() {
+        let origin = |url: &str, hook: bool| SeedOrigin {
+            url: url.to_owned(),
+            treat_loopback_as_public: hook,
+            proxy_resolves_names: false,
+            dns_timeout: Duration::from_secs(10),
+            known: None,
+        };
+        assert!(origin("http://127.0.0.1:1/", false).allows_internal().await);
+        assert!(!origin("http://127.0.0.1:1/", true).allows_internal().await);
+        assert!(!origin("http://[::1]:1/", true).allows_internal().await);
+        assert!(
+            !origin("http://localhost:1/", true).allows_internal().await,
+            "localhost resolves to loopback here"
+        );
+        // Nothing to resolve: the fetch itself fails, so nothing to guard.
+        assert!(origin("ftp://host/", false).allows_internal().await);
+
+        let proxied = |url: &str| SeedOrigin {
+            proxy_resolves_names: true,
+            ..origin(url, false)
+        };
+        assert!(
+            proxied("http://127.0.0.1:1/").allows_internal().await,
+            "a loopback seed stays a LAN seed through a proxy that resolves names"
+        );
+        assert!(
+            !proxied("http://seed.internal.test:1/")
+                .allows_internal()
+                .await,
+            "nobody here can say where that name lands, so its redirects are guarded"
+        );
+
+        let cached = |verdict: bool| SeedOrigin {
+            known: Some(verdict),
+            ..origin("http://127.0.0.1:1/", true)
+        };
+        assert!(cached(true).allows_internal().await);
+        assert!(!cached(false).allows_internal().await);
+    }
+
+    /// Who resolves web-seed host names, which is what decides whether their addresses can be
+    /// judged locally at all: only a proxy that both carries web seeds and resolves names.
+    #[test]
+    fn only_a_proxy_that_resolves_names_takes_the_looking_up() {
+        let mut p = fbt_net::proxy::ProxyConfig::default();
+        assert!(!names_go_to_the_proxy(&p), "no proxy");
+        p.kind = fbt_net::proxy::ProxyKind::Socks5;
+        assert!(
+            names_go_to_the_proxy(&p),
+            "SOCKS5 carrying web seeds, resolving names itself"
+        );
+        p.proxy_peers = false;
+        assert!(!names_go_to_the_proxy(&p), "web seeds go direct");
+        p.proxy_peers = true;
+        p.proxy_hostnames = false;
+        assert!(!names_go_to_the_proxy(&p), "the names are resolved here");
+    }
+
+    /// What a run decided about the seed's own address is kept on the seed for its next one, and a
+    /// failure clears it so the next run asks again: a LAN seed is resolved once per failure cycle
+    /// instead of once per request (a verdict `SeedOrigin` is given is used without asking).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seed_keeps_its_verdict_until_it_backs_off() {
+        let (meta, payload) = torrent(64 * 1024, 16 * 1024);
+        let srv = RangeServer::start(payload.clone()).await;
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::MemStorage::new(payload.len() as u64));
+        let mut actor = crate::torrent::data::tests::test_actor(meta, storage, 64 << 20);
+        actor.add_web_seed(srv.url()).unwrap();
+        let key = actor.web_seeds.seeds[0].key;
+        assert_eq!(
+            actor.web_seeds.seeds[0].allow_internal, None,
+            "nothing has been asked yet"
+        );
+        // The first run reports what it found: a loopback seed is a LAN seed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while actor.web_seeds.seeds[0].allow_internal.is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "no job came back");
+            let Ok(Some(r)) =
+                tokio::time::timeout(Duration::from_millis(500), actor.jobs.join_next()).await
+            else {
+                continue;
+            };
+            actor.on_job_result(r);
+        }
+        assert_eq!(actor.web_seeds.seeds[0].allow_internal, Some(true));
+        // A failure clears it: the address the seed answers at may have changed with it.
+        actor.web_seed_failed(
+            key,
+            FetchError {
+                message: "test".to_owned(),
+                retire: false,
+                cancelled: false,
+            },
+        );
+        assert_eq!(
+            actor.web_seeds.seeds[0].allow_internal, None,
+            "the next run asks again"
+        );
+        crate::torrent::actor::EMITTED.take();
     }
 
     /// A loopback server answering every `Range` request with the bytes of
@@ -1159,6 +1492,7 @@ mod tests {
                 &format!("{}f", srv.url()),
                 0..payload.len() as u64,
                 &throttle,
+                RedirectPolicy::default(),
             )
             .await
             .unwrap();

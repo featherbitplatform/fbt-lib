@@ -40,6 +40,10 @@ pub fn test_settings() -> Settings {
     let mut s = Settings::default();
     s.listen_addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
     s.status_interval = Duration::from_millis(50);
+    // Idle torrents would tick at the slower default; tests that seed with
+    // no peers (most of them) expect today's rate, so keep the two equal
+    // unless a test asks for the slow tick (`idle.rs`).
+    s.idle_status_interval = Duration::from_millis(50);
     s.dht_enabled = false;
     s.dht_bootstrap_nodes = Vec::new();
     s.enable_lsd = false;

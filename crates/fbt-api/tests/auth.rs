@@ -5,12 +5,16 @@ mod support;
 
 use std::net::SocketAddr;
 
+use axum::body::{Body, to_bytes};
+use axum::extract::{ConnectInfo, Request, State};
 use bytes::Bytes;
+use fbt::Session;
 use fbt_api::{ApiConfig, ApiError, Auth, router};
 use http_body_util::Full;
 use hyper::header::{AUTHORIZATION, HOST, ORIGIN, WWW_AUTHENTICATE};
 use hyper::{Method, StatusCode};
 use support::{api, api_with, error_code, get, json, request, send, session, test_config};
+use tower::ServiceExt as _;
 
 fn empty() -> Full<Bytes> {
     Full::new(Bytes::new())
@@ -190,6 +194,56 @@ async fn disabled_auth_accepts_a_listed_origin() {
     assert_eq!(headers["access-control-allow-origin"], "http://ui.example");
 }
 
+/// `GET /api/v1/session` on an `Auth::Disabled` router with `peer` injected
+/// as axum's `ConnectInfo` (what `ApiServer` attaches to every request). A
+/// unit-level injection: a real non-loopback peer cannot exist on a
+/// loopback-only CI runner. The `Host` stays `localhost` throughout, so any
+/// refusal here is the peer check, not the Host guard.
+async fn disabled_from_peer(session: &Session, peer: &str) -> (StatusCode, Bytes) {
+    let mut config = test_config();
+    config.auth = Auth::Disabled;
+    let app = router(session.clone(), &config).expect("router").layer(
+        axum::middleware::from_fn_with_state(
+            ConnectInfo(peer.parse::<SocketAddr>().expect("peer address")),
+            |State(info): State<ConnectInfo<SocketAddr>>,
+             mut req: Request,
+             next: axum::middleware::Next| async move {
+                let _ = req.extensions_mut().insert(info);
+                next.run(req).await
+            },
+        ),
+    );
+    let req = Request::get("/api/v1/session")
+        .header(HOST, "localhost")
+        .body(Body::empty())
+        .expect("request builds");
+    let res = app.oneshot(req).await.expect("router is infallible");
+    let (parts, body) = res.into_parts();
+    (
+        parts.status,
+        to_bytes(body, 1 << 20).await.expect("body reads"),
+    )
+}
+
+#[tokio::test]
+async fn disabled_auth_refuses_remote_peer() {
+    let session = session().await;
+    for peer in [
+        "203.0.113.7:52000",
+        "[2001:db8::7]:1",
+        "[::ffff:10.0.0.1]:1",
+    ] {
+        let (status, body) = disabled_from_peer(&session, peer).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{peer}");
+        assert_eq!(error_code(&body), "forbidden", "{peer}");
+    }
+    // A loopback peer — mapped forms included — passes the guard.
+    for peer in ["127.0.0.1:52000", "[::1]:1", "[::ffff:127.0.0.1]:1"] {
+        let (status, _) = disabled_from_peer(&session, peer).await;
+        assert_eq!(status, StatusCode::OK, "{peer}");
+    }
+}
+
 #[tokio::test]
 async fn empty_token_is_refused() {
     let session = session().await;
@@ -204,6 +258,29 @@ async fn empty_token_is_refused() {
         .await
         .unwrap_err();
     assert!(matches!(err, ApiError::EmptyToken), "{err:?}");
+}
+
+#[tokio::test]
+async fn connection_cap_must_exceed_stream_caps() {
+    let session = session().await;
+    // 40 connections cannot cover 32 file streams plus 16 event streams:
+    // every stream holder must leave a slot for a client that holds its
+    // connection without taking a stream, or the `503` answer to an
+    // eleventh kind of client could never be served.
+    let mut config = test_config();
+    config.max_connections = 40;
+    config.max_streams = 32;
+    config.max_event_streams = 16;
+    let err = router(session.clone(), &config).unwrap_err();
+    assert!(matches!(err, ApiError::InvalidLimits(..)), "{err:?}");
+    // Exactly the sum is not more than it.
+    config.max_connections = 48;
+    let err = router(session.clone(), &config).unwrap_err();
+    assert!(matches!(err, ApiError::InvalidLimits(..)), "{err:?}");
+    // One above the sum serves, and so do the defaults (256 > 32 + 16).
+    config.max_connections = 49;
+    assert!(router(session.clone(), &config).is_ok());
+    assert!(router(session.clone(), &test_config()).is_ok());
 }
 
 #[tokio::test]
@@ -300,6 +377,27 @@ async fn shutdown_stops_serving() {
         .await
         .expect("shutdown returns within 6 s");
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+}
+
+/// `router_with_shutdown` returns its error instead of panicking when no
+/// runtime exists to spawn the shutdown waiter on. The session is built in a
+/// temporary runtime (it needs one) and that runtime is dropped before the
+/// call, so the call itself runs with no runtime in the current thread.
+#[test]
+fn router_with_shutdown_outside_runtime_errors() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let session = rt.block_on(support::session());
+    drop(rt);
+    let err = fbt_api::router_with_shutdown(
+        session,
+        &support::test_config(),
+        std::future::pending::<()>(),
+    )
+    .expect_err("no runtime, so no task to spawn the shutdown waiter on");
+    assert!(matches!(err, ApiError::NoRuntime), "{err:?}");
 }
 
 #[tokio::test]

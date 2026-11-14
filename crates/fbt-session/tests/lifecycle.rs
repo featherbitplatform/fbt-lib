@@ -610,8 +610,11 @@ async fn dropped_remove_future_still_unregisters() {
 #[tokio::test]
 async fn invalid_settings_are_rejected() {
     type Tweak = fn(&mut fbt_session::Settings);
-    let bad: [(&str, Tweak); 16] = [
+    let bad: [(&str, Tweak); 17] = [
         ("status_interval", |s| s.status_interval = Duration::ZERO),
+        ("idle_status_interval", |s| {
+            s.idle_status_interval = Duration::ZERO
+        }),
         ("rechoke_interval", |s| s.rechoke_interval = Duration::ZERO),
         ("keepalive_interval", |s| {
             s.keepalive_interval = Duration::ZERO
