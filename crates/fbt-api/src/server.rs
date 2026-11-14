@@ -11,7 +11,7 @@
 //! of no progress, bodies and permits included.
 
 use std::fmt;
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
@@ -251,7 +251,7 @@ async fn connection(
     loop {
         stalled
             .as_mut()
-            .reset(TokioInstant::now() + watch.time_left(stall_timeout));
+            .reset(arm_deadline(watch.time_left(stall_timeout)));
         tokio::select! {
             biased;
             result = conn.as_mut() => {
@@ -284,6 +284,19 @@ async fn connection(
     }
 }
 
+/// The stall timer's deadline `left` from now. Adding a huge remaining timeout
+/// (an [`ApiConfig::stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout)
+/// of [`Duration::MAX`], say) overflows `Instant` and panics — every connection
+/// task at once — so an overflowing sum falls back to a year out, the far
+/// future tokio's own sleep clamp parks absurd durations at.
+fn arm_deadline(left: Duration) -> TokioInstant {
+    let now = TokioInstant::now();
+    now.checked_add(left).unwrap_or_else(|| {
+        now.checked_add(Duration::from_secs(365 * 24 * 60 * 60))
+            .unwrap_or(now)
+    })
+}
+
 /// Write-progress watch of one connection, shared between [`StalledIo`]
 /// (which records what the kernel accepted) and the connection task (which
 /// decides when bytes have been owed too long). Only that one task polls
@@ -293,7 +306,11 @@ async fn connection(
 #[derive(Debug)]
 struct StallWatch {
     base: TokioInstant,
-    /// Milliseconds since `base` of the last write progress.
+    /// Milliseconds since `base` of the last write progress — lifted to the
+    /// moment a fresh debt starts ([`owed_now`](Self::owed_now)) when nothing
+    /// was owed before it, so [`stalled_out`](Self::stalled_out) measures how
+    /// long the current bytes have been stuck rather than how long since the
+    /// last accepted byte.
     progress_ms: AtomicU64,
     /// Bytes this connection owes the peer that the kernel has not taken:
     /// a `poll_write` ended `Pending`, or took only part of what it was
@@ -320,6 +337,16 @@ impl StallWatch {
     fn recorded(&self, n: usize, len: usize) {
         self.progress_ms.store(self.now_ms(), Ordering::Relaxed);
         self.pending.store(n < len, Ordering::Relaxed);
+    }
+
+    /// Records that a write just went stuck. If nothing was owed before this
+    /// moment, the owed clock starts here too: a body with nothing to send
+    /// for a long stretch gets its full window once a write does stick,
+    /// instead of dying at once against a long-past last accept.
+    fn owed_now(&self) {
+        if !self.pending.swap(true, Ordering::Relaxed) {
+            self.progress_ms.fetch_max(self.now_ms(), Ordering::Relaxed);
+        }
     }
 
     /// True when bytes are owed and the kernel has taken none for `timeout`.
@@ -355,7 +382,12 @@ impl StallWatch {
 /// — so a ready `poll_flush` carries nothing new, and counting flushes as
 /// progress too would feed the watch on every wake instead of only real
 /// movement ("written but unflushed" is what a partial `poll_write` left
-/// behind, which [`recorded`](StallWatch::recorded) already marks pending).
+/// behind, which [`recorded`](StallWatch::recorded) already marks pending;
+/// a write that sticks outright starts the owed clock at that moment, see
+/// [`owed_now`](StallWatch::owed_now)). `is_write_vectored` and
+/// `poll_write_vectored` are forwarded to the socket so hyper keeps its
+/// vectored write strategy through the wrapper; the run's iovecs count as
+/// one write of their summed length.
 struct StalledIo<T> {
     inner: T,
     watch: Arc<StallWatch>,
@@ -385,11 +417,35 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StalledIo<T> {
                 Poll::Ready(Ok(n))
             }
             Poll::Pending => {
-                this.watch.pending.store(true, Ordering::Relaxed);
+                this.watch.owed_now();
                 Poll::Pending
             }
             other => other,
         }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+            Poll::Ready(Ok(n)) if n > 0 => {
+                let total = bufs.iter().map(|b| b.len()).sum::<usize>();
+                this.watch.recorded(n, total);
+                Poll::Ready(Ok(n))
+            }
+            Poll::Pending => {
+                this.watch.owed_now();
+                Poll::Pending
+            }
+            other => other,
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -628,6 +684,28 @@ mod tests {
             Poll::Ready(Ok(n))
         }
 
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.taken >= this.budget {
+                return Poll::Pending;
+            }
+            let n = bufs
+                .iter()
+                .map(|b| b.len())
+                .sum::<usize>()
+                .min(this.budget - this.taken);
+            this.taken += n;
+            Poll::Ready(Ok(n))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
@@ -692,5 +770,86 @@ mod tests {
         let idle = StallWatch::new();
         assert!(!idle.pending.load(Ordering::Relaxed));
         assert!(!idle.stalled_out(Duration::ZERO));
+
+        // Vectored writes count against the summed run, not the last slice.
+        let vwatch = Arc::new(StallWatch::new());
+        let mut vio = StalledIo {
+            inner: Sink {
+                taken: 0,
+                budget: 3,
+            },
+            watch: Arc::clone(&vwatch),
+        };
+        assert!(vio.is_write_vectored(), "forwarded from the socket");
+        let bufs = [IoSlice::new(b"12"), IoSlice::new(b"3456")];
+        assert!(matches!(
+            Pin::new(&mut vio).poll_write_vectored(cx, &bufs),
+            Poll::Ready(Ok(3))
+        ));
+        assert!(
+            vwatch.pending.load(Ordering::Relaxed),
+            "the run's tail is owed"
+        );
+        vio.inner.budget = 10;
+        assert!(matches!(
+            Pin::new(&mut vio).poll_write_vectored(cx, &[IoSlice::new(b"abc")]),
+            Poll::Ready(Ok(3))
+        ));
+        assert!(
+            !vwatch.pending.load(Ordering::Relaxed),
+            "a whole run clears the flag"
+        );
+    }
+
+    /// A body with nothing to send for a long stretch is not cut off at once
+    /// when its first write sticks: the owed clock starts when the debt does.
+    #[tokio::test]
+    async fn owed_clock_starts_with_the_debt() {
+        let watch = Arc::new(StallWatch::new());
+        let mut io = StalledIo {
+            inner: Sink {
+                taken: 0,
+                budget: 0,
+            },
+            watch: Arc::clone(&watch),
+        };
+        let waker = noop_waker();
+        let cx = &mut Context::from_waker(&waker);
+
+        // Quiet for longer than the timeout would allow...
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // ...the first stuck write starts a fresh debt, not an old one:
+        assert!(Pin::new(&mut io).poll_write(cx, b"hi").is_pending());
+        assert!(
+            !watch.stalled_out(Duration::from_millis(50)),
+            "the debt is new"
+        );
+        assert!(watch.time_left(Duration::from_millis(50)) > Duration::from_millis(40));
+
+        // and it matures a full timeout after the write stuck.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(watch.stalled_out(Duration::from_millis(50)));
+    }
+
+    /// A `Duration::MAX` stall timeout must not panic the connection task
+    /// while arming its timer: an overflowing deadline falls back to a year
+    /// out, and neither the parked timer nor the guard holds shutdown.
+    #[tokio::test]
+    async fn stall_timer_survives_the_largest_timeout() {
+        let router = Router::new().route("/", get(|| async { "ok" }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = ApiServer::serve(
+            listener,
+            router,
+            CancellationToken::new(),
+            256,
+            Duration::MAX,
+        )
+        .unwrap();
+        let mut client = TcpStream::connect(server.local_addr()).await.unwrap();
+        assert!(get_ok(&mut client).await, "the task did not panic");
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .expect("the far-future timer does not hold shutdown");
     }
 }
