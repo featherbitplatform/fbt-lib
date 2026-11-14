@@ -71,8 +71,10 @@ async fn idle_torrent_uses_the_slow_tick() {
 }
 
 /// `add_peer` of a live leech ends the idleness at once: the tick runs at
-/// `status_interval` again within a second, not whenever the slow tick that
-/// was already due comes round.
+/// `status_interval` again within 3 s, not whenever the slow tick that was
+/// already due comes round. 3 s is generous for a loaded runner yet still
+/// discriminates: at most two idle ticks (every 2 s) fit in it, nowhere near
+/// the ten fast ones asked for.
 #[tokio::test]
 async fn peer_arrival_restores_the_fast_tick() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -95,14 +97,15 @@ async fn peer_arrival_restores_the_fast_tick() {
     let base = h.status_ticks().await;
     h.add_peer(leech_addr).await.unwrap();
     assert!(
-        ticks_reach(&h, base + 10, Duration::from_secs(1)).await,
+        ticks_reach(&h, base + 10, Duration::from_secs(3)).await,
         "the tick stayed slow after a peer arrived"
     );
     s.shutdown().await;
 }
 
 /// An open reader is tick-driven work (its window and deadlines move with
-/// the clock), so a seeding torrent with one still ticks fast.
+/// the clock), so a seeding torrent with one still ticks fast — ten ticks
+/// within 3 s, where the idle tick could manage at most two.
 #[tokio::test]
 async fn reader_keeps_the_fast_tick() {
     let s = Session::new(idle_settings()).await.unwrap();
@@ -111,7 +114,7 @@ async fn reader_keeps_the_fast_tick() {
     let reader = h.open_file(0).await.unwrap();
     let base = h.status_ticks().await;
     assert!(
-        ticks_reach(&h, base + 10, Duration::from_secs(1)).await,
+        ticks_reach(&h, base + 10, Duration::from_secs(3)).await,
         "the tick slowed down with a reader open"
     );
     drop(reader);
@@ -119,7 +122,8 @@ async fn reader_keeps_the_fast_tick() {
 }
 
 /// Leaving idle publishes at once: after `pause` then `resume` the state is
-/// fresh within 200 ms, not whenever the slow tick next comes round.
+/// fresh within a second, not whenever the slow tick next comes round — a
+/// budget under the 2 s idle interval still tells the two apart.
 #[tokio::test]
 async fn status_is_fresh_after_leaving_idle() {
     let s = Session::new(idle_settings()).await.unwrap();
@@ -128,7 +132,7 @@ async fn status_is_fresh_after_leaving_idle() {
     h.pause().await.unwrap();
     assert_eq!(h.status().state, TorrentState::Paused);
     h.resume().await.unwrap();
-    let fresh = tokio::time::timeout(Duration::from_millis(200), async {
+    let fresh = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if h.status().state != TorrentState::Paused {
                 return true;
@@ -140,7 +144,7 @@ async fn status_is_fresh_after_leaving_idle() {
     .unwrap_or(false);
     assert!(
         fresh,
-        "status still {:?} 200 ms after resume",
+        "status still {:?} a second after resume",
         h.status().state
     );
     s.shutdown().await;
