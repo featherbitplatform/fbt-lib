@@ -3,15 +3,15 @@
 //! Each [`Event`](fbt::Event) becomes one message whose `event:` field is
 //! its snake_case type and whose `data:` is its [`EventDto`] JSON. A
 //! subscriber that falls behind gets `event: lagged` with the number of
-//! events it missed. A comment every 15 s, sent as part of the stream so
-//! hyper ships it as output, keeps proxies from timing the stream out and
-//! counts as activity for the idle timeout — a live but quiet client stays
-//! connected, a client that stopped reading does not.
+//! events it missed. A comment every 15 s keeps proxies from timing the
+//! stream out.
 //!
 //! A stream holds one of [`AppState::events`]' permits until its body is
-//! dropped (the client hung up, or hyper has not polled it for
-//! [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout)). It ends
-//! on [`ApiServer::shutdown`](crate::ApiServer::shutdown) and within 1 s of
+//! dropped (the client hung up, or [`ApiServer`]'s stall guard ended the
+//! connection after
+//! [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout) of
+//! unwritten bytes). It ends on
+//! [`ApiServer::shutdown`](crate::ApiServer::shutdown) and within 1 s of
 //! the session's shutdown — after delivering everything its subscriber had
 //! already queued: the session's event sender lives as long as any
 //! `Session` clone, this API's included, so the stream polls
@@ -24,13 +24,13 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
-use axum::response::sse::{self, Sse};
+use axum::response::sse::{self, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use fbt::{EventMask, EventStream, Session};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use tokio::sync::OwnedSemaphorePermit;
-use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep, sleep};
+use tokio::time::{Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
@@ -39,7 +39,6 @@ use utoipa_axum::routes;
 use crate::dto::{ErrorBody, EventDto};
 use crate::error::{ApiErrorResponse, ApiQuery};
 use crate::routes::AppState;
-use crate::watchdog::Watchdog;
 
 /// How often an idle stream sends a keep-alive comment.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -119,9 +118,10 @@ async fn events(
         state.session.clone(),
         Some(permit),
         state.shutdown.clone(),
-        state.stream_idle_timeout,
     );
-    let mut res = Sse::new(stream).into_response();
+    let mut res = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
+        .into_response();
     res.headers_mut().insert(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
@@ -131,87 +131,26 @@ async fn events(
 
 /// `events` as SSE messages. It ends when `events` does, within
 /// [`SHUTDOWN_CHECK`] of the session's shutdown (delivering everything the
-/// subscriber had already queued first), when `shutdown` fires, and when
-/// hyper stops polling it for `timeout` — see [`Watchdog`]. `permit` is
-/// released when the stream is dropped.
-///
-/// [`Watchdog`]: crate::watchdog::Watchdog
+/// subscriber had already queued first), and when `shutdown` fires; under
+/// [`ApiServer`] a client whose socket stops accepting bytes ends it with
+/// the connection — see
+/// [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout). `permit`
+/// is released when the stream is dropped.
 pub(crate) fn sse_stream(
     events: EventStream,
     session: Session,
     permit: Option<OwnedSemaphorePermit>,
     shutdown: CancellationToken,
-    timeout: Duration,
 ) -> impl Stream<Item = Result<sse::Event, Infallible>> + Send + 'static {
     let mut check = tokio::time::interval(SHUTDOWN_CHECK);
     check.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    Watchdog::new(
-        KeepAlive::new(SessionEvents {
-            events,
-            session,
-            check,
-            _permit: permit,
-        }),
-        timeout,
-    )
+    SessionEvents {
+        events,
+        session,
+        check,
+        _permit: permit,
+    }
     .take_until(shutdown.cancelled_owned())
-}
-
-/// Emits a keep-alive comment when `inner` has been quiet for
-/// [`KEEP_ALIVE`].
-///
-/// Axum's own `Sse::keep_alive` cannot be used here: its stream polls the
-/// inner stream on every tick, and hyper repolls a body whenever its write
-/// buffer has room, so those ticks would look like activity to the
-/// [`Watchdog`] and no SSE stream could ever idle out. This wrapper runs
-/// *below* the watchdog and emits the comment as an item of the stream:
-/// hyper sends it as output (which is what keeps proxies from timing the
-/// stream out), and the watchdog sees it as activity — an idle but live
-/// SSE client is kept alive by its comments, and a client that has stopped
-/// reading is caught when even the comments can no longer be written. The
-/// comment bytes are axum's own [`KeepAlive`] default.
-///
-/// [`Watchdog`]: crate::watchdog::Watchdog
-/// [`KeepAlive`]: axum::response::sse::KeepAlive
-struct KeepAlive<S> {
-    inner: S,
-    /// When the next comment is due. Armed at construction, like axum's.
-    sleep: Pin<Box<Sleep>>,
-}
-
-impl<S> KeepAlive<S> {
-    fn new(inner: S) -> Self {
-        Self {
-            inner,
-            sleep: Box::pin(sleep(KEEP_ALIVE)),
-        }
-    }
-}
-
-impl<S, E> Stream for KeepAlive<S>
-where
-    S: Stream<Item = Result<sse::Event, E>> + Unpin,
-{
-    type Item = Result<sse::Event, E>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match this.inner.poll_next_unpin(cx) {
-            Poll::Ready(Some(item)) => {
-                // Any output restarts the quiet period, including a comment.
-                this.sleep.as_mut().reset(Instant::now() + KEEP_ALIVE);
-                Poll::Ready(Some(item))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => {
-                if this.sleep.as_mut().poll(cx).is_ready() {
-                    this.sleep.as_mut().reset(Instant::now() + KEEP_ALIVE);
-                    return Poll::Ready(Some(Ok(sse::Event::DEFAULT_KEEP_ALIVE)));
-                }
-                Poll::Pending
-            }
-        }
-    }
 }
 
 /// [`EventStream`] mapped to SSE messages, ending with the session.
@@ -339,7 +278,6 @@ mod tests {
             session.clone(),
             None,
             CancellationToken::new(),
-            Duration::from_secs(3600),
         );
         for _ in 0..20 {
             tokio::time::timeout(Duration::from_secs(5), handle.pause())
@@ -427,7 +365,6 @@ mod tests {
             session.clone(),
             None,
             CancellationToken::new(),
-            Duration::from_secs(3600),
         );
         // Each pause and each resume is one state change, sent before its
         // command replies, so all six are in the queue before `shutdown`.

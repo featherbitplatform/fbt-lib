@@ -14,10 +14,12 @@
 //! reader. The body holds one of [`AppState::streams`]' permits and the
 //! reader until it is dropped (the client hung up, or the response is
 //! done); it ends early when the torrent is removed, when
-//! [`ApiServer::shutdown`](crate::ApiServer::shutdown) runs, or when hyper
-//! has not polled it for [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout):
-//! a client that stops reading gets a short read and gives its permit back
-//! within that time.
+//! [`ApiServer::shutdown`](crate::ApiServer::shutdown) runs, and — under
+//! [`ApiServer`] only — when the client stalls: bytes owed but unwritten
+//! for [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout) end
+//! the whole connection, so the short read gives its permit back within
+//! that time. A body merely waiting for a piece has nothing owed and is
+//! left alone however starved it is.
 //!
 //! `HEAD` gets the same status and headers from the metainfo, with no
 //! reader and no permit.
@@ -44,7 +46,6 @@ use crate::error::{ApiErrorResponse, ApiPath};
 use crate::range::{RangeOutcome, parse_range};
 use crate::routes::AppState;
 use crate::routes::torrents::lookup;
-use crate::watchdog::Watchdog;
 
 /// Bytes read from the file per body chunk.
 const CHUNK: usize = 64 * 1024;
@@ -201,10 +202,7 @@ async fn stream_file(
         .await
         .map_err(|e| ApiErrorResponse::internal(format!("seek failed: {e}")))?;
     let body = Permitted {
-        inner: Watchdog::new(
-            ReaderStream::with_capacity(reader.take(plan.count), CHUNK),
-            state.stream_idle_timeout,
-        ),
+        inner: ReaderStream::with_capacity(reader.take(plan.count), CHUNK),
         _permit: permit,
     }
     .take_until(state.shutdown.clone().cancelled_owned());

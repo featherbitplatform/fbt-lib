@@ -18,11 +18,13 @@
 //! # }
 //! ```
 //!
-//! Open event and file streams end when their client hangs up, when the
-//! session shuts down, or when a client goes quiet for
-//! [`ApiConfig::stream_idle_timeout`]; shut the session down before awaiting
-//! a graceful shutdown of your server, or mount [`router_with_shutdown`],
-//! whose streams also end when a future of yours completes.
+//! Open event and file streams end when their client hangs up or the
+//! session shuts down; [`ApiServer`] additionally ends a connection whose
+//! writes have stopped making progress for
+//! [`ApiConfig::stream_idle_timeout`] (see there). Shut the session down
+//! before awaiting a graceful shutdown of your server, or mount
+//! [`router_with_shutdown`], whose streams also end when a future of yours
+//! completes.
 //!
 //! # Running the standalone server
 //!
@@ -71,11 +73,12 @@
 //! - **Caps.** Bodies are limited by [`ApiConfig::max_body_bytes`]
 //!   (`413`), file streams by [`ApiConfig::max_streams`] and event
 //!   streams by [`ApiConfig::max_event_streams`] (`503`). A client that
-//!   stops reading keeps its stream slot only until
-//!   [`ApiConfig::stream_idle_timeout`] ends the body, so those caps bound
-//!   the slots even stalled clients can hold; `ApiServer` serves at most
-//!   [`ApiConfig::max_connections`] connections at once (further clients
-//!   wait in the listen backlog).
+//!   stops reading keeps its stream slot only until `ApiServer` ends the
+//!   stalled connection ([`ApiConfig::stream_idle_timeout`]), so those
+//!   caps bound the slots even stalled clients can hold — a router you
+//!   mount yourself has no stall guard and relies on hang-ups; `ApiServer`
+//!   serves at most [`ApiConfig::max_connections`] connections at once
+//!   (further clients wait in the listen backlog).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -98,7 +101,6 @@ mod paths;
 pub mod range;
 mod routes;
 mod server;
-mod watchdog;
 
 use std::sync::Arc;
 
@@ -120,12 +122,14 @@ pub use server::ApiServer;
 /// it on [`ApiConfig::bind`]: with [`Auth::Disabled`] that address must be
 /// loopback.
 ///
-/// Long-lived bodies (events, file streams) end when the client hangs up,
-/// when a client stops reading for
-/// [`ApiConfig::stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout),
-/// or when the session shuts down (events within 1 s, file streams as
-/// their torrents go). Nothing else ends them, so a graceful shutdown of
-/// your server waits for them: shut the session down first, or use
+/// Long-lived bodies (events, file streams) end when the client hangs up
+/// or the session shuts down (events within 1 s, file streams as their
+/// torrents go). A stalled client — one whose socket stops accepting bytes
+/// — is only unhooked by [`ApiServer`]'s stall guard
+/// ([`ApiConfig::stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout));
+/// a router you mount yourself has none, and relies on the client hanging
+/// up. Nothing else ends the bodies, so a graceful shutdown of your server
+/// waits for them: shut the session down first, or use
 /// [`router_with_shutdown`] and complete its future before (or as) your
 /// server's graceful shutdown starts.
 ///

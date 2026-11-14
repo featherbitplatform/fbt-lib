@@ -22,7 +22,6 @@
 //! token-exempt and `?token=` routes.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -60,10 +59,6 @@ pub(crate) struct AppState {
     /// ([`create::MAX_CONCURRENT_CREATES`]); each blocking build holds one
     /// until it ends, even if the client has gone.
     pub(crate) creates: Arc<Semaphore>,
-    /// [`ApiConfig::stream_idle_timeout`]: every long-lived body is wrapped
-    /// in a [`Watchdog`](crate::watchdog::Watchdog) that ends it when hyper
-    /// stops polling for this long.
-    pub(crate) stream_idle_timeout: Duration,
     /// Cancelled by [`ApiServer::shutdown`](crate::ApiServer::shutdown), or
     /// when the future given to
     /// [`router_with_shutdown`](crate::router_with_shutdown) completes.
@@ -86,7 +81,6 @@ impl AppState {
             creates: Arc::new(Semaphore::new(create::MAX_CONCURRENT_CREATES)),
             session,
             roots,
-            stream_idle_timeout: config.stream_idle_timeout,
             shutdown,
         }
     }

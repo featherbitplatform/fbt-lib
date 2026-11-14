@@ -372,7 +372,7 @@ async fn streams_while_downloading() {
 }
 
 /// A leech in an API whose only seed is paused: its file can never
-/// complete, so a stream of it stalls.
+/// complete, so a stream of it starves for pieces.
 struct Stalled {
     session: Session,
     server: ApiServer,
@@ -388,8 +388,8 @@ struct Stalled {
 async fn stalled(edit: impl FnOnce(&mut ApiConfig)) -> Stalled {
     let seed = Session::new(test_settings()).await.expect("seed session");
     let seed_dir = tempfile::tempdir().expect("tempdir");
-    // 300 000 bytes, more than a loopback socket pair buffers: the stalled
-    // stream test's client has a real body it stops reading mid-way.
+    // A file big enough that a reader with the whole stream open always has
+    // plenty left to ask for once the paused seed stops answering.
     let (m, save) = create(
         seed_dir.path(),
         &[("video.mp4", &pattern(300_000, 4))],
@@ -420,6 +420,36 @@ async fn stalled(edit: impl FnOnce(&mut ApiConfig)) -> Stalled {
         path,
         seed,
         _dirs: (seed_dir, leech_dir),
+    }
+}
+
+/// An API whose own session seeds a single `size`-byte file, with `edit`
+/// on the config. Reads of its stream come straight from disk, so bytes
+/// flow as fast as the connection will take them.
+struct BigSeed {
+    session: Session,
+    _server: ApiServer,
+    base: String,
+    path: String,
+    _dir: tempfile::TempDir,
+}
+
+async fn big_seed(size: usize, edit: impl FnOnce(&mut ApiConfig)) -> BigSeed {
+    let (session, server, base, _) = api_with(edit).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (m, save) = create(dir.path(), &[("big.bin", &pattern(size, 9))], 16384);
+    let handle = session
+        .add_torrent(AddTorrent::new(m.clone(), save))
+        .await
+        .expect("seed add");
+    wait_state(&handle, TorrentState::Seeding).await;
+    let path = format!("/api/v1/torrents/{}/files/0/stream", id_of(&m));
+    BigSeed {
+        session,
+        _server: server,
+        base,
+        path,
+        _dir: dir,
     }
 }
 
@@ -499,13 +529,15 @@ async fn stream_cap_is_503() {
     s.seed.shutdown().await;
 }
 
-/// A stalled stream whose client read only the response head ends on its
-/// own: hyper stops polling the body, `stream_idle_timeout` fires, the body
-/// ends early and the stream permit comes back while the client is still
-/// connected (it neither reads nor hangs up).
+/// A client that reads the response head and nothing more stalls the
+/// connection's writes: the socket pair fills (a 16 MiB body is far more
+/// than hyper's write buffer plus the socket buffers hold), no byte the
+/// kernel accepts moves for `stream_idle_timeout`, and `ApiServer` ends the
+/// whole connection — freeing the single stream permit while the client,
+/// having neither read nor hung up, would otherwise hold it forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stalled_stream_is_ended() {
-    let s = stalled(|c| {
+    let s = big_seed(16 << 20, |c| {
         c.stream_idle_timeout = Duration::from_secs(1);
         c.max_streams = 1;
     })
@@ -513,10 +545,25 @@ async fn stalled_stream_is_ended() {
     let (mut conn, head) = raw_get(&s.base, &s.path, &[]).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 
-    // The watchdog ends the body before its `Content-Length` is met, so
-    // hyper closes the connection: the client's next read is EOF or a
-    // reset, never a hang.
-    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+    // The single permit is free: a second request gets its `206` head.
+    // This is the proof of the kill — and it must come before this client
+    // reads again, because reading would feed the watch real progress.
+    let served = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (_conn, head) = raw_get(&s.base, &s.path, &[("range", "bytes=0-99")]).await;
+            if head.starts_with("HTTP/1.1 206") {
+                return;
+            }
+            assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(served.is_ok(), "the permit is free within 10 s");
+
+    // The stalled connection is closed: reading it now (it was never hung
+    // up) ends in EOF or a reset, never a hang.
+    let closed = tokio::time::timeout(Duration::from_secs(8), async {
         let mut buf = [0u8; 64];
         loop {
             match conn.read(&mut buf).await {
@@ -528,23 +575,63 @@ async fn stalled_stream_is_ended() {
     .await;
     assert!(
         closed.is_ok(),
-        "the stalled connection is closed within 5 s"
+        "the stalled connection is closed within 8 s"
     );
     drop(conn);
+    s.session.shutdown().await;
+}
 
-    // The single permit is free: a second request gets its `206` head.
-    let served = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let (_conn, head) = raw_get(&s.base, &s.path, &[("range", "bytes=0-99")]).await;
-            if head.starts_with("HTTP/1.1 206") {
-                return;
-            }
-            assert!(head.starts_with("HTTP/1.1 503"), "{head}");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+/// A client that keeps draining — 64 KiB every 500 ms against a 1 s stall
+/// timeout — makes write progress inside every window: it must be served to
+/// the end of its body, not stalled out. Each round reads within 3 s;
+/// eight rounds span more than seven timeout windows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_reader_survives_the_idle_timeout() {
+    let s = big_seed(4 << 20, |c| {
+        c.stream_idle_timeout = Duration::from_secs(1);
     })
     .await;
-    assert!(served.is_ok(), "the permit is free within 5 s");
+    let (mut conn, head) = raw_get(&s.base, &s.path, &[]).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let mut got = 0usize;
+    for round in 0..8 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut buf = [0u8; 65_536];
+        let n = tokio::time::timeout(Duration::from_secs(3), conn.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: nothing arrived within 3 s"))
+            .expect("read");
+        assert!(n > 0, "round {round}: the body ended early");
+        got += n;
+    }
+    assert!(got >= 8 * 32_768, "kept flowing: {got} bytes in 8 rounds");
+    drop(conn);
+    s.session.shutdown().await;
+}
+
+/// A file stream waiting for pieces that never come (the seed is paused):
+/// everything the connection owes has been written, nothing is pending, so
+/// the stall watch must not fire — a starved body is not a stalled client.
+/// The stream is proven alive by its permit: three timeout windows past the
+/// start, the sole slot is still taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn starved_pieces_survive_the_idle_timeout() {
+    let s = stalled(|c| {
+        c.stream_idle_timeout = Duration::from_secs(1);
+        c.max_streams = 1;
+    })
+    .await;
+    let (conn, head) = raw_get(&s.base, &s.path, &[]).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    let (status, headers, body) = fetch(Method::GET, &format!("{}{}", s.base, s.path), &[]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    assert_eq!(headers["retry-after"], "1");
+    assert_eq!(error_code(&body), "too_many_streams");
+
+    drop(conn);
     s.session.shutdown().await;
     s.seed.shutdown().await;
 }

@@ -73,15 +73,15 @@ pub struct ApiConfig {
     /// The largest request body; larger ones get `413`. Default
     /// [`MAX_BODY_BYTES`].
     pub max_body_bytes: usize,
-    /// File streams served at once; more get `503`. Default 32. A stream
-    /// whose client goes quiet ends after [`stream_idle_timeout`] and its
-    /// slot comes back.
+    /// File streams served at once; more get `503`. Default 32. A stalled
+    /// client keeps its slot only until [`ApiServer`](crate::ApiServer) ends
+    /// the connection — see [`stream_idle_timeout`].
     ///
     /// [`stream_idle_timeout`]: ApiConfig::stream_idle_timeout
     pub max_streams: usize,
-    /// Event streams served at once; more get `503`. Default 16. A stream
-    /// whose client goes quiet ends after [`stream_idle_timeout`] and its
-    /// slot comes back.
+    /// Event streams served at once; more get `503`. Default 16. A stalled
+    /// client keeps its slot only until [`ApiServer`](crate::ApiServer) ends
+    /// the connection — see [`stream_idle_timeout`].
     ///
     /// [`stream_idle_timeout`]: ApiConfig::stream_idle_timeout
     pub max_event_streams: usize,
@@ -96,20 +96,21 @@ pub struct ApiConfig {
     /// taking a stream, or the refusal an over-cap client gets could never
     /// be served.
     pub max_connections: usize,
-    /// Idle timeout of the long-lived bodies: a file stream or event stream
-    /// hyper has not polled for this long ends early and its client sees a
-    /// short read (its connection closes when the body had bytes hyper was
-    /// still owed). Hyper polls a response body whenever the connection
-    /// could write more of it; a client that stops reading fills its socket,
-    /// polling stops, and this timeout then ends the stream within itself
-    /// and frees its [`max_streams`](Self::max_streams) or
-    /// [`max_event_streams`](Self::max_event_streams) permit — a paused
-    /// client no longer holds a slot forever. Every poll re-arms the timer,
-    /// and an SSE keep-alive comment counts as a poll, so a client that
-    /// reads at all keeps its stream open however idle the session is. A
-    /// stalled download counts as quiet: a file stream whose torrent makes
-    /// no progress for this long ends too; starting it again is the client's
-    /// `Range` request away. Default 10 minutes.
+    /// Stall timeout of connections [`ApiServer`](crate::ApiServer) serves:
+    /// while a connection still owes bytes to the client and the kernel has
+    /// accepted none for this long, the client has stopped reading and the
+    /// whole connection is ended — the body it was serving goes with it,
+    /// freeing its [`max_streams`](Self::max_streams) or
+    /// [`max_event_streams`](Self::max_event_streams) permit and its reader,
+    /// and the client sees a short read. Progress means write progress: a
+    /// client that keeps draining bytes, however slowly, is never cut off;
+    /// an idle keep-alive connection owes nothing and stays open; and a body
+    /// merely waiting for pieces to write (a starved download) has nothing
+    /// pending and is left alone too. A stalled SSE stream is caught the
+    /// same way as a stalled file: only when bytes it cannot deliver pile
+    /// up. [`Duration::ZERO`] turns the guard off. Routers mounted outside
+    /// `ApiServer` get no stall protection at all — whoever serves them owns
+    /// its writers, and only hang-ups free the caps. Default 10 minutes.
     pub stream_idle_timeout: Duration,
 }
 
