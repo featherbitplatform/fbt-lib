@@ -197,6 +197,14 @@ pub struct Settings {
     /// stable API.
     #[doc(hidden)]
     pub metadata_peer_grace: Duration,
+    /// A web seed whose URL resolves to loopback counts as a public origin, so its
+    /// redirects are guarded as a public seed's are (see
+    /// [`TrackerClient::fetch_range`](fbt_tracker::TrackerClient::fetch_range)).
+    /// Internal tunable: tests cannot reach a public address, so this marks their
+    /// loopback seed public to exercise the guard. Not part of the stable API.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub web_seed_treat_loopback_as_public: bool,
     /// Largest info dictionary a magnet torrent fetches from peers (BEP 9),
     /// in bytes; peers advertising more are disconnected. 16 KiB to
     /// [`MAX_METADATA_SIZE`].
@@ -622,6 +630,7 @@ impl Default for Settings {
             tracker: TrackerConfig::default(),
             tracker_retry_base: Duration::from_secs(60),
             metadata_peer_grace: Duration::from_secs(30),
+            web_seed_treat_loopback_as_public: false,
             max_metadata_size: 16 * 1024 * 1024,
             dht_enabled: true,
             dht_bootstrap_nodes: DEFAULT_DHT_BOOTSTRAP.map(str::to_owned).to_vec(),

@@ -7,9 +7,9 @@ use fbt::{
     DisconnectReason, EncryptionPolicy, Event, EventMask, EventStream, FileEntry, FileLayout,
     FileSlice, FsStorage, Info, InfoHashV1, InfoHashV2, InfoHashes, LayoutError, ListenError,
     MAX_DISPLAY_CHARS, MAX_METADATA_SIZE, Magnet, MagnetError, MemStorage, Metainfo, MetainfoError,
-    ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority, RelPath, RemoveMode, Session,
-    SessionError, Settings, Storage, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
-    TrackerConfig, TrackerError, Transport, display_safe,
+    ParseInfoHashError, PeerId, PeerSource, PieceLayout, Priority, RedirectPolicy, RelPath,
+    RemoveMode, Session, SessionError, Settings, Storage, TorrentHandle, TorrentSource,
+    TorrentState, TorrentStatus, TrackerConfig, TrackerError, Transport, display_safe,
 };
 use fbt::{BlockReason, FileStatus, IpFilter, MoveMode, PeerStatus, QueueSettings, TrackerStatus};
 use fbt::{
@@ -72,6 +72,7 @@ fn names(
     _: Option<TrackerStatus>,
     _: Option<TrackerConfig>,
     _: Option<TrackerError>,
+    _: Option<RedirectPolicy>,
     _: Option<Transport>,
     _: Option<StorageError>,
     _: Option<RateLimit>,
@@ -133,6 +134,11 @@ fn surface_compiles() {
         (p.kind, p.host, p.port, p.username, p.password);
     let _: (bool, bool, bool) = (p.proxy_peers, p.proxy_trackers, p.proxy_hostnames);
     let _: Result<(), String> = ProxyConfig::default().validate();
+    // Where a redirect may take a fetch: the default follows as it always did; a web seed
+    // on a public address sets `allow_internal` false.
+    let p = fbt::RedirectPolicy::default();
+    let _: bool = p.allow_internal;
+    assert!(p.allow_internal, "announces keep their redirects");
     let e = fbt::ProxyError::Refused(1);
     let _ = [
         SessionError::Proxy(e),

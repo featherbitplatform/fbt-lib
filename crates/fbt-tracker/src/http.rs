@@ -14,9 +14,10 @@ use hyper::{Request, Uri, header};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
+use fbt_net::addr::is_internal;
 use fbt_net::proxy::{ProxyConfig, ProxyError, ProxyKind};
 
-use crate::connector::ProxyConnector;
+use crate::connector::{ProxyConnector, port_of};
 use crate::tls::{self, Connector};
 use crate::types::{MAX_TRACKER_ID_BYTES, MIN_INTERVAL, bounded_text};
 use crate::urlencode::url_encode_bytes;
@@ -25,6 +26,10 @@ use crate::{
 };
 
 const MAX_REDIRECTS: usize = 3;
+/// The most addresses a redirect target's host is asked for when a policy denies
+/// internal targets: answers past it are not judged, so the check stays bounded
+/// however many addresses a hostile name returns.
+const MAX_REDIRECT_ADDRESSES: usize = 16;
 const MIN_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// Most bytes reserved up front for a range body; it grows past this only
 /// as bytes arrive.
@@ -67,6 +72,39 @@ impl RangePace for Unpaced {
 pub(crate) fn too_slow(bytes: u64, active: Duration) -> bool {
     active > RANGE_RATE_GRACE
         && u128::from(bytes) * 1000 < u128::from(MIN_RANGE_RATE) * active.as_millis()
+}
+
+/// Whether a fetch may be redirected to an address inside the local network.
+///
+/// A `Location` header moves a URL wherever the server likes, so a public web seed can
+/// point us at a host on the user's own network — a LAN service, or a router's metadata
+/// endpoint at `169.254.169.254` — and read back whatever that answers. With
+/// `allow_internal` false such a target is refused before anything is sent to it, on the
+/// addresses its host resolves to, so a public name pointing inward is refused too. See
+/// [`TrackerClient::fetch_range`](crate::TrackerClient::fetch_range) and
+/// [`fbt_net::addr::is_internal`]. A non-exhaustive struct cannot be written out field by
+/// field in another crate, so build the default and change what you need:
+///
+/// ```
+/// let mut policy = fbt_tracker::RedirectPolicy::default();
+/// policy.allow_internal = false;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RedirectPolicy {
+    /// Whether a redirect target may resolve to an internal address: loopback, RFC 1918,
+    /// IPv6 unique-local or link-local, CGNAT, the unspecified address, multicast or
+    /// broadcast. `true` by default, which is how announces have always followed
+    /// redirects and how a web seed configured on a private address keeps working.
+    pub allow_internal: bool,
+}
+
+impl Default for RedirectPolicy {
+    fn default() -> RedirectPolicy {
+        RedirectPolicy {
+            allow_internal: true,
+        }
+    }
 }
 
 /// An HTTP client with its pooled connections.
@@ -136,7 +174,9 @@ impl HttpClient {
     }
 
     async fn fetch(&self, url: String) -> Result<Vec<u8>, TrackerError> {
-        let resp = self.follow(&self.trackers, url, None).await?;
+        let resp = self
+            .follow(&self.trackers, url, None, RedirectPolicy::default())
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(TrackerError::HttpStatus(status.as_u16()));
@@ -146,14 +186,15 @@ impl HttpClient {
 
     /// GETs `url` through `client` (with `range` as its `Range` header),
     /// following at most [`MAX_REDIRECTS`] redirects (never from `https`
-    /// to `http`), and returns the final response, whatever its status.
-    /// Each request waits at most the configured timeout for its response
-    /// head.
+    /// to `http`) as `policy` allows, and returns the final response,
+    /// whatever its status. Each request waits at most the configured
+    /// timeout for its response head.
     async fn follow(
         &self,
         client: &HttpPool,
         mut url: String,
         range: Option<&str>,
+        policy: RedirectPolicy,
     ) -> Result<hyper::Response<hyper::body::Incoming>, TrackerError> {
         let mut redirects = 0;
         loop {
@@ -186,17 +227,23 @@ impl HttpClient {
             if uri.scheme_str() == Some("https") && next.starts_with("http://") {
                 return Err(TrackerError::InvalidResponse("insecure redirect"));
             }
+            // Only a target is judged: the URL the caller asked for is its own choice.
+            if !policy.allow_internal {
+                check_redirect_target(self.timeout, &next).await?;
+            }
             url = next;
         }
     }
 
     /// The bytes `range` of `url` (a web seed's file), through the web
-    /// seed client. See [`TrackerClient::fetch_range`](crate::TrackerClient::fetch_range).
+    /// seed client, following redirects as `policy` allows. See
+    /// [`TrackerClient::fetch_range`](crate::TrackerClient::fetch_range).
     pub(crate) async fn fetch_range(
         &self,
         url: &str,
         range: Range<u64>,
         pace: Option<&dyn RangePace>,
+        policy: RedirectPolicy,
     ) -> Result<Bytes, TrackerError> {
         let pace = pace.unwrap_or(&Unpaced);
         let started = tokio::time::Instant::now();
@@ -207,7 +254,7 @@ impl HttpClient {
         let last = range.end - 1;
         let header = format!("bytes={}-{last}", range.start);
         let resp = self
-            .follow(&self.web_seeds, url.to_owned(), Some(&header))
+            .follow(&self.web_seeds, url.to_owned(), Some(&header), policy)
             .await?;
         let status = resp.status();
         match status.as_u16() {
@@ -381,6 +428,39 @@ fn resolve_location(base: &Uri, location: &str) -> Result<String, TrackerError> 
         return Ok(format!("{scheme}://{auth}{location}"));
     }
     Err(TrackerError::InvalidResponse("unsupported redirect target"))
+}
+
+/// Whether a redirect to `url` may be asked at all under a policy that denies internal
+/// targets: its host is resolved the way the connector resolves it (`getaddrinfo` on the
+/// blocking pool, skipped for an IP literal) and every answer judged, so what decides is
+/// the resolver's reply and not the text of the `Location` header. A target that does not
+/// resolve, or not within `timeout`, is left to the request itself: a silent resolver is
+/// not the seed pointing us inward. The refusal carries no address — the session reports
+/// it with the seed's own URL, which is what a user recognises.
+async fn check_redirect_target(timeout: Duration, url: &str) -> Result<(), TrackerError> {
+    let uri = check_uri(url)?;
+    let host = uri
+        .host()
+        .map(without_brackets)
+        .ok_or_else(|| TrackerError::InvalidUrl("missing host".to_owned()))?;
+    let found =
+        match tokio::time::timeout(timeout, tokio::net::lookup_host((host, port_of(&uri)))).await {
+            Ok(found) => found?,
+            Err(_) => return Ok(()),
+        };
+    for ip in found.take(MAX_REDIRECT_ADDRESSES).map(|a| a.ip()) {
+        if is_internal(ip) {
+            return Err(TrackerError::InternalRedirect);
+        }
+    }
+    Ok(())
+}
+
+/// A URI's host without the brackets around an IPv6 literal, as a resolver takes it.
+fn without_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 fn event_str(e: AnnounceEvent) -> Option<&'static str> {

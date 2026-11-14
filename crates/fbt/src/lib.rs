@@ -477,7 +477,7 @@ pub use fbt_session::{
     Session, SessionError, SessionState, Settings, StorageError, StreamError, TorrentHandle,
     TorrentSource, TorrentState, TorrentStatus, TrackerStatus, Transport,
 };
-pub use fbt_tracker::{TrackerConfig, TrackerError};
+pub use fbt_tracker::{RedirectPolicy, TrackerConfig, TrackerError};
 
 #[cfg(test)]
 mod tests {

@@ -49,8 +49,8 @@ impl ProxyConnector {
 }
 
 /// The port of `uri`, else the default of its scheme (443 for `https`, 80
-/// otherwise).
-fn port_of(uri: &Uri) -> u16 {
+/// otherwise). Also what a redirect target is resolved on.
+pub(crate) fn port_of(uri: &Uri) -> u16 {
     uri.port_u16()
         .unwrap_or(if uri.scheme_str() == Some("https") {
             443

@@ -587,7 +587,12 @@ async fn fetch_range_accepts_a_matching_206() {
     let (addr, _) = serve(vec![partial("bytes 2-5/10", b"cdef")]).await;
     let pace = Counting(Mutex::new((0, 0)));
     let got = client()
-        .fetch_range_paced(&format!("http://{addr}/f"), 2..6, &pace)
+        .fetch_range_paced(
+            &format!("http://{addr}/f"),
+            2..6,
+            &pace,
+            RedirectPolicy::default(),
+        )
         .await
         .unwrap();
     assert_eq!(&got[..], b"cdef");
@@ -601,12 +606,17 @@ async fn fetch_range_takes_a_200_only_for_the_whole_file_from_0() {
     let (addr, _) = serve(vec![http_ok(b"0123456789"), http_ok(b"0123456789")]).await;
     let url = format!("http://{addr}/f");
     assert_eq!(
-        &client().fetch_range(&url, 0..10).await.unwrap()[..],
+        &client()
+            .fetch_range(&url, 0..10, RedirectPolicy::default())
+            .await
+            .unwrap()[..],
         b"0123456789"
     );
     // Asked for part of it: the server ignored the range.
     assert!(matches!(
-        client().fetch_range(&url, 0..5).await,
+        client()
+            .fetch_range(&url, 0..5, RedirectPolicy::default())
+            .await,
         Err(TrackerError::InvalidResponse(_))
     ));
 }
@@ -621,7 +631,9 @@ async fn fetch_range_refuses_a_wrong_content_range() {
     let url = format!("http://{addr}/f");
     for _ in 0..2 {
         assert!(matches!(
-            client().fetch_range(&url, 2..6).await,
+            client()
+                .fetch_range(&url, 2..6, RedirectPolicy::default())
+                .await,
             Err(TrackerError::InvalidResponse(_))
         ));
     }
@@ -642,23 +654,60 @@ async fn fetch_range_refuses_a_body_too_long_or_short() {
     let url = format!("http://{addr}/f");
     let c = client();
     assert!(matches!(
-        c.fetch_range(&url, 2..6).await,
+        c.fetch_range(&url, 2..6, RedirectPolicy::default()).await,
         Err(TrackerError::ResponseTooLarge)
     ));
     assert!(matches!(
-        c.fetch_range(&url, 2..6).await,
+        c.fetch_range(&url, 2..6, RedirectPolicy::default()).await,
         Err(TrackerError::ResponseTooLarge)
     ));
     assert!(matches!(
-        c.fetch_range(&url, 2..6).await,
+        c.fetch_range(&url, 2..6, RedirectPolicy::default()).await,
         Err(TrackerError::InvalidResponse(_))
     ));
     assert!(matches!(
-        c.fetch_range(&url, 2..6).await,
+        c.fetch_range(&url, 2..6, RedirectPolicy::default()).await,
         Err(TrackerError::HttpStatus(404))
     ));
     // An empty range asks nothing.
-    assert!(c.fetch_range(&url, 6..6).await.unwrap().is_empty());
+    assert!(
+        c.fetch_range(&url, 6..6, RedirectPolicy::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A redirect to a host that resolves inside the local network: refused by a policy that
+/// denies internal targets — before anything is sent to the target — and followed as
+/// before by the default one. The origin itself is never judged: only where it redirects
+/// to is, which is why the first request reaches the loopback server either way.
+#[tokio::test]
+async fn fetch_range_redirect_policy_judges_the_target() {
+    let denied = RedirectPolicy {
+        allow_internal: false,
+    };
+    // Origin: a 302 to `/f` on the same (loopback) host; target: the file.
+    let (addr, seen) = serve(vec![redirect("/f"), partial("bytes 2-5/10", b"cdef")]).await;
+    let url = format!("http://{addr}/a");
+    let err = client().fetch_range(&url, 2..6, denied).await.unwrap_err();
+    assert!(matches!(err, TrackerError::InternalRedirect), "{err:?}");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the target is never asked: {:?}",
+        seen.lock().unwrap()
+    );
+
+    // The same server, the same redirect, a policy that allows it.
+    let (addr, seen) = serve(vec![redirect("/f"), partial("bytes 2-5/10", b"cdef")]).await;
+    let url = format!("http://{addr}/a");
+    let got = client()
+        .fetch_range(&url, 2..6, RedirectPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(&got[..], b"cdef");
+    assert_eq!(seen.lock().unwrap().len(), 2, "both requests were made");
 }
 
 #[test]

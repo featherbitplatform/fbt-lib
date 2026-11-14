@@ -124,6 +124,12 @@ pub enum TrackerError {
     /// More than 3 redirects.
     #[error("too many redirects")]
     TooManyRedirects,
+    /// A redirect target resolved to an address inside the local network while the policy
+    /// denied that ([`RedirectPolicy::allow_internal`](crate::RedirectPolicy) is false):
+    /// nothing was sent to it. Only a range fetch (a web seed) reports this; announces keep
+    /// the behaviour they always had.
+    #[error("redirect to an internal address")]
+    InternalRedirect,
     /// The response body exceeded the configured cap.
     #[error("response too large")]
     ResponseTooLarge,
