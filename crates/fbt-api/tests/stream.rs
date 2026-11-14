@@ -388,9 +388,11 @@ struct Stalled {
 async fn stalled(edit: impl FnOnce(&mut ApiConfig)) -> Stalled {
     let seed = Session::new(test_settings()).await.expect("seed session");
     let seed_dir = tempfile::tempdir().expect("tempdir");
+    // 300 000 bytes, more than a loopback socket pair buffers: the stalled
+    // stream test's client has a real body it stops reading mid-way.
     let (m, save) = create(
         seed_dir.path(),
-        &[("video.mp4", &pattern(200_000, 4))],
+        &[("video.mp4", &pattern(300_000, 4))],
         16384,
     );
     let sh = seed
@@ -421,13 +423,22 @@ async fn stalled(edit: impl FnOnce(&mut ApiConfig)) -> Stalled {
     }
 }
 
-/// `GET path` with the bearer token on a raw connection; the connection
-/// and the response head.
-async fn raw_get(base: &str, path: &str) -> (TcpStream, String) {
+/// `GET path` with the bearer token and `headers` on a raw connection; the
+/// connection (left open: hanging up is the test's choice) and the head.
+async fn raw_get(base: &str, path: &str, headers: &[(&str, &str)]) -> (TcpStream, String) {
     let addr = base.trim_start_matches("http://");
     let mut conn = TcpStream::connect(addr).await.expect("connect");
-    let req =
-        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n");
+    let mut lines = vec![
+        format!("GET {path} HTTP/1.1"),
+        format!("Host: {addr}"),
+        format!("Authorization: Bearer {TOKEN}"),
+    ];
+    lines.extend(
+        headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}")),
+    );
+    let req = format!("{}\r\n\r\n", lines.join("\r\n"));
     conn.write_all(req.as_bytes()).await.expect("write");
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -457,7 +468,7 @@ async fn wait_deadlines(h: &TorrentHandle, empty: bool, within: Duration) -> boo
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hang_up_releases_the_reader() {
     let s = stalled(|_| {}).await;
-    let (conn, head) = raw_get(&s.base, &s.path).await;
+    let (conn, head) = raw_get(&s.base, &s.path, &[]).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert!(
         wait_deadlines(&s.handle, false, Duration::from_secs(10)).await,
@@ -475,7 +486,7 @@ async fn hang_up_releases_the_reader() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_cap_is_503() {
     let s = stalled(|c| c.max_streams = 1).await;
-    let (_conn, head) = raw_get(&s.base, &s.path).await;
+    let (_conn, head) = raw_get(&s.base, &s.path, &[]).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     let (status, headers, body) = fetch(Method::GET, &format!("{}{}", s.base, s.path), &[]).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -484,6 +495,56 @@ async fn stream_cap_is_503() {
     // HEAD takes no permit.
     let (status, _, _) = fetch(Method::HEAD, &format!("{}{}", s.base, s.path), &[]).await;
     assert_eq!(status, StatusCode::OK);
+    s.session.shutdown().await;
+    s.seed.shutdown().await;
+}
+
+/// A stalled stream whose client read only the response head ends on its
+/// own: hyper stops polling the body, `stream_idle_timeout` fires, the body
+/// ends early and the stream permit comes back while the client is still
+/// connected (it neither reads nor hangs up).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_stream_is_ended() {
+    let s = stalled(|c| {
+        c.stream_idle_timeout = Duration::from_secs(1);
+        c.max_streams = 1;
+    })
+    .await;
+    let (mut conn, head) = raw_get(&s.base, &s.path, &[]).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    // The watchdog ends the body before its `Content-Length` is met, so
+    // hyper closes the connection: the client's next read is EOF or a
+    // reset, never a hang.
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buf = [0u8; 64];
+        loop {
+            match conn.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the stalled connection is closed within 5 s"
+    );
+    drop(conn);
+
+    // The single permit is free: a second request gets its `206` head.
+    let served = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_conn, head) = raw_get(&s.base, &s.path, &[("range", "bytes=0-99")]).await;
+            if head.starts_with("HTTP/1.1 206") {
+                return;
+            }
+            assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(served.is_ok(), "the permit is free within 5 s");
     s.session.shutdown().await;
     s.seed.shutdown().await;
 }
@@ -530,9 +591,9 @@ async fn remove_ends_open_streams() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_ends_open_sse_and_streams() {
     let s = stalled(|_| {}).await;
-    let (events, head) = raw_get(&s.base, "/api/v1/events").await;
+    let (events, head) = raw_get(&s.base, "/api/v1/events", &[]).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    let (stream, head) = raw_get(&s.base, &s.path).await;
+    let (stream, head) = raw_get(&s.base, &s.path, &[]).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     // Both bodies end at once, so shutdown never reaches the 5 s grace
     // that aborts stragglers.

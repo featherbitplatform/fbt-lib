@@ -245,6 +245,48 @@ async fn disconnect_frees_the_slot() {
     assert!(freed.is_ok(), "the slot is free within 5 s");
 }
 
+/// An event stream whose client read only the response head ends on its own:
+/// hyper stops polling the body, the idle timeout ends it (the 15 s keep-alive
+/// is longer than the 1 s timeout here), and the permit comes free while the
+/// stalled client stays connected.
+#[tokio::test]
+async fn stalled_sse_is_ended() {
+    let (_session, _server, base, token) = api_with(|c| {
+        c.stream_idle_timeout = Duration::from_secs(1);
+        c.max_event_streams = 1;
+    })
+    .await;
+    let (_conn, head) = raw_open(&base).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let url = format!("{base}/api/v1/events");
+    let opened = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (status, _, sse) = Sse::open(&url, Some(token)).await;
+            match status {
+                StatusCode::OK => return sse.expect("the second stream opens"),
+                StatusCode::SERVICE_UNAVAILABLE => {
+                    tokio::time::sleep(Duration::from_millis(50)).await
+                }
+                other => panic!("unexpected status {other}"),
+            }
+        }
+    })
+    .await;
+    let mut second = match opened {
+        Ok(sse) => sse,
+        Err(_) => panic!("the stalled stream's slot is not free within 5 s"),
+    };
+
+    // The freed slot serves a live stream: an add reaches it.
+    let p = payload();
+    add(&base, &p).await;
+    let first = tokio::time::timeout(T, second.next())
+        .await
+        .expect("an event on the new stream");
+    assert!(first.is_some(), "the new stream carries events");
+}
+
 #[tokio::test]
 async fn ends_on_session_shutdown() {
     let (session, _server, base, token) = api().await;

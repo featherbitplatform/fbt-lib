@@ -3,7 +3,9 @@
 //! The server owns every connection task (a [`JoinSet`]), unlike
 //! `axum::serve`, which detaches them: [`ApiServer::shutdown`] can then
 //! promise that nothing of the API (no handler, no body, no
-//! [`AppState`](crate::routes::AppState) clone) outlives it.
+//! [`AppState`](crate::routes::AppState) clone) outlives it. Every request
+//! carries its connection's peer address as axum's `ConnectInfo`, which the
+//! [`Auth::Disabled`](crate::Auth::Disabled) guard reads.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -12,6 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::{ConnectInfo, Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use fbt::Session;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -142,9 +147,10 @@ async fn accept_loop(
                 permit = acquired.ok();
             }
             accepted = listener.accept(), if permit.is_some() => match accepted {
-                Ok((stream, _)) => {
+                Ok((stream, peer)) => {
                     conns.spawn(connection(
                         stream,
+                        peer,
                         router.clone(),
                         shutdown.clone(),
                         permit.take(),
@@ -172,15 +178,23 @@ async fn accept_loop(
 }
 
 /// Serves one connection; on `shutdown` it finishes the request in flight
-/// and closes. `permit` (a slot of [`ApiConfig::max_connections`]) is
-/// released when it returns.
+/// and closes. `peer` (the accepted address) is attached to every request as
+/// axum's [`ConnectInfo`], as `axum::serve` does for its own listeners: the
+/// auth layer reads it under [`Auth::Disabled`](crate::Auth::Disabled).
+/// `permit` (a slot of [`ApiConfig::max_connections`]) is released when it
+/// returns.
 async fn connection(
     stream: TcpStream,
+    peer: SocketAddr,
     router: Router,
     shutdown: CancellationToken,
     permit: Option<OwnedSemaphorePermit>,
 ) {
     let _permit = permit;
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        peer,
+        attach_connect_info,
+    ));
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT)
@@ -199,6 +213,17 @@ async fn connection(
     if let Err(e) = conn.await {
         tracing::trace!(error = %e, "api connection ended");
     }
+}
+
+/// Puts the connection's peer address in the request extensions as axum's
+/// [`ConnectInfo`] extractor reads it.
+async fn attach_connect_info(
+    State(peer): State<SocketAddr>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let _ = req.extensions_mut().insert(ConnectInfo(peer));
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -314,5 +339,40 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), server.shutdown())
             .await
             .expect("an idle connection does not hold up shutdown");
+    }
+
+    /// Every request carries its connection's peer address as axum's
+    /// `ConnectInfo`, whatever the router mounted (the auth layer's
+    /// `Auth::Disabled` peer check reads that extension).
+    #[tokio::test]
+    async fn connect_info_reaches_handlers() {
+        let router = Router::new().route(
+            "/peer",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = ApiServer::serve(listener, router, CancellationToken::new(), 256).unwrap();
+
+        let mut client = TcpStream::connect(server.local_addr()).await.unwrap();
+        client
+            .write_all(b"GET /peer HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0u8; 256];
+            while !got.ends_with(b"127.0.0.1") {
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+        .await
+        .expect("the peer address reaches the handler");
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.contains("200 OK"), "{text}");
+        assert!(text.ends_with("127.0.0.1"), "{text}");
+        server.shutdown().await;
     }
 }

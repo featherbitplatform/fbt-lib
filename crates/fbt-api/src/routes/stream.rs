@@ -13,8 +13,11 @@
 //! reader's position drives the torrent's piece deadlines. Each request opens its own
 //! reader. The body holds one of [`AppState::streams`]' permits and the
 //! reader until it is dropped (the client hung up, or the response is
-//! done); it ends early when the torrent is removed or
-//! [`ApiServer::shutdown`](crate::ApiServer::shutdown) runs.
+//! done); it ends early when the torrent is removed, when
+//! [`ApiServer::shutdown`](crate::ApiServer::shutdown) runs, or when hyper
+//! has not polled it for [`stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout):
+//! a client that stops reading gets a short read and gives its permit back
+//! within that time.
 //!
 //! `HEAD` gets the same status and headers from the metainfo, with no
 //! reader and no permit.
@@ -41,6 +44,7 @@ use crate::error::{ApiErrorResponse, ApiPath};
 use crate::range::{RangeOutcome, parse_range};
 use crate::routes::AppState;
 use crate::routes::torrents::lookup;
+use crate::watchdog::Watchdog;
 
 /// Bytes read from the file per body chunk.
 const CHUNK: usize = 64 * 1024;
@@ -197,7 +201,10 @@ async fn stream_file(
         .await
         .map_err(|e| ApiErrorResponse::internal(format!("seek failed: {e}")))?;
     let body = Permitted {
-        inner: ReaderStream::with_capacity(reader.take(plan.count), CHUNK),
+        inner: Watchdog::new(
+            ReaderStream::with_capacity(reader.take(plan.count), CHUNK),
+            state.stream_idle_timeout,
+        ),
         _permit: permit,
     }
     .take_until(state.shutdown.clone().cancelled_owned());

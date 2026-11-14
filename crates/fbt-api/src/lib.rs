@@ -18,9 +18,10 @@
 //! # }
 //! ```
 //!
-//! Open event and file streams end only when their client hangs up or the
-//! session shuts down, so shut the session down before awaiting a
-//! graceful shutdown of your server, or mount [`router_with_shutdown`],
+//! Open event and file streams end when their client hangs up, when the
+//! session shuts down, or when a client goes quiet for
+//! [`ApiConfig::stream_idle_timeout`]; shut the session down before awaiting
+//! a graceful shutdown of your server, or mount [`router_with_shutdown`],
 //! whose streams also end when a future of yours completes.
 //!
 //! # Running the standalone server
@@ -52,9 +53,12 @@
 //!   cannot send headers; no other route does.
 //! - **Loopback and no auth.** [`Auth::Disabled`] is allowed only with a
 //!   loopback [`ApiConfig::bind`]. Requests whose `Host` is not
-//!   `localhost`, `127.0.0.1` or `[::1]`, or whose `Origin` is not in
-//!   [`ApiConfig::cors_origins`], get `403`: the guard against CSRF and DNS
-//!   rebinding.
+//!   `localhost`, `127.0.0.1` or `[::1]`, whose `Origin` is not in
+//!   [`ApiConfig::cors_origins`], or whose peer address is not loopback
+//!   where the request carries axum's `ConnectInfo` (which
+//!   [`ApiServer`] attaches to every request), get `403`:
+//!   the guard against CSRF and DNS rebinding. A router you mount without
+//!   that extension keeps the Host and Origin guard alone.
 //! - **CORS.** Off unless [`ApiConfig::cors_origins`] lists origins.
 //! - **`allowed_roots`.** When set, every path a request names (save
 //!   paths, move targets, creation sources) must lie inside a root. The
@@ -66,9 +70,12 @@
 //!   that lead out of it are resolved and refused too.
 //! - **Caps.** Bodies are limited by [`ApiConfig::max_body_bytes`]
 //!   (`413`), file streams by [`ApiConfig::max_streams`] and event
-//!   streams by [`ApiConfig::max_event_streams`] (`503`). A paused client
-//!   keeps its stream slot, so `max_streams` is what bounds the slots idle
-//!   clients can hold.
+//!   streams by [`ApiConfig::max_event_streams`] (`503`). A client that
+//!   stops reading keeps its stream slot only until
+//!   [`ApiConfig::stream_idle_timeout`] ends the body, so those caps bound
+//!   the slots even stalled clients can hold; `ApiServer` serves at most
+//!   [`ApiConfig::max_connections`] connections at once (further clients
+//!   wait in the listen backlog).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -91,6 +98,7 @@ mod paths;
 pub mod range;
 mod routes;
 mod server;
+mod watchdog;
 
 use std::sync::Arc;
 
@@ -113,6 +121,8 @@ pub use server::ApiServer;
 /// loopback.
 ///
 /// Long-lived bodies (events, file streams) end when the client hangs up,
+/// when a client stops reading for
+/// [`ApiConfig::stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout),
 /// or when the session shuts down (events within 1 s, file streams as
 /// their torrents go). Nothing else ends them, so a graceful shutdown of
 /// your server waits for them: shut the session down first, or use
@@ -125,7 +135,8 @@ pub use server::ApiServer;
 /// for [`Auth::Disabled`] with a bind address that is not loopback,
 /// [`ApiError::InvalidOrigin`] for a CORS origin that is not a valid header
 /// value, [`ApiError::InvalidRoot`] for an allowed root that does not
-/// exist.
+/// exist, [`ApiError::InvalidLimits`] for a `max_connections` that does not
+/// exceed the stream caps.
 pub fn router(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiError> {
     build_router(session, config, CancellationToken::new())
 }
@@ -167,11 +178,8 @@ pub fn router(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiE
 ///
 /// # Errors
 ///
-/// Those of [`router`].
-///
-/// # Panics
-///
-/// Outside a Tokio runtime, which it spawns the task on.
+/// Those of [`router`], plus [`ApiError::NoRuntime`] when called outside a
+/// Tokio runtime: the task needs one. (It used to panic there.)
 pub fn router_with_shutdown(
     session: Session,
     config: &ApiConfig,
@@ -183,7 +191,10 @@ pub fn router_with_shutdown(
     // outlive the router when `shutdown` never completes.
     let dropped = CancellationToken::new();
     let guard = Arc::new(dropped.clone().drop_guard());
-    tokio::spawn(async move {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return Err(ApiError::NoRuntime);
+    };
+    runtime.spawn(async move {
         tokio::select! {
             () = shutdown => token.cancel(),
             () = dropped.cancelled() => {}
