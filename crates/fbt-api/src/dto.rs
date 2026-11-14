@@ -203,6 +203,11 @@ pub(crate) struct TorrentInfo {
     pub(crate) name: String,
     /// The metadata is known.
     pub(crate) has_metadata: bool,
+    /// BEP 52 piece layers the metadata does not hold yet: one per file of
+    /// more than one piece whose layer is still missing (0 for a v1 torrent,
+    /// and once every layer arrived or was built). A v2-only torrent downloads
+    /// what it can verify meanwhile and fetches the rest beside the download.
+    pub(crate) layers_missing: u32,
     /// `downloading_metadata`, `queued_for_checking`, `checking_files`,
     /// `downloading`, `seeding`, `paused`, `queued` or `error`.
     #[schema(example = "seeding")]
@@ -277,6 +282,7 @@ impl From<&TorrentStatus> for TorrentInfo {
             version: None,
             name: s.name.clone(),
             has_metadata: s.has_metadata,
+            layers_missing: s.layers_missing,
             state: state_name(&s.state),
             checking_progress: match s.state {
                 TorrentState::CheckingFiles { progress } => Some(progress),
