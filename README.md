@@ -2,11 +2,11 @@
 
 A from-scratch, pure-Rust BitTorrent library with the feature breadth of libtorrent, and an idiomatic async Rust API. It is the engine for featherbittorrent, a future client with a terminal UI, a web UI and media streaming while downloading. It has no UI of its own and runs on macOS, Linux and Windows.
 
-Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 added the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange (v0.2.0). Milestone 3 added uTP, local and NAT reach, rate limits and a write-back cache (v0.3.0). Milestone 4 added streaming while downloading, with a seekable reader over a torrent that is still downloading (v0.4.0). Milestone 5 added persistence and operations (resume data, queueing, proxies, IP filtering, web seeds and more DHT) (v0.5.0). Milestone 6 adds BitTorrent v2 and hybrid torrents (BEP 52) and torrent creation, and is heading for v0.6.0. Nothing is published to crates.io and the API will change.
+Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 added the Mainline DHT, magnet links with metadata exchange, MSE/PE encryption and peer exchange (v0.2.0). Milestone 3 added uTP, local and NAT reach, rate limits and a write-back cache (v0.3.0). Milestone 4 added streaming while downloading, with a seekable reader over a torrent that is still downloading (v0.4.0). Milestone 5 added persistence and operations (resume data, queueing, proxies, IP filtering, web seeds and more DHT) (v0.5.0). Milestone 6 added BitTorrent v2 and hybrid torrents (BEP 52) and torrent creation (v0.6.0). Milestone 7 added `fbt-api`, the HTTP/JSON API (v0.7.0). The next release, 0.8.0, hardens rather than adds: idle torrents tick slowly instead of twice a second, remote strings are display-safe, web-seed redirects into the local network are refused, stalled API streams end, and v2 torrents start before their piece layers arrive. Nothing is published to crates.io and the API will change.
 
 ## Features
 
-- BitTorrent v1, v2 and hybrid torrents (BEP 52): Merkle-tree verification, hash requests and serving, piece layers fetched from peers, hybrids announced under both info hashes, `btmh` magnets; creating v1, v2 and hybrid `.torrent` files (`CreateTorrent`)
+- BitTorrent v1, v2 and hybrid torrents (BEP 52): Merkle-tree verification, hash requests and serving, piece layers fetched from peers while the download runs (`TorrentStatus::layers_missing` counts what is still out), hybrids announced under both info hashes, `btmh` magnets; creating v1, v2 and hybrid `.torrent` files (`CreateTorrent`)
 - HTTP(S) and UDP trackers, verified storage, piece picking and a tokio session with an event stream
 - Mainline DHT (BEP 5, BEP 42 node ids) in its own crate, `fbt-dht`
 - Magnet links with metadata exchange from peers (BEP 9, BEP 10)
@@ -22,11 +22,11 @@ Status: pre-release. Milestone 1 (core download) shipped as v0.1.0. Milestone 2 
 - Moving a torrent's storage and renaming its files; skipped files are never created (a part file holds their pieces' shared bytes); colliding paths are renamed
 - SOCKS5 and HTTP `CONNECT` proxies for peers, web seeds, trackers and, through SOCKS5, the DHT and uTP
 - IP filter, one connection per IP per torrent, and smart ban of peers that send bad blocks
-- HTTP and HTTPS web seeds (BEP 19)
+- HTTP and HTTPS web seeds (BEP 19): a seed whose own address is public may not be redirected into the local network
 - DHT scrape (BEP 33), `sample_infohashes` (BEP 51) and immutable and mutable items (BEP 44); tracker scrape
 - `serde` for the public config structs (the `serde` feature)
-- `fbt-api`: an HTTP/JSON API over a session (axum): torrent control, session settings, server-sent events, byte-range file streaming and an OpenAPI document, with bearer-token auth and allowed roots; mount its router or run `ApiServer`
-- Pure Rust, no `unsafe`; hostile peer, tracker, proxy, web seed, resume and `.torrent` input is bounded
+- `fbt-api`: an HTTP/JSON API over a session (axum): torrent control, session settings, server-sent events, byte-range file streaming and an OpenAPI document, with bearer-token auth and allowed roots; mount its router or run `ApiServer`, which ends a connection whose client stopped reading (`ApiConfig::stream_idle_timeout`)
+- Pure Rust, no `unsafe`; hostile peer, tracker, proxy, web seed, resume and `.torrent` input is bounded, and every remote string that reaches a user — names, tracker and web-seed messages, peer client names — is display-safe (`display_safe`, which drops control and format characters and caps the length)
 
 ## Usage
 
@@ -196,7 +196,7 @@ Torrents are auto-managed by default: in queue order, at most 3 downloads and 5 
 
 `Session::set_ip_filter` installs an `IpFilter` (block and allow ranges, the last rule wins) for peers from every source, never for trackers, DHT nodes or the proxy. A torrent accepts one connection per IP address by default (`Settings::max_peers_per_ip`; loopback is exempt). Smart ban bans, for the rest of the session, the peer whose blocks made a piece fail its hash check, and never an honest co-contributor; bans live apart from the filter (`Session::banned_peers`). Blocked peers are reported as `Event::PeerBlocked`.
 
-Web seeds (BEP 19) come from a torrent's `url-list`, a magnet's `ws` or `TorrentHandle::add_web_seed`, and are fetched with ranged HTTP(S) requests under the download limits and through the proxy. A failing seed backs off from 30 s to 30 minutes; a 4xx answer other than 408 and 429, or corrupt data, retires it (`Event::WebSeedError`).
+Web seeds (BEP 19) come from a torrent's `url-list`, a magnet's `ws` or `TorrentHandle::add_web_seed`, and are fetched with ranged HTTP(S) requests under the download limits and through the proxy. A failing seed backs off from 30 s to 30 minutes; a 4xx answer other than 408 and 429, or corrupt data, retires it (`Event::WebSeedError`). A seed whose own address is public may not be redirected into the local network (loopback, RFC 1918, IPv6 unique-local and link-local, CGNAT): the target is judged on the addresses its connection dials, not on the `Location` text, and a refusal retires the seed. A torrent whose `url-list` already names a private address is a LAN seed and keeps working, its redirects included — what is guarded is where a public seed sends us, not where a seed lives. Through a proxy that resolves names (`proxy_hostnames`) a host name is left to the proxy, which decides where it goes; only a target spelled as an address is judged.
 
 ### What goes on your LAN
 
@@ -240,13 +240,16 @@ cargo fmt --all --check
 cargo deny --all-features check
 ```
 
+`bash dev/stress.sh <package> <test-binary-or---lib> <test-name> <runs>` runs one test over and over (4 at a time, each repetition killed together with everything it forked once it outlives `STRESS_TIMEOUT`) to reproduce an intermittent failure or prove one away; Unix only.
+
 ## Benchmarks
 
 `bash dev/bench.sh` runs a loopback throughput and idle-torrent benchmark and appends a row to [docs/benchmarks.md](docs/benchmarks.md), which also records the targets and the method. It is not gated in CI.
 
 ## Known limitations
 
-- uTP throughput and CPU, and the CPU of 1,000 idle torrents, miss their targets on the recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)). Milestone 4 removed the in-flight window scans, the byte-wise payload queue and the zero-fill per read from the uTP hot path, but the measured numbers did not move: about 579 Mbit/s at 42.7 % of a core per 100 Mbit/s, against targets of 1000 Mbit/s and 15 %, with TCP at about 5100 Mbit/s. About 90 % of the on-CPU time is system calls (one `sendto` and one `recvfrom` per 1.4 KiB datagram, plus the reactor wakeups), and batching them (`sendmmsg`, `recvmmsg`, GSO) needs platform FFI, which the no-unsafe rule rules out. The idle CPU is to be revisited.
+- uTP throughput and CPU miss their targets on the recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)). Milestone 4 removed the in-flight window scans, the byte-wise payload queue and the zero-fill per read from the uTP hot path, but the measured numbers did not move: about 579 Mbit/s at 42.7 % of a core per 100 Mbit/s, against targets of 1000 Mbit/s and 15 %, with TCP at about 5100 Mbit/s. About 90 % of the on-CPU time is system calls (one `sendto` and one `recvfrom` per 1.4 KiB datagram, plus the reactor wakeups), and batching them (`sendmmsg`, `recvmmsg`, GSO) needs platform FFI, which the no-unsafe rule rules out.
+- The CPU of 1 000 idle torrents meets its target from 0.8.0: a torrent that is seeding or paused with nothing going on ticks every `Settings::idle_status_interval` (5 s) instead of twice a second, and the benchmark column measured 0.18–0.20 % against 0.82–1.70 in every earlier release. The cost of that is granularity: an idle torrent's rates, `active_time` and `seeding_time`, and its seed-ratio and seed-time checks, refresh at the idle period (state changes publish immediately; a download with peers or work running keeps the fast tick).
 - Reading a skipped file of a finished torrent switches its state between `Seeding` and `Downloading` once per piece until the window is written. It is parked for a later fix.
 - LSD joins the multicast group on the default interface only, and on a host with no default route it fails to start: the session then runs without LSD.
 
