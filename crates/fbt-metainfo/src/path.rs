@@ -9,7 +9,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use fbt_core::{MAX_DISPLAY_CHARS, display_safe};
+use fbt_core::display_safe;
 
 /// Longest component, in bytes, that is kept as is.
 pub(crate) const MAX_COMPONENT_BYTES: usize = 255;
@@ -143,11 +143,16 @@ pub(crate) fn truncate_at_boundary(s: &str, max: usize) -> &str {
 /// rules: no trailing dot or space, at most [`MAX_COMPONENT_BYTES`] bytes with
 /// the extension kept, and no reserved device stem. `None` when nothing usable
 /// remains.
+///
+/// The length filter is left to the byte rule on purpose, and `display_safe` is
+/// called uncapped (`usize::MAX`, so its output is bounded by the input): a
+/// character cap here would cut a long name before that rule could, and it would
+/// cut off the extension that rule exists to keep.
 fn clean_piece(piece: &str) -> Option<String> {
     if piece.is_empty() || piece == "." || piece == ".." {
         return None;
     }
-    let flat = display_safe(piece, MAX_DISPLAY_CHARS);
+    let flat = display_safe(piece, usize::MAX);
     let replaced: String = flat
         .chars()
         .map(|c| {
@@ -288,6 +293,18 @@ mod tests {
         let s = format!("{}.mkv", "é".repeat(200));
         let out = p(&[&s]);
         assert!(out.len() <= 255 && out.ends_with(".mkv"));
+        // A stem of over 256 characters: the byte rule does the cutting, with
+        // the extension kept. A character filter applied first would have left
+        // nothing of the extension to keep.
+        for stem in ["a".repeat(300), "é".repeat(300), "日".repeat(300)] {
+            let s = format!("{stem}.mkv");
+            let out = p(&[&s]);
+            assert!(
+                out.len() <= MAX_COMPONENT_BYTES && out.ends_with(".mkv"),
+                "{} bytes: {out}",
+                out.len()
+            );
+        }
     }
 
     #[test]

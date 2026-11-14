@@ -54,9 +54,15 @@ fn is_format(c: char) -> bool {
 
 /// `s` as a user should see it: Unicode control (Cc) and format (Cf) characters
 /// dropped, every run of whitespace replaced by one space, surrounding
-/// whitespace trimmed, combining marks that have no kept character before them
-/// dropped, and the result cut to `max_chars` characters on a character
-/// boundary. Nothing usable left gives the empty string.
+/// whitespace trimmed, combining marks with nothing to sit on dropped (a mark at
+/// the start, or one after a separator that became this result's space), and the
+/// result cut to `max_chars` characters on a character boundary. Nothing usable
+/// left gives the empty string.
+///
+/// The result never starts or ends with a space, and cutting it short never
+/// glues two words together: a separator only goes in when at least one
+/// character can follow it, so a cut lands inside a word, not on the space
+/// between two.
 ///
 /// Control characters that Unicode classes as whitespace (`\t`, `\n`, `\r`,
 /// `U+0085`) count as whitespace here, so they separate words rather than
@@ -69,8 +75,7 @@ pub fn display_safe(s: &str, max_chars: usize) -> String {
     // Kept characters, spaces included: the cap counts characters.
     let mut kept = 0usize;
     // A separator seen since the last kept character. It becomes one space, or
-    // nothing at all while nothing is kept yet, which is what trims the front;
-    // one never goes on the end, because a run at the tail stays pending.
+    // nothing at all while nothing is kept yet, which is what trims the front.
     let mut space = false;
     for c in s.chars() {
         if c.is_whitespace() {
@@ -78,15 +83,22 @@ pub fn display_safe(s: &str, max_chars: usize) -> String {
             continue;
         }
         // Cc (the whitespace ones went above) and Cf are invisible: gone. A mark
-        // with nothing kept before it has no base to sit on, so it goes too.
-        if is_format(c) || c.is_control() || (kept == 0 && is_combining_mark(c)) {
+        // has no base when nothing was kept or the only thing since then is the
+        // separator pending here, so it goes too.
+        if is_format(c) || c.is_control() || ((kept == 0 || space) && is_combining_mark(c)) {
             continue;
         }
-        if space && kept > 0 && kept < max_chars {
+        if space && kept > 0 {
+            // Room for this space and one more character: without that the
+            // result would end on a space, or the next word would be glued to
+            // this one, so the string ends here instead.
+            if kept.saturating_add(2) > max_chars {
+                break;
+            }
             out.push(' ');
             kept += 1;
-            space = false;
         }
+        space = false;
         if kept == max_chars {
             break;
         }
@@ -100,20 +112,27 @@ pub fn display_safe(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    /// The table every caller relies on.
+    /// The table every caller relies on: `(input, max_chars, output)`.
     #[test]
     fn display_safe_table() {
-        for (input, want) in [
-            ("ok", "ok"),
-            ("a\u{202E}b", "ab"),
-            ("a\u{200B}\u{FEFF}b", "ab"),
-            ("a\nb\tc", "a b c"),
-            ("\u{301}x", "x"),
-            ("  a   b  ", "a b"),
-            ("\u{85}x", "x"), // C1 control (NEL): a separator, trimmed at the front
-            ("", ""),
+        for (input, max, want) in [
+            ("ok", MAX_DISPLAY_CHARS, "ok"),
+            ("a\u{202E}b", MAX_DISPLAY_CHARS, "ab"),
+            ("a\u{200B}\u{FEFF}b", MAX_DISPLAY_CHARS, "ab"),
+            ("a\nb\tc", MAX_DISPLAY_CHARS, "a b c"),
+            ("\u{301}x", MAX_DISPLAY_CHARS, "x"),
+            ("  a   b  ", MAX_DISPLAY_CHARS, "a b"),
+            // A mark after a collapsed separator has nothing to sit on either.
+            ("a \u{301}b", MAX_DISPLAY_CHARS, "a b"),
+            // C1 control (NEL): a separator, trimmed at the front.
+            ("\u{85}x", MAX_DISPLAY_CHARS, "x"),
+            ("", MAX_DISPLAY_CHARS, ""),
+            // A cut never leaves a space on the end and never glues words: it
+            // stops before a separator with no character to follow it.
+            ("ab c", 3, "ab"),
+            ("a b", 2, "a"),
         ] {
-            assert_eq!(display_safe(input, MAX_DISPLAY_CHARS), want, "{input:?}");
+            assert_eq!(display_safe(input, max), want, "{input:?} at {max}");
         }
         // 10 000 characters cut to `max_chars`, on a character boundary.
         let long = "é".repeat(10_000);
@@ -162,7 +181,8 @@ mod tests {
         assert_eq!(display_safe("a \t\n\r b", MAX_DISPLAY_CHARS), "a b");
     }
 
-    /// A mark stays when something precedes it and goes when nothing does.
+    /// A mark stays when a kept character precedes it, and goes when nothing it
+    /// could sit on does: the start, or a separator that became this space.
     #[test]
     fn marks_need_a_base() {
         // Composed and decomposed `é` both stay: neither is a lone mark.
@@ -171,7 +191,10 @@ mod tests {
         // A mark with nothing before it, and one whose base was dropped.
         assert_eq!(display_safe("\u{301}\u{302}x", MAX_DISPLAY_CHARS), "x");
         assert_eq!(display_safe("\u{202E}\u{301}x", MAX_DISPLAY_CHARS), "x");
-        // Marks elsewhere than the start are left alone.
+        // The mark on a separator is a mark on the space we emit for it, so it
+        // goes; `a \u{301}b` reads `a b`.
+        assert_eq!(display_safe("a \u{301}b", MAX_DISPLAY_CHARS), "a b");
+        // Marks elsewhere than those two places are left alone.
         assert_eq!(display_safe("x\u{301}y", MAX_DISPLAY_CHARS), "x\u{301}y");
     }
 
