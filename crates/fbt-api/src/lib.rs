@@ -53,8 +53,9 @@
 //! use fbt_api::{ApiConfig, ApiServer, Auth, AuthRejection, AuthRequest, Authenticator};
 //! use std::sync::Arc;
 //!
-//! /// Lets through the requests carrying `x-session: letmein`. In an app this is
-//! /// the table of session tokens your own login route fills.
+//! /// Lets through the requests carrying `x-session: letmein`, and the login
+//! /// route that hands out that token. In an app the table of session tokens is
+//! /// what a real authenticator would check.
 //! #[derive(Debug)]
 //! struct Gate;
 //!
@@ -62,6 +63,9 @@
 //!     fn authorize(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
 //!         match request.headers.get("x-session") {
 //!             Some(value) if value == "letmein" => Ok(()),
+//!             // Nothing else is exempt — only CORS preflights skip the
+//!             // authenticator — so this route must be let through by name.
+//!             _ if request.matched_path == Some("/api/v1/auth/login") => Ok(()),
 //!             _ => Err(AuthRejection::Unauthorized),
 //!         }
 //!     }
@@ -212,10 +216,16 @@ pub fn router(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiE
 ///
 /// The `?token=` query token stays fbt-api's own: only its file-stream and event
 /// routes accept it, so an extra route authenticates through the header — or
-/// whatever your authenticator accepts. And `max_body_bytes` is axum's
-/// `DefaultBodyLimit`, which the body extractors (`Bytes`, `String`, `Json`,
-/// `Form`, …) enforce: a handler of yours that takes `Request` or `Body` and
-/// consumes frames itself is not limited by it, so cap such a body yourself.
+/// whatever your authenticator accepts. Nothing of yours is exempt, either: only
+/// CORS preflights are answered before auth, so a login route on `extra` has to
+/// be let through by your [`Authenticator`] — possible under [`Auth::Custom`]
+/// alone, because [`Auth::Token`] wants the bearer token from every request that
+/// is not fbt-api's own document.
+///
+/// And `max_body_bytes` is axum's `DefaultBodyLimit`, which the body extractors
+/// (`Bytes`, `String`, `Json`, `Form`, …) enforce: a handler of yours that takes
+/// `Request` or `Body` and consumes frames itself is not limited by it, so cap
+/// such a body yourself.
 ///
 /// fbt-api's own exemptions are recognised at the *end* of the matched path (so
 /// its router can be nested under a prefix), which an extra route can trip:
@@ -227,14 +237,14 @@ pub fn router(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiE
 /// # Panics
 ///
 /// When `extra` registers a route fbt-api already serves: axum panics when two
-/// routers answer the same method on the same path (`get` answers `HEAD` too, so
-/// an extra `HEAD` collides with a served `GET`). Everything fbt-api serves is
+/// routers answer the same method on the same path. Everything fbt-api serves is
 /// under `/api/v1/`, exactly the paths [`openapi()`] lists — pick other ones
 /// (`/api/v1/auth/login` and `/api/v1/fs/tree` are free, `GET /api/v1/session`
-/// is not). Adding a *different* method to a path fbt-api serves merges without
-/// panicking; do not: neither the document nor the auth rules would know it. If
-/// `extra` has a fallback of its own, that one then answers paths neither router
-/// matches.
+/// is not). Do not add a method to a path fbt-api serves either: a different one
+/// merges without panicking, but neither the document nor the auth rules would
+/// know it, and a `HEAD` there silently takes over what that path answers to
+/// `HEAD`. If `extra` has a fallback of its own, that one then answers paths
+/// neither router matches.
 ///
 /// # Errors
 ///
