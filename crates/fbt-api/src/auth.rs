@@ -46,18 +46,25 @@ const MAX_QUERY_TOKEN: usize = 4096;
 /// request — `openapi.json` included, CORS preflights still excepted —
 /// whether the client may proceed.
 ///
-/// The check is synchronous and runs on the connection's task inside
-/// `std::panic::catch_unwind`: keep it cheap (session tokens in memory;
-/// anything slower belongs in a login route of your own), and a panic gets
-/// that request a `500` while the server keeps serving.
+/// The check is synchronous and runs on the connection's task: keep it cheap
+/// (session tokens in memory; anything slower belongs in a login route of
+/// your own). It runs inside `std::panic::catch_unwind` under
+/// `AssertUnwindSafe`: a panic is caught, gets that request a `500` while the
+/// server keeps serving, and is still printed to stderr by the process's
+/// panic hook — but unwind safety here is asserted, not proven, so state this
+/// authenticator holds may be left inconsistent by a panic; make it robust to
+/// that (or hold none).
 pub trait Authenticator: Send + Sync + std::fmt::Debug + 'static {
     /// Allows the request (`Ok(())`) or rejects it with its [`AuthRejection`].
     fn authorize(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection>;
 }
 
 /// What an [`Authenticator`] gets from a request, built by the auth layer for
-/// every request handed to [`Auth::Custom`].
+/// every request handed to [`Auth::Custom`]. Outside this crate build one with
+/// [`AuthRequest::new`] (the struct is non-exhaustive) — enough to unit-test
+/// an `Authenticator` directly.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct AuthRequest<'a> {
     /// The request's method.
     pub method: &'a Method,
@@ -77,10 +84,33 @@ pub struct AuthRequest<'a> {
     pub peer: Option<SocketAddr>,
 }
 
+impl<'a> AuthRequest<'a> {
+    /// Builds a request from its parts, the way the auth layer does: for
+    /// unit-testing an [`Authenticator`] away from a server. Pass what the
+    /// real layer would: `matched_path` as the route template or `None`,
+    /// `query_token` only as the decoded value of the routes that take one.
+    pub fn new(
+        method: &'a Method,
+        matched_path: Option<&'a str>,
+        headers: &'a HeaderMap,
+        query_token: Option<&'a str>,
+        peer: Option<SocketAddr>,
+    ) -> AuthRequest<'a> {
+        AuthRequest {
+            method,
+            matched_path,
+            headers,
+            query_token,
+            peer,
+        }
+    }
+}
+
 /// How an [`Authenticator`] rejects a request. The auth layer answers each
 /// variant with the crate's standard error body and the status and headers
 /// named here.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AuthRejection {
     /// `401`, exactly like a wrong bearer token today: the same body and
     /// `WWW-Authenticate: Bearer`.
@@ -155,13 +185,13 @@ fn check_custom(
     // The query token only on the routes that take it today; a value that
     // is not valid UTF-8 (or longer than `MAX_QUERY_TOKEN`, which decoding
     // already refuses) is as good as absent for a `&str` API.
-    let query = match route_in(QUERY_TOKEN, req.method(), matched) {
-        true => req
-            .uri()
+    let query = if route_in(QUERY_TOKEN, req.method(), matched) {
+        req.uri()
             .query()
             .and_then(query_token)
-            .and_then(|bytes| String::from_utf8(bytes).ok()),
-        false => None,
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    } else {
+        None
     };
     let peer = req
         .extensions()

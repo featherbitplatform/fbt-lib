@@ -44,9 +44,10 @@
 //!
 //! Every client is untrusted until authenticated: request bodies, query
 //! strings, path parameters and headers never panic the server, and every
-//! body and collection has a size cap. A token holder is fully trusted:
-//! the API is the session's own control surface
-//! ([`ApiConfig::allowed_roots`] limits the paths it may name).
+//! body and collection has a size cap. A client the configured [`Auth`]
+//! admits — a token holder, or whoever your [`Auth::Custom`] authenticator
+//! lets through — is fully trusted: the API is the session's own control
+//! surface ([`ApiConfig::allowed_roots`] limits the paths it may name).
 //!
 //! - **Token.** With [`Auth::Token`] every request but
 //!   `GET /api/v1/openapi.json` and CORS preflights needs

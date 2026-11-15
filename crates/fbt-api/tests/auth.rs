@@ -547,6 +547,17 @@ impl Authenticator for PanicOnce {
     }
 }
 
+/// Rejects everything and counts how often it was asked.
+#[derive(Debug)]
+struct CountingReject(std::sync::atomic::AtomicUsize);
+
+impl Authenticator for CountingReject {
+    fn authorize(&self, _request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(AuthRejection::Unauthorized)
+    }
+}
+
 /// `router` with `Auth::Custom(auth)` and a fixed loopback peer injected as
 /// axum's `ConnectInfo` (what `ApiServer` attaches to every request). The
 /// middleware is added with `.layer`, so it runs ahead of the auth layer and
@@ -732,4 +743,68 @@ async fn custom_panic_is_500() {
     let (status, _, body) = call(&app, get_req("/api/v1/session")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json(&body)["torrents"], 0);
+}
+
+#[tokio::test]
+async fn custom_cors_preflight_skips_authenticator() {
+    let session = session().await;
+    let gate = Arc::new(CountingReject(std::sync::atomic::AtomicUsize::new(0)));
+    let mut config = test_config();
+    config.auth = Auth::Custom(gate.clone());
+    config.cors_origins = vec!["http://ui.example".to_owned()];
+    let app = router(session, &config).expect("router");
+
+    // The CORS layer, outside auth, answers the preflight itself: the
+    // authenticator is never asked.
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/api/v1/session")
+        .header("origin", "http://ui.example")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "authorization")
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, headers, _) = call(&app, req).await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(headers["access-control-allow-origin"], "http://ui.example");
+    assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    // A plain request is not a preflight and does reach the authenticator —
+    // so the counter counts; it just never saw the preflight.
+    let (status, _, _) = call(&app, get_req("/api/v1/session")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// Embedders unit-test their authenticator: `AuthRequest::new` builds what
+/// the auth layer would hand it, no server involved (the struct itself is
+/// non-exhaustive, so outside fbt-api this constructor is how one builds it).
+#[test]
+fn custom_authenticator_is_callable_directly() {
+    let recorder = Recorder::default();
+    let method = Method::GET;
+    let headers = axum::http::HeaderMap::new();
+    let peer = "203.0.113.7:52000"
+        .parse::<SocketAddr>()
+        .expect("peer address");
+    let request = AuthRequest::new(
+        &method,
+        Some("/api/v1/torrents"),
+        &headers,
+        Some("tok"),
+        Some(peer),
+    );
+    assert!(recorder.authorize(&request).is_ok());
+    let seen = recorder.seen();
+    assert_eq!(seen.method, "GET");
+    assert_eq!(seen.matched_path.as_deref(), Some("/api/v1/torrents"));
+    assert_eq!(seen.query_token.as_deref(), Some("tok"));
+    assert_eq!(seen.peer, Some(peer));
+
+    // Rejections come back the same way.
+    let request = AuthRequest::new(&method, None, &headers, None, None);
+    assert!(matches!(
+        HeaderGate.authorize(&request),
+        Err(AuthRejection::Unauthorized)
+    ));
 }

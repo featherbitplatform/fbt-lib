@@ -101,6 +101,18 @@ fn authenticator_surface(
     Auth::Custom(a)
 }
 
+/// `AuthRequest` is non-exhaustive, so outside the crate its constructor is
+/// the public way to build one; pin its signature.
+fn auth_request_ctor<'a>(
+    method: &'a Method,
+    matched_path: Option<&'a str>,
+    headers: &'a HeaderMap,
+    query_token: Option<&'a str>,
+    peer: Option<SocketAddr>,
+) -> AuthRequest<'a> {
+    AuthRequest::new(method, matched_path, headers, query_token, peer)
+}
+
 #[test]
 fn defaults() {
     let c = ApiConfig::default();
