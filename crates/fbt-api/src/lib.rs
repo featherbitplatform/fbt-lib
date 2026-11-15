@@ -40,6 +40,11 @@
 //! # }
 //! ```
 //!
+//! [`ApiServer::start_with`] serves routes of your own beside the API, merged
+//! ahead of the auth, body-limit and CORS layers so they get every one of them
+//! ([`router_with`] does the same for a router you mount yourself). They must
+//! not repeat a path the API serves — those are the ones [`openapi()`] lists.
+//!
 //! # Security model
 //!
 //! Every client is untrusted until authenticated: request bodies, query
@@ -153,7 +158,43 @@ pub use server::ApiServer;
 /// exist, [`ApiError::InvalidLimits`] for a `max_connections` that does not
 /// exceed the stream caps.
 pub fn router(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiError> {
-    build_router(session, config, CancellationToken::new())
+    build_router(
+        session,
+        config,
+        CancellationToken::new(),
+        axum::Router::new(),
+    )
+}
+
+/// [`router`], with `extra` — routes of your own, whose handlers carry whatever
+/// state they need — merged into the API's, ahead of its layers. They are
+/// authenticated by the same [`Auth`] (the bearer token under [`Auth::Token`],
+/// the loopback guard under [`Auth::Disabled`], your [`Authenticator`] under
+/// [`Auth::Custom`], which sees them with their matched path), refuse bodies
+/// over [`ApiConfig::max_body_bytes`] and get the same CORS layer as fbt-api's
+/// own routes. Served by [`ApiServer::start_with`] they also hold one of its
+/// connection slots and end with its stall guard. The `?token=` query token
+/// stays fbt-api's own: only its file-stream and event routes accept it, so an
+/// extra route needs the header — or whatever your authenticator accepts.
+///
+/// # Panics
+///
+/// When `extra` registers a route fbt-api already serves: merging two routers
+/// that answer the same method on the same path panics in axum. Everything
+/// fbt-api serves is under `/api/v1/`, exactly the paths [`openapi()`] lists —
+/// so pick other ones (`/api/v1/auth/login` and `/api/v1/fs/tree` are free,
+/// `GET /api/v1/session` is not). If `extra` has a fallback of its own, that
+/// one then answers paths neither router matches.
+///
+/// # Errors
+///
+/// Those of [`router`].
+pub fn router_with(
+    session: Session,
+    config: &ApiConfig,
+    extra: axum::Router,
+) -> Result<axum::Router, ApiError> {
+    build_router(session, config, CancellationToken::new(), extra)
 }
 
 /// [`router`], whose long-lived bodies (events, file streams) also end
@@ -201,7 +242,7 @@ pub fn router_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<axum::Router, ApiError> {
     let token = CancellationToken::new();
-    let router = build_router(session, config, token.clone())?;
+    let router = build_router(session, config, token.clone(), axum::Router::new())?;
     // Cancelled when the last router clone goes, so the task does not
     // outlive the router when `shutdown` never completes.
     let dropped = CancellationToken::new();
@@ -218,11 +259,13 @@ pub fn router_with_shutdown(
     Ok(router.layer(axum::Extension(guard)))
 }
 
-/// [`router`], whose long-lived bodies also end when `shutdown` fires.
+/// [`router`], whose long-lived bodies also end when `shutdown` fires, with
+/// `extra` merged in ahead of the layers ([`router_with`]).
 pub(crate) fn build_router(
     session: Session,
     config: &ApiConfig,
     shutdown: CancellationToken,
+    extra: axum::Router,
 ) -> Result<axum::Router, ApiError> {
     let validated = config.validate()?;
     let auth = auth::AuthState {
@@ -232,10 +275,14 @@ pub(crate) fn build_router(
     let state = routes::AppState::new(session, config, validated.roots, shutdown);
     let (router, _) = routes::api_router().split_for_parts();
     // `layer` wraps outside what came before: routes, then auth, then CORS.
+    // `extra` is merged before them — after the state is gone, so it needs
+    // none of its own — which is what puts every layer, and the matched path
+    // the auth layer reads, on its routes too.
     let router = router
+        .with_state(state)
+        .merge(extra)
         .layer(axum::middleware::from_fn_with_state(auth, auth::layer))
-        .layer(DefaultBodyLimit::max(config.max_body_bytes))
-        .with_state(state);
+        .layer(DefaultBodyLimit::max(config.max_body_bytes));
     if validated.origins.is_empty() {
         return Ok(router);
     }

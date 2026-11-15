@@ -12,7 +12,8 @@ use axum::http::{HeaderMap, Method};
 use fbt::Session;
 use fbt_api::range::{RangeOutcome, parse_range};
 use fbt_api::{
-    ApiConfig, ApiError, ApiServer, Auth, MAX_BODY_BYTES, openapi, router, router_with_shutdown,
+    ApiConfig, ApiError, ApiServer, Auth, MAX_BODY_BYTES, openapi, router, router_with,
+    router_with_shutdown,
 };
 use fbt_api::{AuthRejection, AuthRequest, Authenticator};
 
@@ -20,6 +21,7 @@ const _: usize = MAX_BODY_BYTES;
 
 fn functions() {
     let _: fn(Session, &ApiConfig) -> Result<axum::Router, ApiError> = router;
+    let _: fn(Session, &ApiConfig, axum::Router) -> Result<axum::Router, ApiError> = router_with;
     let _: fn() -> utoipa::openapi::OpenApi = openapi;
     let _: ApiConfig = ApiConfig::new(String::new());
     let _: ApiConfig = ApiConfig::new("token");
@@ -45,6 +47,18 @@ fn mounted(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiErro
 
 async fn server(session: Session, config: ApiConfig) -> Result<(), ApiError> {
     let server: ApiServer = ApiServer::start(session, config).await?;
+    server.shutdown().await;
+    Ok(())
+}
+
+/// [`ApiServer::start_with`] takes the embedder's own routes as a plain
+/// `axum::Router`, served behind fbt-api's layers.
+async fn server_with_extra(
+    session: Session,
+    config: ApiConfig,
+    extra: axum::Router,
+) -> Result<(), ApiError> {
+    let server: ApiServer = ApiServer::start_with(session, config, extra).await?;
     server.shutdown().await;
     Ok(())
 }

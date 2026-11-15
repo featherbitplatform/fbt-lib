@@ -78,8 +78,52 @@ impl ApiServer {
     /// The config errors of [`router`](crate::router), and
     /// [`ApiError::Bind`] when the address cannot be bound.
     pub async fn start(session: Session, config: ApiConfig) -> Result<ApiServer, ApiError> {
+        Self::start_with(session, config, Router::new()).await
+    }
+
+    /// [`start`](Self::start), with `extra` — routes of your own — served
+    /// beside the API on this listener. They are merged ahead of fbt-api's
+    /// auth, body-limit and CORS layers ([`router_with`](crate::router_with)
+    /// spells that out for a router you mount yourself): the same
+    /// [`Auth`](crate::Auth) decides who may reach them, and a body over
+    /// [`ApiConfig::max_body_bytes`] is refused there too. Being on this
+    /// listener, they hold one of [`ApiConfig::max_connections`] slots, end
+    /// with the stall guard
+    /// ([`ApiConfig::stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout))
+    /// and close on [`shutdown`](Self::shutdown).
+    ///
+    /// ```no_run
+    /// # async fn demo(session: fbt::Session) -> Result<(), Box<dyn std::error::Error>> {
+    /// use axum::{Router, routing::get};
+    /// use fbt_api::{ApiConfig, ApiServer};
+    ///
+    /// // The embedder's own routes, on paths fbt-api does not serve.
+    /// let mine = Router::new().route("/api/v1/auth/login", get(|| async { "log in" }));
+    /// let server = ApiServer::start_with(session, ApiConfig::new("secret-token"), mine).await?;
+    /// println!("API on http://{}", server.local_addr());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When `extra` registers a route fbt-api already serves: merging two
+    /// routers that answer the same method on the same path panics in axum.
+    /// Everything fbt-api serves is under `/api/v1/`, exactly the paths
+    /// [`openapi`](crate::openapi) lists — so pick other ones
+    /// (`/api/v1/auth/login` and `/api/v1/fs/tree` are free,
+    /// `GET /api/v1/session` is not).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`start`](Self::start).
+    pub async fn start_with(
+        session: Session,
+        config: ApiConfig,
+        extra: Router,
+    ) -> Result<ApiServer, ApiError> {
         let shutdown = CancellationToken::new();
-        let router = crate::build_router(session, &config, shutdown.clone())?;
+        let router = crate::build_router(session, &config, shutdown.clone(), extra)?;
         let listener = TcpListener::bind(config.bind)
             .await
             .map_err(ApiError::Bind)?;
