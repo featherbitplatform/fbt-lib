@@ -5,18 +5,23 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::{HeaderMap, Method};
 use fbt::Session;
 use fbt_api::range::{RangeOutcome, parse_range};
 use fbt_api::{
-    ApiConfig, ApiError, ApiServer, Auth, MAX_BODY_BYTES, openapi, router, router_with_shutdown,
+    ApiConfig, ApiError, ApiServer, Auth, MAX_BODY_BYTES, openapi, router, router_with,
+    router_with_shutdown,
 };
+use fbt_api::{AuthRejection, AuthRequest, Authenticator};
 
 const _: usize = MAX_BODY_BYTES;
 
 fn functions() {
     let _: fn(Session, &ApiConfig) -> Result<axum::Router, ApiError> = router;
+    let _: fn(Session, &ApiConfig, axum::Router) -> Result<axum::Router, ApiError> = router_with;
     let _: fn() -> utoipa::openapi::OpenApi = openapi;
     let _: ApiConfig = ApiConfig::new(String::new());
     let _: ApiConfig = ApiConfig::new("token");
@@ -46,6 +51,18 @@ async fn server(session: Session, config: ApiConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// [`ApiServer::start_with`] takes the embedder's own routes as a plain
+/// `axum::Router`, served behind fbt-api's layers.
+async fn server_with_extra(
+    session: Session,
+    config: ApiConfig,
+    extra: axum::Router,
+) -> Result<(), ApiError> {
+    let server: ApiServer = ApiServer::start_with(session, config, extra).await?;
+    server.shutdown().await;
+    Ok(())
+}
+
 fn config_fields(c: &mut ApiConfig) {
     let _: &mut SocketAddr = &mut c.bind;
     let _: &mut Auth = &mut c.auth;
@@ -59,7 +76,7 @@ fn config_fields(c: &mut ApiConfig) {
 }
 
 fn variants(a: &Auth, e: &ApiError) -> bool {
-    matches!(a, Auth::Token(_) | Auth::Disabled)
+    matches!(a, Auth::Token(_) | Auth::Disabled | Auth::Custom(_))
         && matches!(
             e,
             ApiError::EmptyToken
@@ -70,6 +87,44 @@ fn variants(a: &Auth, e: &ApiError) -> bool {
                 | ApiError::NoRuntime
                 | ApiError::Bind(_)
         )
+}
+
+/// The pluggable-authenticator surface: `Auth::Custom` carries an
+/// `Arc<dyn Authenticator>`, the request exposes these fields, and every
+/// rejection variant is one of these.
+fn authenticator_surface(
+    a: Arc<dyn Authenticator>,
+    r: &AuthRequest<'_>,
+    rej: &AuthRejection,
+) -> Auth {
+    let _: fn(&dyn Authenticator, &AuthRequest<'_>) -> Result<(), AuthRejection> =
+        <dyn Authenticator>::authorize;
+    let _: &Method = r.method;
+    let _: Option<&str> = r.matched_path;
+    let _: &HeaderMap = r.headers;
+    let _: Option<&str> = r.query_token;
+    let _: Option<SocketAddr> = r.peer;
+    assert!(matches!(
+        rej,
+        AuthRejection::Unauthorized
+            | AuthRejection::Forbidden
+            | AuthRejection::TooManyRequests {
+                retry_after_secs: _
+            }
+    ));
+    Auth::Custom(a)
+}
+
+/// `AuthRequest` is non-exhaustive, so outside the crate its constructor is
+/// the public way to build one; pin its signature.
+fn auth_request_ctor<'a>(
+    method: &'a Method,
+    matched_path: Option<&'a str>,
+    headers: &'a HeaderMap,
+    query_token: Option<&'a str>,
+    peer: Option<SocketAddr>,
+) -> AuthRequest<'a> {
+    AuthRequest::new(method, matched_path, headers, query_token, peer)
 }
 
 #[test]

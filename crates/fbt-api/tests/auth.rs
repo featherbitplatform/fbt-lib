@@ -1,15 +1,16 @@
-//! Bearer auth, the `Auth::Disabled` guard, config validation, CORS and
-//! server shutdown.
+//! Bearer auth, the `Auth::Disabled` guard, the `Auth::Custom`
+//! authenticator, config validation, CORS and server shutdown.
 
 mod support;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::extract::{ConnectInfo, Request, State};
 use bytes::Bytes;
 use fbt::Session;
-use fbt_api::{ApiConfig, ApiError, Auth, router};
+use fbt_api::{ApiConfig, ApiError, Auth, AuthRejection, AuthRequest, Authenticator, router};
 use http_body_util::Full;
 use hyper::header::{AUTHORIZATION, HOST, ORIGIN, WWW_AUTHENTICATE};
 use hyper::{Method, StatusCode};
@@ -457,4 +458,353 @@ async fn every_documented_route_needs_the_token() {
     }
     assert!(checked >= 30, "{checked} operations checked");
     server.shutdown().await;
+}
+
+/// What a [`Recorder`] last saw, as owned values.
+#[derive(Clone, Debug)]
+struct Seen {
+    method: String,
+    matched_path: Option<String>,
+    query_token: Option<String>,
+    peer: Option<SocketAddr>,
+}
+
+/// An `Authenticator` that allows everything and records what it saw.
+#[derive(Debug, Default)]
+struct Recorder(std::sync::Mutex<Option<Seen>>);
+
+impl Authenticator for Recorder {
+    fn authorize(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        let seen = Seen {
+            method: request.method.as_str().to_owned(),
+            matched_path: request.matched_path.map(str::to_owned),
+            query_token: request.query_token.map(str::to_owned),
+            peer: request.peer,
+        };
+        *self.0.lock().expect("no panic under the lock") = Some(seen);
+        Ok(())
+    }
+}
+
+impl Recorder {
+    /// What the last request looked like to the authenticator.
+    fn seen(&self) -> Seen {
+        self.0
+            .lock()
+            .expect("no panic under the lock")
+            .clone()
+            .expect("a request was authorized")
+    }
+}
+
+/// Allows only requests carrying `x-test: ok`, rejecting the rest as
+/// unauthenticated.
+#[derive(Debug)]
+struct HeaderGate;
+
+impl Authenticator for HeaderGate {
+    fn authorize(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        match request.headers.get("x-test") {
+            Some(value) if value == "ok" => Ok(()),
+            _ => Err(AuthRejection::Unauthorized),
+        }
+    }
+}
+
+/// Rejects everything as forbidden.
+#[derive(Debug)]
+struct ForbidAll;
+
+impl Authenticator for ForbidAll {
+    fn authorize(&self, _request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        Err(AuthRejection::Forbidden)
+    }
+}
+
+/// Rejects everything as rate limited, asking for a 7 s retry.
+#[derive(Debug)]
+struct RateLimited;
+
+impl Authenticator for RateLimited {
+    fn authorize(&self, _request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        Err(AuthRejection::TooManyRequests {
+            retry_after_secs: 7,
+        })
+    }
+}
+
+/// Panics on its first call, then allows everything.
+#[derive(Debug, Default)]
+struct PanicOnce(std::sync::atomic::AtomicBool);
+
+impl Authenticator for PanicOnce {
+    fn authorize(&self, _request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        if self.0.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            Ok(())
+        } else {
+            panic!("authenticator exploded");
+        }
+    }
+}
+
+/// Rejects everything and counts how often it was asked.
+#[derive(Debug)]
+struct CountingReject(std::sync::atomic::AtomicUsize);
+
+impl Authenticator for CountingReject {
+    fn authorize(&self, _request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(AuthRejection::Unauthorized)
+    }
+}
+
+/// `router` with `Auth::Custom(auth)` and a fixed loopback peer injected as
+/// axum's `ConnectInfo` (what `ApiServer` attaches to every request). The
+/// middleware is added with `.layer`, so it runs ahead of the auth layer and
+/// the extension is visible there — the same unit-level injection
+/// [`disabled_from_peer`] uses.
+fn custom_router(session: &Session, auth: Arc<dyn Authenticator>) -> axum::Router {
+    let peer = "127.0.0.1:52000"
+        .parse::<SocketAddr>()
+        .expect("peer address");
+    let mut config = test_config();
+    config.auth = Auth::Custom(auth);
+    router(session.clone(), &config)
+        .expect("router")
+        .layer(axum::middleware::from_fn(
+            move |mut req: Request, next: axum::middleware::Next| async move {
+                let _ = req.extensions_mut().insert(ConnectInfo(peer));
+                next.run(req).await
+            },
+        ))
+}
+
+/// Sends `req` through `app` and reads status, headers and the whole body.
+async fn call(app: &axum::Router, req: Request) -> (StatusCode, axum::http::HeaderMap, Bytes) {
+    let res = app
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("router is infallible");
+    let (parts, body) = res.into_parts();
+    (
+        parts.status,
+        parts.headers,
+        to_bytes(body, 1 << 20).await.expect("body reads"),
+    )
+}
+
+/// [`call`]'s status only: for the event stream, whose body never ends and
+/// must be dropped unread.
+async fn call_status(app: &axum::Router, req: Request) -> StatusCode {
+    let res = app
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("router is infallible");
+    let (parts, _stream) = res.into_parts();
+    parts.status
+}
+
+fn get_req(uri: &str) -> Request {
+    Request::get(uri)
+        .body(Body::empty())
+        .expect("request builds")
+}
+
+#[tokio::test]
+async fn custom_allows_and_rejects() {
+    let session = session().await;
+    let app = custom_router(&session, Arc::new(HeaderGate));
+
+    let req = Request::get("/api/v1/session")
+        .header("x-test", "ok")
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _, body) = call(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["torrents"], 0);
+
+    // The rejection's status and body, `WWW-Authenticate` included.
+    let (status, headers, body) = call(&app, get_req("/api/v1/session")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers["www-authenticate"], "Bearer");
+    assert_eq!(error_code(&body), "unauthorized");
+
+    // With `Token`, `openapi.json` is exempt; with `Custom` the embedder's
+    // authenticator decides for it too.
+    let (status, _, _) = call(&app, get_req("/api/v1/openapi.json")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let req = Request::get("/api/v1/openapi.json")
+        .header("x-test", "ok")
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _, body) = call(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json(&body)["paths"]["/api/v1/session"].is_object());
+}
+
+#[tokio::test]
+async fn custom_sees_peer_and_matched_path() {
+    let session = session().await;
+    let recorder = Arc::new(Recorder::default());
+    let app = custom_router(&session, recorder.clone());
+    let (status, _, body) = call(&app, get_req("/api/v1/torrents")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json(&body).as_array().expect("list").is_empty());
+
+    let seen = recorder.seen();
+    assert_eq!(seen.method, "GET");
+    assert_eq!(seen.matched_path.as_deref(), Some("/api/v1/torrents"));
+    assert_eq!(seen.query_token, None);
+    assert_eq!(
+        seen.peer.map(|peer| peer.ip().to_string()),
+        Some("127.0.0.1".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn query_token_only_on_stream_and_events() {
+    let session = session().await;
+    let recorder = Arc::new(Recorder::default());
+    let app = custom_router(&session, recorder.clone());
+
+    // The event stream sees the percent-decoded token (its body never ends:
+    // read only the status).
+    let status = call_status(&app, get_req("/api/v1/events?token=a%2Bb+c")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recorder.seen().query_token.as_deref(), Some("a+b c"));
+
+    // The file stream too — an unknown id still proves the authenticator ran,
+    // since the 404 comes from the handler behind it.
+    let stream = format!(
+        "/api/v1/torrents/{}/files/0/stream?token=abc",
+        "ab".repeat(20)
+    );
+    let (status, _, body) = call(&app, get_req(&stream)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&body), "not_found");
+    assert_eq!(recorder.seen().query_token.as_deref(), Some("abc"));
+
+    // Every other route ignores the parameter.
+    let (status, _, _) = call(&app, get_req("/api/v1/session?token=abc")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recorder.seen().query_token, None);
+
+    // The cap is 4096 decoded bytes: exactly that reaches the authenticator,
+    // one byte more does not.
+    let status = call_status(
+        &app,
+        get_req(&format!("/api/v1/events?token={}", "a".repeat(4096))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        recorder.seen().query_token.as_deref().map(str::len),
+        Some(4096)
+    );
+    let status = call_status(
+        &app,
+        get_req(&format!("/api/v1/events?token={}", "a".repeat(4097))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recorder.seen().query_token, None);
+}
+
+#[tokio::test]
+async fn custom_forbidden_and_429() {
+    let session = session().await;
+    let app = custom_router(&session, Arc::new(ForbidAll));
+    let (status, _, body) = call(&app, get_req("/api/v1/session")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error_code(&body), "forbidden");
+
+    let app = custom_router(&session, Arc::new(RateLimited));
+    let (status, headers, body) = call(&app, get_req("/api/v1/session")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["retry-after"], "7");
+    assert_eq!(error_code(&body), "too_many_requests");
+}
+
+#[tokio::test]
+async fn custom_panic_is_500() {
+    let session = session().await;
+    let app = custom_router(&session, Arc::new(PanicOnce::default()));
+
+    let (status, _, body) = call(&app, get_req("/api/v1/session")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error_code(&body), "internal");
+    // The standard body: the panic's own message does not leak to the client.
+    let text = String::from_utf8(body.to_vec()).expect("body is UTF-8");
+    assert!(!text.contains("exploded"), "{text}");
+
+    // The connection and the server keep working: the next request is served.
+    let (status, _, body) = call(&app, get_req("/api/v1/session")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["torrents"], 0);
+}
+
+#[tokio::test]
+async fn custom_cors_preflight_skips_authenticator() {
+    let session = session().await;
+    let gate = Arc::new(CountingReject(std::sync::atomic::AtomicUsize::new(0)));
+    let mut config = test_config();
+    config.auth = Auth::Custom(gate.clone());
+    config.cors_origins = vec!["http://ui.example".to_owned()];
+    let app = router(session, &config).expect("router");
+
+    // The CORS layer, outside auth, answers the preflight itself: the
+    // authenticator is never asked.
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/api/v1/session")
+        .header("origin", "http://ui.example")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "authorization")
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, headers, _) = call(&app, req).await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(headers["access-control-allow-origin"], "http://ui.example");
+    assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    // A plain request is not a preflight and does reach the authenticator —
+    // so the counter counts; it just never saw the preflight.
+    let (status, _, _) = call(&app, get_req("/api/v1/session")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(gate.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// Embedders unit-test their authenticator: `AuthRequest::new` builds what
+/// the auth layer would hand it, no server involved (the struct itself is
+/// non-exhaustive, so outside fbt-api this constructor is how one builds it).
+#[test]
+fn custom_authenticator_is_callable_directly() {
+    let recorder = Recorder::default();
+    let method = Method::GET;
+    let headers = axum::http::HeaderMap::new();
+    let peer = "203.0.113.7:52000"
+        .parse::<SocketAddr>()
+        .expect("peer address");
+    let request = AuthRequest::new(
+        &method,
+        Some("/api/v1/torrents"),
+        &headers,
+        Some("tok"),
+        Some(peer),
+    );
+    assert!(recorder.authorize(&request).is_ok());
+    let seen = recorder.seen();
+    assert_eq!(seen.method, "GET");
+    assert_eq!(seen.matched_path.as_deref(), Some("/api/v1/torrents"));
+    assert_eq!(seen.query_token.as_deref(), Some("tok"));
+    assert_eq!(seen.peer, Some(peer));
+
+    // Rejections come back the same way.
+    let request = AuthRequest::new(&method, None, &headers, None, None);
+    assert!(matches!(
+        HeaderGate.authorize(&request),
+        Err(AuthRejection::Unauthorized)
+    ));
 }

@@ -65,7 +65,8 @@ pub enum ApiError {
 /// `invalid_path`; `401` `unauthorized` (with `WWW-Authenticate: Bearer`);
 /// `403` `path_not_allowed`, `forbidden`; `404` `not_found`; `409`
 /// `no_metadata`, `duplicate_torrent`, `busy`, `already_exists`; `413`
-/// `body_too_large`; `416` `range_not_satisfiable`; `501` `unsupported`;
+/// `body_too_large`; `416` `range_not_satisfiable`; `429`
+/// `too_many_requests` (with `Retry-After: <seconds>`); `501` `unsupported`;
 /// `503` `too_many_streams` (with `Retry-After: 1`), `shutting_down`,
 /// `dht_disabled`, `busy` (too many torrent creations); `500` `internal`.
 #[derive(Debug)]
@@ -76,6 +77,8 @@ pub(crate) struct ApiErrorResponse {
     pub(crate) code: &'static str,
     /// A human-readable message.
     pub(crate) message: String,
+    /// `Retry-After` delay-seconds to send, when the client should come back.
+    pub(crate) retry_after_secs: Option<u64>,
 }
 
 impl ApiErrorResponse {
@@ -85,6 +88,7 @@ impl ApiErrorResponse {
             status,
             code,
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -114,11 +118,24 @@ impl ApiErrorResponse {
 
     /// `503 too_many_streams`, with `Retry-After: 1`.
     pub(crate) fn too_many_streams() -> Self {
-        Self::new(
+        let mut e = Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "too_many_streams",
             "too many open streams, retry later",
-        )
+        );
+        e.retry_after_secs = Some(1);
+        e
+    }
+
+    /// `429 too_many_requests`, with `Retry-After: <retry_after_secs>`.
+    pub(crate) fn too_many_requests(retry_after_secs: u64) -> Self {
+        let mut e = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_requests",
+            "too many requests, retry later",
+        );
+        e.retry_after_secs = Some(retry_after_secs);
+        e
     }
 
     /// `500 internal`.
@@ -139,16 +156,13 @@ impl IntoResponse for ApiErrorResponse {
             },
         };
         let mut res = (self.status, axum::Json(body)).into_response();
-        match self.code {
-            "unauthorized" => {
-                res.headers_mut()
-                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-            }
-            "too_many_streams" => {
-                res.headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            }
-            _ => {}
+        if self.code == "unauthorized" {
+            res.headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        if let Some(secs) = self.retry_after_secs {
+            // `Retry-After` as delay-seconds; the http crate renders a u64.
+            res.headers_mut().insert(header::RETRY_AFTER, secs.into());
         }
         res
     }

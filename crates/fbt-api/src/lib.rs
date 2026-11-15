@@ -40,13 +40,58 @@
 //! # }
 //! ```
 //!
+//! [`ApiServer::start_with`] serves routes of your own beside the API, merged
+//! ahead of the auth, body-limit and CORS layers so all three apply to them
+//! ([`router_with`] does the same for a router you mount yourself, and says what
+//! the limit does and does not reach). They must not repeat a path the API
+//! serves — those are the ones [`openapi()`] lists. Here an [`Auth::Custom`]
+//! authenticator and a login route share one server:
+//!
+//! ```no_run
+//! # async fn demo(session: fbt::Session) -> Result<(), Box<dyn std::error::Error>> {
+//! use axum::{Router, routing::post};
+//! use fbt_api::{ApiConfig, ApiServer, Auth, AuthRejection, AuthRequest, Authenticator};
+//! use std::sync::Arc;
+//!
+//! /// Lets through the requests carrying `x-session: letmein`, and the login
+//! /// route that hands out that token. In an app the table of session tokens is
+//! /// what a real authenticator would check.
+//! #[derive(Debug)]
+//! struct Gate;
+//!
+//! impl Authenticator for Gate {
+//!     fn authorize(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+//!         match request.headers.get("x-session") {
+//!             Some(value) if value == "letmein" => Ok(()),
+//!             // Nothing else is exempt — only CORS preflights skip the
+//!             // authenticator — so this route must be let through by name.
+//!             _ if request.matched_path == Some("/api/v1/auth/login") => Ok(()),
+//!             _ => Err(AuthRejection::Unauthorized),
+//!         }
+//!     }
+//! }
+//!
+//! // `Auth::Custom` is allowed with any bind: the authenticator decides.
+//! let mut config = ApiConfig::default();
+//! config.auth = Auth::Custom(Arc::new(Gate));
+//!
+//! // A route of your own, on a path fbt-api does not serve.
+//! let mine = Router::new().route("/api/v1/auth/login", post(|| async { "log in" }));
+//! let server = ApiServer::start_with(session, config, mine).await?;
+//! println!("API on http://{}", server.local_addr());
+//! server.shutdown().await;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Security model
 //!
 //! Every client is untrusted until authenticated: request bodies, query
 //! strings, path parameters and headers never panic the server, and every
-//! body and collection has a size cap. A token holder is fully trusted:
-//! the API is the session's own control surface
-//! ([`ApiConfig::allowed_roots`] limits the paths it may name).
+//! body and collection has a size cap. A client the configured [`Auth`]
+//! admits — a token holder, or whoever your [`Auth::Custom`] authenticator
+//! lets through — is fully trusted: the API is the session's own control
+//! surface ([`ApiConfig::allowed_roots`] limits the paths it may name).
 //!
 //! - **Token.** With [`Auth::Token`] every request but
 //!   `GET /api/v1/openapi.json` and CORS preflights needs
@@ -61,6 +106,15 @@
 //!   [`ApiServer`] attaches to every request), get `403`:
 //!   the guard against CSRF and DNS rebinding. A router you mount without
 //!   that extension keeps the Host and Origin guard alone.
+//! - **Pluggable.** [`Auth::Custom`] hands every request — this document
+//!   included, only CORS preflights answered before it — to your own
+//!   [`Authenticator`]: it sees the method, matched path, headers, the
+//!   `?token=` value on the same routes that take it today, and the peer
+//!   address where one is known, and answers with an [`AuthRejection`]
+//!   (`401`, `403` or `429`). The call is synchronous on purpose (session
+//!   tokens in memory; anything slower belongs in your own login route) and
+//!   runs inside `std::panic::catch_unwind`: a panic gets that request a
+//!   `500` and the server keeps serving.
 //! - **CORS.** Off unless [`ApiConfig::cors_origins`] lists origins.
 //! - **`allowed_roots`.** When set, every path a request names (save
 //!   paths, move targets, creation sources) must lie inside a root. The
@@ -110,6 +164,7 @@ use fbt::Session;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+pub use auth::{AuthRejection, AuthRequest, Authenticator};
 pub use config::{ApiConfig, Auth, MAX_BODY_BYTES};
 pub use error::ApiError;
 pub use server::ApiServer;
@@ -142,7 +197,64 @@ pub use server::ApiServer;
 /// exist, [`ApiError::InvalidLimits`] for a `max_connections` that does not
 /// exceed the stream caps.
 pub fn router(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiError> {
-    build_router(session, config, CancellationToken::new())
+    build_router(
+        session,
+        config,
+        CancellationToken::new(),
+        axum::Router::new(),
+    )
+}
+
+/// [`router`], with `extra` — routes of your own, whose handlers carry whatever
+/// state they need — merged into the API's ahead of its layers, so every layer
+/// applies to them too: the same [`Auth`] decides who may reach them (the bearer
+/// token under [`Auth::Token`], the loopback guard under [`Auth::Disabled`], your
+/// [`Authenticator`] under [`Auth::Custom`], which sees them with their matched
+/// path), they get [`ApiConfig::max_body_bytes`] and the same CORS layer as
+/// fbt-api's own routes. Served by [`ApiServer::start_with`] they also hold one
+/// of its connection slots and end with its stall guard.
+///
+/// The `?token=` query token stays fbt-api's own: only its file-stream and event
+/// routes accept it, so an extra route authenticates through the header — or
+/// whatever your authenticator accepts. Nothing of yours is exempt, either: only
+/// CORS preflights are answered before auth, so a login route on `extra` has to
+/// be let through by your [`Authenticator`] — possible under [`Auth::Custom`]
+/// alone, because [`Auth::Token`] wants the bearer token from every request that
+/// is not fbt-api's own document.
+///
+/// And `max_body_bytes` is axum's `DefaultBodyLimit`, which the body extractors
+/// (`Bytes`, `String`, `Json`, `Form`, …) enforce: a handler of yours that takes
+/// `Request` or `Body` and consumes frames itself is not limited by it, so cap
+/// such a body yourself.
+///
+/// fbt-api's own exemptions are recognised at the *end* of the matched path (so
+/// its router can be nested under a prefix), which an extra route can trip:
+/// under [`Auth::Token`] a `GET` whose path ends in `/api/v1/openapi.json` needs
+/// no token, and one ending in `/api/v1/events` or
+/// `/api/v1/torrents/{id}/files/{index}/stream` takes `?token=`. End your paths
+/// differently.
+///
+/// # Panics
+///
+/// When `extra` registers a route fbt-api already serves: axum panics when two
+/// routers answer the same method on the same path. Everything fbt-api serves is
+/// under `/api/v1/`, exactly the paths [`openapi()`] lists — pick other ones
+/// (`/api/v1/auth/login` and `/api/v1/fs/tree` are free, `GET /api/v1/session`
+/// is not). Do not add a method to a path fbt-api serves either: a different one
+/// merges without panicking, but neither the document nor the auth rules would
+/// know it, and a `HEAD` there silently takes over what that path answers to
+/// `HEAD`. If `extra` has a fallback of its own, that one then answers paths
+/// neither router matches.
+///
+/// # Errors
+///
+/// Those of [`router`].
+pub fn router_with(
+    session: Session,
+    config: &ApiConfig,
+    extra: axum::Router,
+) -> Result<axum::Router, ApiError> {
+    build_router(session, config, CancellationToken::new(), extra)
 }
 
 /// [`router`], whose long-lived bodies (events, file streams) also end
@@ -190,7 +302,7 @@ pub fn router_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<axum::Router, ApiError> {
     let token = CancellationToken::new();
-    let router = build_router(session, config, token.clone())?;
+    let router = build_router(session, config, token.clone(), axum::Router::new())?;
     // Cancelled when the last router clone goes, so the task does not
     // outlive the router when `shutdown` never completes.
     let dropped = CancellationToken::new();
@@ -207,11 +319,13 @@ pub fn router_with_shutdown(
     Ok(router.layer(axum::Extension(guard)))
 }
 
-/// [`router`], whose long-lived bodies also end when `shutdown` fires.
+/// [`router`], whose long-lived bodies also end when `shutdown` fires, with
+/// `extra` merged in ahead of the layers ([`router_with`]).
 pub(crate) fn build_router(
     session: Session,
     config: &ApiConfig,
     shutdown: CancellationToken,
+    extra: axum::Router,
 ) -> Result<axum::Router, ApiError> {
     let validated = config.validate()?;
     let auth = auth::AuthState {
@@ -221,10 +335,14 @@ pub(crate) fn build_router(
     let state = routes::AppState::new(session, config, validated.roots, shutdown);
     let (router, _) = routes::api_router().split_for_parts();
     // `layer` wraps outside what came before: routes, then auth, then CORS.
+    // `extra` is merged before them — after the state is gone, so it needs
+    // none of its own — which is what puts every layer, and the matched path
+    // the auth layer reads, on its routes too.
     let router = router
+        .with_state(state)
+        .merge(extra)
         .layer(axum::middleware::from_fn_with_state(auth, auth::layer))
-        .layer(DefaultBodyLimit::max(config.max_body_bytes))
-        .with_state(state);
+        .layer(DefaultBodyLimit::max(config.max_body_bytes));
     if validated.origins.is_empty() {
         return Ok(router);
     }

@@ -78,8 +78,61 @@ impl ApiServer {
     /// The config errors of [`router`](crate::router), and
     /// [`ApiError::Bind`] when the address cannot be bound.
     pub async fn start(session: Session, config: ApiConfig) -> Result<ApiServer, ApiError> {
+        Self::start_with(session, config, Router::new()).await
+    }
+
+    /// [`start`](Self::start), with `extra` — routes of your own — served
+    /// beside the API on this listener. They are merged ahead of fbt-api's
+    /// layers ([`router_with`](crate::router_with) spells out what that gives
+    /// them and what to avoid): the same [`Auth`](crate::Auth) decides who may
+    /// reach them, they get [`ApiConfig::max_body_bytes`] as axum's
+    /// `DefaultBodyLimit` — which the body extractors (`Bytes`, `String`,
+    /// `Json`, `Form`, …) enforce, while a handler that consumes `Body` itself
+    /// must cap it — and the same CORS layer. Being on this listener, they hold
+    /// one of [`ApiConfig::max_connections`] slots, end with the stall guard
+    /// ([`ApiConfig::stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout))
+    /// and close on [`shutdown`](Self::shutdown). Only CORS preflights are
+    /// answered before auth, so a login route of yours has to be let through by
+    /// your own [`Authenticator`](crate::Authenticator) — `Auth::Custom`, as
+    /// `Auth::Token` wants the bearer token from everything else.
+    ///
+    /// ```no_run
+    /// # async fn demo(session: fbt::Session) -> Result<(), Box<dyn std::error::Error>> {
+    /// use axum::{Router, routing::get};
+    /// use fbt_api::{ApiConfig, ApiServer};
+    ///
+    /// // The embedder's own routes, on paths fbt-api does not serve. Under
+    /// // `Auth::Token` they need the bearer token like every other request here;
+    /// // a login route that issues tokens must be let through by an
+    /// // `Auth::Custom` authenticator instead.
+    /// let mine = Router::new().route("/api/v1/fs/tree", get(|| async { "tree" }));
+    /// let server = ApiServer::start_with(session, ApiConfig::new("secret-token"), mine).await?;
+    /// println!("API on http://{}", server.local_addr());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When `extra` registers a route fbt-api already serves: axum panics when
+    /// two routers answer the same method on the same path. Everything fbt-api
+    /// serves is under `/api/v1/`, exactly the paths [`openapi`](crate::openapi)
+    /// lists — so pick other ones (`/api/v1/auth/login` and `/api/v1/fs/tree`
+    /// are free, `GET /api/v1/session` is not). Do not add a method to a path
+    /// fbt-api serves either: a different one merges without panicking, but
+    /// neither the document nor the auth rules would know it, and a `HEAD`
+    /// there silently takes over what that path answers to `HEAD`.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`start`](Self::start).
+    pub async fn start_with(
+        session: Session,
+        config: ApiConfig,
+        extra: Router,
+    ) -> Result<ApiServer, ApiError> {
         let shutdown = CancellationToken::new();
-        let router = crate::build_router(session, &config, shutdown.clone())?;
+        let router = crate::build_router(session, &config, shutdown.clone(), extra)?;
         let listener = TcpListener::bind(config.bind)
             .await
             .map_err(ApiError::Bind)?;
