@@ -37,7 +37,9 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util`: the server tests' paused clocks (`start_paused`), as in the
+# sibling crates; without it a standalone `-p fbt-api` test run cannot build.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tower.workspace = true
 socket2.workspace = true
 bytes.workspace = true
