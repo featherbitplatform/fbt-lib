@@ -15,9 +15,10 @@ use axum::http::header::AUTHORIZATION;
 use axum::routing::{get, post};
 use fbt::Session;
 use fbt_api::{ApiConfig, ApiServer, Auth, AuthRejection, AuthRequest, Authenticator, router_with};
-use hyper::header::WWW_AUTHENTICATE;
+use http_body_util::Full;
+use hyper::header::{ORIGIN, WWW_AUTHENTICATE};
 use hyper::{Method, StatusCode};
-use support::{TOKEN, error_code, json, send_body, session, test_config};
+use support::{TOKEN, error_code, json, request, send, send_body, session, test_config};
 use tower::ServiceExt as _;
 
 /// The embedder's own routes: a `GET` that answers, and a `POST` that reports
@@ -45,6 +46,11 @@ async fn api_with_extra(
         .expect("api server starts");
     let base = format!("http://{}", server.local_addr());
     (session, server, base, TOKEN)
+}
+
+/// An empty body for the hyper client.
+fn empty() -> Full<Bytes> {
+    Full::new(Bytes::new())
 }
 
 #[tokio::test]
@@ -186,6 +192,47 @@ async fn extra_routes_respect_body_limit() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     let text = String::from_utf8_lossy(&body);
     assert!(!text.contains("2048"), "{text}");
+}
+
+#[tokio::test]
+async fn extra_route_gets_cors() {
+    let (_session, _server, base, token) = api_with_extra(
+        |c| c.cors_origins = vec!["http://ui.example".to_owned()],
+        extra(),
+    )
+    .await;
+    let url = format!("{base}/api/v1/x/hello");
+
+    // The CORS layer is outside the merged routes, so a request from a listed
+    // origin carries its header.
+    let req = request(Method::GET, &url, Some(token))
+        .header(ORIGIN, "http://ui.example")
+        .body(empty())
+        .expect("request builds");
+    let (status, headers, body) = send(req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), b"hello from extra");
+    assert_eq!(headers["access-control-allow-origin"], "http://ui.example");
+
+    // An origin fbt-api does not list carries none.
+    let req = request(Method::GET, &url, Some(token))
+        .header(ORIGIN, "http://other.example")
+        .body(empty())
+        .expect("request builds");
+    let (_, headers, _) = send(req).await;
+    assert!(!headers.contains_key("access-control-allow-origin"));
+
+    // A preflight is answered by the CORS layer before auth and needs no token:
+    // what an embedder's own login route relies on.
+    let req = request(Method::OPTIONS, &url, None)
+        .header(ORIGIN, "http://ui.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "authorization")
+        .body(empty())
+        .expect("request builds");
+    let (status, headers, _) = send(req).await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(headers["access-control-allow-origin"], "http://ui.example");
 }
 
 /// A client mounting `router_with` in its own server gets the same layers on

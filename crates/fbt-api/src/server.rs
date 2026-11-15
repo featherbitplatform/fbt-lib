@@ -83,12 +83,13 @@ impl ApiServer {
 
     /// [`start`](Self::start), with `extra` — routes of your own — served
     /// beside the API on this listener. They are merged ahead of fbt-api's
-    /// auth, body-limit and CORS layers ([`router_with`](crate::router_with)
-    /// spells that out for a router you mount yourself): the same
-    /// [`Auth`](crate::Auth) decides who may reach them, and a body over
-    /// [`ApiConfig::max_body_bytes`] is refused there too. Being on this
-    /// listener, they hold one of [`ApiConfig::max_connections`] slots, end
-    /// with the stall guard
+    /// layers ([`router_with`](crate::router_with) spells out what that gives
+    /// them and what to avoid): the same [`Auth`](crate::Auth) decides who may
+    /// reach them, they get [`ApiConfig::max_body_bytes`] as axum's
+    /// `DefaultBodyLimit` — which the body extractors (`Bytes`, `String`,
+    /// `Json`, `Form`, …) enforce, while a handler that consumes `Body` itself
+    /// must cap it — and the same CORS layer. Being on this listener, they hold
+    /// one of [`ApiConfig::max_connections`] slots, end with the stall guard
     /// ([`ApiConfig::stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout))
     /// and close on [`shutdown`](Self::shutdown).
     ///
@@ -107,12 +108,15 @@ impl ApiServer {
     ///
     /// # Panics
     ///
-    /// When `extra` registers a route fbt-api already serves: merging two
-    /// routers that answer the same method on the same path panics in axum.
-    /// Everything fbt-api serves is under `/api/v1/`, exactly the paths
+    /// When `extra` registers a route fbt-api already serves: axum panics when
+    /// two routers answer the same method on the same path (`get` answers
+    /// `HEAD` too, so an extra `HEAD` collides with a served `GET`). Everything
+    /// fbt-api serves is under `/api/v1/`, exactly the paths
     /// [`openapi`](crate::openapi) lists — so pick other ones
     /// (`/api/v1/auth/login` and `/api/v1/fs/tree` are free,
-    /// `GET /api/v1/session` is not).
+    /// `GET /api/v1/session` is not). Adding a *different* method to a path
+    /// fbt-api serves merges without panicking; do not: neither the document
+    /// nor the auth rules would know it.
     ///
     /// # Errors
     ///

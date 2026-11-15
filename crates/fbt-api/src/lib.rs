@@ -41,9 +41,44 @@
 //! ```
 //!
 //! [`ApiServer::start_with`] serves routes of your own beside the API, merged
-//! ahead of the auth, body-limit and CORS layers so they get every one of them
-//! ([`router_with`] does the same for a router you mount yourself). They must
-//! not repeat a path the API serves — those are the ones [`openapi()`] lists.
+//! ahead of the auth, body-limit and CORS layers so all three apply to them
+//! ([`router_with`] does the same for a router you mount yourself, and says what
+//! the limit does and does not reach). They must not repeat a path the API
+//! serves — those are the ones [`openapi()`] lists. Here an [`Auth::Custom`]
+//! authenticator and a login route share one server:
+//!
+//! ```no_run
+//! # async fn demo(session: fbt::Session) -> Result<(), Box<dyn std::error::Error>> {
+//! use axum::{Router, routing::post};
+//! use fbt_api::{ApiConfig, ApiServer, Auth, AuthRejection, AuthRequest, Authenticator};
+//! use std::sync::Arc;
+//!
+//! /// Lets through the requests carrying `x-session: letmein`. In an app this is
+//! /// the table of session tokens your own login route fills.
+//! #[derive(Debug)]
+//! struct Gate;
+//!
+//! impl Authenticator for Gate {
+//!     fn authorize(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection> {
+//!         match request.headers.get("x-session") {
+//!             Some(value) if value == "letmein" => Ok(()),
+//!             _ => Err(AuthRejection::Unauthorized),
+//!         }
+//!     }
+//! }
+//!
+//! // `Auth::Custom` is allowed with any bind: the authenticator decides.
+//! let mut config = ApiConfig::default();
+//! config.auth = Auth::Custom(Arc::new(Gate));
+//!
+//! // A route of your own, on a path fbt-api does not serve.
+//! let mine = Router::new().route("/api/v1/auth/login", post(|| async { "log in" }));
+//! let server = ApiServer::start_with(session, config, mine).await?;
+//! println!("API on http://{}", server.local_addr());
+//! server.shutdown().await;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Security model
 //!
@@ -167,24 +202,39 @@ pub fn router(session: Session, config: &ApiConfig) -> Result<axum::Router, ApiE
 }
 
 /// [`router`], with `extra` — routes of your own, whose handlers carry whatever
-/// state they need — merged into the API's, ahead of its layers. They are
-/// authenticated by the same [`Auth`] (the bearer token under [`Auth::Token`],
-/// the loopback guard under [`Auth::Disabled`], your [`Authenticator`] under
-/// [`Auth::Custom`], which sees them with their matched path), refuse bodies
-/// over [`ApiConfig::max_body_bytes`] and get the same CORS layer as fbt-api's
-/// own routes. Served by [`ApiServer::start_with`] they also hold one of its
-/// connection slots and end with its stall guard. The `?token=` query token
-/// stays fbt-api's own: only its file-stream and event routes accept it, so an
-/// extra route needs the header — or whatever your authenticator accepts.
+/// state they need — merged into the API's ahead of its layers, so every layer
+/// applies to them too: the same [`Auth`] decides who may reach them (the bearer
+/// token under [`Auth::Token`], the loopback guard under [`Auth::Disabled`], your
+/// [`Authenticator`] under [`Auth::Custom`], which sees them with their matched
+/// path), they get [`ApiConfig::max_body_bytes`] and the same CORS layer as
+/// fbt-api's own routes. Served by [`ApiServer::start_with`] they also hold one
+/// of its connection slots and end with its stall guard.
+///
+/// The `?token=` query token stays fbt-api's own: only its file-stream and event
+/// routes accept it, so an extra route authenticates through the header — or
+/// whatever your authenticator accepts. And `max_body_bytes` is axum's
+/// `DefaultBodyLimit`, which the body extractors (`Bytes`, `String`, `Json`,
+/// `Form`, …) enforce: a handler of yours that takes `Request` or `Body` and
+/// consumes frames itself is not limited by it, so cap such a body yourself.
+///
+/// fbt-api's own exemptions are recognised at the *end* of the matched path (so
+/// its router can be nested under a prefix), which an extra route can trip:
+/// under [`Auth::Token`] a `GET` whose path ends in `/api/v1/openapi.json` needs
+/// no token, and one ending in `/api/v1/events` or
+/// `/api/v1/torrents/{id}/files/{index}/stream` takes `?token=`. End your paths
+/// differently.
 ///
 /// # Panics
 ///
-/// When `extra` registers a route fbt-api already serves: merging two routers
-/// that answer the same method on the same path panics in axum. Everything
-/// fbt-api serves is under `/api/v1/`, exactly the paths [`openapi()`] lists —
-/// so pick other ones (`/api/v1/auth/login` and `/api/v1/fs/tree` are free,
-/// `GET /api/v1/session` is not). If `extra` has a fallback of its own, that
-/// one then answers paths neither router matches.
+/// When `extra` registers a route fbt-api already serves: axum panics when two
+/// routers answer the same method on the same path (`get` answers `HEAD` too, so
+/// an extra `HEAD` collides with a served `GET`). Everything fbt-api serves is
+/// under `/api/v1/`, exactly the paths [`openapi()`] lists — pick other ones
+/// (`/api/v1/auth/login` and `/api/v1/fs/tree` are free, `GET /api/v1/session`
+/// is not). Adding a *different* method to a path fbt-api serves merges without
+/// panicking; do not: neither the document nor the auth rules would know it. If
+/// `extra` has a fallback of its own, that one then answers paths neither router
+/// matches.
 ///
 /// # Errors
 ///
