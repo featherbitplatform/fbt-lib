@@ -1,6 +1,7 @@
 //! The auth layer: bearer token (header, or `?token=` on the streaming
-//! and event routes), the exempt routes, and the [`Auth::Disabled`]
-//! loopback-peer, Host and Origin guard.
+//! and event routes), the exempt routes, the [`Auth::Disabled`]
+//! loopback-peer, Host and Origin guard, and [`Auth::Custom`], which hands
+//! every request to the embedder's own [`Authenticator`].
 //!
 //! It is added with `Router::layer`, so each matched route's
 //! [`MatchedPath`] is set when it runs. Routes are recognised by the
@@ -10,7 +11,7 @@
 //!
 //! CORS preflights never get here when CORS is on: the CORS layer, outside
 //! this one, answers them itself. With CORS off an `OPTIONS` request is
-//! like any other and needs the token.
+//! like any other and authenticated as such.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,7 +24,9 @@ use axum::response::{IntoResponse, Response};
 use crate::config::{Auth, is_loopback};
 use crate::error::ApiErrorResponse;
 
-/// Routes that need no token, as `(method, matched path suffix)`.
+/// Routes that need no token, as `(method, matched path suffix)`. Only
+/// [`Auth::Token`] consults them: [`Auth::Custom`] sees every request, this
+/// document included, and the embedder decides.
 const EXEMPT: &[(Method, &str)] = &[(Method::GET, "/api/v1/openapi.json")];
 
 /// Routes that also take `?token=`, as `(method, matched path suffix)`:
@@ -38,6 +41,58 @@ const QUERY_TOKEN: &[(Method, &str)] = &[
 
 /// Longest `?token=` value decoded; a longer one fails.
 const MAX_QUERY_TOKEN: usize = 4096;
+
+/// A pluggable authenticator for [`Auth::Custom`]: it decides, for every
+/// request — `openapi.json` included, CORS preflights still excepted —
+/// whether the client may proceed.
+///
+/// The check is synchronous and runs on the connection's task inside
+/// `std::panic::catch_unwind`: keep it cheap (session tokens in memory;
+/// anything slower belongs in a login route of your own), and a panic gets
+/// that request a `500` while the server keeps serving.
+pub trait Authenticator: Send + Sync + std::fmt::Debug + 'static {
+    /// Allows the request (`Ok(())`) or rejects it with its [`AuthRejection`].
+    fn authorize(&self, request: &AuthRequest<'_>) -> Result<(), AuthRejection>;
+}
+
+/// What an [`Authenticator`] gets from a request, built by the auth layer for
+/// every request handed to [`Auth::Custom`].
+#[derive(Debug)]
+pub struct AuthRequest<'a> {
+    /// The request's method.
+    pub method: &'a Method,
+    /// The matched route template (`/api/v1/torrents/{id}`), with the mount
+    /// prefix when the router is nested; `None` when no route matched (a 404).
+    pub matched_path: Option<&'a str>,
+    /// The request headers, `Authorization` included when the client sent one.
+    pub headers: &'a HeaderMap,
+    /// The percent-decoded `?token=` value, offered only on the routes that
+    /// take a query token today — the file streams and the event stream —
+    /// and only when it decodes to valid UTF-8 of at most 4096 bytes; `None`
+    /// elsewhere, when absent or malformed, and when longer.
+    pub query_token: Option<&'a str>,
+    /// The peer address, from axum's `ConnectInfo` when the server attaches
+    /// it ([`ApiServer`](crate::ApiServer) does for every request; a router
+    /// mounted elsewhere gets what that server provides).
+    pub peer: Option<SocketAddr>,
+}
+
+/// How an [`Authenticator`] rejects a request. The auth layer answers each
+/// variant with the crate's standard error body and the status and headers
+/// named here.
+#[derive(Debug)]
+pub enum AuthRejection {
+    /// `401`, exactly like a wrong bearer token today: the same body and
+    /// `WWW-Authenticate: Bearer`.
+    Unauthorized,
+    /// `403 forbidden`.
+    Forbidden,
+    /// `429 too_many_requests` with `Retry-After: <retry_after_secs>`.
+    TooManyRequests {
+        /// How long the client should wait before retrying.
+        retry_after_secs: u64,
+    },
+}
 
 /// What the auth layer needs from the config.
 #[derive(Debug, Clone)]
@@ -61,6 +116,7 @@ fn check(state: &AuthState, req: &Request) -> Result<(), ApiErrorResponse> {
     let token = match &state.auth {
         Auth::Disabled => return guard_disabled(&state.origins, req),
         Auth::Token(token) => token.as_bytes(),
+        Auth::Custom(authenticator) => return check_custom(authenticator, req),
     };
     let matched = req
         .extensions()
@@ -81,6 +137,70 @@ fn check(state: &AuthState, req: &Request) -> Result<(), ApiErrorResponse> {
         return Ok(());
     }
     Err(ApiErrorResponse::unauthorized())
+}
+
+/// [`Auth::Custom`]: hand the request to the embedder's authenticator and
+/// map its rejection to a response. Every request gets here — `openapi.json`
+/// included; only CORS preflights are answered earlier, by the CORS layer.
+/// A panicking authenticator cannot take the connection or the server down:
+/// the panic is caught and that request gets a `500`.
+fn check_custom(
+    authenticator: &Arc<dyn Authenticator>,
+    req: &Request,
+) -> Result<(), ApiErrorResponse> {
+    let matched = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str);
+    // The query token only on the routes that take it today; a value that
+    // is not valid UTF-8 (or longer than `MAX_QUERY_TOKEN`, which decoding
+    // already refuses) is as good as absent for a `&str` API.
+    let query = match route_in(QUERY_TOKEN, req.method(), matched) {
+        true => req
+            .uri()
+            .query()
+            .and_then(query_token)
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
+        false => None,
+    };
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|&ConnectInfo(peer)| peer);
+    let request = AuthRequest {
+        method: req.method(),
+        matched_path: matched,
+        headers: req.headers(),
+        query_token: query.as_deref(),
+        peer,
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        authenticator.authorize(&request)
+    })) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(rejection)) => Err(match rejection {
+            AuthRejection::Unauthorized => ApiErrorResponse::unauthorized(),
+            AuthRejection::Forbidden => {
+                ApiErrorResponse::forbidden("the authenticator rejected this request")
+            }
+            AuthRejection::TooManyRequests { retry_after_secs } => {
+                ApiErrorResponse::too_many_requests(retry_after_secs)
+            }
+        }),
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("no panic message");
+            tracing::error!(
+                method = %req.method(),
+                path = ?matched,
+                "the API authenticator panicked: {detail}"
+            );
+            Err(ApiErrorResponse::internal("the authenticator panicked"))
+        }
+    }
 }
 
 fn route_in(routes: &[(Method, &str)], method: &Method, matched: Option<&str>) -> bool {

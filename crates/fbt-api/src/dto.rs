@@ -79,9 +79,9 @@ pub(crate) struct ErrorDetail {
     /// `invalid_priorities`, `invalid_path` (400); `unauthorized` (401);
     /// `path_not_allowed`, `forbidden` (403); `not_found` (404);
     /// `no_metadata`, `duplicate_torrent`, `busy`, `already_exists` (409);
-    /// `body_too_large` (413); `range_not_satisfiable` (416); `internal`
-    /// (500); `unsupported` (501); `too_many_streams`, `shutting_down`,
-    /// `dht_disabled`, `busy` (503).
+    /// `body_too_large` (413); `range_not_satisfiable` (416);
+    /// `too_many_requests` (429); `internal` (500); `unsupported` (501);
+    /// `too_many_streams`, `shutting_down`, `dht_disabled`, `busy` (503).
     #[schema(example = "not_found")]
     pub(crate) code: String,
     /// Human-readable message.

@@ -61,6 +61,15 @@
 //!   [`ApiServer`] attaches to every request), get `403`:
 //!   the guard against CSRF and DNS rebinding. A router you mount without
 //!   that extension keeps the Host and Origin guard alone.
+//! - **Pluggable.** [`Auth::Custom`] hands every request — this document
+//!   included, only CORS preflights answered before it — to your own
+//!   [`Authenticator`]: it sees the method, matched path, headers, the
+//!   `?token=` value on the same routes that take it today, and the peer
+//!   address where one is known, and answers with an [`AuthRejection`]
+//!   (`401`, `403` or `429`). The call is synchronous on purpose (session
+//!   tokens in memory; anything slower belongs in your own login route) and
+//!   runs inside `std::panic::catch_unwind`: a panic gets that request a
+//!   `500` and the server keeps serving.
 //! - **CORS.** Off unless [`ApiConfig::cors_origins`] lists origins.
 //! - **`allowed_roots`.** When set, every path a request names (save
 //!   paths, move targets, creation sources) must lie inside a root. The
@@ -110,6 +119,7 @@ use fbt::Session;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+pub use auth::{AuthRejection, AuthRequest, Authenticator};
 pub use config::{ApiConfig, Auth, MAX_BODY_BYTES};
 pub use error::ApiError;
 pub use server::ApiServer;

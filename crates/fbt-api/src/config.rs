@@ -9,6 +9,7 @@ use std::time::Duration;
 use axum::http::HeaderValue;
 
 use crate::ApiError;
+use crate::auth::Authenticator;
 use crate::paths::Root;
 
 /// The largest request body: a `.torrent` or resume upload (32 MiB). The
@@ -33,6 +34,17 @@ pub enum Auth {
     /// and DNS rebinding). A router mounted without that extension keeps the
     /// Host and Origin guard alone.
     Disabled,
+    /// A pluggable authenticator: every request — `openapi.json` included,
+    /// CORS preflights still answered by the CORS layer first — goes to
+    /// [`authorize`](crate::Authenticator::authorize), which sees the method,
+    /// matched path, headers, query token and peer address and allows it or
+    /// answers with an [`AuthRejection`](crate::AuthRejection): `401`, `403`
+    /// or `429`. A panicking authenticator gets its request a `500`; the
+    /// server keeps serving. Allowed with any [`bind`](ApiConfig::bind): the
+    /// authenticator decides what a valid client is. The check is synchronous
+    /// on purpose — session tokens in memory; anything slower belongs in a
+    /// login route of your own.
+    Custom(Arc<dyn Authenticator>),
 }
 
 impl fmt::Debug for Auth {
@@ -41,6 +53,9 @@ impl fmt::Debug for Auth {
             // The token is a secret: never in logs.
             Auth::Token(_) => f.write_str("Token(<redacted>)"),
             Auth::Disabled => f.write_str("Disabled"),
+            // Nothing of the authenticator's is ours to redact: its own
+            // `Debug` decides what it shows.
+            Auth::Custom(authenticator) => write!(f, "Custom({authenticator:?})"),
         }
     }
 }
@@ -146,6 +161,8 @@ impl ApiConfig {
             Auth::Disabled if !is_loopback(self.bind.ip()) => {
                 return Err(ApiError::InsecureBind);
             }
+            // A non-empty token, a loopback `Disabled`, and `Custom` with any
+            // bind — the authenticator decides what a valid client is.
             _ => {}
         }
         if self.max_connections <= self.max_streams.saturating_add(self.max_event_streams) {
@@ -209,6 +226,31 @@ mod tests {
         let shown = format!("{config:?}");
         assert!(!shown.contains("s3cret"), "{shown}");
         assert!(shown.contains("Token(<redacted>)"), "{shown}");
+    }
+
+    /// `Auth::Custom`'s `Debug` is the authenticator's own output wrapped in
+    /// `Custom(..)`: fbt-api redacts nothing it does not own.
+    #[test]
+    fn custom_debug_redacts_nothing_it_does_not_own() {
+        struct Show;
+
+        impl fmt::Debug for Show {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("my-authenticator")
+            }
+        }
+
+        impl crate::auth::Authenticator for Show {
+            fn authorize(
+                &self,
+                _request: &crate::auth::AuthRequest<'_>,
+            ) -> Result<(), crate::auth::AuthRejection> {
+                Ok(())
+            }
+        }
+
+        let auth = Auth::Custom(Arc::new(Show));
+        assert_eq!(format!("{auth:?}"), "Custom(my-authenticator)");
     }
 
     #[test]
