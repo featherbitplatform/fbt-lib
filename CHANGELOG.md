@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-15
+
 ### Added
 
 - `fbt-api`: pluggable authentication for apps that know their own clients — `Auth::Custom(Arc<dyn Authenticator>)`, with `Authenticator`, `AuthRequest` and `AuthRejection` re-exported from `fbt_api`. Every request goes to `Authenticator::authorize(&AuthRequest)`, `GET /api/v1/openapi.json` included (only CORS preflights are answered earlier, by the CORS layer), and the request it gets carries the method, the matched route template, the headers, the decoded `?token=` value on the same routes that take one today, and the peer address where one is known. Allow it, or answer with an `AuthRejection`: `Unauthorized` (the standard 401 body and `WWW-Authenticate: Bearer`, like a wrong token), `Forbidden` (403) or `TooManyRequests { retry_after_secs }` (429 with `Retry-After`). The check is synchronous on purpose — session tokens in memory; anything slower belongs in a login route of your own — and it runs inside `std::panic::catch_unwind`, so an authenticator that panics gets that request a 500 while the server keeps serving. It is allowed with any `bind`: the authenticator decides what a valid client is, where `Auth::Disabled` needs loopback. `AuthRequest` is non-exhaustive, so outside this crate build one with `AuthRequest::new(method, matched_path, headers, query_token, peer)` to unit-test an authenticator without a server ([#26](https://github.com/featherbitplatform/fbt-lib/pull/26))
@@ -312,6 +314,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Security CI: semgrep, cargo-deny, grype and gitleaks (`.github/workflows/security.yml`, `dev/sast.sh`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 - Release workflow: tag check against the workspace version, CycloneDX SBOM and a GitHub release with the changelog section (`.github/workflows/release.yml`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 
+[0.9.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.9.0
 [0.8.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.8.0
 [0.7.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.7.0
 [0.6.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.6.0
