@@ -102,6 +102,7 @@ fn authenticator_surface(
     let _: &Method = r.method;
     let _: Option<&str> = r.matched_path;
     let _: &HeaderMap = r.headers;
+    let _: &str = r.path;
     let _: Option<&str> = r.query_token;
     let _: Option<SocketAddr> = r.peer;
     assert!(matches!(
@@ -125,6 +126,24 @@ fn auth_request_ctor<'a>(
     peer: Option<SocketAddr>,
 ) -> AuthRequest<'a> {
     AuthRequest::new(method, matched_path, headers, query_token, peer)
+}
+
+/// `with_path` overrides the path `new` defaulted to; pin its signature and
+/// its effect.
+#[test]
+fn auth_request_with_path() {
+    let method = Method::GET;
+    let headers = HeaderMap::new();
+    assert_eq!(
+        AuthRequest::new(&method, Some("/x"), &headers, None, None).path,
+        "/x"
+    );
+    assert_eq!(
+        AuthRequest::new(&method, None, &headers, None, None)
+            .with_path("/x")
+            .path,
+        "/x"
+    );
 }
 
 #[test]
