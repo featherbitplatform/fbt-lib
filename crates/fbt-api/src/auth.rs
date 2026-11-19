@@ -76,7 +76,10 @@ pub struct AuthRequest<'a> {
     /// The request URI's path exactly as received — percent-encoded, without
     /// the query — set from `req.uri().path()`; `""` when
     /// [`AuthRequest::new`] built this request and no path was given with
-    /// [`AuthRequest::with_path`].
+    /// [`AuthRequest::with_path`]. Under `Router::nest` this is the path
+    /// below the mount point (the prefix is stripped), unlike
+    /// [`matched_path`](Self::matched_path), which keeps it; a parameter in
+    /// the mount prefix is therefore not visible here.
     pub path: &'a str,
     /// The percent-decoded `?token=` value, offered only on the routes that
     /// take a query token today — the file streams and the event stream —

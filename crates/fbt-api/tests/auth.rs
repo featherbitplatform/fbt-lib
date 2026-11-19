@@ -706,6 +706,52 @@ async fn path_is_percent_encoded_as_sent() {
     assert!(seen.path.contains("%41"), "{}", seen.path);
 }
 
+/// `Router::nest` strips the mount prefix before the nested router's layers
+/// run, so `path` is what is below the mount point (while `matched_path`
+/// keeps the prefix); a parameter in the prefix would be invisible there.
+/// The router is fbt-api's own, from `router`, nested under `/prefix`.
+#[tokio::test]
+async fn path_below_a_nest_is_stripped() {
+    let session = session().await;
+    let recorder = Arc::new(Recorder::default());
+    let peer = "127.0.0.1:52000"
+        .parse::<SocketAddr>()
+        .expect("peer address");
+    let mut config = test_config();
+    config.auth = Auth::Custom(recorder.clone());
+    let app = axum::Router::new().nest(
+        "/prefix",
+        router(session, &config)
+            .expect("router")
+            .layer(axum::middleware::from_fn(
+                move |mut req: Request, next: axum::middleware::Next| async move {
+                    let _ = req.extensions_mut().insert(ConnectInfo(peer));
+                    next.run(req).await
+                },
+            )),
+    );
+    let (status, _, _) = call(
+        &app,
+        get_req(&format!(
+            "/prefix/api/v1/torrents/{}/files/0/stream?token=x",
+            "ab".repeat(20)
+        )),
+    )
+    .await;
+    // An unknown id answers 404 from the handler behind the authenticator.
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let seen = recorder.seen();
+    assert_eq!(
+        seen.path,
+        format!("/api/v1/torrents/{}/files/0/stream", "ab".repeat(20))
+    );
+    assert_eq!(
+        seen.matched_path.as_deref(),
+        Some("/prefix/api/v1/torrents/{id}/files/{index}/stream")
+    );
+}
+
 #[tokio::test]
 async fn query_token_only_on_stream_and_events() {
     let session = session().await;
