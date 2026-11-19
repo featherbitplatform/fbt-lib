@@ -73,6 +73,11 @@ pub struct AuthRequest<'a> {
     pub matched_path: Option<&'a str>,
     /// The request headers, `Authorization` included when the client sent one.
     pub headers: &'a HeaderMap,
+    /// The request URI's path exactly as received — percent-encoded, without
+    /// the query — set from `req.uri().path()`; `""` when
+    /// [`AuthRequest::new`] built this request and no path was given with
+    /// [`AuthRequest::with_path`].
+    pub path: &'a str,
     /// The percent-decoded `?token=` value, offered only on the routes that
     /// take a query token today — the file streams and the event stream —
     /// and only when it decodes to valid UTF-8 of at most 4096 bytes; `None`
@@ -99,10 +104,17 @@ impl<'a> AuthRequest<'a> {
         AuthRequest {
             method,
             matched_path,
+            path: matched_path.unwrap_or(""),
             headers,
             query_token,
             peer,
         }
+    }
+
+    /// The request URI's path exactly as received (percent-encoded, without
+    /// the query), overriding the one [`AuthRequest::new`] defaulted to.
+    pub fn with_path(self, path: &'a str) -> AuthRequest<'a> {
+        AuthRequest { path, ..self }
     }
 }
 
@@ -200,6 +212,7 @@ fn check_custom(
     let request = AuthRequest {
         method: req.method(),
         matched_path: matched,
+        path: req.uri().path(),
         headers: req.headers(),
         query_token: query.as_deref(),
         peer,

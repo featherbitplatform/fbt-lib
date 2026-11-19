@@ -108,9 +108,11 @@
 //!   that extension keeps the Host and Origin guard alone.
 //! - **Pluggable.** [`Auth::Custom`] hands every request — this document
 //!   included, only CORS preflights answered before it — to your own
-//!   [`Authenticator`]: it sees the method, matched path, headers, the
-//!   `?token=` value on the same routes that take it today, and the peer
-//!   address where one is known, and answers with an [`AuthRejection`]
+//!   [`Authenticator`]: it sees the method, the request path as received
+//!   (percent-encoded, without the query), the matched route template, the
+//!   headers, the `?token=` value on the same routes that take it today, and
+//!   the peer address where one is known, and answers with an
+//!   [`AuthRejection`]
 //!   (`401`, `403` or `429`). The call is synchronous on purpose (session
 //!   tokens in memory; anything slower belongs in your own login route) and
 //!   runs inside `std::panic::catch_unwind`: a panic gets that request a

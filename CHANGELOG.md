@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `fbt-api`: `AuthRequest` carries the request's path — `pub path: &'a str`, the request URI's path exactly as received (percent-encoded, without the query), set by the auth layer from `req.uri().path()`, so an `Auth::Custom` authenticator can scope a decision to the exact URL it was asked for (a stream token limited to one file, for instance), where `matched_path` only gives the route template. Additive: `AuthRequest::new` keeps its signature and defaults `path` to the matched template (`""` when there is none), and the new `AuthRequest::with_path(path)` overrides it for tests. `AuthRequest` is `#[non_exhaustive]`, so nothing outside this crate can build one as a struct literal — downstream code is unaffected
+
 ## [0.9.0] - 2026-11-15
 
 ### Added
