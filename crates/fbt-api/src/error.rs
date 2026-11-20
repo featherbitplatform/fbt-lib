@@ -252,7 +252,11 @@ fn is_body_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
 /// An extractor rejection: a body-read time-out as `408 request_timeout`,
 /// `413 body_too_large`, a server-side failure as `500 internal`, anything
 /// else `400 invalid_request`.
-fn rejection(status: StatusCode, text: String, err: Option<&(dyn std::error::Error + 'static)>) -> ApiErrorResponse {
+fn rejection(
+    status: StatusCode,
+    text: String,
+    err: Option<&(dyn std::error::Error + 'static)>,
+) -> ApiErrorResponse {
     if let Some(err) = err
         && is_body_timeout(err)
     {
