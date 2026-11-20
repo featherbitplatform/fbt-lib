@@ -439,13 +439,18 @@ async fn a_body_above_the_minimum_rate_completes() {
         .await;
     let mut client = TcpStream::connect(addr).await.expect("connects");
     send_login_headers(&mut client, token, 3000).await;
+    let mut written = 0usize;
     for _ in 0..30 {
-        client
-            .write_all(&[0u8; 100])
-            .await
-            .expect("100 body bytes written");
+        match client.write_all(&[0u8; 100]).await {
+            Ok(()) => written += 100,
+            Err(_) => break,
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(
+        written == 3000,
+        "a body above the minimum rate was cut off: only {written} of 3000 bytes were written"
+    );
     let mut buf = [0u8; 4096];
     let mut got = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
