@@ -466,6 +466,32 @@ where
         self.timeout.saturating_add(extra)
     }
 
+    /// Arm the lazy sleep against `due`: create it on the first idle poll, or
+    /// move it when its due instant is no longer `due` or it has already
+    /// fired. A fired sleep answers `Ready` forever until reset, so an early
+    /// wake must re-arm to register a live waker; a sleep still armed at
+    /// `due` that has not fired is left alone rather than reset on every poll.
+    fn arm_timer(&mut self, due: TokioInstant) {
+        match self.timer.take() {
+            Some(mut timer) => {
+                if timer.deadline() != due || timer.is_elapsed() {
+                    timer.as_mut().reset(due);
+                }
+                self.timer = Some(timer);
+            }
+            None => self.timer = Some(Box::pin(sleep_until(due))),
+        }
+    }
+
+    /// Poll the lazy sleep: `Pending` until its due instant passes. A body
+    /// that never idles leaves the timer unset, and nothing is armed for it.
+    fn poll_timer(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match &mut self.timer {
+            Some(timer) => timer.as_mut().poll(cx),
+            None => Poll::Pending,
+        }
+    }
+
     /// True when the deadline has passed; runs the time-out on the first
     /// observation of it (logs once) and stays true after. The deadline is
     /// measured from `started`, not from the moment of this call: a body
@@ -591,30 +617,31 @@ where
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Pending => {
-                // The deadline may have moved since the last poll (a data frame
-                // extended it), so arm at `started + deadline` and wait on it:
-                // the time-out must fire even while no byte arrives. An
-                // overflowing sum is a deadline so far out it is as good as not
-                // there, so it parks in [`arm_deadline`]'s far future; falling
-                // back to `started` would fire at once and fake a time-out. The
-                // sleep is created here, on the first idle poll, rather than for
-                // every request.
-                let due = match started.checked_add(this.deadline()) {
-                    Some(due) => due,
-                    None => arm_deadline(Duration::MAX),
-                };
-                let timer = this.timer.get_or_insert_with(|| Box::pin(sleep_until(due)));
-                timer.as_mut().reset(due);
-                if matches!(timer.as_mut().poll(cx), Poll::Ready(())) {
-                    // The timer fired. Time out when the clock has reached the
-                    // deadline; an early wake (which cannot happen today) lets
-                    // the caller poll again.
-                    if this.stalled_out() {
-                        return Poll::Ready(Some(Err(Self::timeout_error())));
+                // Wait on the deadline so the time-out fires even while no byte
+                // arrives. An overflowing sum is a deadline so far out it is as
+                // good as not there, so it parks in [`arm_deadline`]'s far
+                // future; falling back to `started` would fire at once and fake
+                // a time-out. Loop on an early wake (the sleep fired before the
+                // clock reached the deadline, which cannot happen today):
+                // [`Self::arm_timer`] re-arms the fired sleep so the next poll
+                // registers a live waker instead of parking on one that would
+                // never fire again. The loop cannot spin: `stalled_out` is
+                // checked first, and a freshly re-armed sleep answers `Pending`
+                // on its first poll.
+                loop {
+                    let due = match started.checked_add(this.deadline()) {
+                        Some(due) => due,
+                        None => arm_deadline(Duration::MAX),
+                    };
+                    this.arm_timer(due);
+                    if matches!(this.poll_timer(cx), Poll::Ready(())) {
+                        if this.stalled_out() {
+                            return Poll::Ready(Some(Err(Self::timeout_error())));
+                        }
+                    } else {
+                        return Poll::Pending;
                     }
-                    return Poll::Pending;
                 }
-                Poll::Pending
             }
         }
     }
