@@ -582,6 +582,7 @@ dependencies = [
  "bytes",
  "fbt",
  "futures-util",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

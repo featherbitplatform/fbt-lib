@@ -44,6 +44,7 @@ ed25519-dalek = { version = "3", default-features = false, features = ["fast", "
 rand = "0.10"
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+http-body = "1"
 http-body-util = "0.1"
 # The connector trait hyper's client takes (the trackers' proxy connector).
 tower-service = "0.3"

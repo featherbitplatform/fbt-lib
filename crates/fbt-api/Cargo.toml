@@ -21,6 +21,8 @@ pure-rust = ["fbt/pure-rust"]
 [dependencies]
 fbt = { path = "../fbt", default-features = false }
 axum.workspace = true
+# The request-body guard (BodyDeadline) wraps hyper's `Incoming`.
+http-body.workspace = true
 utoipa.workspace = true
 utoipa-axum.workspace = true
 tower-http.workspace = true
