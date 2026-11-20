@@ -210,13 +210,6 @@ impl Drop for ApiServer {
     }
 }
 
-/// Accepts connections until `shutdown` fires, then drains them: idle
-/// ones close at once, busy ones get [`SHUTDOWN_GRACE`], the rest are
-/// aborted. Returns once every connection task is gone.
-///
-/// It takes a permit of `limit` before each `accept`, and the connection
-/// holds it until it closes: with every permit taken, new clients wait in
-/// the listener's backlog and cost no file descriptor.
 /// The per-connection guards, threaded from [`ApiConfig`] to each
 /// [`connection`].
 #[derive(Clone, Copy)]
@@ -232,6 +225,13 @@ struct Guards {
     body_min_rate: u32,
 }
 
+/// Accepts connections until `shutdown` fires, then drains them: idle
+/// ones close at once, busy ones get [`SHUTDOWN_GRACE`], the rest are
+/// aborted. Returns once every connection task is gone.
+///
+/// It takes a permit of `limit` before each `accept`, and the connection
+/// holds it until it closes: with every permit taken, new clients wait in
+/// the listener's backlog and cost no file descriptor.
 async fn accept_loop(
     listener: TcpListener,
     base: TowerToHyperService<Router>,
