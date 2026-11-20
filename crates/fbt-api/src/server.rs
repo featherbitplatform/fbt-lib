@@ -295,6 +295,7 @@ async fn accept_loop(
 /// A client that keeps draining (however slowly), an idle keep-alive
 /// connection and a body waiting for pieces to write all make or await
 /// progress and are left alone — [`Duration::ZERO`] disables the guard.
+#[allow(clippy::too_many_arguments)]
 async fn connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -426,12 +427,7 @@ impl<B> BodyDeadline<B>
 where
     B: http_body::Body<Data = Bytes>,
 {
-    fn new(
-        inner: B,
-        timeout: Duration,
-        min_rate: u32,
-        stall: Arc<CancellationToken>,
-    ) -> Self {
+    fn new(inner: B, timeout: Duration, min_rate: u32, stall: Arc<CancellationToken>) -> Self {
         Self {
             inner,
             timeout,
@@ -454,7 +450,10 @@ where
     fn deadline(&self) -> Duration {
         let min_rate = u64::from(self.min_rate).max(1);
         // `received / min_rate` seconds, in milliseconds, rounded up.
-        let extra_ms = (self.received.saturating_mul(1000).saturating_add(min_rate - 1))
+        let extra_ms = (self
+            .received
+            .saturating_mul(1000)
+            .saturating_add(min_rate - 1))
             / min_rate;
         let extra_ms = extra_ms.min(u64::MAX / 4);
         let total_ms = self
@@ -499,7 +498,10 @@ where
 
     /// The time-out's error.
     fn timeout_error() -> Box<dyn std::error::Error + Send + Sync> {
-        Box::new(io::Error::new(io::ErrorKind::TimedOut, "request body too slow"))
+        Box::new(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "request body too slow",
+        ))
     }
 }
 
@@ -804,9 +806,7 @@ where
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let (mut parts, incoming) = req.into_parts();
-        parts
-            .extensions
-            .insert(ConnectInfo(self.peer));
+        parts.extensions.insert(ConnectInfo(self.peer));
         let body = BodyDeadline::new(
             incoming,
             self.body_read_timeout,

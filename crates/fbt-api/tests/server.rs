@@ -363,12 +363,11 @@ async fn closed_within(client: &mut TcpStream, budget: Duration) -> bool {
 /// 200.
 #[tokio::test]
 async fn a_body_that_stops_arriving_closes_the_connection() {
-    let (_session, _server, addr, token) =
-        body_server(|c| {
-            c.body_read_timeout = Duration::from_millis(300);
-            c.body_min_rate = 1000;
-        })
-        .await;
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+    })
+    .await;
     let mut client = TcpStream::connect(addr).await.expect("connects");
     send_login_headers(&mut client, token, 1000).await;
     client
@@ -390,12 +389,11 @@ async fn a_body_that_stops_arriving_closes_the_connection() {
 /// timer alone would never catch this.
 #[tokio::test]
 async fn a_trickled_body_is_cut_off_although_bytes_keep_coming() {
-    let (_session, _server, addr, token) =
-        body_server(|c| {
-            c.body_read_timeout = Duration::from_millis(300);
-            c.body_min_rate = 1000;
-        })
-        .await;
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+    })
+    .await;
     let mut client = TcpStream::connect(addr).await.expect("connects");
     send_login_headers(&mut client, token, 100_000).await;
     // 1 byte every 100 ms: each byte stretches the deadline by 1 ms, so
@@ -418,10 +416,7 @@ async fn a_trickled_body_is_cut_off_although_bytes_keep_coming() {
             break;
         }
     }
-    assert!(
-        closed_while_sending,
-        "a trickled body kept its connection"
-    );
+    assert!(closed_while_sending, "a trickled body kept its connection");
     drop(client);
     _server.shutdown().await;
 }
@@ -431,12 +426,11 @@ async fn a_trickled_body_is_cut_off_although_bytes_keep_coming() {
 /// extension keeps the deadline ahead. A fixed total deadline would cut it.
 #[tokio::test]
 async fn a_body_above_the_minimum_rate_completes() {
-    let (_session, _server, addr, token) =
-        body_server(|c| {
-            c.body_read_timeout = Duration::from_millis(300);
-            c.body_min_rate = 1000;
-        })
-        .await;
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+    })
+    .await;
     let mut client = TcpStream::connect(addr).await.expect("connects");
     send_login_headers(&mut client, token, 3000).await;
     let mut written = 0usize;
@@ -474,15 +468,14 @@ async fn a_body_above_the_minimum_rate_completes() {
 /// guard closes them, a fresh request is served: the permits come back.
 #[tokio::test]
 async fn a_stalled_body_frees_its_connection_permit() {
-    let (_session, _server, addr, token) =
-        body_server(|c| {
-            c.body_read_timeout = Duration::from_millis(300);
-            c.body_min_rate = 1000;
-            c.max_streams = 1;
-            c.max_event_streams = 1;
-            c.max_connections = 3;
-        })
-        .await;
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+        c.max_streams = 1;
+        c.max_event_streams = 1;
+        c.max_connections = 3;
+    })
+    .await;
     let mut stalled = Vec::new();
     for _ in 0..3 {
         let mut client = TcpStream::connect(addr).await.expect("connects");
@@ -534,12 +527,11 @@ async fn a_stalled_body_frees_its_connection_permit() {
 /// it later still gets 200.
 #[tokio::test]
 async fn a_zero_body_read_timeout_turns_the_guard_off() {
-    let (_session, _server, addr, token) =
-        body_server(|c| {
-            c.body_read_timeout = Duration::ZERO;
-            c.body_min_rate = 1000;
-        })
-        .await;
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::ZERO;
+        c.body_min_rate = 1000;
+    })
+    .await;
     let mut client = TcpStream::connect(addr).await.expect("connects");
     send_login_headers(&mut client, token, 1000).await;
     client
