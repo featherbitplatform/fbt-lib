@@ -8,7 +8,13 @@
 //! [`Auth::Disabled`](crate::Auth::Disabled) guard reads, and every
 //! connection is watched for write stalls: a client that stops reading gets
 //! dropped after [`ApiConfig::stream_idle_timeout`](crate::ApiConfig::stream_idle_timeout)
-//! of no progress, bodies and permits included.
+//! of no progress, bodies and permits included. Request bodies are guarded
+//! the other way around: a client that sends headers and then dribbles a
+//! body (or never sends it) holds its connection and its
+//! [`ApiConfig::max_connections`](crate::ApiConfig::max_connections) permit
+//! until [`ApiConfig::body_read_timeout`](crate::ApiConfig::body_read_timeout)
+//! runs out, extended by the bytes it keeps arriving at
+//! [`ApiConfig::body_min_rate`](crate::ApiConfig::body_min_rate).
 
 use std::fmt;
 use std::io::{self, IoSlice};
@@ -21,7 +27,9 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ConnectInfo;
+use bytes::Bytes;
 use fbt::Session;
+use http_body::Frame;
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -142,25 +150,32 @@ impl ApiServer {
             shutdown,
             config.max_connections,
             config.stream_idle_timeout,
+            config.body_read_timeout,
+            config.body_min_rate,
         )
     }
 
     /// Serves `router` on `listener` until `shutdown` fires, ending a
     /// connection whose writes have made no progress for `stall_timeout`
-    /// ([`Duration::ZERO`] disables that guard).
+    /// ([`Duration::ZERO`] disables that guard) and one whose request body
+    /// takes longer than `body_read_timeout`, extended byte for byte at
+    /// `body_min_rate` (also [`Duration::ZERO`]-off).
     fn serve(
         listener: TcpListener,
         router: Router,
         shutdown: CancellationToken,
         max_connections: usize,
         stall_timeout: Duration,
+        body_read_timeout: Duration,
+        body_min_rate: u32,
     ) -> Result<ApiServer, ApiError> {
         let local_addr = listener.local_addr().map_err(ApiError::Bind)?;
         let limit = Arc::new(Semaphore::new(
             max_connections.clamp(1, Semaphore::MAX_PERMITS),
         ));
         // The tower service is built once for the listener; each connection
-        // only wraps it (see [`WithPeer`]) instead of re-layering the router.
+        // only wraps it (see [`WithPeer`]) instead of re-layering the
+        // router.
         let base = TowerToHyperService::new(router);
         let task = tokio::spawn(accept_loop(
             listener,
@@ -168,6 +183,8 @@ impl ApiServer {
             shutdown.clone(),
             limit,
             stall_timeout,
+            body_read_timeout,
+            body_min_rate,
         ));
         Ok(ApiServer {
             local_addr,
@@ -217,6 +234,8 @@ async fn accept_loop(
     shutdown: CancellationToken,
     limit: Arc<Semaphore>,
     stall_timeout: Duration,
+    body_read_timeout: Duration,
+    body_min_rate: u32,
 ) {
     let mut conns = JoinSet::new();
     let mut permit: Option<OwnedSemaphorePermit> = None;
@@ -236,6 +255,8 @@ async fn accept_loop(
                         shutdown.clone(),
                         permit.take(),
                         stall_timeout,
+                        body_read_timeout,
+                        body_min_rate,
                     ));
                 }
                 Err(e) => {
@@ -281,6 +302,8 @@ async fn connection(
     shutdown: CancellationToken,
     permit: Option<OwnedSemaphorePermit>,
     stall_timeout: Duration,
+    body_read_timeout: Duration,
+    body_min_rate: u32,
 ) {
     let _permit = permit;
     let watch = Arc::new(StallWatch::new());
@@ -288,9 +311,16 @@ async fn connection(
         inner: stream,
         watch: Arc::clone(&watch),
     });
+    // Cancelled by [`BodyDeadline`] when a request body takes too long to
+    // arrive: dropping the connection future then ends the request the body
+    // belongs to, exactly like the stall branch below.
+    let body_stall = CancellationToken::new();
     let service = WithPeer {
         inner: base.clone(),
         peer,
+        body_read_timeout,
+        body_min_rate,
+        body_stall: Arc::new(body_stall.clone()),
     };
     let mut conn = pin!(
         http1::Builder::new()
@@ -311,6 +341,12 @@ async fn connection(
                 if let Err(e) = result {
                     tracing::trace!(error = %e, "api connection ended");
                 }
+                return;
+            }
+            () = body_stall.cancelled() => {
+                // A request body took too long to arrive; the handler got
+                // its error. Drop the connection: the request, its body and
+                // this connection's permit go with it.
                 return;
             }
             () = shutdown.cancelled() => {
@@ -348,6 +384,191 @@ fn arm_deadline(left: Duration) -> TokioInstant {
         now.checked_add(Duration::from_secs(365 * 24 * 60 * 60))
             .unwrap_or(now)
     })
+}
+
+/// One incoming request body with a deadline on how long it may take to
+/// arrive: the client gets `timeout`, plus one second of reading per
+/// `min_rate` bytes it has delivered (see
+/// [`ApiConfig::body_min_rate`](crate::ApiConfig::body_min_rate) for the
+/// `0` case). The clock starts at the first
+/// [`poll_frame`](http_body::Body::poll_frame) (when a handler begins
+/// reading the body, not when the request arrived), so a handler that
+/// awaits something else first does not spend the client's allowance.
+///
+/// Every data frame pushes the deadline out by the bytes it carried, so a
+/// client that keeps an average rate of at least `min_rate` bytes per
+/// second is never cut off, however it chunks. A mere idle-gap timer would
+/// not be enough: one byte every 29 seconds never trips one.
+///
+/// On time-out the body yields an error and `stall` is cancelled, so the
+/// connection task ends the whole connection and its
+/// [`ApiConfig::max_connections`](crate::ApiConfig::max_connections) permit
+/// with it. The clock is tokio's, so a paused test clock advances it
+/// exactly.
+struct BodyDeadline<B> {
+    inner: B,
+    timeout: Duration,
+    min_rate: u32,
+    stall: Arc<CancellationToken>,
+    /// When the first `poll_frame` ran; the deadline is measured from here.
+    started: Option<TokioInstant>,
+    /// Bytes of data received so far.
+    received: u64,
+    /// The armed sleep: due when the deadline is, re-armed whenever the
+    /// deadline moves, polled only while the inner body is `Pending`.
+    timer: Pin<Box<tokio::time::Sleep>>,
+    /// The guard is finished: a time-out already ran, or the stream ended.
+    /// `poll_frame` then never looks at the clock again.
+    closed: bool,
+}
+
+impl<B> BodyDeadline<B>
+where
+    B: http_body::Body<Data = Bytes>,
+{
+    fn new(
+        inner: B,
+        timeout: Duration,
+        min_rate: u32,
+        stall: Arc<CancellationToken>,
+    ) -> Self {
+        Self {
+            inner,
+            timeout,
+            min_rate,
+            stall,
+            started: None,
+            received: 0,
+            // Never polled before the first `poll_frame` arms it there.
+            timer: Box::pin(sleep(Duration::from_secs(365 * 24 * 60 * 60))),
+            closed: false,
+        }
+    }
+
+    /// The deadline as a duration from `started`: the base allowance plus
+    /// the bytes received at the minimum rate, rounded up per byte (a
+    /// body must not be billed less than its bytes are worth). Saturation
+    /// keeps a hostile combination (a `u64::MAX` frame over a huge
+    /// `min_rate`) out of a panic; `min_rate` of 0 extends the deadline by
+    /// nothing.
+    fn deadline(&self) -> Duration {
+        let per_byte_ms = (1000u64 / u64::from(self.min_rate).max(1)).max(1);
+        let extra_ms = self
+            .received
+            .saturating_mul(per_byte_ms)
+            .saturating_add(1000)
+            .min(u64::MAX / 4);
+        let total_ms = self
+            .timeout
+            .as_millis()
+            .min(u64::MAX as u128 / 4)
+            .saturating_add(extra_ms as u128)
+            .min(u64::MAX as u128 / 4);
+        Duration::from_millis(total_ms as u64)
+    }
+
+    /// True when the deadline has passed; runs the time-out on the first
+    /// observation of it (logs once, cancels the connection token) and
+    /// stays true after.
+    fn stalled_out(&mut self) -> bool {
+        if self.closed {
+            return true;
+        }
+        if self.started.is_none() {
+            return false;
+        }
+        let deadline = self.deadline();
+        if TokioInstant::now() < arm_deadline(deadline) {
+            return false;
+        }
+        self.closed = true;
+        tracing::debug!("api request body too slow");
+        self.stall.cancel();
+        true
+    }
+
+    /// The time-out's error.
+    fn timeout_error() -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(io::Error::new(io::ErrorKind::TimedOut, "request body too slow"))
+    }
+}
+
+impl<B> http_body::Body for BodyDeadline<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        // `B` is `Unpin`, so `Self` is too and every piece is a plain
+        // projection; the inner body is polled through its own `Pin`.
+        let this = self.get_mut();
+        if this.closed {
+            return Poll::Ready(Some(Err(Self::timeout_error())));
+        }
+        if this.started.is_none() {
+            this.started = Some(TokioInstant::now());
+            let deadline = this.deadline();
+            this.timer.as_mut().reset(arm_deadline(deadline));
+        }
+        if this.stalled_out() {
+            return Poll::Ready(Some(Err(Self::timeout_error())));
+        }
+        let poll = Pin::new(&mut this.inner).poll_frame(cx);
+        match poll {
+            Poll::Ready(None) => {
+                // End of stream: the guard is done with it.
+                this.closed = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                let received = frame
+                    .data_ref()
+                    .map(|d| u64::try_from(d.len()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                this.received = this.received.saturating_add(received);
+                if frame.data_ref().is_none() {
+                    // A trailers frame ends the stream too.
+                    this.closed = true;
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Pending => {
+                // The deadline may have moved since the last poll, so
+                // re-arm at the current one and wait on it: the timeout
+                // must fire even while no byte arrives.
+                let deadline = this.deadline();
+                this.timer.as_mut().reset(arm_deadline(deadline));
+                match this.timer.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        if this.stalled_out() {
+                            Poll::Ready(Some(Err(Self::timeout_error())))
+                        } else {
+                            // The deadline moved past the timer's due
+                            // moment; the inner body still has what it
+                            // had, and the caller polls again.
+                            Poll::Pending
+                        }
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Write-progress watch of one connection, shared between [`StalledIo`]
@@ -513,26 +734,47 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StalledIo<T> {
 }
 
 /// Attaches the connection's peer address to every request as axum's
-/// [`ConnectInfo`] — the `add_extension` of services. The router and its
-/// tower service are built once for the listener; each connection wraps
-/// that shared service in this one-liner instead of re-layering anything.
+/// [`ConnectInfo`] and bounds how long each request's body may take to
+/// arrive ([`BodyDeadline`]). The router is built once for the listener;
+/// each connection calls it as a tower service after replacing the request
+/// body. `body_stall` is the connection's one [`CancellationToken`],
+/// cancelled by [`BodyDeadline`] on time-out; the connection task ends the
+/// connection on it.
+/// Attaches the connection's peer address to every request as axum's
+/// [`ConnectInfo`] and bounds how long each request's body may take to
+/// arrive ([`BodyDeadline`]). The tower service is built once for the
+/// listener; each connection only wraps it. `body_stall` is the
+/// connection's one [`CancellationToken`], cancelled by [`BodyDeadline`]
+/// on time-out; the connection task ends the connection on it.
 #[derive(Clone)]
 struct WithPeer<S> {
     inner: S,
     peer: SocketAddr,
+    body_read_timeout: Duration,
+    body_min_rate: u32,
+    body_stall: Arc<CancellationToken>,
 }
 
 impl<S> Service<Request<Incoming>> for WithPeer<S>
 where
-    S: Service<Request<Incoming>> + Clone,
+    S: Service<Request<BodyDeadline<Incoming>>> + Clone,
 {
     type Response = S::Response;
     type Error = S::Error;
     type Future = S::Future;
 
-    fn call(&self, mut req: Request<Incoming>) -> Self::Future {
-        let _ = req.extensions_mut().insert(ConnectInfo(self.peer));
-        self.inner.call(req)
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
+        let (mut parts, incoming) = req.into_parts();
+        parts
+            .extensions
+            .insert(ConnectInfo(self.peer));
+        let body = BodyDeadline::new(
+            incoming,
+            self.body_read_timeout,
+            self.body_min_rate,
+            Arc::clone(&self.body_stall),
+        );
+        self.inner.call(Request::from_parts(parts, body))
     }
 }
 
@@ -566,6 +808,8 @@ mod tests {
             CancellationToken::new(),
             256,
             Duration::ZERO,
+            Duration::ZERO,
+            500,
         )
         .unwrap();
 
@@ -617,6 +861,8 @@ mod tests {
             CancellationToken::new(),
             2,
             Duration::ZERO,
+            Duration::ZERO,
+            500,
         )
         .unwrap();
         let mut a = TcpStream::connect(server.local_addr()).await.unwrap();
@@ -657,6 +903,8 @@ mod tests {
             CancellationToken::new(),
             256,
             Duration::ZERO,
+            Duration::ZERO,
+            500,
         )
         .unwrap();
         let mut client = TcpStream::connect(server.local_addr()).await.unwrap();
@@ -689,6 +937,8 @@ mod tests {
             CancellationToken::new(),
             256,
             Duration::ZERO,
+            Duration::ZERO,
+            500,
         )
         .unwrap();
 
@@ -899,6 +1149,8 @@ mod tests {
             CancellationToken::new(),
             256,
             Duration::MAX,
+            Duration::ZERO,
+            500,
         )
         .unwrap();
         let mut client = TcpStream::connect(server.local_addr()).await.unwrap();
