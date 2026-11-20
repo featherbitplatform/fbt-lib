@@ -132,19 +132,20 @@ fn bind_one(addr: SocketAddr, listen: bool) -> io::Result<(Endpoint, Option<io::
 }
 
 /// A port for a bind retry: uniformly random in the IANA dynamic range.
-/// Retries pick their own ports because OSes that hand out ephemeral ports
-/// in sequence (Windows) can put every OS-chosen retry inside one block
-/// reserved for UDP.
+/// Retries pick their own ports: asking the OS for port 0 again can keep
+/// landing on ports the UDP side cannot use, on Windows ports reserved for
+/// UDP or ports another UDP socket already holds.
 fn random_dynamic_port() -> u16 {
     rand::random_range(49_152..=65_535)
 }
 
 /// The attempt loop of [`bind_one`], with the UDP bind and the retry ports
 /// as parameters. Attempt 1 binds TCP on `addr`; while `addr` has port 0
-/// each later attempt before the last binds it on `next_port()`, and a TCP
-/// bind that fails on such a picked port counts as a used attempt, not an
-/// error for the caller. The last attempt binds TCP on `addr` (port 0)
-/// again, so the exhausted case still has a listener to hand back.
+/// each later attempt before the last binds it on `next_port()`, set on
+/// `addr` itself so a link-local address keeps its scope id. A TCP bind
+/// that fails on such a picked port counts as a used attempt, not an error
+/// for the caller. The last attempt binds TCP on `addr` (port 0) again, so
+/// the exhausted case still has a listener to hand back.
 fn bind_one_with(
     addr: SocketAddr,
     listen: bool,
@@ -154,8 +155,15 @@ fn bind_one_with(
     let mut attempt = 1;
     loop {
         let picked = addr.port() == 0 && attempt > 1 && attempt < BIND_ATTEMPTS;
+        // A picked port is reached only after a UDP bind failed, rare
+        // outside Windows, where bind_tcp has no SO_REUSEADDR. Off Windows
+        // that option is on, so a picked-port TCP bind can succeed beside
+        // another process's listener on the other address form of the same
+        // port (wildcard against specific); it does not steal that listener.
         let target = if picked {
-            SocketAddr::new(addr.ip(), next_port())
+            let mut target = addr;
+            target.set_port(next_port());
+            target
         } else {
             addr
         };
