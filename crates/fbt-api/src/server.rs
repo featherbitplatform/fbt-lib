@@ -566,8 +566,10 @@ where
             };
         }
         if this.timeout.is_zero() {
-            // The guard is off: pass the inner body through, remembering
-            // only when it ends.
+            // Defensive only: `WithPeer` never wraps the body when the
+            // timeout is zero, so no production path reaches here. The guard
+            // is off: pass the inner body through, remembering only when it
+            // ends.
             return match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     if frame.data_ref().is_none() {
