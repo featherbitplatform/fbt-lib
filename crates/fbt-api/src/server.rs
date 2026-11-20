@@ -446,18 +446,17 @@ where
     }
 
     /// The deadline as a duration from `started`: the base allowance plus
-    /// the bytes received at the minimum rate, rounded up per byte (a
-    /// body must not be billed less than its bytes are worth). Saturation
-    /// keeps a hostile combination (a `u64::MAX` frame over a huge
-    /// `min_rate`) out of a panic; `min_rate` of 0 extends the deadline by
-    /// nothing.
+    /// the bytes received at the minimum rate, rounded up to the next
+    /// millisecond (a body must not be billed less than its bytes are
+    /// worth). Saturation keeps a hostile combination (a `u64::MAX` frame
+    /// over a huge `min_rate`) out of a panic; `min_rate` of 0 extends the
+    /// deadline by nothing.
     fn deadline(&self) -> Duration {
-        let per_byte_ms = (1000u64 / u64::from(self.min_rate).max(1)).max(1);
-        let extra_ms = self
-            .received
-            .saturating_mul(per_byte_ms)
-            .saturating_add(1000)
-            .min(u64::MAX / 4);
+        let min_rate = u64::from(self.min_rate).max(1);
+        // `received / min_rate` seconds, in milliseconds, rounded up.
+        let extra_ms = (self.received.saturating_mul(1000).saturating_add(min_rate - 1))
+            / min_rate;
+        let extra_ms = extra_ms.min(u64::MAX / 4);
         let total_ms = self
             .timeout
             .as_millis()
@@ -469,16 +468,27 @@ where
 
     /// True when the deadline has passed; runs the time-out on the first
     /// observation of it (logs once, cancels the connection token) and
-    /// stays true after.
+    /// stays true after. The deadline is measured from `started`, not from
+    /// the moment of this call: a body whose clock started long ago is
+    /// still past its deadline now, even if this check runs late.
     fn stalled_out(&mut self) -> bool {
         if self.closed {
             return true;
         }
-        if self.started.is_none() {
+        if self.timeout.is_zero() {
             return false;
         }
+        let Some(started) = self.started else {
+            return false;
+        };
         let deadline = self.deadline();
-        if TokioInstant::now() < arm_deadline(deadline) {
+        // The deadline is `started + deadline`; it has passed when the
+        // elapsed time since `started` reaches `deadline`. `checked_add`
+        // keeps a huge `deadline` out of a panic (see [`arm_deadline`]).
+        let due = started
+            .checked_add(deadline)
+            .unwrap_or_else(|| started.checked_add(Duration::MAX).unwrap_or(started));
+        if TokioInstant::now() < due {
             return false;
         }
         self.closed = true;
@@ -511,11 +521,36 @@ where
         if this.closed {
             return Poll::Ready(Some(Err(Self::timeout_error())));
         }
-        if this.started.is_none() {
-            this.started = Some(TokioInstant::now());
-            let deadline = this.deadline();
-            this.timer.as_mut().reset(arm_deadline(deadline));
+        if this.timeout.is_zero() {
+            // The guard is off: pass the inner body through.
+            return match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if frame.data_ref().is_none() {
+                        this.closed = true;
+                    }
+                    Poll::Ready(Some(Ok(frame)))
+                }
+                Poll::Ready(None) => {
+                    this.closed = true;
+                    Poll::Ready(None)
+                }
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+                Poll::Pending => Poll::Pending,
+            };
         }
+        let started = match this.started {
+            Some(started) => started,
+            None => {
+                let started = TokioInstant::now();
+                this.started = Some(started);
+                let deadline = this.deadline();
+                let due = started
+                    .checked_add(deadline)
+                    .unwrap_or_else(|| started.checked_add(Duration::MAX).unwrap_or(started));
+                this.timer.as_mut().reset(due);
+                started
+            }
+        };
         if this.stalled_out() {
             return Poll::Ready(Some(Err(Self::timeout_error())));
         }
@@ -540,11 +575,15 @@ where
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Pending => {
-                // The deadline may have moved since the last poll, so
-                // re-arm at the current one and wait on it: the timeout
-                // must fire even while no byte arrives.
+                // The deadline may have moved since the last poll (a data
+                // frame extended it), so re-arm at `started + deadline`
+                // and wait on it: the timeout must fire even while no byte
+                // arrives.
                 let deadline = this.deadline();
-                this.timer.as_mut().reset(arm_deadline(deadline));
+                let due = started
+                    .checked_add(deadline)
+                    .unwrap_or_else(|| started.checked_add(Duration::MAX).unwrap_or(started));
+                this.timer.as_mut().reset(due);
                 match this.timer.as_mut().poll(cx) {
                     Poll::Ready(()) => {
                         if this.stalled_out() {
@@ -785,6 +824,7 @@ mod tests {
 
     use axum::routing::get;
     use futures_util::task::noop_waker;
+    use http_body::Body as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -1102,6 +1142,49 @@ mod tests {
             !vwatch.pending.load(Ordering::Relaxed),
             "a whole run clears the flag"
         );
+    }
+
+    /// A body that never arrives times out and cancels its token.
+    #[tokio::test(start_paused = true)]
+    async fn body_deadline_fires_on_a_pending_body() {
+        struct Pending;
+        impl http_body::Body for Pending {
+            type Data = Bytes;
+            type Error = Box<dyn std::error::Error + Send + Sync>;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                Poll::Pending
+            }
+        }
+        let token = Arc::new(CancellationToken::new());
+        let mut body = BodyDeadline::new(
+            Pending,
+            Duration::from_millis(100),
+            1000,
+            Arc::clone(&token),
+        );
+        let waker = noop_waker();
+        let cx = &mut Context::from_waker(&waker);
+
+        // First poll starts the clock and goes pending.
+        assert!(Pin::new(&mut body).poll_frame(cx).is_pending());
+        // The deadline is 100 ms out; the clock is paused, so no time has
+        // passed.
+        assert!(!token.is_cancelled(), "the deadline has not passed yet");
+        // Past the deadline the body times out and cancels the token.
+        sleep(Duration::from_millis(150)).await;
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(cx),
+            Poll::Ready(Some(Err(_)))
+        ));
+        assert!(token.is_cancelled(), "the timeout cancels the connection");
+        // The guard stays latched.
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(cx),
+            Poll::Ready(Some(Err(_)))
+        ));
     }
 
     /// A body with nothing to send for a long stretch is not cut off at once
