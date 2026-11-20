@@ -134,7 +134,11 @@
 //!   caps bound the slots even stalled clients can hold — a router you
 //!   mount yourself has no stall guard and relies on hang-ups; `ApiServer`
 //!   serves at most [`ApiConfig::max_connections`] connections at once
-//!   (further clients wait in the listen backlog).
+//!   (further clients wait in the listen backlog). A client that sends
+//!   headers and then dribbles a request body (or never sends it) holds
+//!   its connection slot until [`ApiConfig::body_read_timeout`] runs out,
+//!   extended by the bytes it keeps arriving at
+//!   [`ApiConfig::body_min_rate`]; `Duration::ZERO` turns that guard off.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
