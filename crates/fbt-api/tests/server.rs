@@ -7,6 +7,7 @@ mod support;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
@@ -19,6 +20,8 @@ use http_body_util::Full;
 use hyper::header::{ORIGIN, WWW_AUTHENTICATE};
 use hyper::{Method, StatusCode};
 use support::{TOKEN, error_code, json, request, send, send_body, session, test_config};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tower::ServiceExt as _;
 
 /// The embedder's own routes: a `GET` that answers, and a `POST` that reports
@@ -295,4 +298,459 @@ async fn call(app: &Router, req: Request) -> (StatusCode, axum::http::HeaderMap,
 async fn call_status(app: &Router, req: Request) -> StatusCode {
     let (status, _, _) = call(app, req).await;
     status
+}
+
+// ---------------------------------------------------------------------------
+// Request-body read deadline (body_read_timeout / body_min_rate)
+// ---------------------------------------------------------------------------
+
+/// An extra route that reads the whole body and answers with its length.
+fn login() -> Router {
+    Router::new().route(
+        "/api/v1/auth/login",
+        post(|body: Bytes| async move { body.len().to_string() }),
+    )
+}
+
+/// A server for the body-deadline tests: `test_config` with `edit` applied,
+/// serving [`login`] on top of the API. Returns the session, the server,
+/// the bound address and the token.
+async fn body_server(
+    edit: impl FnOnce(&mut ApiConfig),
+) -> (Session, ApiServer, SocketAddr, &'static str) {
+    let session = session().await;
+    let mut config = test_config();
+    edit(&mut config);
+    let server = ApiServer::start_with(session.clone(), config, login())
+        .await
+        .expect("api server starts");
+    let addr = server.local_addr();
+    (session, server, addr, TOKEN)
+}
+
+/// Sends the request line and headers for a `POST /api/v1/auth/login` of
+/// `content_length` bytes on `client`.
+async fn send_login_headers(client: &mut TcpStream, token: &str, content_length: usize) {
+    client
+        .write_all(
+            format!(
+                "POST /api/v1/auth/login HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {content_length}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("headers written");
+}
+
+/// The total byte length of the HTTP response in `buf`, or `None` when the
+/// headers are not yet complete or the body has no `Content-Length`.
+/// `buf` must contain at least the full header block.
+fn response_body_len(buf: &[u8]) -> Option<usize> {
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let header = std::str::from_utf8(&buf[..header_end]).ok()?;
+    let content_length = header
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })?;
+    Some(header_end + content_length)
+}
+
+/// True when the socket is closed (a read returns EOF or an error) within
+/// `budget`.
+async fn closed_within(client: &mut TcpStream, budget: Duration) -> bool {
+    let mut buf = [0u8; 4096];
+    let closed = tokio::time::timeout(budget, async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => return true,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    matches!(closed, Ok(true))
+}
+
+/// A stalled body (10 of 1000 bytes, then nothing) loses the connection
+/// well inside the base allowance: the guard cuts it, and it never answers
+/// 200.
+#[tokio::test]
+async fn a_body_that_stops_arriving_closes_the_connection() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+    })
+    .await;
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    send_login_headers(&mut client, token, 1000).await;
+    client
+        .write_all(&[0u8; 10])
+        .await
+        .expect("10 body bytes written");
+    // 10 bytes at 1000 B/s stretch the deadline to about 301 ms; long gone
+    // by the 3 s budget. Nothing else arrives.
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => return true,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    // The guard answers an error before closing; it must
+                    // not be a 200.
+                    if got.starts_with(b"HTTP/1.1 200") {
+                        return false;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(closed, Ok(true)),
+        "a stalled body kept its connection"
+    );
+    if let Ok(text) = String::from_utf8(got) {
+        assert!(
+            !text.starts_with("HTTP/1.1 200"),
+            "a stalled body got 200: {text}"
+        );
+    }
+    drop(client);
+    _server.shutdown().await;
+}
+
+/// A body that keeps arriving (1 byte every 100 ms) stays far under the
+/// minimum rate of 1000 B/s, so the deadline still runs out: an idle-gap
+/// timer alone would never catch this.
+#[tokio::test]
+async fn a_trickled_body_is_cut_off_although_bytes_keep_coming() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+    })
+    .await;
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    send_login_headers(&mut client, token, 100_000).await;
+    // 1 byte every 100 ms: each byte stretches the deadline by 1 ms, so
+    // after 300 bytes (30 ms real time) the deadline is due at about 300 ms.
+    // The connection must be closed while the client is still sending:
+    // an idle-gap timer (the mutation) would keep it open for the whole
+    // 40 s of trickling and only close it after the client stops.
+    let mut closed_while_sending = false;
+    for _ in 0..400 {
+        match client.write_u8(0).await {
+            Ok(()) => {}
+            Err(_) => {
+                closed_while_sending = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if closed_within(&mut client, Duration::from_millis(50)).await {
+            closed_while_sending = true;
+            break;
+        }
+    }
+    assert!(closed_while_sending, "a trickled body kept its connection");
+    drop(client);
+    _server.shutdown().await;
+}
+
+/// A body above the minimum rate (100 bytes every 50 ms, 2000 B/s) arrives
+/// far past the 300 ms base allowance and still completes: the per-byte
+/// extension keeps the deadline ahead. A fixed total deadline would cut it.
+#[tokio::test]
+async fn a_body_above_the_minimum_rate_completes() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+    })
+    .await;
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    send_login_headers(&mut client, token, 3000).await;
+    let mut written = 0usize;
+    for _ in 0..30 {
+        match client.write_all(&[0u8; 100]).await {
+            Ok(()) => written += 100,
+            Err(_) => break,
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        written == 3000,
+        "a body above the minimum rate was cut off: only {written} of 3000 bytes were written"
+    );
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // Read until the header end and the full Content-Length body, or EOF.
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(body_len) = response_body_len(&got)
+                        && got.len() >= body_len
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("a body above the minimum rate was cut off: no response within 5 s");
+    let text = String::from_utf8_lossy(&got);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.contains("3000"), "{text}");
+    drop(client);
+    _server.shutdown().await;
+}
+
+/// Three stalled bodies occupy all three `max_connections` slots; once the
+/// guard closes them, a fresh request is served: the permits come back.
+#[tokio::test]
+async fn a_stalled_body_frees_its_connection_permit() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+        c.max_streams = 1;
+        c.max_event_streams = 1;
+        c.max_connections = 3;
+    })
+    .await;
+    let mut stalled = Vec::new();
+    for _ in 0..3 {
+        let mut client = TcpStream::connect(addr).await.expect("connects");
+        send_login_headers(&mut client, token, 1000).await;
+        client
+            .write_all(&[0u8; 10])
+            .await
+            .expect("10 body bytes written");
+        stalled.push(client);
+    }
+    for client in stalled.iter_mut() {
+        assert!(
+            closed_within(client, Duration::from_secs(3)).await,
+            "a stalled body never gave back its permit: its connection stayed open"
+        );
+    }
+    // Every slot is free again: a fresh request is served.
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    client
+        .write_all(b"GET /api/v1/session HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer ")
+        .await
+        .expect("request written");
+    client
+        .write_all(format!("{token}\r\n\r\n").as_bytes())
+        .await
+        .expect("request written");
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !got.starts_with(b"HTTP/1.1 200") {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await
+    .expect("a stalled body never gave back its permit: no new request served");
+    assert!(
+        got.starts_with(b"HTTP/1.1 200"),
+        "a stalled body never gave back its permit: {got:?}"
+    );
+    drop(client);
+    _server.shutdown().await;
+}
+
+/// `body_read_timeout = Duration::ZERO` passes the body through unwrapped:
+/// a stalled body keeps its connection (no 200, no close), and completing
+/// it later still gets 200.
+#[tokio::test]
+async fn a_zero_body_read_timeout_turns_the_guard_off() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::ZERO;
+        c.body_min_rate = 1000;
+    })
+    .await;
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    send_login_headers(&mut client, token, 1000).await;
+    client
+        .write_all(&[0u8; 10])
+        .await
+        .expect("10 body bytes written");
+    // With the guard off the connection stays open: the read times out
+    // rather than returning EOF or an error.
+    let mut buf = [0u8; 4096];
+    let pending = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf)).await;
+    assert!(
+        pending.is_err(),
+        "the guard is off, so a stalled body closed its connection: {pending:?}"
+    );
+    // And completing the body still answers 200.
+    client
+        .write_all(&[0u8; 990])
+        .await
+        .expect("rest of the body written");
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(body_len) = response_body_len(&got)
+                        && got.len() >= body_len
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("the body completes once the client sends it");
+    assert!(
+        got.starts_with(b"HTTP/1.1 200"),
+        "the body never completed: {got:?}"
+    );
+    drop(client);
+    _server.shutdown().await;
+}
+
+/// A chunked request body with a trailer sent promptly is not timed out:
+/// the guard must not latch `done` on the trailers frame and then error on
+/// the next poll.
+#[tokio::test]
+async fn a_chunked_body_with_trailers_is_not_timed_out() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_secs(2);
+        c.body_min_rate = 1000;
+    })
+    .await;
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    // A chunked POST to the login route (which reads the whole body).
+    client
+        .write_all(
+            format!(
+                "POST /api/v1/auth/login HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("headers written");
+    // Three chunks, sent promptly.
+    for chunk in ["hello", " world", "!"] {
+        client
+            .write_all(format!("{:x}\r\n{}\r\n", chunk.len(), chunk).as_bytes())
+            .await
+            .expect("chunk written");
+    }
+    // Final zero-length chunk followed by a trailer and the blank line.
+    client
+        .write_all(b"0\r\nX-Check: 1\r\n\r\n")
+        .await
+        .expect("final chunk written");
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(body_len) = response_body_len(&got)
+                        && got.len() >= body_len
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("a body with trailers was timed out: no response within 5 s");
+    let text = String::from_utf8_lossy(&got);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "a body with trailers was timed out: {text}"
+    );
+    // The login route answers with the body length (12 bytes: "hello world!").
+    assert!(
+        text.contains("12"),
+        "a body with trailers was timed out: expected length 12, got {text}"
+    );
+    drop(client);
+    _server.shutdown().await;
+}
+
+/// A stalled body on a route that reads `ApiJson` gets `408 request_timeout`
+/// in the JSON error body, not a bare close or a 400.
+#[tokio::test]
+async fn a_slow_body_gets_408() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+    })
+    .await;
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    // A JSON POST to a real fbt-api route that reads ApiJson. The body is
+    // declared as 1000 bytes but only 10 arrive, then nothing: the deadline
+    // runs out while the extractor is collecting the body.
+    client
+        .write_all(
+            format!(
+                "POST /api/v1/torrents HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("headers written");
+    client
+        .write_all(b"{\"magnet\": \"magnet")
+        .await
+        .expect("partial body written");
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(body_len) = response_body_len(&got)
+                        && got.len() >= body_len
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("a slow body did not get 408: no response within 5 s");
+    let text = String::from_utf8_lossy(&got);
+    assert!(
+        text.starts_with("HTTP/1.1 408"),
+        "a slow body did not get 408: {text}"
+    );
+    assert!(
+        text.contains("request_timeout"),
+        "a slow body did not get 408: no request_timeout code: {text}"
+    );
+    drop(client);
+    _server.shutdown().await;
 }

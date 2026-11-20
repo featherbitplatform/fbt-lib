@@ -127,6 +127,28 @@ pub struct ApiConfig {
     /// `ApiServer` get no stall protection at all — whoever serves them owns
     /// its writers, and only hang-ups free the caps. Default 10 minutes.
     pub stream_idle_timeout: Duration,
+    /// How long a request body may take to arrive before its connection is
+    /// ended. The clock starts when a handler begins reading the body, not
+    /// when the request arrives. Each byte received pushes the deadline out
+    /// by 1/[`body_min_rate`](Self::body_min_rate) seconds, so a client
+    /// that keeps the average rate up, however it chunks, is never cut off.
+    /// A client that sends headers and then dribbles the body (or never
+    /// sends it) would otherwise hold its
+    /// [`max_connections`](Self::max_connections) slot forever: the stall
+    /// guard ([`stream_idle_timeout`](Self::stream_idle_timeout)) watches
+    /// writes, and such a connection owes none.
+    /// [`Duration::ZERO`] turns the guard off. Routers mounted outside
+    /// [`ApiServer`](crate::ApiServer) get none of it: whoever serves them
+    /// owns the request bodies. Default 20 seconds.
+    pub body_read_timeout: Duration,
+    /// The minimum average rate, in bytes per second, a request body must
+    /// arrive at while [`body_read_timeout`](Self::body_read_timeout) is on:
+    /// each byte received pushes the deadline out by `1 / body_min_rate`
+    /// seconds. `0` means no extension: the body must then arrive whole
+    /// within [`body_read_timeout`](Self::body_read_timeout). Routers
+    /// mounted outside [`ApiServer`](crate::ApiServer) get none of it.
+    /// Default 500.
+    pub body_min_rate: u32,
 }
 
 impl Default for ApiConfig {
@@ -141,6 +163,8 @@ impl Default for ApiConfig {
             max_event_streams: 16,
             max_connections: 256,
             stream_idle_timeout: Duration::from_secs(600),
+            body_read_timeout: Duration::from_secs(20),
+            body_min_rate: 500,
         }
     }
 }
