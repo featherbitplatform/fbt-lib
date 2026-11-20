@@ -73,6 +73,8 @@ fn config_fields(c: &mut ApiConfig) {
     let _: &mut usize = &mut c.max_event_streams;
     let _: &mut usize = &mut c.max_connections;
     let _: &mut Duration = &mut c.stream_idle_timeout;
+    let _: &mut Duration = &mut c.body_read_timeout;
+    let _: &mut u32 = &mut c.body_min_rate;
 }
 
 fn variants(a: &Auth, e: &ApiError) -> bool {
@@ -158,5 +160,7 @@ fn defaults() {
     assert_eq!(c.max_event_streams, 16);
     assert_eq!(c.max_connections, 256);
     assert_eq!(c.stream_idle_timeout, Duration::from_secs(600));
+    assert_eq!(c.body_read_timeout, Duration::from_secs(20));
+    assert_eq!(c.body_min_rate, 500);
     assert!(matches!(&ApiConfig::new("t").auth, Auth::Token(t) if t == "t"));
 }

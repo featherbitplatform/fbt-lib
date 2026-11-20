@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `fbt-api`: `ApiConfig::body_read_timeout` (default 20 s) and `ApiConfig::body_min_rate` (default 500 bytes/s): a client that sends headers and then dribbles a request body (or never sends it) no longer holds its `max_connections` slot forever. The clock starts when a handler begins reading the body and every byte received pushes the deadline out by `1 / body_min_rate` seconds, so a client that keeps the average rate up is never cut off. `Duration::ZERO` turns the guard off; `body_min_rate` of 0 gives no per-byte extension (the body must arrive whole within `body_read_timeout`). Routers mounted outside `ApiServer` get none of it.
+
+### Fixed
+
+- `fbt-api`: a client that sends a request body slowly can no longer hold a connection and its `max_connections` permit forever. `ApiServer` now ends a connection whose request body takes longer than `body_read_timeout` (extended by the bytes it keeps arriving at `body_min_rate`), freeing the connection and its permit. The stall guard (`stream_idle_timeout`) only watched write progress; such a connection owes no writes and was never cut off. When the handler is still able to answer, a body that arrives too slowly is answered `408` with code `request_timeout`.
+
 ## [0.10.0] - 2026-11-19
 
 ### Added
