@@ -553,10 +553,14 @@ where
                 Poll::Pending => Poll::Pending,
             };
         }
-        if this.started.is_none() {
-            let started = TokioInstant::now();
-            this.started = Some(started);
-        }
+        let started = match this.started {
+            Some(started) => started,
+            None => {
+                let started = TokioInstant::now();
+                this.started = Some(started);
+                started
+            }
+        };
         if this.stalled_out() {
             return Poll::Ready(Some(Err(Self::timeout_error())));
         }
@@ -586,9 +590,15 @@ where
                 // The deadline may have moved since the last poll (a data
                 // frame extended it), so re-arm at `started + deadline`
                 // and wait on it: the timeout must fire even while no byte
-                // arrives.
-                let deadline = this.deadline();
-                this.timer.as_mut().reset(arm_deadline(deadline));
+                // arrives. An overflowing sum is a deadline so far out it is
+                // as good as not there, so it parks in [`arm_deadline`]'s
+                // far future; falling back to `started` would fire at once
+                // and fake a time-out.
+                let due = match started.checked_add(this.deadline()) {
+                    Some(due) => due,
+                    None => arm_deadline(Duration::MAX),
+                };
+                this.timer.as_mut().reset(due);
                 match this.timer.as_mut().poll(cx) {
                     Poll::Ready(()) => {
                         if this.stalled_out() {
