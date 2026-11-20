@@ -130,7 +130,7 @@ pub struct ApiConfig {
     /// How long a request body may take to arrive before its connection is
     /// ended. The clock starts when a handler begins reading the body, not
     /// when the request arrives. Each byte received pushes the deadline out
-    /// by `1 / [`body_min_rate`](Self::body_min_rate)` seconds, so a client
+    /// by 1/[`body_min_rate`](Self::body_min_rate) seconds, so a client
     /// that keeps the average rate up, however it chunks, is never cut off.
     /// A client that sends headers and then dribbles the body (or never
     /// sends it) would otherwise hold its
