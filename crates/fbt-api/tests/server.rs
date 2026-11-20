@@ -342,6 +342,24 @@ async fn send_login_headers(client: &mut TcpStream, token: &str, content_length:
         .expect("headers written");
 }
 
+/// The total byte length of the HTTP response in `buf`, or `None` when the
+/// headers are not yet complete or the body has no `Content-Length`.
+/// `buf` must contain at least the full header block.
+fn response_body_len(buf: &[u8]) -> Option<usize> {
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let header = std::str::from_utf8(&buf[..header_end]).ok()?;
+    let content_length = header
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })?;
+    Some(header_end + content_length)
+}
+
 /// True when the socket is closed (a read returns EOF or an error) within
 /// `budget`.
 async fn closed_within(client: &mut TcpStream, budget: Duration) -> bool {
@@ -376,10 +394,34 @@ async fn a_body_that_stops_arriving_closes_the_connection() {
         .expect("10 body bytes written");
     // 10 bytes at 1000 B/s stretch the deadline to about 301 ms; long gone
     // by the 3 s budget. Nothing else arrives.
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => return true,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    // The guard answers an error before closing; it must
+                    // not be a 200.
+                    if got.starts_with(b"HTTP/1.1 200") {
+                        return false;
+                    }
+                }
+            }
+        }
+    })
+    .await;
     assert!(
-        closed_within(&mut client, Duration::from_secs(3)).await,
+        matches!(closed, Ok(true)),
         "a stalled body kept its connection"
     );
+    if let Ok(text) = String::from_utf8(got) {
+        assert!(
+            !text.starts_with("HTTP/1.1 200"),
+            "a stalled body got 200: {text}"
+        );
+    }
     drop(client);
     _server.shutdown().await;
 }
@@ -448,10 +490,19 @@ async fn a_body_above_the_minimum_rate_completes() {
     let mut buf = [0u8; 4096];
     let mut got = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !got.starts_with(b"HTTP/1.1 200") {
+        // Read until the header end and the full Content-Length body, or EOF.
+        loop {
             match client.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(body_len) = response_body_len(&got) {
+                        if got.len() >= body_len {
+                            break;
+                        }
+                    }
+                }
             }
         }
     })
@@ -553,10 +604,18 @@ async fn a_zero_body_read_timeout_turns_the_guard_off() {
         .expect("rest of the body written");
     let mut got = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !got.starts_with(b"HTTP/1.1 200") {
+        loop {
             match client.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(body_len) = response_body_len(&got) {
+                        if got.len() >= body_len {
+                            break;
+                        }
+                    }
+                }
             }
         }
     })
@@ -565,6 +624,132 @@ async fn a_zero_body_read_timeout_turns_the_guard_off() {
     assert!(
         got.starts_with(b"HTTP/1.1 200"),
         "the body never completed: {got:?}"
+    );
+    drop(client);
+    _server.shutdown().await;
+}
+
+/// A chunked request body with a trailer sent promptly is not timed out:
+/// the guard must not latch `done` on the trailers frame and then error on
+/// the next poll.
+#[tokio::test]
+async fn a_chunked_body_with_trailers_is_not_timed_out() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_secs(2);
+        c.body_min_rate = 1000;
+    })
+    .await;
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    // A chunked POST to the login route (which reads the whole body).
+    client
+        .write_all(
+            format!(
+                "POST /api/v1/auth/login HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("headers written");
+    // Three chunks, sent promptly.
+    for chunk in ["hello", " world", "!"] {
+        client
+            .write_all(format!("{:x}\r\n{}\r\n", chunk.len(), chunk).as_bytes())
+            .await
+            .expect("chunk written");
+    }
+    // Final zero-length chunk followed by a trailer and the blank line.
+    client
+        .write_all(b"0\r\nX-Check: 1\r\n\r\n")
+        .await
+        .expect("final chunk written");
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(body_len) = response_body_len(&got) {
+                        if got.len() >= body_len {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("a body with trailers was timed out: no response within 5 s");
+    let text = String::from_utf8_lossy(&got);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "a body with trailers was timed out: {text}"
+    );
+    // The login route answers with the body length (12 bytes: "hello world!").
+    assert!(
+        text.contains("12"),
+        "a body with trailers was timed out: expected length 12, got {text}"
+    );
+    drop(client);
+    _server.shutdown().await;
+}
+
+/// A stalled body on a route that reads `ApiJson` gets `408 request_timeout`
+/// in the JSON error body, not a bare close or a 400.
+#[tokio::test]
+async fn a_slow_body_gets_408() {
+    let (_session, _server, addr, token) = body_server(|c| {
+        c.body_read_timeout = Duration::from_millis(300);
+        c.body_min_rate = 1000;
+    })
+    .await;
+    let mut client = TcpStream::connect(addr).await.expect("connects");
+    // A JSON POST to a real fbt-api route that reads ApiJson. The body is
+    // declared as 1000 bytes but only 10 arrive, then nothing: the deadline
+    // runs out while the extractor is collecting the body.
+    client
+        .write_all(
+            format!(
+                "POST /api/v1/torrents HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("headers written");
+    client
+        .write_all(b"{\"magnet\": \"magnet")
+        .await
+        .expect("partial body written");
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(body_len) = response_body_len(&got) {
+                        if got.len() >= body_len {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("a slow body did not get 408: no response within 5 s");
+    let text = String::from_utf8_lossy(&got);
+    assert!(
+        text.starts_with("HTTP/1.1 408"),
+        "a slow body did not get 408: {text}"
+    );
+    assert!(
+        text.contains("request_timeout"),
+        "a slow body did not get 408: no request_timeout code: {text}"
     );
     drop(client);
     _server.shutdown().await;

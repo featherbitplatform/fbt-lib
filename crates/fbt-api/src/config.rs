@@ -129,24 +129,22 @@ pub struct ApiConfig {
     pub stream_idle_timeout: Duration,
     /// How long a request body may take to arrive before its connection is
     /// ended. The clock starts when a handler begins reading the body, not
-    /// when the request arrives, and every byte received pushes the deadline
-    /// out by one [`body_min_rate`](Self::body_min_rate) second of reading,
-    /// so a client that keeps the average rate up, however it chunks, is
-    /// never cut off — the body must as a whole take no longer than this
-    /// allowance plus the bytes it takes it at the minimum rate. A client
-    /// that sends headers and then dribbles the body (or never sends it)
-    /// would otherwise hold its [`max_connections`](Self::max_connections)
-    /// slot forever: the stall guard
-    /// ([`stream_idle_timeout`](Self::stream_idle_timeout)) watches writes,
-    /// and such a connection owes none. [`Duration::ZERO`] turns the guard
-    /// off. Routers mounted outside [`ApiServer`](crate::ApiServer) get none
-    /// of it: whoever serves them owns the request bodies. Default 20
-    /// seconds.
+    /// when the request arrives. Each byte received pushes the deadline out
+    /// by `1 / [`body_min_rate`](Self::body_min_rate)` seconds, so a client
+    /// that keeps the average rate up, however it chunks, is never cut off.
+    /// A client that sends headers and then dribbles the body (or never
+    /// sends it) would otherwise hold its
+    /// [`max_connections`](Self::max_connections) slot forever: the stall
+    /// guard ([`stream_idle_timeout`](Self::stream_idle_timeout)) watches
+    /// writes, and such a connection owes none.
+    /// [`Duration::ZERO`] turns the guard off. Routers mounted outside
+    /// [`ApiServer`](crate::ApiServer) get none of it: whoever serves them
+    /// owns the request bodies. Default 20 seconds.
     pub body_read_timeout: Duration,
     /// The minimum average rate, in bytes per second, a request body must
     /// arrive at while [`body_read_timeout`](Self::body_read_timeout) is on:
     /// each byte received pushes the deadline out by `1 / body_min_rate`
-    /// seconds. `0` means no extension — the body must then arrive whole
+    /// seconds. `0` means no extension: the body must then arrive whole
     /// within [`body_read_timeout`](Self::body_read_timeout). Routers
     /// mounted outside [`ApiServer`](crate::ApiServer) get none of it.
     /// Default 500.

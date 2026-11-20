@@ -228,9 +228,36 @@ impl From<CreateError> for ApiErrorResponse {
     }
 }
 
-/// An extractor rejection: `413 body_too_large`, a server-side failure as
-/// `500 internal`, anything else `400 invalid_request`.
-fn rejection(status: StatusCode, text: String) -> ApiErrorResponse {
+/// Walks the `source()` chain of `err` looking for an [`io::Error`] of kind
+/// [`TimedOut`](io::ErrorKind::TimedOut): the body-read deadline's error,
+/// wrapped however many layers deep by axum's body-buffering rejections.
+fn is_body_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: &(dyn std::error::Error + 'static) = err;
+    if let Some(io_err) = cur.downcast_ref::<io::Error>() {
+        if io_err.kind() == io::ErrorKind::TimedOut {
+            return true;
+        }
+    }
+    while let Some(source) = cur.source() {
+        cur = source;
+        if let Some(io_err) = cur.downcast_ref::<io::Error>() {
+            if io_err.kind() == io::ErrorKind::TimedOut {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// An extractor rejection: a body-read time-out as `408 request_timeout`,
+/// `413 body_too_large`, a server-side failure as `500 internal`, anything
+/// else `400 invalid_request`.
+fn rejection(status: StatusCode, text: String, err: Option<&(dyn std::error::Error + 'static)>) -> ApiErrorResponse {
+    if let Some(err) = err
+        && is_body_timeout(err)
+    {
+        return ApiErrorResponse::new(StatusCode::REQUEST_TIMEOUT, "request_timeout", text);
+    }
     if status == StatusCode::PAYLOAD_TOO_LARGE {
         ApiErrorResponse::new(status, "body_too_large", text)
     } else if status.is_server_error() {
@@ -242,25 +269,25 @@ fn rejection(status: StatusCode, text: String) -> ApiErrorResponse {
 
 impl From<JsonRejection> for ApiErrorResponse {
     fn from(r: JsonRejection) -> Self {
-        rejection(r.status(), r.body_text())
+        rejection(r.status(), r.body_text(), Some(&r))
     }
 }
 
 impl From<BytesRejection> for ApiErrorResponse {
     fn from(r: BytesRejection) -> Self {
-        rejection(r.status(), r.body_text())
+        rejection(r.status(), r.body_text(), Some(&r))
     }
 }
 
 impl From<QueryRejection> for ApiErrorResponse {
     fn from(r: QueryRejection) -> Self {
-        rejection(r.status(), r.body_text())
+        rejection(r.status(), r.body_text(), None)
     }
 }
 
 impl From<PathRejection> for ApiErrorResponse {
     fn from(r: PathRejection) -> Self {
-        rejection(r.status(), r.body_text())
+        rejection(r.status(), r.body_text(), None)
     }
 }
 
