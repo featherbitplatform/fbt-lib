@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `fbt-api`: a client that sends a request body slowly can no longer hold a connection and its `max_connections` permit forever. `ApiServer` now ends a connection whose request body takes longer than `body_read_timeout` (extended by the bytes it keeps arriving at `body_min_rate`), freeing the connection and its permit. The stall guard (`stream_idle_timeout`) only watched write progress; such a connection owes no writes and was never cut off.
+- `fbt-api`: a client that sends a request body slowly can no longer hold a connection and its `max_connections` permit forever. `ApiServer` now ends a connection whose request body takes longer than `body_read_timeout` (extended by the bytes it keeps arriving at `body_min_rate`), freeing the connection and its permit. The stall guard (`stream_idle_timeout`) only watched write progress; such a connection owes no writes and was never cut off. When the handler is still able to answer, a body that arrives too slowly is answered `408` with code `request_timeout`.
 
 ## [0.10.0] - 2026-11-19
 

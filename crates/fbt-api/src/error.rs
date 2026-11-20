@@ -63,8 +63,8 @@ pub enum ApiError {
 /// Codes and statuses (keep [`crate::dto::ErrorDetail`]'s docs in step):
 /// `400` `invalid_request`, `invalid_id`, `invalid_priorities`,
 /// `invalid_path`; `401` `unauthorized` (with `WWW-Authenticate: Bearer`);
-/// `403` `path_not_allowed`, `forbidden`; `404` `not_found`; `409`
-/// `no_metadata`, `duplicate_torrent`, `busy`, `already_exists`; `413`
+/// `403` `path_not_allowed`, `forbidden`; `404` `not_found`; `408`
+/// `request_timeout`; `409` `no_metadata`, `duplicate_torrent`, `busy`, `already_exists`; `413`
 /// `body_too_large`; `416` `range_not_satisfiable`; `429`
 /// `too_many_requests` (with `Retry-After: <seconds>`); `501` `unsupported`;
 /// `503` `too_many_streams` (with `Retry-After: 1`), `shutting_down`,
