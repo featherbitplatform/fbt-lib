@@ -18,7 +18,8 @@ async fn loopback_dht(bootstrap: Vec<String>) -> Dht {
     c.bind_v6 = None;
     c.bootstrap = bootstrap;
     c.query_rate_per_ip = 10_000;
-    c.query_timeout = Duration::from_millis(500);
+    // a busy machine delivers replies late, not never: 2 s counts a late answer too
+    c.query_timeout = Duration::from_secs(2);
     Dht::spawn(c).await.unwrap()
 }
 
@@ -26,7 +27,8 @@ fn dht_settings(bootstrap: Vec<String>) -> Settings {
     let mut s = test_settings();
     s.dht_enabled = true;
     s.dht_bootstrap_nodes = bootstrap;
-    s.dht_query_timeout = Duration::from_millis(500);
+    // a busy machine delivers replies late, not never: 2 s counts a late answer too
+    s.dht_query_timeout = Duration::from_secs(2);
     s.dht_query_rate_per_ip = 10_000;
     s
 }
