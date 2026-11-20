@@ -155,11 +155,11 @@ fn bind_one_with(
     let mut attempt = 1;
     loop {
         let picked = addr.port() == 0 && attempt > 1 && attempt < BIND_ATTEMPTS;
-        // A picked port is reached only after a UDP bind failed, rare
-        // outside Windows, where bind_tcp has no SO_REUSEADDR. Off Windows
-        // that option is on, so a picked-port TCP bind can succeed beside
-        // another process's listener on the other address form of the same
-        // port (wildcard against specific); it does not steal that listener.
+        // Off Windows bind_tcp sets SO_REUSEADDR, so on BSD/macOS a picked-port
+        // bind can succeed beside another process's listener on the other address
+        // form of the same port; a specific listen address then takes the
+        // connections to that address from a wildcard listener. Reached only after
+        // a UDP bind failed, which is rare outside Windows.
         let target = if picked {
             let mut target = addr;
             target.set_port(next_port());
