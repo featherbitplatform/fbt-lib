@@ -400,15 +400,26 @@ async fn a_trickled_body_is_cut_off_although_bytes_keep_coming() {
     send_login_headers(&mut client, token, 100_000).await;
     // 1 byte every 100 ms: each byte stretches the deadline by 1 ms, so
     // after 300 bytes (30 ms real time) the deadline is due at about 300 ms.
+    // The connection must be closed while the client is still sending:
+    // an idle-gap timer (the mutation) would keep it open for the whole
+    // 40 s of trickling and only close it after the client stops.
+    let mut closed_while_sending = false;
     for _ in 0..400 {
-        client.write_u8(0).await.expect("1 body byte written");
+        match client.write_u8(0).await {
+            Ok(()) => {}
+            Err(_) => {
+                closed_while_sending = true;
+                break;
+            }
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
         if closed_within(&mut client, Duration::from_millis(50)).await {
+            closed_while_sending = true;
             break;
         }
     }
     assert!(
-        closed_within(&mut client, Duration::from_secs(3)).await,
+        closed_while_sending,
         "a trickled body kept its connection"
     );
     drop(client);
