@@ -3040,8 +3040,8 @@ mod tests {
         a.table_v4.as_mut().unwrap().failed(&far(1).id);
         a.table_v4.as_mut().unwrap().failed(&far(1).id);
         assert_eq!(a.table_v4.as_ref().unwrap().len(), K);
-        // the eviction the query timeout performs for a bad entry drops it:
-        // the table falls below K
+        // drop the bad entry the way `insert` does when a new node takes its
+        // IP: the table falls below K
         a.table_v4.as_mut().unwrap().evict_bad(bucket, far(1).addr);
         assert_eq!(
             a.table_v4.as_ref().unwrap().len(),

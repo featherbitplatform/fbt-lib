@@ -333,8 +333,9 @@ impl RoutingTable {
         self.buckets.iter().map(|b| b.nodes.len()).sum()
     }
 
-    /// Removes the bad entry (if any) whose address is `addr` from bucket `i`:
-    /// the same eviction the query timeout performs, for tests.
+    /// Removes the bad entry (if any) at `addr` from bucket `i`, for tests.
+    /// Production code drops an entry without replacing it only in `insert`,
+    /// when a new node takes over a bad entry's IP.
     #[cfg(test)]
     pub(crate) fn evict_bad(&mut self, i: usize, addr: SocketAddr) {
         if let Some(bucket) = self.buckets.get_mut(i)
