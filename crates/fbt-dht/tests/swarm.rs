@@ -46,12 +46,12 @@ async fn swarm(n: usize, bind: &str) -> Vec<Dht> {
 }
 
 /// Introduces every node to every other one: each pings each, so a table does
-/// not have to wait on discovery. A node whose bootstrap got nothing is never
-/// retried by bootstrap (that runs only while every table is empty) and
-/// refreshes only after 60 s, so this is the only thing that lifts it out of an
-/// empty or nearly empty table. The pairs go in a circle, one ping per node per
-/// wave: peers answered many at once are answered late enough for the 500 ms
-/// query timeout to write the introduction off, and a write-off is permanent.
+/// not depend on discovery or on the bootstrap retry. That retry runs while no
+/// table holds K nodes, so in a swarm of fewer than K nodes it runs until the
+/// test ends. The pairs go in a circle, one ping per node per wave, 25 ms apart:
+/// a node asked by many peers at once answers some later than the asker's query
+/// timeout (2 s, 500 ms in `ready_swarm`) allows, and that introduction is
+/// simply lost.
 async fn introduce_all(nodes: &[Dht]) {
     let addrs: Vec<SocketAddr> = nodes.iter().map(|d| d.local_addrs()[0]).collect();
     let n = nodes.len();
