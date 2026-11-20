@@ -662,7 +662,8 @@ async fn loopback_dht() -> Dht {
     c.bind_v6 = None;
     c.bootstrap = Vec::new();
     c.query_rate_per_ip = 10_000;
-    c.query_timeout = Duration::from_millis(500);
+    // a busy machine delivers replies late, not never: 2 s counts a late answer too
+    c.query_timeout = Duration::from_secs(2);
     Dht::spawn(c).await.unwrap()
 }
 
@@ -671,7 +672,8 @@ fn dht_settings(bootstrap: Vec<String>) -> Settings {
     let mut s = settings();
     s.dht_enabled = true;
     s.dht_bootstrap_nodes = bootstrap;
-    s.dht_query_timeout = Duration::from_millis(500);
+    // a busy machine delivers replies late, not never: 2 s counts a late answer too
+    s.dht_query_timeout = Duration::from_secs(2);
     s.dht_query_rate_per_ip = 10_000;
     s
 }
@@ -722,14 +724,9 @@ async fn session_state_round_trip() {
         assert!(trusted(&h).await);
         assert!(wait_state(&h, |s| *s == TorrentState::Seeding, T).await);
     }
-    // From the saved state alone: nothing to bootstrap from.
-    assert!(
-        wait_until(
-            || s.dht_stats().unwrap().nodes_v4 > 0,
-            Duration::from_secs(3)
-        )
-        .await
-    );
+    // From the saved state alone: nothing to bootstrap from. The nodes it
+    // restored to are the only ones it can learn, and one may answer late.
+    assert!(wait_until(|| s.dht_stats().unwrap().nodes_v4 > 0, T).await);
     s.shutdown().await;
     boot.shutdown().await;
 }

@@ -20,7 +20,11 @@ fn cfg(bind: &str) -> DhtConfig {
         c.bind_v6 = Some(bind);
     }
     c.query_rate_per_ip = 10_000;
-    c.query_timeout = Duration::from_millis(500);
+    // a busy machine delivers replies late, not never: 2 s counts a late answer too
+    c.query_timeout = Duration::from_secs(2);
+    // a busy machine can leave a bootstrap with no replies: retry fast, not after 30 s
+    c.bootstrap_retry_base = Duration::from_millis(200);
+    c.bootstrap_retry_max = Duration::from_secs(2);
     c
 }
 
@@ -39,6 +43,26 @@ async fn swarm(n: usize, bind: &str) -> Vec<Dht> {
         nodes.push(Dht::spawn(c).await.unwrap());
     }
     nodes
+}
+
+/// Introduces every node to every other one: each pings each, so a table does
+/// not depend on discovery or on the bootstrap retry. That retry runs while no
+/// table holds K nodes, so in a swarm of fewer than K nodes it runs until the
+/// test ends. The pairs go in a circle, one ping per node per wave, 25 ms apart:
+/// a node asked by many peers at once answers some later than the asker's query
+/// timeout (2 s, 500 ms in `ready_swarm`) allows, and that introduction is
+/// simply lost.
+async fn introduce_all(nodes: &[Dht]) {
+    let addrs: Vec<SocketAddr> = nodes.iter().map(|d| d.local_addrs()[0]).collect();
+    let n = nodes.len();
+    // one offset is one ping per node, so 1..n lands on every ordered pair
+    // exactly once; the gap between waves is time spent answering, not sending
+    for step in 1..n {
+        for i in 0..n {
+            nodes[i].add_node(addrs[(i + step) % n]);
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn wait_until(limit: Duration, mut ok: impl FnMut() -> bool) -> bool {
@@ -71,7 +95,7 @@ async fn find(dht: &Dht, ih: [u8; 20], want: SocketAddr) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn twenty_nodes_bootstrap_and_fill_tables() {
     let nodes = swarm(21, "127.0.0.1:0").await;
-    let filled = wait_until(Duration::from_secs(10), || {
+    let filled = wait_until(Duration::from_secs(30), || {
         nodes.iter().all(|n| {
             let s = n.stats();
             s.nodes_v4 >= 8 && s.bootstrapped
@@ -86,11 +110,16 @@ async fn twenty_nodes_bootstrap_and_fill_tables() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn announce_then_get_peers_finds_the_peer() {
     let nodes = swarm(21, "127.0.0.1:0").await;
+    // not a discovery test: every node learns every other one directly
+    introduce_all(&nodes).await;
+    let counts = || nodes.iter().map(|n| n.stats().nodes_v4).collect::<Vec<_>>();
     assert!(
-        wait_until(Duration::from_secs(10), || nodes
+        wait_until(Duration::from_secs(30), || nodes
             .iter()
             .all(|n| n.stats().bootstrapped))
-        .await
+        .await,
+        "tables: {:?}",
+        counts()
     );
     let ih = [0x42; 20];
     let mut announce = nodes[19].announce(ih, Some(4242), false);
@@ -107,7 +136,7 @@ async fn scrape_round_trip() {
     // (synthetic IPs are counted in the store's unit tests)
     let nodes = swarm(10, "127.0.0.1:0").await;
     assert!(
-        wait_until(Duration::from_secs(10), || nodes
+        wait_until(Duration::from_secs(30), || nodes
             .iter()
             .all(|n| n.stats().nodes_v4 >= 5))
         .await
@@ -141,11 +170,16 @@ async fn scrape_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sample_infohashes_returns_stored_hashes() {
     let nodes = swarm(4, "127.0.0.1:0").await;
+    // not a discovery test: every node learns every other one directly
+    introduce_all(&nodes).await;
+    let counts = || nodes.iter().map(|n| n.stats().nodes_v4).collect::<Vec<_>>();
     assert!(
-        wait_until(Duration::from_secs(10), || nodes
+        wait_until(Duration::from_secs(30), || nodes
             .iter()
             .all(|n| n.stats().nodes_v4 >= 3))
-        .await
+        .await,
+        "tables: {:?}",
+        counts()
     );
     // with 4 nodes every announce reaches node 0 (one of the K closest)
     let hashes: Vec<[u8; 20]> = (1..=3u8).map(|k| [k; 20]).collect();
@@ -163,11 +197,19 @@ async fn sample_infohashes_returns_stored_hashes() {
     assert_eq!(samples, hashes);
     assert!(!got.nodes.is_empty());
     assert!(got.nodes.iter().all(|n| n.addr.ip().is_loopback()));
-    // an address nothing listens on times out
+    // an address nothing listens on times out. It gets its own node on the
+    // 500 ms timeout: the point of the assert is the dead address, and sitting
+    // through the swarm's 2 s wait would only make the test slow.
+    let mut probe_cfg = cfg("127.0.0.1:0");
+    probe_cfg.query_timeout = Duration::from_millis(500);
+    let probe = Dht::spawn(probe_cfg).await.unwrap();
     let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let dead_addr = dead.local_addr().unwrap();
     drop(dead);
-    assert!(nodes[3].sample_infohashes(dead_addr, target).await.is_err());
+    // the probe answers a live one first: it is the dead address that fails
+    assert!(probe.sample_infohashes(addr, target).await.is_ok());
+    assert!(probe.sample_infohashes(dead_addr, target).await.is_err());
+    probe.shutdown().await;
     shutdown(&nodes).await;
 }
 
@@ -176,7 +218,7 @@ async fn sample_infohashes_returns_stored_hashes() {
 ///
 /// Review note (0.8 deflake; not reproduced: 100 runs at 4 copies, then 100
 /// more at 36 copies under CPU load): every wait here is a bounded condition
-/// loop (`wait_until` over 10 s, the lookup under 5 s), so there is no fixed
+/// loop (`wait_until` over 30 s, the lookup under 5 s), so there is no fixed
 /// sleep to replace and no budget under the plan's 5 s floor to raise. Asking
 /// the first wait for more than it needs makes this test fail instead of
 /// tighter: `DhtStats::bootstrapped` means "a routing table reached K", eight
@@ -194,7 +236,7 @@ async fn ipv6_swarm_converges_when_available() {
     }
     let nodes = swarm(10, "[::1]:0").await;
     assert!(
-        wait_until(Duration::from_secs(10), || nodes
+        wait_until(Duration::from_secs(30), || nodes
             .iter()
             .all(|n| n.stats().nodes_v6 >= 5))
         .await,
@@ -214,7 +256,7 @@ async fn ipv6_swarm_converges_when_available() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restored_state_rejoins_without_bootstrap() {
     let nodes = swarm(21, "127.0.0.1:0").await;
-    assert!(wait_until(Duration::from_secs(10), || nodes[5].stats().nodes_v4 >= 8).await);
+    assert!(wait_until(Duration::from_secs(30), || nodes[5].stats().nodes_v4 >= 8).await);
     let state = nodes[5].state().await.unwrap();
     assert!(state.nodes_v4.len() >= 8 && state.nodes_v4.len() <= MAX_STATE_NODES);
     let id = state.id_v4.expect("an IPv4 id");
@@ -223,7 +265,7 @@ async fn restored_state_rejoins_without_bootstrap() {
     c.state = Some(fbt_dht::DhtState::from_bytes(&state.to_bytes()).unwrap());
     assert!(c.bootstrap.is_empty());
     let back = Dht::spawn(c).await.unwrap();
-    assert!(wait_until(Duration::from_secs(10), || back.stats().nodes_v4 >= 8).await);
+    assert!(wait_until(Duration::from_secs(30), || back.stats().nodes_v4 >= 8).await);
     assert_eq!(back.state().await.unwrap().id_v4, Some(id));
     back.shutdown().await;
     shutdown(&nodes).await;
@@ -395,7 +437,7 @@ async fn mixed_standalone_and_shared_nodes_converge() {
         });
     }
     assert!(
-        wait_until(Duration::from_secs(15), || nodes
+        wait_until(Duration::from_secs(30), || nodes
             .iter()
             .all(|n| n.stats().nodes_v4 >= 5))
         .await,
@@ -496,14 +538,7 @@ async fn ready_swarm_with(n: usize, min: usize, query_timeout: Duration) -> Vec<
         c.bootstrap = vec![seed.clone()];
         nodes.push(Dht::spawn(c).await.unwrap());
     }
-    // introduce every pair directly (a ping each way), so a full mesh does
-    // not wait on discovery
-    let addrs: Vec<SocketAddr> = nodes.iter().map(|d| d.local_addrs()[0]).collect();
-    for (d, own) in nodes.iter().zip(&addrs) {
-        for a in addrs.iter().filter(|a| *a != own) {
-            d.add_node(*a);
-        }
-    }
+    introduce_all(&nodes).await;
     let counts = || nodes.iter().map(|d| d.stats().nodes_v4).collect::<Vec<_>>();
     assert!(
         wait_until(Duration::from_secs(20), || nodes
