@@ -333,6 +333,21 @@ impl RoutingTable {
         self.buckets.iter().map(|b| b.nodes.len()).sum()
     }
 
+    /// Removes the bad entry (if any) at `addr` from bucket `i`, for tests.
+    /// Production code drops an entry without replacing it only in `insert`,
+    /// when a new node takes over a bad entry's IP.
+    #[cfg(test)]
+    pub(crate) fn evict_bad(&mut self, i: usize, addr: SocketAddr) {
+        if let Some(bucket) = self.buckets.get_mut(i)
+            && let Some(p) = bucket
+                .nodes
+                .iter()
+                .position(|e| e.is_bad() && e.info.addr == addr)
+        {
+            self.remove_at(i, p);
+        }
+    }
+
     /// Non-empty buckets with no node heard from in the last 15 minutes.
     pub(crate) fn stale_buckets(&self, now: Instant) -> Vec<usize> {
         self.buckets
