@@ -105,11 +105,11 @@ pub struct DhtConfig {
     pub max_items: usize,
     /// Our queries in flight at once; more give `Busy`.
     pub max_pending_queries: usize,
-    /// First bootstrap retry delay (doubles per attempt). A node retries as
-    /// long as no routing table holds 8 (`K`) nodes, so in a network with
-    /// fewer than 8 nodes it keeps retrying at this pace, each retry no later
-    /// than the previous delay doubled, up to `bootstrap_retry_max` (15 min
-    /// by default) per retry.
+    /// First bootstrap retry delay. The delay doubles per attempt, up to
+    /// `bootstrap_retry_max` (15 min by default), and counts from the end of
+    /// the previous attempt. A node retries until one routing table holds 8
+    /// (`K`) nodes, so in a network of fewer than 8 nodes it retries
+    /// indefinitely at that pace.
     #[doc(hidden)]
     pub bootstrap_retry_base: Duration,
     /// Longest bootstrap retry delay.
@@ -2931,7 +2931,10 @@ mod tests {
         }
         a.on_timer(t0 + a.retry_base);
         assert_eq!(a.boot_attempt, 1);
-        assert!(a.boot_task.is_some());
+        assert!(
+            !a.boot_task.as_ref().unwrap().is_finished(),
+            "no new bootstrap attempt started"
+        );
         if let Some(t) = a.boot_task.take() {
             t.abort();
         }
@@ -2960,7 +2963,10 @@ mod tests {
             a.boot_attempt, 1,
             "a node short of K entries did not retry its bootstrap"
         );
-        assert!(a.boot_task.is_some(), "no new bootstrap attempt started");
+        assert!(
+            !a.boot_task.as_ref().unwrap().is_finished(),
+            "no new bootstrap attempt started"
+        );
         if let Some(t) = a.boot_task.take() {
             t.abort();
         }
@@ -2994,6 +3000,67 @@ mod tests {
             a.boot_due, None,
             "a bootstrapped node keeps scheduling retries"
         );
+    }
+
+    /// A node that reached `K` and falls below it is rescheduled again.
+    #[tokio::test]
+    async fn a_node_that_falls_below_k_retries_again() {
+        let (mut a, _tx) = actor(DhtConfig {
+            bootstrap: vec!["127.0.0.1:9".into()],
+            ..cfg()
+        });
+        let t0 = Instant::now();
+        let done = tokio::spawn(async {});
+        a.boot_started = true;
+        a.boot_task = Some(done);
+        while !a.boot_task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        for k in 0..K {
+            a.learn(far(k as u8), t0);
+        }
+        let t = a.table_v4.as_ref().unwrap();
+        let bucket = t
+            .own_id()
+            .bucket_index(&far(1).id)
+            .expect("an own id shares a prefix");
+        assert_eq!(a.table_v4.as_ref().unwrap().len(), K);
+        a.boot_task = Some(tokio::spawn(async {}));
+        while !a.boot_task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        a.boot_due = Some(t0);
+        a.on_timer(t0);
+        assert_eq!(
+            a.boot_due, None,
+            "a bootstrapped node keeps scheduling retries"
+        );
+        // `far(1)` fails twice and turns bad; the bucket's replacement cache
+        // is empty, so it keeps its slot (bad entries still count in `len`)
+        a.table_v4.as_mut().unwrap().failed(&far(1).id);
+        a.table_v4.as_mut().unwrap().failed(&far(1).id);
+        assert_eq!(a.table_v4.as_ref().unwrap().len(), K);
+        // the eviction the query timeout performs for a bad entry drops it:
+        // the table falls below K
+        a.table_v4.as_mut().unwrap().evict_bad(bucket, far(1).addr);
+        assert_eq!(
+            a.table_v4.as_ref().unwrap().len(),
+            K - 1,
+            "the evicted node still counted as a table entry"
+        );
+        a.boot_task = Some(tokio::spawn(async {}));
+        while !a.boot_task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        a.on_timer(t0);
+        assert_eq!(
+            a.boot_due,
+            Some(t0 + backoff(a.retry_base, a.retry_max, a.boot_attempt)),
+            "a node that fell below K was not rescheduled"
+        );
+        if let Some(t) = a.boot_task.take() {
+            t.abort();
+        }
     }
 
     /// The safety net reschedules a retry for a table short of `K` nodes, not

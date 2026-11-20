@@ -333,6 +333,20 @@ impl RoutingTable {
         self.buckets.iter().map(|b| b.nodes.len()).sum()
     }
 
+    /// Removes the bad entry (if any) whose address is `addr` from bucket `i`:
+    /// the same eviction the query timeout performs, for tests.
+    #[cfg(test)]
+    pub(crate) fn evict_bad(&mut self, i: usize, addr: SocketAddr) {
+        if let Some(bucket) = self.buckets.get_mut(i)
+            && let Some(p) = bucket
+                .nodes
+                .iter()
+                .position(|e| e.is_bad() && e.info.addr == addr)
+        {
+            self.remove_at(i, p);
+        }
+    }
+
     /// Non-empty buckets with no node heard from in the last 15 minutes.
     pub(crate) fn stale_buckets(&self, now: Instant) -> Vec<usize> {
         self.buckets
