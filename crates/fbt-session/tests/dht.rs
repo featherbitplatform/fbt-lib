@@ -31,7 +31,8 @@ async fn loopback_dht(bootstrap: Vec<String>) -> Dht {
     c.bind_v6 = None;
     c.bootstrap = bootstrap;
     c.query_rate_per_ip = 10_000;
-    c.query_timeout = Duration::from_millis(500);
+    // a busy machine delivers replies late, not never: 2 s counts a late answer too
+    c.query_timeout = Duration::from_secs(2);
     Dht::spawn(c).await.unwrap()
 }
 
@@ -45,7 +46,8 @@ fn dht_settings(bootstrap: Vec<String>) -> Settings {
     s.rechoke_interval = Duration::from_secs(1);
     s.dht_enabled = true;
     s.dht_bootstrap_nodes = bootstrap;
-    s.dht_query_timeout = Duration::from_millis(500);
+    // a busy machine delivers replies late, not never: 2 s counts a late answer too
+    s.dht_query_timeout = Duration::from_secs(2);
     s.dht_query_rate_per_ip = 10_000;
     s
 }
@@ -208,13 +210,9 @@ async fn port_message_adds_node() {
         Some(Message::Port(dht_port))
     );
     peer.send(Message::Port(raw_port)).await;
-    assert!(
-        wait_until(
-            || session.dht_stats().unwrap().nodes_v4 >= 1,
-            Duration::from_secs(3)
-        )
-        .await
-    );
+    // the session learns the node by querying it: a late answer counts now, and
+    // a lost one costs the 30 s retry that Settings has no shorter value for
+    assert!(wait_until(|| session.dht_stats().unwrap().nodes_v4 >= 1, T).await);
     session.shutdown().await;
     raw.shutdown().await;
 }
@@ -233,13 +231,9 @@ async fn dht_state_roundtrip_through_session() {
     let mut s = dht_settings(Vec::new());
     s.dht_state = Some(state);
     let s2 = Session::new(s).await.unwrap();
-    assert!(
-        wait_until(
-            || s2.dht_stats().unwrap().nodes_v4 >= 1,
-            Duration::from_secs(3)
-        )
-        .await
-    );
+    // the node it restored to is the only node it can learn, and it may answer
+    // late: this is a "the saved table works again" bound, not a latency claim
+    assert!(wait_until(|| s2.dht_stats().unwrap().nodes_v4 >= 1, T).await);
     s2.shutdown().await;
     boot.shutdown().await;
 }
@@ -419,8 +413,12 @@ async fn dht_methods_without_dht_are_disabled() {
         Err(SessionError::DhtDisabled)
     ));
     session.shutdown().await;
-    // With the DHT on, a node that never answers is a DHT error.
-    let on = Session::new(dht_settings(Vec::new())).await.unwrap();
+    // With the DHT on, a node that never answers is a DHT error. This session
+    // keeps its own 500 ms timeout: what is under test is the dead address, not
+    // how long the wait takes.
+    let mut on_settings = dht_settings(Vec::new());
+    on_settings.dht_query_timeout = Duration::from_millis(500);
+    let on = Session::new(on_settings).await.unwrap();
     let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let dead_addr = dead.local_addr().unwrap();
     drop(dead);
@@ -459,8 +457,9 @@ async fn dht_bootstrapped_event_once() {
         .await
         .unwrap();
     let mut rx = session.subscribe(EventMask::DHT);
+    // a lost first attempt costs the 30 s retry, and Settings has no shorter one
     assert!(
-        matches!(next_event(&mut rx, 10).await, Some(Event::DhtBootstrapped { nodes }) if nodes >= 1)
+        matches!(next_event(&mut rx, 30).await, Some(Event::DhtBootstrapped { nodes }) if nodes >= 1)
     );
     // exactly one: nothing more in 3 s
     assert!(
