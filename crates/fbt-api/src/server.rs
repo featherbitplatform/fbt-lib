@@ -40,7 +40,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant as TokioInstant, sleep};
+use tokio::time::{Instant as TokioInstant, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::{ApiConfig, ApiError};
@@ -406,9 +406,12 @@ struct BodyDeadline<B> {
     started: Option<TokioInstant>,
     /// Bytes of data received so far.
     received: u64,
-    /// The armed sleep: due when the deadline is, re-armed whenever the
-    /// deadline moves, polled only while the inner body is `Pending`.
-    timer: Pin<Box<tokio::time::Sleep>>,
+    /// The armed sleep that ends the guard when the deadline passes, created
+    /// on the first `Pending` poll so a body that never idles (a GET whose
+    /// body is never read) pays nothing for it. Armed at the deadline and
+    /// re-armed whenever the deadline moves; polled only while the inner body
+    /// is `Pending`.
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
     /// The deadline passed; every further poll answers the time-out's
     /// error. The stream may still have frames (a client may keep sending
     /// into the void), but hyper ends the connection after the error
@@ -434,8 +437,9 @@ where
             peer,
             started: None,
             received: 0,
-            // Never polled before the first `poll_frame` arms it there.
-            timer: Box::pin(sleep(Duration::from_secs(365 * 24 * 60 * 60))),
+            // Created on the first `Pending` poll in `poll_frame`, not here: a
+            // GET whose body is never read never pays for the sleep.
+            timer: None,
             timed_out: false,
             done: false,
         }
@@ -587,31 +591,30 @@ where
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Pending => {
-                // The deadline may have moved since the last poll (a data
-                // frame extended it), so re-arm at `started + deadline`
-                // and wait on it: the timeout must fire even while no byte
-                // arrives. An overflowing sum is a deadline so far out it is
-                // as good as not there, so it parks in [`arm_deadline`]'s
-                // far future; falling back to `started` would fire at once
-                // and fake a time-out.
+                // The deadline may have moved since the last poll (a data frame
+                // extended it), so arm at `started + deadline` and wait on it:
+                // the time-out must fire even while no byte arrives. An
+                // overflowing sum is a deadline so far out it is as good as not
+                // there, so it parks in [`arm_deadline`]'s far future; falling
+                // back to `started` would fire at once and fake a time-out. The
+                // sleep is created here, on the first idle poll, rather than for
+                // every request.
                 let due = match started.checked_add(this.deadline()) {
                     Some(due) => due,
                     None => arm_deadline(Duration::MAX),
                 };
-                this.timer.as_mut().reset(due);
-                match this.timer.as_mut().poll(cx) {
-                    Poll::Ready(()) => {
-                        if this.stalled_out() {
-                            Poll::Ready(Some(Err(Self::timeout_error())))
-                        } else {
-                            // The deadline moved past the timer's due
-                            // moment; the inner body still has what it
-                            // had, and the caller polls again.
-                            Poll::Pending
-                        }
+                let timer = this.timer.get_or_insert_with(|| Box::pin(sleep_until(due)));
+                timer.as_mut().reset(due);
+                if matches!(timer.as_mut().poll(cx), Poll::Ready(())) {
+                    // The timer fired. Time out when the clock has reached the
+                    // deadline; an early wake (which cannot happen today) lets
+                    // the caller poll again.
+                    if this.stalled_out() {
+                        return Poll::Ready(Some(Err(Self::timeout_error())));
                     }
-                    Poll::Pending => Poll::Pending,
+                    return Poll::Pending;
                 }
+                Poll::Pending
             }
         }
     }
