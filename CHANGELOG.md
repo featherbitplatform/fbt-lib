@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `fbt-session`: on Windows, a session listening on port 0 could end up with its UDP socket (DHT, uTP, UDP trackers) on a different port from its TCP listen port. After a UDP bind failed, every retry asked the OS for a fresh port; Windows hands out ephemeral ports close to sequentially and keeps blocks of them excluded for UDP separately from TCP's, so a run of retries could all fall inside one excluded block. Retries now pick their ports at random from the IANA dynamic range, and the last one rebinds on the address as given ([#36](https://github.com/featherbitplatform/fbt-lib/issues/36))
+
 ## [0.11.0] - 2026-11-20
 
 ### Added

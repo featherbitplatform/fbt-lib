@@ -22,8 +22,10 @@ use crate::error::SessionError;
 use crate::event::{Event, ExternalIpSource};
 use crate::settings::Settings;
 
-/// Tries per port-0 address to find a port free for both TCP and UDP.
-const BIND_ATTEMPTS: usize = 8;
+/// Tries per port-0 address to find a port free for both TCP and UDP. The
+/// attempts between the first and the last pick their own ports (see
+/// [`random_dynamic_port`]).
+const BIND_ATTEMPTS: usize = 16;
 
 /// Backlog of each TCP listener (tokio's default for `TcpListener::bind`).
 const LISTEN_BACKLOG: i32 = 1024;
@@ -114,16 +116,60 @@ pub(crate) async fn bind_all(
 }
 
 /// Binds TCP on `addr`, then UDP on the TCP's port. With port 0 a UDP
-/// failure retries both on a fresh port, up to [`BIND_ATTEMPTS`] times;
-/// otherwise the endpoint keeps TCP only and the UDP error comes back.
-/// Without `listen` the TCP socket is closed once UDP is bound (or failed).
+/// failure retries both, up to [`BIND_ATTEMPTS`] times: the attempts between
+/// the first and the last bind TCP on a random port from the dynamic range
+/// (see [`random_dynamic_port`]), and the last asks the OS for one on `addr`
+/// again, as the first did. With an explicit port there is no retry: the
+/// endpoint keeps TCP only and the UDP error comes back. Without `listen`
+/// the TCP socket is closed once UDP is bound (or failed).
 fn bind_one(addr: SocketAddr, listen: bool) -> io::Result<(Endpoint, Option<io::Error>)> {
+    bind_one_with(
+        addr,
+        listen,
+        &mut SharedUdpSocket::bind,
+        &mut random_dynamic_port,
+    )
+}
+
+/// A port for a bind retry: uniformly random in the IANA dynamic range.
+/// Retries pick their own ports because OSes that hand out ephemeral ports
+/// in sequence (Windows) can put every OS-chosen retry inside one block
+/// reserved for UDP.
+fn random_dynamic_port() -> u16 {
+    rand::random_range(49_152..=65_535)
+}
+
+/// The attempt loop of [`bind_one`], with the UDP bind and the retry ports
+/// as parameters. Attempt 1 binds TCP on `addr`; while `addr` has port 0
+/// each later attempt before the last binds it on `next_port()`, and a TCP
+/// bind that fails on such a picked port counts as a used attempt, not an
+/// error for the caller. The last attempt binds TCP on `addr` (port 0)
+/// again, so the exhausted case still has a listener to hand back.
+fn bind_one_with(
+    addr: SocketAddr,
+    listen: bool,
+    bind_udp: &mut dyn FnMut(SocketAddr) -> io::Result<SharedUdpSocket>,
+    next_port: &mut dyn FnMut() -> u16,
+) -> io::Result<(Endpoint, Option<io::Error>)> {
     let mut attempt = 1;
     loop {
-        let tcp = bind_tcp(addr, listen)?;
+        let picked = addr.port() == 0 && attempt > 1 && attempt < BIND_ATTEMPTS;
+        let target = if picked {
+            SocketAddr::new(addr.ip(), next_port())
+        } else {
+            addr
+        };
+        let tcp = match bind_tcp(target, listen) {
+            Ok(tcp) => tcp,
+            Err(_) if picked => {
+                attempt += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let local = tcp.local_addr()?;
         let tcp = listen.then_some(tcp);
-        match SharedUdpSocket::bind(local) {
+        match bind_udp(local) {
             Ok(udp) => {
                 let ep = Endpoint {
                     addr: local,
@@ -816,5 +862,100 @@ mod tests {
         assert_eq!(hub.take_batch(later), vec![h(1)], "after the interval");
         hub.want(&[h(1)], later + Duration::from_secs(1));
         assert!(hub.take_batch(later + Duration::from_secs(1)).is_empty());
+    }
+
+    /// A port just released by a bound and dropped listener; the OS can hand
+    /// it to a later bind again, which is how the tests make a UDP bind fail
+    /// on a port the TCP bind holds.
+    fn free_loopback_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a probe listener");
+        let port = probe.local_addr().expect("the probe address").port();
+        drop(probe);
+        port
+    }
+
+    #[tokio::test]
+    async fn a_refused_udp_port_is_retried_on_a_port_this_code_picks() {
+        let port = free_loopback_port();
+        let (ep, udp_err) = bind_one_with(
+            sa("127.0.0.1:0"),
+            true,
+            &mut |local: SocketAddr| {
+                if local.port() == port {
+                    SharedUdpSocket::bind(local)
+                } else {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                }
+            },
+            &mut || port,
+        )
+        .expect("a bind whose UDP failure is retried");
+        assert_eq!(
+            ep.addr.port(),
+            port,
+            "a refused UDP port was not retried on a picked port"
+        );
+        assert!(
+            udp_err.is_none(),
+            "a retry that binds both protocols reports no UDP error"
+        );
+        let udp = ep.udp.expect("the retry binds UDP beside TCP");
+        assert_eq!(
+            udp.local_addr().port(),
+            port,
+            "the UDP socket keeps the port the retry picked"
+        );
+        udp.close();
+    }
+
+    #[tokio::test]
+    async fn an_explicit_port_is_not_retried() {
+        let port = free_loopback_port();
+        let addr = sa(&format!("127.0.0.1:{port}"));
+        let mut refusals = 0;
+        let (ep, udp_err) = bind_one_with(
+            addr,
+            true,
+            &mut |_: SocketAddr| {
+                refusals += 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+            &mut || -> u16 { panic!("an explicit port retried on a picked port") },
+        )
+        .expect("a bind on an explicit port");
+        assert!(ep.tcp.is_some(), "the explicit port keeps its listener");
+        assert_eq!(
+            ep.addr, addr,
+            "an explicit bind keeps the port it was given"
+        );
+        let e = udp_err.expect("the refused UDP bind comes back to the caller");
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the caller gets the UDP bind's own error"
+        );
+        assert!(
+            ep.udp.is_none(),
+            "an explicit port whose UDP bind failed keeps no UDP socket"
+        );
+        assert_eq!(refusals, 1, "an explicit port gets exactly one UDP bind");
+    }
+
+    #[test]
+    fn random_dynamic_ports_stay_in_range() {
+        let mut seen = HashSet::new();
+        for _ in 0..10_000 {
+            let port = random_dynamic_port();
+            assert!(
+                (49_152..=65_535).contains(&port),
+                "{port} is outside the dynamic range"
+            );
+            seen.insert(port);
+        }
+        assert!(
+            seen.len() >= 100,
+            "10 000 draws gave only {} distinct ports",
+            seen.len()
+        );
     }
 }
