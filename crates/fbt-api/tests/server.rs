@@ -497,10 +497,10 @@ async fn a_body_above_the_minimum_rate_completes() {
                 Err(_) => break,
                 Ok(n) => {
                     got.extend_from_slice(&buf[..n]);
-                    if let Some(body_len) = response_body_len(&got) {
-                        if got.len() >= body_len {
-                            break;
-                        }
+                    if let Some(body_len) = response_body_len(&got)
+                        && got.len() >= body_len
+                    {
+                        break;
                     }
                 }
             }
@@ -610,10 +610,10 @@ async fn a_zero_body_read_timeout_turns_the_guard_off() {
                 Err(_) => break,
                 Ok(n) => {
                     got.extend_from_slice(&buf[..n]);
-                    if let Some(body_len) = response_body_len(&got) {
-                        if got.len() >= body_len {
-                            break;
-                        }
+                    if let Some(body_len) = response_body_len(&got)
+                        && got.len() >= body_len
+                    {
+                        break;
                     }
                 }
             }
@@ -671,10 +671,10 @@ async fn a_chunked_body_with_trailers_is_not_timed_out() {
                 Err(_) => break,
                 Ok(n) => {
                     got.extend_from_slice(&buf[..n]);
-                    if let Some(body_len) = response_body_len(&got) {
-                        if got.len() >= body_len {
-                            break;
-                        }
+                    if let Some(body_len) = response_body_len(&got)
+                        && got.len() >= body_len
+                    {
+                        break;
                     }
                 }
             }
@@ -731,10 +731,10 @@ async fn a_slow_body_gets_408() {
                 Err(_) => break,
                 Ok(n) => {
                     got.extend_from_slice(&buf[..n]);
-                    if let Some(body_len) = response_body_len(&got) {
-                        if got.len() >= body_len {
-                            break;
-                        }
+                    if let Some(body_len) = response_body_len(&got)
+                        && got.len() >= body_len
+                    {
+                        break;
                     }
                 }
             }
