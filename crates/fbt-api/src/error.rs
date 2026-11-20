@@ -232,19 +232,14 @@ impl From<CreateError> for ApiErrorResponse {
 /// [`TimedOut`](io::ErrorKind::TimedOut): the body-read deadline's error,
 /// wrapped however many layers deep by axum's body-buffering rejections.
 fn is_body_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut cur: &(dyn std::error::Error + 'static) = err;
-    if let Some(io_err) = cur.downcast_ref::<io::Error>() {
-        if io_err.kind() == io::ErrorKind::TimedOut {
+    let mut node = Some(err);
+    while let Some(cur) = node {
+        if let Some(io_err) = cur.downcast_ref::<io::Error>()
+            && io_err.kind() == io::ErrorKind::TimedOut
+        {
             return true;
         }
-    }
-    while let Some(source) = cur.source() {
-        cur = source;
-        if let Some(io_err) = cur.downcast_ref::<io::Error>() {
-            if io_err.kind() == io::ErrorKind::TimedOut {
-                return true;
-            }
-        }
+        node = cur.source();
     }
     false
 }
