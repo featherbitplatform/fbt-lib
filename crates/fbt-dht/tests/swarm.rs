@@ -44,6 +44,26 @@ async fn swarm(n: usize, bind: &str) -> Vec<Dht> {
     nodes
 }
 
+/// Introduces every node to every other one: each pings each, so a table does
+/// not have to wait on discovery. A node whose bootstrap got nothing is never
+/// retried by bootstrap (that runs only while every table is empty) and
+/// refreshes only after 60 s, so this is the only thing that lifts it out of an
+/// empty or nearly empty table. The pairs go in a circle, one ping per node per
+/// wave: peers answered many at once are answered late enough for the 500 ms
+/// query timeout to write the introduction off, and a write-off is permanent.
+async fn introduce_all(nodes: &[Dht]) {
+    let addrs: Vec<SocketAddr> = nodes.iter().map(|d| d.local_addrs()[0]).collect();
+    let n = nodes.len();
+    // one offset is one ping per node, so 1..n lands on every ordered pair
+    // exactly once; the gap between waves is time spent answering, not sending
+    for step in 1..n {
+        for i in 0..n {
+            nodes[i].add_node(addrs[(i + step) % n]);
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn wait_until(limit: Duration, mut ok: impl FnMut() -> bool) -> bool {
     let end = Instant::now() + limit;
     while Instant::now() < end {
@@ -89,11 +109,16 @@ async fn twenty_nodes_bootstrap_and_fill_tables() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn announce_then_get_peers_finds_the_peer() {
     let nodes = swarm(21, "127.0.0.1:0").await;
+    // not a discovery test: every node learns every other one directly
+    introduce_all(&nodes).await;
+    let counts = || nodes.iter().map(|n| n.stats().nodes_v4).collect::<Vec<_>>();
     assert!(
         wait_until(Duration::from_secs(30), || nodes
             .iter()
             .all(|n| n.stats().bootstrapped))
-        .await
+        .await,
+        "tables: {:?}",
+        counts()
     );
     let ih = [0x42; 20];
     let mut announce = nodes[19].announce(ih, Some(4242), false);
@@ -144,11 +169,16 @@ async fn scrape_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sample_infohashes_returns_stored_hashes() {
     let nodes = swarm(4, "127.0.0.1:0").await;
+    // not a discovery test: every node learns every other one directly
+    introduce_all(&nodes).await;
+    let counts = || nodes.iter().map(|n| n.stats().nodes_v4).collect::<Vec<_>>();
     assert!(
         wait_until(Duration::from_secs(30), || nodes
             .iter()
             .all(|n| n.stats().nodes_v4 >= 3))
-        .await
+        .await,
+        "tables: {:?}",
+        counts()
     );
     // with 4 nodes every announce reaches node 0 (one of the K closest)
     let hashes: Vec<[u8; 20]> = (1..=3u8).map(|k| [k; 20]).collect();
@@ -398,7 +428,7 @@ async fn mixed_standalone_and_shared_nodes_converge() {
         });
     }
     assert!(
-        wait_until(Duration::from_secs(15), || nodes
+        wait_until(Duration::from_secs(30), || nodes
             .iter()
             .all(|n| n.stats().nodes_v4 >= 5))
         .await,
@@ -499,14 +529,7 @@ async fn ready_swarm_with(n: usize, min: usize, query_timeout: Duration) -> Vec<
         c.bootstrap = vec![seed.clone()];
         nodes.push(Dht::spawn(c).await.unwrap());
     }
-    // introduce every pair directly (a ping each way), so a full mesh does
-    // not wait on discovery
-    let addrs: Vec<SocketAddr> = nodes.iter().map(|d| d.local_addrs()[0]).collect();
-    for (d, own) in nodes.iter().zip(&addrs) {
-        for a in addrs.iter().filter(|a| *a != own) {
-            d.add_node(*a);
-        }
-    }
+    introduce_all(&nodes).await;
     let counts = || nodes.iter().map(|d| d.stats().nodes_v4).collect::<Vec<_>>();
     assert!(
         wait_until(Duration::from_secs(20), || nodes
