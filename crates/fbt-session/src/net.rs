@@ -864,14 +864,23 @@ mod tests {
         assert!(hub.take_batch(later + Duration::from_secs(1)).is_empty());
     }
 
-    /// A port just released by a bound and dropped listener; the OS can hand
-    /// it to a later bind again, which is how the tests make a UDP bind fail
-    /// on a port the TCP bind holds.
+    /// A loopback port free for both protocols, as the bind tests need: it
+    /// comes from the UDP allocator (ports from there sit in no UDP-excluded
+    /// block, the Windows case this fix is for) and a TCP bind on it proves
+    /// TCP can use it too. A failing TCP bind drops the UDP socket and tries
+    /// again, up to 20 times; both probes are dropped before the port is
+    /// returned.
     fn free_loopback_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a probe listener");
-        let port = probe.local_addr().expect("the probe address").port();
-        drop(probe);
-        port
+        for _ in 0..20 {
+            let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("a probe UDP socket");
+            let local = udp.local_addr().expect("the probe UDP address");
+            let tcp_free = std::net::TcpListener::bind(local).is_ok();
+            drop(udp);
+            if tcp_free {
+                return local.port();
+            }
+        }
+        panic!("no port free for both TCP and UDP in 20 tries");
     }
 
     #[tokio::test]
@@ -906,6 +915,58 @@ mod tests {
             "the UDP socket keeps the port the retry picked"
         );
         udp.close();
+    }
+
+    #[tokio::test]
+    async fn a_busy_picked_port_counts_as_an_attempt() {
+        let busy = free_loopback_port();
+        let holder = std::net::TcpListener::bind(sa(&format!("127.0.0.1:{busy}")))
+            .expect("a listener holding the busy port");
+        let picked = free_loopback_port();
+        let mut calls = 0;
+        let bound = bind_one_with(
+            sa("127.0.0.1:0"),
+            true,
+            &mut |local: SocketAddr| {
+                if local.port() == picked {
+                    SharedUdpSocket::bind(local)
+                } else {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                }
+            },
+            &mut || {
+                calls += 1;
+                if calls == 1 { busy } else { picked }
+            },
+        );
+        // Matched by hand, not with expect: when a busy picked port turns
+        // into an error for the caller, that is what must fail, with this
+        // message, and not a line above it.
+        let (ep, udp_err) = match bound {
+            Ok(ok) => ok,
+            Err(e) => panic!("a busy picked port was returned as an error: {e}"),
+        };
+        assert_eq!(
+            ep.addr.port(),
+            picked,
+            "the attempt after the busy port did not land on the free one"
+        );
+        assert!(
+            udp_err.is_none(),
+            "a bind that survives a busy picked port reports no UDP error"
+        );
+        let udp = ep.udp.expect("the attempt on the free port binds UDP too");
+        assert_eq!(
+            udp.local_addr().port(),
+            picked,
+            "the UDP socket keeps the port of the attempt that succeeded"
+        );
+        assert_eq!(
+            calls, 2,
+            "the busy picked port was not counted as an attempt"
+        );
+        udp.close();
+        drop(holder);
     }
 
     #[tokio::test]
