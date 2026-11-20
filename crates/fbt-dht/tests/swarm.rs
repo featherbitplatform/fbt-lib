@@ -20,7 +20,8 @@ fn cfg(bind: &str) -> DhtConfig {
         c.bind_v6 = Some(bind);
     }
     c.query_rate_per_ip = 10_000;
-    c.query_timeout = Duration::from_millis(500);
+    // a busy machine delivers replies late, not never: 2 s counts a late answer too
+    c.query_timeout = Duration::from_secs(2);
     // a busy machine can leave a bootstrap with no replies: retry fast, not after 30 s
     c.bootstrap_retry_base = Duration::from_millis(200);
     c.bootstrap_retry_max = Duration::from_secs(2);
@@ -196,11 +197,19 @@ async fn sample_infohashes_returns_stored_hashes() {
     assert_eq!(samples, hashes);
     assert!(!got.nodes.is_empty());
     assert!(got.nodes.iter().all(|n| n.addr.ip().is_loopback()));
-    // an address nothing listens on times out
+    // an address nothing listens on times out. It gets its own node on the
+    // 500 ms timeout: the point of the assert is the dead address, and sitting
+    // through the swarm's 2 s wait would only make the test slow.
+    let mut probe_cfg = cfg("127.0.0.1:0");
+    probe_cfg.query_timeout = Duration::from_millis(500);
+    let probe = Dht::spawn(probe_cfg).await.unwrap();
     let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let dead_addr = dead.local_addr().unwrap();
     drop(dead);
-    assert!(nodes[3].sample_infohashes(dead_addr, target).await.is_err());
+    // the probe answers a live one first: it is the dead address that fails
+    assert!(probe.sample_infohashes(addr, target).await.is_ok());
+    assert!(probe.sample_infohashes(dead_addr, target).await.is_err());
+    probe.shutdown().await;
     shutdown(&nodes).await;
 }
 
