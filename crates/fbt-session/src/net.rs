@@ -894,11 +894,16 @@ mod tests {
     #[tokio::test]
     async fn a_refused_udp_port_is_retried_on_a_port_this_code_picks() {
         let port = free_loopback_port();
+        // The first UDP bind is refused whatever port it is offered: attempt
+        // 1 asks the OS for port 0, and were the OS to hand out this very
+        // port, attempt 1 would succeed and the retry would never run.
+        let mut udp_calls = 0;
         let (ep, udp_err) = bind_one_with(
             sa("127.0.0.1:0"),
             true,
             &mut |local: SocketAddr| {
-                if local.port() == port {
+                udp_calls += 1;
+                if udp_calls > 1 && local.port() == port {
                     SharedUdpSocket::bind(local)
                 } else {
                     Err(io::Error::from(io::ErrorKind::PermissionDenied))
@@ -931,12 +936,16 @@ mod tests {
         let holder = std::net::TcpListener::bind(sa(&format!("127.0.0.1:{busy}")))
             .expect("a listener holding the busy port");
         let picked = free_loopback_port();
+        // As in the retry test, the first UDP bind is refused whatever port
+        // it is offered, so the test never depends on what port 0 returns.
+        let mut udp_calls = 0;
         let mut calls = 0;
         let bound = bind_one_with(
             sa("127.0.0.1:0"),
             true,
             &mut |local: SocketAddr| {
-                if local.port() == picked {
+                udp_calls += 1;
+                if udp_calls > 1 && local.port() == picked {
                     SharedUdpSocket::bind(local)
                 } else {
                     Err(io::Error::from(io::ErrorKind::PermissionDenied))
