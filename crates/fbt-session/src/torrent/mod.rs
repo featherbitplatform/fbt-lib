@@ -79,6 +79,8 @@ pub(crate) enum Cmd {
     Reannounce(oneshot::Sender<()>),
     Scrape(oneshot::Sender<()>),
     SetPriorities(Vec<Priority>, oneshot::Sender<Result<(), SessionError>>),
+    /// Downloads one file's pieces in order, lowest index first.
+    SetFileInOrder(usize, bool, oneshot::Sender<Result<(), SessionError>>),
     AddPeer(SocketAddr, oneshot::Sender<()>),
     Pieces(oneshot::Sender<Bitfield>),
     SetRateLimit(RateLimit, oneshot::Sender<()>),
@@ -405,6 +407,26 @@ impl TorrentHandle {
             });
         }
         self.call(|tx| Cmd::SetPriorities(p, tx)).await?
+    }
+
+    /// Downloads one file's pieces in order, lowest index first, ahead of
+    /// other pieces of the same priority (`on`), or rarest first again (`!on`).
+    /// Other files are not affected. Not saved in the resume data: it lasts
+    /// until it is turned off or the torrent is removed or the session restarts.
+    ///
+    /// Fails with [`SessionError::NoMetadata`] for a magnet whose metadata has
+    /// not arrived, and [`SessionError::InvalidFileIndex`] for a file past the end.
+    pub async fn set_file_in_order(&self, file: usize, on: bool) -> Result<(), SessionError> {
+        let files = self
+            .metainfo()
+            .ok_or(SessionError::NoMetadata)?
+            .info
+            .files
+            .len();
+        if file >= files {
+            return Err(SessionError::InvalidFileIndex { index: file, files });
+        }
+        self.call(|tx| Cmd::SetFileInOrder(file, on, tx)).await?
     }
 
     /// Connects to a peer.
@@ -815,4 +837,38 @@ fn plain_rel_path(path: &str) -> Result<RelPath, SessionError> {
 /// True if `a` and `b` are the same state, ignoring checking progress.
 pub(crate) fn same_state(a: &TorrentState, b: &TorrentState) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// The pieces that overlap file `index`'s byte range: a piece shared
+/// with a neighbouring file counts. Empty for an empty file or an index
+/// past the end.
+pub(crate) fn file_pieces(meta: &Metainfo, index: usize) -> std::ops::Range<u32> {
+    let layout = meta.piece_layout();
+    let n = layout.num_pieces();
+    let Some(range) = meta.file_layout().file_range(index) else {
+        return 0..0;
+    };
+    if range.is_empty() || n == 0 {
+        return 0..0;
+    }
+    let first = u32::try_from(range.start / u64::from(layout.piece_len())).unwrap_or(n);
+    let end = range.end.saturating_sub(1) / u64::from(layout.piece_len()) + 1;
+    let last = u32::try_from(end).map_or(n, |e| e.min(n));
+    first..last
+}
+
+/// The pieces in order: one range per file marked in `in_order`, shared
+/// pieces counted once.
+pub(crate) fn in_order_ranges(
+    meta: &Metainfo,
+    in_order: Option<&Bitfield>,
+) -> Vec<std::ops::Range<u32>> {
+    let Some(b) = in_order else {
+        return Vec::new();
+    };
+    (0..meta.info.files.len())
+        .filter(|&i| b.get(i as u32))
+        .map(|i| file_pieces(meta, i))
+        .filter(|r| !r.is_empty())
+        .collect()
 }

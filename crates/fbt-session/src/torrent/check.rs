@@ -10,6 +10,7 @@ use fbt_core::Bitfield;
 
 use super::actor::{Actor, Phase};
 use super::data::Job;
+use super::in_order_ranges;
 use super::layers;
 use super::peer::Peer;
 use crate::picker::{PeerKey, PiecePicker};
@@ -251,6 +252,11 @@ impl Actor {
                 }
                 picker.set_piece_priorities(&l.piece_prio);
                 picker.set_sequential(l.sequential);
+                // The files in order survive the rebuild.
+                let in_order = l.in_order_files.clone();
+                for r in in_order_ranges(&l.meta, in_order.as_ref()) {
+                    picker.set_in_order(r, true);
+                }
                 // Peers still connected (a magnet keeps those it fetched
                 // the metadata through) count toward availability.
                 add_availability(&mut picker, &self.peers, self.generation);
