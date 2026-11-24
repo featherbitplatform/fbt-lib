@@ -176,10 +176,9 @@ async fn file_in_order_needs_metadata() {
     session.shutdown().await;
 }
 
-/// An empty file has no pieces: turning it on is harmless (and a pad file
-/// is a valid index, likewise).
+/// An empty file has no pieces: turning it on is harmless.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn file_in_order_empty_and_pad_files_are_harmless() {
+async fn file_in_order_empty_file_is_harmless() {
     let files: [(&str, usize); 3] = [("a", MIB), ("empty", 0), ("b", MIB)];
     let (m, payload) = make_torrent(&files, PL as u32);
     let (seed, _sh) = seeder(&m, &payload).await;

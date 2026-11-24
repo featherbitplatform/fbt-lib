@@ -4,7 +4,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PieceLayout};
@@ -166,7 +165,7 @@ pub struct PiecePicker {
     sequential: bool,
     /// Pieces in order: picked ahead of other pieces of the same priority,
     /// lowest index first (see [`set_in_order`](Self::set_in_order)).
-    in_order: Arc<Bitfield>,
+    in_order: Bitfield,
     /// The queued pieces that are in order, by (priority, index).
     ordered: BTreeSet<(Reverse<u8>, u32)>,
     /// Wanted `Unrequested` pieces, bucketed by (priority, availability).
@@ -230,7 +229,7 @@ impl PiecePicker {
             seeds: 0,
             state,
             sequential: false,
-            in_order: Arc::new(Bitfield::new(n)),
+            in_order: Bitfield::new(n),
             ordered: BTreeSet::new(),
             buckets: BTreeMap::new(),
             pos: vec![NOT_QUEUED; len],
@@ -285,7 +284,7 @@ impl PiecePicker {
     /// is queued.
     pub fn set_in_order(&mut self, pieces: Range<u32>, on: bool) {
         let n = self.layout.num_pieces() as usize;
-        let in_order = Arc::make_mut(&mut self.in_order);
+        let in_order = &mut self.in_order;
         let mut changed = Vec::new();
         for piece in pieces {
             let i = piece as usize;
@@ -2140,7 +2139,7 @@ mod tests {
             for _ in 0..80 {
                 let k = r.random_range(0..peers.len());
                 let key = PeerKey(k as u64);
-                match r.random_range(0..15u32) {
+                match r.random_range(0..16u32) {
                     0 | 1 => {
                         let max = r.random_range(1..=8);
                         let got = p.pick(key, peers[k].pieces(), max, &mut r);
@@ -2188,6 +2187,11 @@ mod tests {
                         p.set_piece_priorities(&prio);
                     }
                     8 => p.set_sequential(r.random_bool(0.5)),
+                    15 => {
+                        // A range of pieces marked in order or cleared again.
+                        let (a, b) = (r.random_range(0..=n), r.random_range(0..=n));
+                        p.set_in_order(a.min(b)..b.max(a), r.random_bool(0.5));
+                    }
                     14 => {
                         // A range of pieces held back or let go again.
                         let (a, b) = (r.random_range(0..=n), r.random_range(0..=n));

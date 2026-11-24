@@ -784,17 +784,20 @@ impl Actor {
             return;
         };
         let n = l.meta.info.files.len();
+        let (Ok(count), Ok(idx)) = (u32::try_from(n), u32::try_from(file)) else {
+            return;
+        };
         if file >= n {
             return;
         }
         if on {
             let b = match l.in_order_files.as_mut() {
                 Some(b) => b,
-                None => l.in_order_files.insert(Bitfield::new(n as u32)),
+                None => l.in_order_files.insert(Bitfield::new(count)),
             };
-            b.set(file as u32);
+            b.set(idx);
         } else if let Some(b) = l.in_order_files.as_mut() {
-            b.clear(file as u32);
+            b.clear(idx);
             if b.count_ones() == 0 {
                 l.in_order_files = None;
             }
@@ -810,10 +813,6 @@ impl Actor {
             picker.set_in_order(r, true);
         }
         // The order changed: the peers' requests follow it.
-        let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
-        for key in keys {
-            self.update_interest(key);
-        }
         self.top_up_all(None);
     }
 
