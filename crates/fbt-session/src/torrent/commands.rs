@@ -96,6 +96,12 @@ impl Actor {
                 self.publish();
                 let _ = tx.send(Ok(()));
             }
+            Cmd::SetFileInOrder(file, on, tx) => {
+                // Does not touch the storage, so it never waits for a move.
+                self.set_file_in_order(file, on);
+                self.publish();
+                let _ = tx.send(Ok(()));
+            }
             Cmd::AddPeer(addr, tx) => {
                 if !self.refuse_blocked(addr)
                     && !self.retries.is_never(&addr)

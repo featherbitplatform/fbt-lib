@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `TorrentHandle::set_file_in_order`: download one file's pieces in order at runtime, for streaming. The file's pieces are picked lowest index first ahead of other pieces of the same priority, the torrent's other files stay rarest first, and reader deadlines are unchanged. Not saved in the resume data.
+
 ## [0.11.1] - 2026-11-21
 
 ### Fixed

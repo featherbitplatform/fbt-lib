@@ -4,6 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PieceLayout};
@@ -117,8 +118,10 @@ type BucketKey = (Reverse<u8>, u32);
 /// Order: free blocks of partial pieces (priority descending), then new
 /// pieces by priority descending and rarest first (or lowest index when
 /// sequential, random tie-break otherwise), then end-game duplicates once
-/// every block of every wanted piece is requested. Single-threaded: owned by
-/// one torrent actor.
+/// every block of every wanted piece is requested. Pieces marked in order
+/// ([`set_in_order`](Self::set_in_order)) win over rarest first at equal
+/// priority, lowest index first; sequential mode takes precedence over
+/// both. Single-threaded: owned by one torrent actor.
 ///
 /// Pieces can also be held back independently of their priority
 /// ([`set_pickable`]): a held-back piece stays wanted (progress, the part
@@ -161,6 +164,11 @@ pub struct PiecePicker {
     seeds: u32,
     state: Vec<PieceState>,
     sequential: bool,
+    /// Pieces in order: picked ahead of other pieces of the same priority,
+    /// lowest index first (see [`set_in_order`](Self::set_in_order)).
+    in_order: Arc<Bitfield>,
+    /// The queued pieces that are in order, by (priority, index).
+    ordered: BTreeSet<(Reverse<u8>, u32)>,
     /// Wanted `Unrequested` pieces, bucketed by (priority, availability).
     buckets: BTreeMap<BucketKey, Vec<u32>>,
     /// Index of each piece inside its bucket, or [`NOT_QUEUED`].
@@ -222,6 +230,8 @@ impl PiecePicker {
             seeds: 0,
             state,
             sequential: false,
+            in_order: Arc::new(Bitfield::new(n)),
+            ordered: BTreeSet::new(),
             buckets: BTreeMap::new(),
             pos: vec![NOT_QUEUED; len],
             seq: BTreeSet::new(),
@@ -264,6 +274,49 @@ impl PiecePicker {
     /// Sequential mode: new pieces in index order instead of rarest first.
     pub fn set_sequential(&mut self, on: bool) {
         self.sequential = on;
+    }
+
+    /// Marks `pieces` in order (`on`), or clears the mark (`!on`): the
+    /// marked pieces are picked ahead of other pieces of the same priority,
+    /// lowest index first. Out-of-range pieces are ignored. Only the
+    /// queued (unrequested, wanted, pickable) pieces the mark applies to
+    /// change their pick order: a piece already started keeps downloading,
+    /// and one passed, failed or held back is picked again in order when it
+    /// is queued.
+    pub fn set_in_order(&mut self, pieces: Range<u32>, on: bool) {
+        let n = self.layout.num_pieces() as usize;
+        let in_order = Arc::make_mut(&mut self.in_order);
+        let mut changed = Vec::new();
+        for piece in pieces {
+            let i = piece as usize;
+            if i >= n {
+                break;
+            }
+            let was = in_order.get(piece);
+            if was == on {
+                continue;
+            }
+            if on {
+                in_order.set(piece);
+            } else {
+                in_order.clear(piece);
+            }
+            changed.push(piece);
+        }
+        for piece in changed {
+            let queued = self
+                .pos
+                .get(piece as usize)
+                .is_some_and(|&p| p != NOT_QUEUED);
+            let key = (Reverse(self.prio_of(piece)), piece);
+            if queued {
+                if on {
+                    self.ordered.insert(key);
+                } else {
+                    self.ordered.remove(&key);
+                }
+            }
+        }
     }
 
     /// Holds `pieces` back (`pickable` false) or lets them be picked again.
@@ -877,6 +930,9 @@ impl PiecePicker {
             *p = at;
         }
         self.seq.insert((key.0, piece));
+        if self.in_order.get(piece) {
+            self.ordered.insert((key.0, piece));
+        }
     }
 
     /// Removes a piece from the candidates; call before changing its
@@ -906,6 +962,9 @@ impl PiecePicker {
             *p = NOT_QUEUED;
         }
         self.seq.remove(&(key.0, piece));
+        if self.in_order.get(piece) {
+            self.ordered.remove(&(key.0, piece));
+        }
     }
 
     fn change_avail(&mut self, piece: u32, up: bool) {
@@ -949,7 +1008,9 @@ impl PiecePicker {
     }
 
     /// The next new piece the peer has: lowest index when sequential, else
-    /// rarest with a random starting point inside the bucket.
+    /// the in-order pieces (lowest index, their priority first) when one is
+    /// at least as prioritised as the rarest-first pick, else rarest with a
+    /// random starting point inside the bucket.
     fn next_new(&self, has: PeerPieces, rng: &mut impl rand::Rng) -> Option<u32> {
         if self.sequential {
             return self
@@ -958,7 +1019,24 @@ impl PiecePicker {
                 .map(|&(_, i)| i)
                 .find(|&i| peer_has_piece(has, i));
         }
-        for bucket in self.buckets.values() {
+        let a = self
+            .ordered
+            .iter()
+            .find(|&&(_, i)| peer_has_piece(has, i))
+            .map(|&(prio, i)| (prio, i));
+        let b = self.rarest(has, rng);
+        match (a, b) {
+            (Some((_, i)), None) => Some(i),
+            (Some((pa, i)), Some((pb, _))) if pa <= pb => Some(i),
+            (_, Some((_, i))) => Some(i),
+            (None, None) => None,
+        }
+    }
+
+    /// Today's rarest-first pick: priority descending, then availability
+    /// ascending with a random starting point inside the bucket.
+    fn rarest(&self, has: PeerPieces, rng: &mut impl rand::Rng) -> Option<(Reverse<u8>, u32)> {
+        for (key, bucket) in &self.buckets {
             let len = bucket.len();
             if len == 0 {
                 continue;
@@ -970,8 +1048,8 @@ impl PiecePicker {
                 .chain(bucket.iter().take(start))
                 .copied()
                 .find(|&i| peer_has_piece(has, i));
-            if found.is_some() {
-                return found;
+            if let Some(i) = found {
+                return Some((key.0, i));
             }
         }
         None
@@ -1276,7 +1354,7 @@ mod tests {
                 len: 16_384
             }]
         );
-        // Then piece 2 (availability 2), then piece 0 (availability 3).
+        // Then piece 2 (availability 3), then piece 0 (availability 3).
         let got = p.pick(PeerKey(9), PeerPieces::All, 2, &mut rng());
         assert_eq!(got, vec![blk(2, 0), blk(0, 0)]);
         // A seed raises every piece equally and changes nothing.
@@ -1442,6 +1520,164 @@ mod tests {
             p.pick(PeerKey(1), PeerPieces::All, 2, &mut rng()),
             vec![blk(3, 0), blk(2, 0)]
         );
+    }
+
+    /// A range in order wins over rarest-first at equal priority, and
+    /// yields to a higher priority: its pieces are picked lowest index
+    /// first, then the rest rarest first.
+    #[test]
+    fn in_order_range_picks_lowest_index_first() {
+        let mut p = picker(8, 1);
+        let peers: &[&[u8]] = &[
+            &[1, 1, 1, 1, 1, 1, 0, 0],
+            &[1, 1, 1, 1, 1, 1, 0, 0],
+            &[1, 1, 0, 0, 1, 1, 1, 1],
+            &[1, 1, 0, 0, 1, 1, 0, 0],
+            &[0, 0, 0, 0, 0, 0, 1, 1],
+            &[0, 0, 1, 1, 0, 0, 1, 1],
+        ];
+        for bits in peers {
+            p.add_peer_pieces(PeerPieces::Some(&bf(bits)));
+        }
+        // Rarest first would start with pieces 2 and 3 (availability 3);
+        // in order, it starts with piece 2 because the range says so.
+        p.set_in_order(2..6, true);
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(2, 0)]
+        );
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(3, 0)]
+        );
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(4, 0)]
+        );
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(5, 0)]
+        );
+        // The rest is rarest first again: 6 and 7 (availability 3) before 0
+        // and 1 (availability 4), ties random.
+        let rest = p.pick(PeerKey(1), PeerPieces::All, 10, &mut rng());
+        let mut pieces: Vec<u32> = rest.iter().map(|b| b.piece).collect();
+        pieces.sort_unstable();
+        assert_eq!(pieces, vec![0, 1, 6, 7]);
+        assert_eq!(rest.len(), 4);
+        let a = p.availability(0);
+        let b = p.availability(7);
+        assert!(a > b);
+    }
+
+    /// A higher-priority piece outside the in-order range is still picked
+    /// before the range's pieces.
+    #[test]
+    fn higher_priority_beats_in_order() {
+        let mut p = picker(8, 1);
+        p.add_peer_pieces(PeerPieces::All);
+        p.set_in_order(0..4, true);
+        p.set_piece_priorities(&[4, 4, 4, 4, 4, 4, 4, 7]);
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(7, 0)]
+        );
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(0, 0)]
+        );
+    }
+
+    /// In order is a switch: off again, the same picker is rarest first.
+    #[test]
+    fn in_order_off_restores_rarest_first() {
+        let mut p = picker(8, 1);
+        let peers: &[&[u8]] = &[
+            &[1, 1, 1, 1, 1, 1, 0, 0],
+            &[1, 1, 1, 1, 1, 1, 0, 0],
+            &[1, 1, 0, 0, 1, 1, 1, 1],
+            &[1, 1, 0, 0, 1, 1, 0, 0],
+            &[0, 0, 0, 0, 0, 0, 1, 1],
+            &[0, 0, 1, 1, 0, 0, 1, 1],
+        ];
+        for bits in peers {
+            p.add_peer_pieces(PeerPieces::Some(&bf(bits)));
+        }
+        // Pieces 4 and 5 (availability 4) are not rarest first's choice:
+        // pieces 2, 3, 6 and 7 (availability 3) are.
+        p.set_in_order(4..6, true);
+        p.set_in_order(4..6, false);
+        let pick = p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng());
+        let piece = pick.first().map(|b| b.piece);
+        assert!(
+            matches!(piece, Some(2 | 3 | 6 | 7)),
+            "rarest first again: {pick:?}"
+        );
+    }
+
+    /// Re-applying the same priorities keeps the in-order mark: the mark
+    /// is per piece, not a by-product of the priority pass.
+    #[test]
+    fn in_order_survives_priority_change() {
+        let mut p = picker(8, 1);
+        let peers: &[&[u8]] = &[
+            &[1, 1, 1, 1, 1, 1, 0, 0],
+            &[1, 1, 1, 1, 1, 1, 0, 0],
+            &[1, 1, 0, 0, 1, 1, 1, 1],
+            &[1, 1, 0, 0, 1, 1, 0, 0],
+            &[0, 0, 0, 0, 0, 0, 1, 1],
+            &[0, 0, 1, 1, 0, 0, 1, 1],
+        ];
+        for bits in peers {
+            p.add_peer_pieces(PeerPieces::Some(&bf(bits)));
+        }
+        p.set_in_order(2..6, true);
+        p.set_piece_priorities(&[4; 8]);
+        // Without the mark rarest first would have picked piece 3 or 2
+        // (availability 3) only by chance, and piece 4 (availability 4)
+        // never first; the marks put 2, 3, 4 in that order.
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(2, 0)]
+        );
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(3, 0)]
+        );
+        assert_eq!(
+            p.pick(PeerKey(1), PeerPieces::All, 1, &mut rng()),
+            vec![blk(4, 0)]
+        );
+    }
+
+    /// The mark is per piece: pieces that leave the queue (started, passed,
+    /// held back) lose their queue entry, and a piece back in the queue is
+    /// in order again. The set stays in step in every state.
+    #[test]
+    fn in_order_toggled_while_pieces_are_in_flight() {
+        let mut p = picker(8, 1);
+        p.add_peer_pieces(PeerPieces::All);
+        // Four pieces are already started: they are not in the queue any
+        // more, so the mark does not change what is picked.
+        assert_eq!(p.pick(PeerKey(1), PeerPieces::All, 4, &mut rng()).len(), 4);
+        let started: Vec<u32> = p.partial_pieces().collect();
+        assert_eq!(started.len(), 4);
+        p.set_in_order(0..8, true);
+        check_invariants(&p, &[0; 8], 1);
+        for i in 0..4u32 {
+            assert!(p.in_order.get(i), "the mark is per piece");
+        }
+        let mut ordered: Vec<u32> = p.ordered.iter().map(|&(_, i)| i).collect();
+        ordered.sort_unstable();
+        let mut queued: Vec<u32> = (0..8).filter(|i| !started.contains(i)).collect();
+        queued.sort_unstable();
+        assert_eq!(
+            ordered, queued,
+            "only the queued pieces are in the ordered set"
+        );
+        p.set_in_order(0..8, false);
+        check_invariants(&p, &[0; 8], 1);
+        assert!(p.ordered.is_empty(), "off again: nothing in order");
     }
 
     #[test]
@@ -1759,6 +1995,11 @@ mod tests {
                 );
             }
             assert_eq!(p.seq.contains(&(Reverse(prio), i)), queued, "seq of {i}");
+            assert_eq!(
+                p.ordered.contains(&(Reverse(prio), i)),
+                queued && p.in_order.get(i),
+                "ordered of {i}"
+            );
             let downloading = p.downloading.get(&i);
             assert_eq!(
                 downloading.is_some(),
@@ -1815,6 +2056,10 @@ mod tests {
         assert!(p.buckets.values().all(|b| !b.is_empty()), "empty bucket");
         let queued: usize = p.buckets.values().map(Vec::len).sum();
         assert_eq!(queued, p.seq.len());
+        for &(Reverse(pr), i) in &p.ordered {
+            assert_eq!(pr, p.prio_of(i), "ordered key of {i}");
+            assert!(p.in_order.get(i), "unmarked piece {i} in ordered");
+        }
         assert_eq!(
             p.partial.len(),
             p.partial.iter().collect::<HashSet<_>>().len()

@@ -25,6 +25,7 @@ use super::announcer::{self, Announcer, Signals};
 use super::data::Job;
 use super::deadline::Deadlines;
 use super::dht::{self, DhtAnnouncer, DhtParams};
+use super::in_order_ranges;
 use super::known::{Known, dialable};
 use super::layers::{self, HashServing, LayerBuilder, LayerFetch};
 use super::magnet::MagnetState;
@@ -116,6 +117,14 @@ pub(super) struct Loaded {
     pub total_wanted: u64,
     pub file_prio: Vec<Priority>,
     pub sequential: bool,
+    /// Files downloaded in order, lowest piece index first, ahead of other
+    /// pieces of the same priority (see [`TorrentHandle::set_file_in_order`]).
+    /// Not saved in the resume data: it lasts until it is turned off, the
+    /// torrent is removed or the session restarts. `None` before the
+    /// metadata is known, or when no file is in order.
+    ///
+    /// [`TorrentHandle::set_file_in_order`]: super::TorrentHandle::set_file_in_order
+    pub in_order_files: Option<Bitfield>,
     /// Partially downloaded pieces, by index.
     pub bufs: HashMap<u32, Vec<u8>>,
     /// Which files the storage is told are wanted; follows `file_prio`.
@@ -205,6 +214,7 @@ impl Loaded {
             total_wanted,
             file_prio,
             sequential,
+            in_order_files: None,
             bufs: HashMap::new(),
             wanted,
             renamed: BTreeMap::new(),
@@ -761,6 +771,50 @@ impl Actor {
     /// The metadata, with every layer fetched or built since it arrived.
     pub(super) fn known_meta(&self) -> Option<&Arc<Metainfo>> {
         self.loaded.as_ref().map(|l| &l.meta)
+    }
+
+    /// Downloads the pieces of file `index` in order, lowest index first,
+    /// ahead of other pieces of the same priority (`on`), or rarest first
+    /// again (`!on`). Other files are not affected: turning a file off
+    /// clears only its pieces, so a piece shared with another file that is
+    /// still in order stays in order. Accepted while paused, where it is
+    /// remembered and applies once the torrent runs.
+    pub(super) fn set_file_in_order(&mut self, file: usize, on: bool) {
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        let n = l.meta.info.files.len();
+        if file >= n {
+            return;
+        }
+        if on {
+            let b = match l.in_order_files.as_mut() {
+                Some(b) => b,
+                None => l.in_order_files.insert(Bitfield::new(n as u32)),
+            };
+            b.set(file as u32);
+        } else if let Some(b) = l.in_order_files.as_mut() {
+            b.clear(file as u32);
+            if b.count_ones() == 0 {
+                l.in_order_files = None;
+            }
+        }
+        let Some(picker) = l.picker.as_mut() else {
+            return;
+        };
+        // Clear every mark, then set the files still in order: a piece
+        // shared with another file that is still in order stays marked.
+        let ranges = in_order_ranges(&l.meta, l.in_order_files.as_ref());
+        picker.set_in_order(0..l.layout.num_pieces(), false);
+        for r in ranges {
+            picker.set_in_order(r, true);
+        }
+        // The order changed: the peers' requests follow it.
+        let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
+        for key in keys {
+            self.update_interest(key);
+        }
+        self.top_up_all(None);
     }
 
     /// Sets the metadata and the storage built for it: the one place either
