@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-24
+
 ### Added
 
-- `TorrentHandle::set_file_in_order`: download one file's pieces in order at runtime, for streaming. The file's pieces are picked lowest index first ahead of other pieces of the same priority, the torrent's other files stay rarest first, and reader deadlines are unchanged. Not saved in the resume data.
+- `TorrentHandle::set_file_in_order`: download one file's pieces in order at runtime, for streaming. The file's pieces are picked lowest index first ahead of other pieces of the same priority, the torrent's other files stay rarest first, and reader deadlines are unchanged. Not saved in the resume data. ([#43](https://github.com/featherbitplatform/fbt-lib/pull/43))
 
 ## [0.11.1] - 2026-11-21
 
@@ -341,6 +343,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Security CI: semgrep, cargo-deny, grype and gitleaks (`.github/workflows/security.yml`, `dev/sast.sh`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 - Release workflow: tag check against the workspace version, CycloneDX SBOM and a GitHub release with the changelog section (`.github/workflows/release.yml`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 
+[0.12.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.12.0
 [0.11.1]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.11.1
 [0.11.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.11.0
 [0.10.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.10.0
