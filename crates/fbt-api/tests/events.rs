@@ -522,24 +522,43 @@ fn events_route_is_documented() {
     let get = &doc["paths"]["/api/v1/events"]["get"];
     assert!(get.is_object(), "{doc}");
     assert!(get["responses"]["200"]["content"]["text/event-stream"].is_object());
-    // The proxy health event and its states are in the document.
-    let schemas = serde_json::to_string(&doc["components"]["schemas"]).expect("schemas");
-    assert!(
-        schemas.contains("proxy_state_changed"),
-        "the proxy state event is not in the document"
+    // The proxy health event is in the document, and its `state` names the
+    // five states as a schema *enum* (not prose, and not a set of words a
+    // `contains` could satisfy by accident: "reachable" inside
+    // "unreachable" would not count).
+    let schemas = &doc["components"]["schemas"];
+    let event = schemas["EventDto"]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("EventDto is not a union: {schemas}"))
+        .iter()
+        .find(|v| {
+            v["properties"]["type"]["enum"]
+                .as_array()
+                .is_some_and(|e| e.iter().any(|n| n == "proxy_state_changed"))
+        })
+        .unwrap_or_else(|| panic!("no proxy_state_changed variant in {schemas}"));
+    let state = &event["properties"]["state"];
+    // The field points at the state's own schema; follow the `$ref`.
+    let names: Vec<String> =
+        if let Some(reference) = state["$ref"].as_str().and_then(|r| r.rsplit('/').next()) {
+            serde_json::from_value(schemas[reference]["enum"].clone()).expect("the enum")
+        } else {
+            serde_json::from_value(state["enum"].clone()).expect("an inline enum")
+        };
+    let mut names = names;
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "login_refused",
+            "not_set",
+            "reachable",
+            "udp_not_relayed",
+            "unknown",
+            "unreachable",
+        ],
+        "the documented proxy states"
     );
-    for state in [
-        "not_set",
-        "reachable",
-        "udp_not_relayed",
-        "unreachable",
-        "login_refused",
-    ] {
-        assert!(
-            schemas.contains(state),
-            "the proxy state {state} is not in the document"
-        );
-    }
 }
 
 /// A change of the session's proxy reaches an open event stream as a

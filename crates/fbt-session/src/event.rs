@@ -382,10 +382,14 @@ pub enum Event {
         message: String,
     },
     /// The proxy's health changed
-    /// ([`Session::proxy_state`](crate::Session::proxy_state)). Emitted only
-    /// when the state differs from the last one reported; the first one
-    /// after [`Session::set_network_settings`](crate::Session::set_network_settings)
-    /// describes the new proxy.
+    /// ([`Session::proxy_state`](crate::Session::proxy_state)). Emitted when
+    /// the state's *variant* differs from the last one reported, and never
+    /// for a new reason under an unchanged variant (an `Unreachable` that
+    /// fails again differently does not re-emit). Switching between two
+    /// proxies that land in the same variant (two unreachable ones, say)
+    /// therefore emits nothing; the first event after
+    /// [`Session::set_network_settings`](crate::Session::set_network_settings)
+    /// describes the new proxy only when its variant differs.
     ProxyStateChanged {
         /// The new state.
         state: ProxyState,

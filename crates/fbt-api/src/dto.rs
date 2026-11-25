@@ -875,6 +875,26 @@ pub(crate) struct CreateTorrentRequest {
     pub(crate) private: bool,
 }
 
+/// The proxy state an [`EventDto::ProxyStateChanged`] carries, as its own
+/// schema so the OpenAPI document lists the five names as an enum rather than
+/// describing them in prose.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProxyStateDto {
+    /// No proxy is set.
+    NotSet,
+    /// The proxy answered.
+    Reachable,
+    /// The proxy answers TCP but will not relay UDP.
+    UdpNotRelayed,
+    /// The proxy could not be reached.
+    Unreachable,
+    /// The proxy refused the credentials.
+    LoginRefused,
+    /// A state a later `fbt` adds; the API does not know it.
+    Unknown,
+}
+
 /// One session event, as the `data:` of a server-sent event whose
 /// `event:` field equals `type`. Torrent ids are the 40-hex wire hash.
 #[derive(Debug, Serialize, ToSchema)]
@@ -1104,9 +1124,8 @@ pub(crate) enum EventDto {
     },
     /// The proxy's health changed.
     ProxyStateChanged {
-        /// `not_set`, `reachable`, `udp_not_relayed`, `unreachable` or
-        /// `login_refused`.
-        state: &'static str,
+        /// The state, as the schema's enum names it.
+        state: ProxyStateDto,
         /// Why, for `unreachable`; `null` otherwise.
         reason: Option<String>,
     },
@@ -1197,15 +1216,17 @@ fn block_reason(reason: BlockReason) -> &'static str {
 }
 
 /// A proxy state's name and, for an unreachable proxy, its reason.
-fn proxy_state(state: &fbt::ProxyState) -> (&'static str, Option<String>) {
+fn proxy_state(state: &fbt::ProxyState) -> (ProxyStateDto, Option<String>) {
     match state {
-        fbt::ProxyState::NotSet => ("not_set", None),
-        fbt::ProxyState::Reachable => ("reachable", None),
-        fbt::ProxyState::UdpNotRelayed => ("udp_not_relayed", None),
-        fbt::ProxyState::Unreachable { reason } => ("unreachable", Some(reason.clone())),
-        fbt::ProxyState::LoginRefused => ("login_refused", None),
+        fbt::ProxyState::NotSet => (ProxyStateDto::NotSet, None),
+        fbt::ProxyState::Reachable => (ProxyStateDto::Reachable, None),
+        fbt::ProxyState::UdpNotRelayed => (ProxyStateDto::UdpNotRelayed, None),
+        fbt::ProxyState::Unreachable { reason } => {
+            (ProxyStateDto::Unreachable, Some(reason.clone()))
+        }
+        fbt::ProxyState::LoginRefused => (ProxyStateDto::LoginRefused, None),
         // A state a later `fbt` adds.
-        _ => ("unknown", None),
+        _ => (ProxyStateDto::Unknown, None),
     }
 }
 
@@ -1570,7 +1591,7 @@ mod tests {
                 message: String::new(),
             },
             EventDto::ProxyStateChanged {
-                state: "",
+                state: ProxyStateDto::Unreachable,
                 reason: None,
             },
             EventDto::Lagged { missed: 0 },

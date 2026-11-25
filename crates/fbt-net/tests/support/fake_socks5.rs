@@ -3,10 +3,12 @@
 #![allow(dead_code)]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{Notify, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,10 @@ pub enum Script {
     /// tests whose "remote" is a documentation address or a name that must not
     /// be resolved here.
     RecordOnly,
+    /// The UDP ASSOCIATE is granted (`REP 0`) and the control connection is
+    /// closed at once: the client takes a relay and the proxy drops the
+    /// association immediately, so a session that rebuilds on a relay flaps.
+    DropAssociation,
 }
 
 #[derive(Default)]
@@ -52,9 +58,71 @@ struct Log {
     relay: Option<SocketAddr>,
 }
 
+/// A latch that parks a connection the fake has accepted but not answered
+/// yet: a test proves a probe is in flight ([`waiting`](Self::waiting)) and
+/// lets it finish ([`release`](Self::release)) instead of racing the clock.
+#[derive(Clone, Debug)]
+pub struct Gate {
+    inner: Arc<GateInner>,
+}
+
+#[derive(Debug)]
+struct GateInner {
+    release: watch::Sender<bool>,
+    waiting: AtomicUsize,
+}
+
+impl Gate {
+    /// A gate that is closed: every connection the fake accepts from now on
+    /// parks until [`release`](Self::release).
+    pub fn new() -> Gate {
+        let (release, _) = watch::channel(false);
+        Gate {
+            inner: Arc::new(GateInner {
+                release,
+                waiting: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// How many connections are parked at the gate now.
+    pub fn waiting(&self) -> usize {
+        self.inner.waiting.load(Ordering::SeqCst)
+    }
+
+    /// Opens the gate: every parked connection, and every later one, goes on.
+    pub fn release(&self) {
+        self.inner.release.send_replace(true);
+    }
+
+    /// Parks until the gate opens (or the fake is dropped, which lets the
+    /// connection end with it).
+    async fn wait(&self) {
+        self.inner.waiting.fetch_add(1, Ordering::SeqCst);
+        let mut open = self.inner.release.subscribe();
+        while !*open.borrow() {
+            if open.changed().await.is_err() {
+                break;
+            }
+        }
+        self.inner.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Default for Gate {
+    fn default() -> Gate {
+        Gate::new()
+    }
+}
+
 pub struct FakeSocks5 {
     addr: SocketAddr,
     log: Arc<Mutex<Log>>,
+    /// Asks the accept loop to stop accepting (see
+    /// [`stop_accepting`](Self::stop_accepting)).
+    stop: watch::Sender<bool>,
+    /// Fires once the listener is gone (the port is free).
+    stopped: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
@@ -72,26 +140,80 @@ impl FakeSocks5 {
     /// Starts the fake on `addr` (port 0 asks the OS for a free port), so a
     /// test can point a client at a port it knows before the client exists.
     pub async fn start_on(addr: SocketAddr, script: Script) -> FakeSocks5 {
+        FakeSocks5::start_with(addr, script, None).await
+    }
+
+    /// [`start`](Self::start) with a [`Gate`].
+    pub async fn start_gated(script: Script) -> (FakeSocks5, Gate) {
+        FakeSocks5::start_on_gated(SocketAddr::from(([127, 0, 0, 1], 0)), script).await
+    }
+
+    /// [`start_on`](Self::start_on) with a [`Gate`]: every connection the
+    /// fake accepts parks at the gate until the test releases it, so a test
+    /// knows a probe is in flight before it lets it finish.
+    pub async fn start_on_gated(addr: SocketAddr, script: Script) -> (FakeSocks5, Gate) {
+        let gate = Gate::new();
+        let fake = FakeSocks5::start_with(addr, script, Some(gate.clone())).await;
+        (fake, gate)
+    }
+
+    async fn start_with(addr: SocketAddr, script: Script, gate: Option<Gate>) -> FakeSocks5 {
         let listener = TcpListener::bind(addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let log = Arc::new(Mutex::new(Log::default()));
         let shared = log.clone();
+        let (stop, mut stopping) = watch::channel(false);
+        let stopped = Arc::new(Notify::new());
+        let notify = stopped.clone();
         let task = tokio::spawn(async move {
             // Dropped (so every connection aborted) when this task is aborted.
             let mut conns = JoinSet::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                let script = script.clone();
-                let log = shared.clone();
-                conns.spawn(async move {
-                    let _ = serve(stream, script, log).await;
-                });
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        let script = script.clone();
+                        let log = shared.clone();
+                        let gate = gate.clone();
+                        conns.spawn(async move {
+                            let _ = serve(stream, script, log, gate).await;
+                        });
+                    }
+                    r = stopping.changed() => {
+                        if r.is_err() || *stopping.borrow_and_update() {
+                            break;
+                        }
+                    }
+                }
             }
+            // Stop accepting: dropping the listener frees the port, while the
+            // connections already accepted (a relay's control connection) stay
+            // open until the fake itself is dropped.
+            drop(listener);
+            notify.notify_one();
+            while conns.join_next().await.is_some() {}
         });
-        FakeSocks5 { addr, log, task }
+        FakeSocks5 {
+            addr,
+            log,
+            stop,
+            stopped,
+            task,
+        }
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Stops accepting and closes the listen port at once, so a dial to
+    /// [`addr`](Self::addr) is refused, while the connections already
+    /// accepted -- a relay's control connection -- stay open until the fake
+    /// is dropped. A dial refused this way is what makes a peer dial report
+    /// `ProxyError::Unreachable` with the live relay still healthy.
+    pub async fn stop_accepting(&self) {
+        self.stop.send_replace(true);
+        self.stopped.notified().await;
     }
 
     /// CONNECT targets as text (`127.0.0.1:80`, `localhost:80`).
@@ -123,7 +245,17 @@ pub fn closed_port() -> SocketAddr {
     addr
 }
 
-async fn serve(mut s: TcpStream, script: Script, log: Arc<Mutex<Log>>) -> std::io::Result<()> {
+async fn serve(
+    mut s: TcpStream,
+    script: Script,
+    log: Arc<Mutex<Log>>,
+    gate: Option<Gate>,
+) -> std::io::Result<()> {
+    if let Some(gate) = &gate {
+        // Park before answering anything: the client's request is in flight
+        // and goes no further until the test releases it.
+        gate.wait().await;
+    }
     if let Script::Silent = script {
         // Accept, then hold the connection open without reading or writing:
         // `pending` never resolves, so the stream lives until the fake is
@@ -309,6 +441,11 @@ async fn associate(mut s: TcpStream, script: Script, log: Arc<Mutex<Log>>) -> st
         log.relay = Some(relay.local_addr()?);
     }
     s.write_all(&reply(0, bnd)).await?;
+    if script == Script::DropAssociation {
+        // Granted and dropped at once: the client has the association and the
+        // control connection is gone in the same breath.
+        return Ok(());
+    }
     let mut client: Option<SocketAddr> = None;
     let mut buf = vec![0u8; 65536];
     let mut ctl = [0u8; 64];

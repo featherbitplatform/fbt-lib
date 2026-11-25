@@ -66,6 +66,10 @@ pub(crate) struct NetStack {
     /// Every shared UDP socket (the endpoints', then the per-family
     /// fallbacks), or the one relayed socket under a SOCKS5 proxy.
     pub udp: Vec<SharedUdpSocket>,
+    /// Whether the UDP socket above is a SOCKS5 relay (built from an
+    /// association) rather than a direct socket: `relay_is_live` reads it to
+    /// tell a relayed stack from a direct one without opening the socket.
+    pub relayed: bool,
     /// Local service discovery and its announce bookkeeping.
     pub lsd: LsdHub,
     /// UPnP and PCP/NAT-PMP port mapping; `None` with both off.
@@ -116,6 +120,7 @@ impl NetStack {
             dht_addrs: Vec::new(),
             utp: Vec::new(),
             udp: Vec::new(),
+            relayed: false,
             lsd: LsdHub::disabled(),
             portmap: None,
             local_addrs: Vec::new(),
@@ -168,6 +173,7 @@ impl NetStack {
         let bind_udp = relay.is_none() && effective.proxy.kind == ProxyKind::None;
         let (endpoints, listen_errors) = bind_all(&effective, &applied, addrs, bind_udp).await?;
         let local_addrs: Vec<SocketAddr> = endpoints.iter().map(|e| e.addr).collect();
+        let relayed = relay.is_some();
         let udp: Vec<SharedUdpSocket> = match relay {
             Some(assoc) => vec![bind_relay(&local_addrs, assoc)?],
             None if bind_udp => {
@@ -229,6 +235,7 @@ impl NetStack {
             dht_addrs,
             utp,
             udp,
+            relayed,
             lsd,
             portmap,
             local_addrs,
@@ -411,6 +418,7 @@ impl NetStack {
             dht_addrs: Vec::new(),
             utp: Vec::new(),
             udp: Vec::new(),
+            relayed: false,
             lsd: LsdHub::disabled(),
             portmap: None,
             local_addrs: Vec::new(),

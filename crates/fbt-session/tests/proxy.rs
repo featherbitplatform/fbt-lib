@@ -330,10 +330,224 @@ async fn login_refused_is_its_own_state() {
     s.shutdown().await;
 }
 
+/// A probe of the *old* proxy that finishes after the user changed to
+/// another one does not overwrite the new proxy's state (I1): the health
+/// task applies a result only while the stored settings still equal the ones
+/// it probed, so a dead proxy cannot be reported `Reachable` -- a state
+/// nothing re-probes -- because of a probe taken before the change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_probe_does_not_overwrite_the_new_proxy() {
+    // A proxy that carries TCP only, so the probe is a greeting (not a UDP
+    // association) and its result is the plain `Reachable` the health task
+    // would overwrite the state with.
+    let addr = closed_port();
+    let mut st = settings();
+    st.proxy = proxy(ProxyKind::Socks5, addr);
+    st.proxy.proxy_peers = false;
+    st.proxy.proxy_trackers = false;
+    let s = Session::new(st).await.unwrap();
+    let mut events = s.subscribe(EventMask::STATUS);
+    assert!(matches!(s.proxy_state(), ProxyState::Unreachable { .. }));
+
+    // The proxy answers again on the same address but holds the greeting:
+    // the health task's probe connects and parks there, provably in flight.
+    let (_fake, gate) = FakeSocks5::start_on_gated(addr, Script::Ok).await;
+    assert!(
+        wait_until(|| gate.waiting() >= 1, T).await,
+        "no probe of the old proxy was in flight"
+    );
+
+    // The user switches to another dead proxy while that probe is parked.
+    let mut net = s.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, closed_port());
+    s.set_network_settings(net).await.unwrap();
+    assert!(matches!(s.proxy_state(), ProxyState::Unreachable { .. }));
+
+    // Let the old probe answer: its `Reachable` must not reach the state.
+    gate.release();
+    assert!(
+        next_matching(
+            &mut events,
+            |e| matches!(
+                e,
+                Event::ProxyStateChanged {
+                    state: ProxyState::Reachable
+                }
+            ),
+            Duration::from_millis(500)
+        )
+        .await
+        .is_none(),
+        "a probe of the old proxy reported the new one reachable"
+    );
+    assert!(
+        matches!(s.proxy_state(), ProxyState::Unreachable { .. }),
+        "the state of the new proxy was overwritten: {:?}",
+        s.proxy_state()
+    );
+    s.shutdown().await;
+}
+
+/// Dropping every handle of a session whose proxy is down releases its
+/// listen port at once, even while the health task waits out its backoff
+/// (I2): the task sleeps holding only a `Weak`, so the session is not kept
+/// alive by it (a strong handle would hold the port up to
+/// `proxy_retry_max`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_session_releases_its_port_while_the_health_task_waits() {
+    let mut st = settings();
+    st.proxy = proxy(ProxyKind::Socks5, closed_port());
+    // Long enough that the task is asleep, not probing, when the session
+    // goes: its backoff must not hold the port.
+    st.proxy_retry_base = Duration::from_secs(30);
+    st.proxy_retry_max = Duration::from_secs(60);
+    let s = Session::new(st).await.unwrap();
+    assert!(matches!(s.proxy_state(), ProxyState::Unreachable { .. }));
+    let port = s.local_addr().port();
+    // Let the health task reach its backoff wait: it is asleep in it when the
+    // session goes (the wait is what must not hold the port).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+        "the session stopped listening before it was dropped"
+    );
+    // No shutdown: dropping the last handle must be enough.
+    drop(s);
+    assert!(
+        wait_until(
+            || std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            Duration::from_secs(1)
+        )
+        .await,
+        "the listen port {port} is still bound a second after the session went"
+    );
+}
+
+/// A proxy that grants the UDP association and drops it at once is retried
+/// on the doubling backoff, not once per `proxy_retry_base` (I3): each
+/// `Reachable` is a probe success that must not reset the schedule, so a
+/// flapping proxy cannot drive a state change (and a full rebuild) every
+/// base interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flapping_proxy_is_not_retried_at_the_base_interval() {
+    let fake = FakeSocks5::start(Script::DropAssociation).await;
+    let mut st = settings();
+    st.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    let s = Session::new(st).await.unwrap();
+    let mut events = s.subscribe(EventMask::STATUS);
+    // The relay is lost the moment it is taken: the state flaps between
+    // `Reachable` and `Unreachable` (two events per cycle). Over 2 s the
+    // doubling schedule (50, 100, 200, 400, 400, …) allows about ten cycles;
+    // the base interval alone would allow twice as many.
+    let mut changes = 0;
+    let end = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(ev)) = tokio::time::timeout_at(end, events.recv()).await {
+        if matches!(ev, Event::ProxyStateChanged { .. }) {
+            changes += 1;
+        }
+    }
+    assert!(
+        changes <= 24,
+        "{changes} state changes in 2 s: the flapping proxy is retried at the base interval"
+    );
+    s.shutdown().await;
+}
+
+/// A dial the proxy refused while its relay is healthy moves the state to
+/// `Unreachable`, but the next successful probe does not rebuild the stack
+/// (I4): the live relay was never lost, so rebuilding it would tear down
+/// uTP, the DHT and the announces for nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reachable_probe_keeps_a_live_relay() {
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let addr = fake.addr();
+    let (m, payload) = torrent();
+    let (seed, _) = seeder(&m, &payload).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, addr);
+    let l = leecher(st, &m, payload.len()).await;
+    assert_eq!(l.session.proxy_state(), ProxyState::Reachable);
+    assert_eq!(l.session.demux_stats().len(), 1, "no relayed UDP socket");
+    assert!(!l.session.demux_stats()[0].1.relay_lost);
+    let generation = l.session.net_generation();
+
+    // The proxy stops accepting: a peer dial through it fails to connect
+    // (the relay's control connection stays up), which reports the proxy
+    // unreachable.
+    fake.stop_accepting().await;
+    l.handle.add_peer(closed_port()).await.unwrap();
+    assert!(
+        wait_until(
+            || matches!(l.session.proxy_state(), ProxyState::Unreachable { .. }),
+            T
+        )
+        .await,
+        "the refused dial did not move the state: {:?}",
+        l.session.proxy_state()
+    );
+
+    // The proxy answers again; the probe succeeds while the live stack still
+    // has its relay, so the stack must be left alone.
+    let fake = FakeSocks5::start_on(addr, Script::Ok).await;
+    assert!(
+        wait_until(|| l.session.proxy_state() == ProxyState::Reachable, T).await,
+        "the proxy did not come back: {:?}",
+        l.session.proxy_state()
+    );
+    assert_eq!(
+        l.session.net_generation(),
+        generation,
+        "a healthy relayed stack was rebuilt"
+    );
+    assert_eq!(l.session.demux_stats().len(), 1);
+    l.session.shutdown().await;
+    seed.shutdown().await;
+    drop(fake);
+}
+
+/// A new reason under the *same* state is not a state change (M2): the
+/// stored state carries the latest reason (`proxy_state` reports it), but
+/// `Event::ProxyStateChanged` is emitted only when the variant differs, so a
+/// proxy that fails differently does not re-announce `Unreachable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_reason_under_the_same_state_does_not_emit() {
+    let mut st = dial_tcp(settings());
+    // Short, so the second proxy's silent handshake times out promptly.
+    st.connect_timeout = Duration::from_millis(200);
+    st.proxy = proxy(ProxyKind::Socks5, closed_port());
+    let s = Session::new(st).await.unwrap();
+    let mut events = s.subscribe(EventMask::STATUS);
+    let ProxyState::Unreachable { reason } = s.proxy_state() else {
+        panic!("expected Unreachable, got {:?}", s.proxy_state())
+    };
+
+    // A proxy that accepts the connection and answers nothing: the state is
+    // `Unreachable` again, with the timeout as the new reason.
+    let silent = FakeSocks5::start(Script::Silent).await;
+    let mut net = s.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, silent.addr());
+    s.set_network_settings(net).await.unwrap();
+    let ProxyState::Unreachable { reason: latest } = s.proxy_state() else {
+        panic!("expected Unreachable, got {:?}", s.proxy_state())
+    };
+    assert_ne!(latest, reason, "the reason did not follow the new proxy");
+    assert!(
+        next_matching(
+            &mut events,
+            |e| matches!(e, Event::ProxyStateChanged { .. }),
+            Duration::from_millis(500)
+        )
+        .await
+        .is_none(),
+        "an Unreachable with a new reason was reported as a state change"
+    );
+    s.shutdown().await;
+}
+
 /// A proxy that was unreachable is re-probed until it answers: when it comes
-/// back on the same address the state turns `Reachable`, the relayed UDP
-/// socket replaces the missing one, and a UDP tracker announce through the
-/// relay is answered.
+/// back on the same address the state turns `Reachable`, exactly once, the
+/// relayed UDP socket replaces the missing one, and a UDP tracker announce
+/// through the relay is answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn association_returns_after_proxy_comes_back() {
     let addr = closed_port();
@@ -367,14 +581,33 @@ async fn association_returns_after_proxy_comes_back() {
     assert!(came_back.is_some(), "the proxy did not come back");
     assert_eq!(l.session.proxy_state(), ProxyState::Reachable);
     assert!(!l.session.demux_stats()[0].1.relay_lost);
-    // The rebuilt stack announces to the UDP tracker through the relay.
-    let reply = next_matching(
-        &mut l.events,
-        |e| matches!(e, Event::TrackerReply { .. }),
-        T,
-    )
+    // The rebuilt stack announces to the UDP tracker through the relay, and
+    // that wait counts the state events: the comeback is reported exactly
+    // once (the rebuild re-affirms the `Reachable` the classification under
+    // the change lock already set, and a state set twice emits once).
+    let mut changes = 0usize;
+    let mut announced = false;
+    let wait = tokio::time::timeout(T, async {
+        while let Some(ev) = l.events.recv().await {
+            match ev {
+                Event::ProxyStateChanged { .. } => changes += 1,
+                Event::TrackerReply { .. } => {
+                    announced = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
     .await;
-    assert!(reply.is_some(), "no UDP tracker announce through the relay");
+    assert!(
+        wait.is_ok() && announced,
+        "no UDP tracker announce through the relay"
+    );
+    assert_eq!(
+        changes, 0,
+        "the proxy's comeback was reported as {changes} more state changes"
+    );
     assert!(
         fake.udp_targets().contains(&tracker_addr),
         "{:?}",

@@ -758,6 +758,32 @@ impl SessionInner {
             .clone()
     }
 
+    /// Sets the proxy health *state*, but only if the stored network settings
+    /// are still `net`: the health task probes a value it read earlier and
+    /// must not overwrite the state of a proxy the user has changed to since.
+    /// Takes the change lock (a tokio mutex, as [`apply_change`] does), so a
+    /// change in flight completes first and wins.
+    ///
+    /// [`apply_change`]: Self::apply_change
+    pub(crate) async fn set_if_current(&self, net: &NetworkSettings, state: ProxyState) {
+        let _guard = self.change.lock().await;
+        if self.shared.is_shutdown() {
+            return;
+        }
+        if self.network() == *net {
+            self.shared.proxy_health.set(state);
+        }
+    }
+
+    /// Whether the live stack still carries a SOCKS5 relay that has not been
+    /// lost: a successful probe then needs no rebuild (the relayed UDP
+    /// socket, the DHT and uTP are still the ones the stack was built with).
+    /// False on a direct stack and on a closed one.
+    pub(crate) fn relay_is_live(&self) -> bool {
+        let net = self.shared.net();
+        net.relayed && net.udp.iter().all(|u| !u.stats().relay_lost)
+    }
+
     /// Applies `net` as the session's network settings: the steps that make
     /// the change safe (the order is the guarantee). Under the change lock
     /// (so two changes apply one after the other, and the shutdown never
@@ -1111,11 +1137,28 @@ impl Session {
     /// combination the session cannot work with) and with
     /// [`SessionError::Shutdown`] once the session has shut down. Setting a
     /// value equal to the current one is a no-op.
+    ///
+    /// A change that fails while building the new stack (a listen address
+    /// that cannot be bound) leaves the closed stack installed and the
+    /// *previous* settings stored: the proxy the caller asked for was never
+    /// applied. The health task keeps probing that previous value and -- when
+    /// the previous proxy relays UDP -- rebuilds the stack with its relay, so
+    /// the previous proxy is restored without another change.
     pub async fn set_network_settings(&self, net: NetworkSettings) -> Result<(), SessionError> {
         if self.inner.shared.is_shutdown() {
             return Err(SessionError::Shutdown);
         }
         self.inner.rebuild(net).await
+    }
+
+    /// The generation of the network stack installed now: it increments by
+    /// two on every rebuild ([`set_network_settings`](Self::set_network_settings),
+    /// the health task's relay rebuild), so a test can tell a rebuilt stack
+    /// from an untouched one. Internal (tests observe a rebuild with it);
+    /// not part of the stable API.
+    #[doc(hidden)]
+    pub fn net_generation(&self) -> u64 {
+        self.inner.shared.net().generation
     }
 
     /// BEP 55 holepunch activity so far, over every torrent: `Rendezvous`
