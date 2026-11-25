@@ -30,6 +30,10 @@ pub enum Script {
     /// target had already spoken: a client that reads past the reply loses
     /// them.
     Trailer(Vec<u8>),
+    /// The connection is accepted, then nothing is read and nothing is
+    /// answered: a client's greeting or request waits until its own timeout
+    /// (or until the fake goes away and drops the connection).
+    Silent,
 }
 
 #[derive(Default)]
@@ -86,6 +90,12 @@ impl FakeSocks5 {
 }
 
 async fn serve(mut s: TcpStream, script: Script, log: Arc<Mutex<Log>>) -> std::io::Result<()> {
+    if let Script::Silent = script {
+        // Accept, then hold the connection open without reading or writing:
+        // `pending` never resolves, so the stream lives until the fake is
+        // dropped (which aborts this task and closes it).
+        return std::future::pending().await;
+    }
     // Greeting: VER NMETHODS METHODS.
     let mut head = [0u8; 2];
     s.read_exact(&mut head).await?;
