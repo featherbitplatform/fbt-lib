@@ -90,6 +90,9 @@ pub(super) struct Peer {
     pub tx: Option<mpsc::Sender<PeerCommand>>,
     /// Picker generation the peer belongs to.
     pub generation: u64,
+    /// The network stack generation the connection was dialled or accepted
+    /// under; a change closes the connections below the new generation.
+    pub net_generation: u64,
     /// We dialled it.
     pub outgoing: bool,
     /// Outgoing and still holding a half-open slot.
@@ -183,6 +186,9 @@ impl Peer {
             addr,
             tx: Some(tx),
             generation,
+            // Set from the stack the dial or accept read when the peer is
+            // inserted (see `Actor::spawn_dial` and `Actor::on_incoming`).
+            net_generation: 0,
             outgoing: false,
             connecting: false,
             connected: false,

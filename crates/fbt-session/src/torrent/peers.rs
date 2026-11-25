@@ -601,6 +601,7 @@ impl Actor {
             .map(|(k, p)| (*k, p.supports_holepunch()));
         let ours: Vec<SocketAddr> = self
             .shared
+            .net()
             .utp
             .iter()
             .map(fbt_utp::UtpSocket::local_addr)
@@ -643,7 +644,8 @@ impl Actor {
         if self.is_private() {
             return;
         }
-        let (Some(dht), Some(p)) = (self.shared.dht.as_ref(), self.peers.get(&key)) else {
+        let dht = self.shared.net().dht.clone();
+        let (Some(dht), Some(p)) = (dht, self.peers.get(&key)) else {
             return;
         };
         dht.add_node(SocketAddr::new(p.addr.ip(), port));

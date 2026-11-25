@@ -138,7 +138,8 @@ impl Actor {
                 stream,
                 handshake,
                 addr,
-            } => self.on_incoming(*stream, handshake, addr),
+                generation,
+            } => self.on_incoming(*stream, handshake, addr, generation),
             Cmd::Remove(mode, tx) => {
                 let r = self.stop(Some(mode)).await;
                 // Done here rather than by the caller, whose future may be
@@ -161,6 +162,17 @@ impl Actor {
             Cmd::FilterChanged(tx) => {
                 self.on_filter_changed();
                 let _ = tx.send(());
+            }
+            Cmd::NetworkChanged {
+                generation,
+                close_tcp,
+                tx,
+            } => {
+                self.on_network_changed(generation, close_tcp);
+                let _ = tx.send(());
+            }
+            Cmd::NetworkReady(generation) => {
+                self.on_network_ready(generation);
             }
             Cmd::BansChanged => {
                 self.close_blocked();

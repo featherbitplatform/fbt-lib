@@ -47,6 +47,11 @@ pub enum DisconnectReason {
     /// We closed it: the IP filter blocks it (set while it was connected),
     /// it is banned, or its IP has too many connections to the torrent.
     Blocked(BlockReason),
+    /// The session's network settings changed under it (the proxy, in
+    /// practice): the connection was dialled or accepted under a network
+    /// stack that no longer exists, so it is closed and the address is
+    /// dialled again on the new stack.
+    NetworkChanged,
 }
 
 /// The pieces a remote announced, owned.

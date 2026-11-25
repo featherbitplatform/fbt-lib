@@ -76,6 +76,7 @@ pub mod error;
 mod event;
 mod listener;
 mod net;
+mod netstack;
 mod peer;
 pub mod picker;
 mod queue;
@@ -111,7 +112,8 @@ pub use resume::{
 };
 pub use session::{AddTorrent, Priority, RemoveMode, Session, TorrentSource};
 pub use settings::{
-    DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, Settings,
+    DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, NetworkSettings,
+    Settings,
 };
 pub use status::{FileStatus, PeerStatus, TorrentState, TorrentStatus, TrackerStatus};
 pub use storage::{CacheStats, FileStamp, MoveMode, StorageError};
