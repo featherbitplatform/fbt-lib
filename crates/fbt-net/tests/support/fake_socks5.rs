@@ -200,8 +200,11 @@ impl Target {
         }
     }
 
-    /// Dials the target. Only an address can be reached: a name would have to
-    /// be resolved here, which this proxy does not do.
+    /// Dials the target of a CONNECT, resolving a name the way a proxy that
+    /// resolves names does (the tests use loopback names only). Relayed UDP
+    /// datagrams do not reach a name here: `associate` logs such a target and
+    /// drops it, so a datagram a test means for a documentation name is never
+    /// resolved nor forwarded.
     async fn dial(&self) -> std::io::Result<TcpStream> {
         match self {
             Target::Addr(a) => TcpStream::connect(*a).await,

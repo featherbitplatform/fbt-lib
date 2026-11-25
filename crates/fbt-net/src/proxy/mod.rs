@@ -241,7 +241,7 @@ pub async fn connect_tcp(
     target: ProxyTarget,
     timeout: Duration,
 ) -> Result<TcpStream, ProxyError> {
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_in(timeout);
     match cfg.kind {
         ProxyKind::None => {
             let target = prepare_target(cfg, target).await?;
@@ -304,7 +304,7 @@ pub async fn probe(cfg: &ProxyConfig, timeout: Duration) -> Result<(), ProxyErro
     if cfg.kind == ProxyKind::None {
         return Ok(());
     }
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_in(timeout);
     let mut s = dial_proxy(cfg, deadline).await?;
     if cfg.kind == ProxyKind::Socks5 {
         handshake(deadline, socks5::negotiate(&mut s, cfg)).await?;
@@ -327,6 +327,27 @@ pub fn udp_not_relayed(e: &ProxyError) -> bool {
 async fn within<F: Future>(deadline: Instant, fut: F) -> Option<F::Output> {
     let left = deadline.saturating_duration_since(Instant::now());
     tokio::time::timeout(left, fut).await.ok()
+}
+
+/// How far a timeout too large for an `Instant` is stretched: beyond any
+/// exchange this crate bounds, and far too short to overflow.
+const FAR_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// The deadline `timeout` from now.
+///
+/// A timeout no `Instant` can hold is one a caller can hand in: a
+/// `Settings::connect_timeout` is not range-checked, and a deserialised
+/// `Duration::MAX` reaches the proxied dial and the UDP association. It
+/// saturates at [`FAR_DEADLINE`] instead of panicking, so a settings value
+/// cannot take the session down; the exchange is then still bounded, by a year
+/// rather than by forever.
+fn deadline_in(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .or_else(|| now.checked_add(FAR_DEADLINE))
+        // The clock is within a year of its own maximum: every exchange is cut
+        // off at once rather than panicking.
+        .unwrap_or(now)
 }
 
 /// The handshake phase of a proxied exchange, bounded by the time left until
@@ -475,7 +496,7 @@ pub async fn udp_associate(cfg: &ProxyConfig, timeout: Duration) -> Result<Socks
     if cfg.kind != ProxyKind::Socks5 {
         return Err(ProxyError::Unsupported);
     }
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_in(timeout);
     let mut control = dial_proxy(cfg, deadline).await?;
     let bnd = match within(deadline, associate_request(&mut control, cfg)).await {
         Some(r) => r?,

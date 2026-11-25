@@ -685,6 +685,31 @@ async fn dial_to_closed_port_is_unreachable() {
     ));
 }
 
+/// A timeout no `Instant` can hold must not panic. `Settings::connect_timeout`
+/// is not range-checked and can be deserialised, so a `Duration::MAX` in it
+/// reaches the proxied dial and the UDP association; the proxy is still dialled
+/// and its refusal still reported.
+#[tokio::test]
+async fn huge_timeout_does_not_panic() {
+    let cfg = socks5(closed_port());
+    assert!(matches!(
+        connect_tcp(&cfg, addr_target(), Duration::MAX).await,
+        Err(ProxyError::Unreachable(_))
+    ));
+    assert!(matches!(
+        probe(&cfg, Duration::MAX).await,
+        Err(ProxyError::Unreachable(_))
+    ));
+    assert!(matches!(
+        udp_associate(&cfg, Duration::MAX).await,
+        Err(ProxyError::Unreachable(_))
+    ));
+    // A reachable proxy is still reached and answered, so the deadline is far
+    // off rather than already past.
+    let (_fake, c) = socks5_fake(Script::Ok).await;
+    probe(&c, Duration::MAX).await.unwrap();
+}
+
 /// A proxy that wants credentials and gets the wrong ones is reachable: the
 /// probe reports the login, not a reachability failure, and the right
 /// password goes through.
