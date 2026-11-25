@@ -257,10 +257,11 @@ impl Actor {
     }
 
     /// Dials `addr` over `transport` in slots already reserved, on `stack`
-    /// (the caller's single read of the network stack). `None` when the
-    /// stack is closed (a change in flight): nothing must be dialled through
-    /// a stack the session no longer has, and the slots the caller reserved
-    /// are given back here, so the candidate stays queued for the new stack.
+    /// (the caller's single read of the network stack). `None`, giving the
+    /// slots the caller reserved back, when the stack does not allow
+    /// `transport` outgoing (a closed stack allows nothing): no caller may
+    /// dial a transport this stack turned off, and nothing must go through a
+    /// stack the session no longer has.
     fn spawn_dial(
         &mut self,
         stack: &NetStack,
@@ -268,7 +269,8 @@ impl Actor {
         transport: Transport,
         source: PeerSource,
     ) -> Option<PeerKey> {
-        if stack.closed {
+        if !self.transport_usable_in(stack, &addr, transport) {
+            self.unreserve_dial();
             return None;
         }
         let utp = match transport {
@@ -329,12 +331,21 @@ impl Actor {
                 self.unreserve_dial();
                 continue;
             }
-            // A pending fallback goes first; otherwise the transport the
-            // settings and what we know of the address prefer.
-            let transport = self
-                .retries
-                .fallback_transport(&addr)
-                .or_else(|| self.first_transport_in(&stack, &addr));
+            // A pending fallback goes first, but only if this stack still
+            // allows it: a change can turn a transport off (an HTTP proxy
+            // carrying peers turns outgoing uTP off) while the fallback
+            // waits, and a stale one must not dial around it. Otherwise the
+            // transport the settings and what we know of the address prefer.
+            let transport = match self.retries.fallback_transport(&addr) {
+                Some(t) if self.transport_usable_in(&stack, &addr, t) => Some(t),
+                Some(_) => {
+                    // Not usable on this stack: forget it and take what the
+                    // stack prefers, which refuses a direct dial of its own.
+                    self.retries.clear_transport_failed(&addr);
+                    self.first_transport_in(&stack, &addr)
+                }
+                None => self.first_transport_in(&stack, &addr),
+            };
             let Some(transport) = transport else {
                 debug!(%addr, "no enabled transport can reach this address");
                 self.unreserve_dial();
@@ -369,8 +380,8 @@ impl Actor {
             return false;
         }
         debug!(%addr, "holepunch: dialling over uTP");
+        // `spawn_dial` gives the slots back itself when it refuses.
         let Some(key) = self.spawn_dial(&stack, addr, Transport::Utp, PeerSource::Holepunch) else {
-            self.unreserve_dial();
             return false;
         };
         if let Some(p) = self.peers.get_mut(&key) {
@@ -1092,6 +1103,67 @@ pub(super) mod tests {
             a.candidates.len(),
             1,
             "the address was dropped instead of kept for the new stack"
+        );
+    }
+
+    /// A uTP fallback queued while outgoing uTP was on must not be dialled
+    /// over uTP on a stack that forbids it: an HTTP proxy carrying peers
+    /// turns outgoing uTP off in the applied switches, yet a uTP socket is
+    /// still built on every UDP socket, so `utp_for` hands one out. Nothing
+    /// may be dialled over a transport the stack does not allow, whatever
+    /// queued the fallback.
+    #[tokio::test]
+    async fn no_utp_fallback_on_a_stack_that_forbids_outgoing_utp() {
+        use crate::settings::NetworkSettings;
+
+        let mut a = actor_with(&[16_384], 16_384, 0);
+        // A stack of the shape a proxy change builds: an HTTP proxy carrying
+        // peers, over loopback listeners and no DHT, LSD, UPnP or NAT-PMP.
+        let settings = crate::settings::Settings {
+            listen_addrs: vec![SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))],
+            dht_enabled: false,
+            dht_bootstrap_nodes: Vec::new(),
+            enable_lsd: false,
+            enable_upnp: false,
+            enable_natpmp: false,
+            ..crate::settings::Settings::default()
+        };
+        // `ProxyConfig` is `#[non_exhaustive]` in fbt-net: built field by
+        // field, not as a literal.
+        let mut proxy_cfg = crate::ProxyConfig::default();
+        proxy_cfg.kind = crate::ProxyKind::Http;
+        proxy_cfg.host = "127.0.0.1".to_owned();
+        proxy_cfg.proxy_peers = true;
+        let net = NetworkSettings {
+            proxy: proxy_cfg,
+            ..settings.network()
+        };
+        let stack = NetStack::build(&settings, &net, &settings.listen_addrs, None, 2, None)
+            .await
+            .expect("the proxy stack");
+        // The leak's shape: outgoing uTP off, but a uTP socket to hand out.
+        let target = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
+        assert!(
+            !stack.net.enable_outgoing_utp,
+            "the fixture must forbid outgoing uTP"
+        );
+        assert!(
+            stack.utp_for(&target).is_some(),
+            "the fixture needs a uTP socket: that is what the leak hands out"
+        );
+        a.shared.set_net(Arc::new(stack));
+
+        // What a direct stack did before the change: a TCP connect failed,
+        // so the address waits for a uTP fallback.
+        assert!(
+            a.retries.transport_failed(target, Transport::Tcp),
+            "the uTP fallback was not queued"
+        );
+        a.on_found_peers(PeerSource::Tracker, vec![target]);
+        a.try_connect();
+        assert!(
+            a.peers.values().all(|p| p.transport != Transport::Utp),
+            "a uTP dial was started on a stack that forbids outgoing uTP"
         );
     }
 

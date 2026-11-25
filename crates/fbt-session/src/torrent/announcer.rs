@@ -299,6 +299,8 @@ enum Walk {
 enum Interrupt {
     /// `running`, `starts` or `exit` changed: re-plan now.
     Lifecycle,
+    /// The network stack changed: the walk went with the stack it read.
+    NetworkChanged,
     /// Every sender is gone.
     Closed,
 }
@@ -461,7 +463,9 @@ impl Task {
             if due > now {
                 match self.wait_lifecycle(Some(due)).await {
                     Interrupt::Closed => return,
-                    Interrupt::Lifecycle => continue,
+                    // `wait_lifecycle` waits on the lifecycle signals only,
+                    // never on the network stack.
+                    Interrupt::Lifecycle | Interrupt::NetworkChanged => continue,
                 }
             }
             if event == AnnounceEvent::Completed {
@@ -475,16 +479,21 @@ impl Task {
             {
                 Err(Interrupt::Closed) => return,
                 Err(Interrupt::Lifecycle) => continue,
+                // The stack changed under the walk. If the session is
+                // between stacks, wait for the next one before walking
+                // again: the closed client fails at once, and its errors are
+                // not the trackers'.
+                Err(Interrupt::NetworkChanged) | Ok(Walk::Abandoned) => {
+                    if matches!(self.wait_for_net_change().await, Interrupt::Closed) {
+                        return;
+                    }
+                    continue;
+                }
                 Ok(Walk::NoTrackers) => {
                     self.publish_next(None);
                     // Nothing left to announce to; wait for the end.
                     let _ = self.signals.wait_for(|s| s.exit).await;
                     return;
-                }
-                Ok(Walk::Abandoned) => {
-                    // The stack changed mid-walk: re-plan against the one
-                    // the session has now.
-                    continue;
                 }
                 Ok(Walk::Failed) => {
                     if event == AnnounceEvent::Completed {
@@ -553,6 +562,37 @@ impl Task {
         }
     }
 
+    /// Waits for the next network stack (or for the torrent or the session
+    /// to end) while the closed stack of a change in flight is installed.
+    /// The stack is read after subscribing, so a change that lands in
+    /// between is still seen.
+    async fn wait_for_net_change(&mut self) -> Interrupt {
+        loop {
+            let mut net_changed = self.shared.net_changed();
+            if !self.shared.net().closed {
+                return Interrupt::Lifecycle;
+            }
+            tokio::select! {
+                r = self.signals.changed() => {
+                    if r.is_err() {
+                        return Interrupt::Closed;
+                    }
+                    let sig = self.signals.borrow_and_update().clone();
+                    // Stopped or going away: the run loop handles it.
+                    if sig.exit || !sig.running {
+                        return Interrupt::Lifecycle;
+                    }
+                    // Anything else: keep waiting for the new stack.
+                }
+                r = net_changed.changed() => {
+                    if r.is_err() {
+                        return Interrupt::Closed;
+                    }
+                }
+            }
+        }
+    }
+
     /// Walks the tiers, abandoning the walk if the torrent stops or starts
     /// over meanwhile. Other signal changes are handled after the walk.
     async fn walk_interruptible(
@@ -617,7 +657,7 @@ impl Task {
                         ));
                     }
                 }
-                _ = net_changed.changed() => return Err(Interrupt::Lifecycle),
+                _ = net_changed.changed() => return Err(Interrupt::NetworkChanged),
             }
         }
     }
@@ -650,6 +690,11 @@ impl Task {
     /// never retried.
     async fn stopped(&mut self, urls: &HashSet<String>, left: u64) {
         let base = self.request_template(AnnounceEvent::Stopped, left);
+        // A change of network stack abandons the stop: its cloned client
+        // would otherwise keep the old pool (and the request in flight) alive
+        // and finish it through the stack it started on. Subscribed before
+        // the stack is read, so a change that lands in between is still seen.
+        let mut net_changed = self.shared.net_changed();
         let mut set = JoinSet::new();
         let mut ids = HashMap::new();
         for url in urls {
@@ -665,7 +710,19 @@ impl Task {
         }
         let mut pending = urls.clone();
         let deadline = Instant::now() + STOPPED_TIMEOUT;
-        while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, set.join_next()).await {
+        loop {
+            let joined = tokio::select! {
+                joined = tokio::time::timeout_at(deadline, set.join_next()) => joined,
+                _ = net_changed.changed() => {
+                    // The stack changed: the requests still out go with the
+                    // set (aborted), so none of them reports a timeout it
+                    // did not have.
+                    return;
+                }
+            };
+            let Ok(Some(joined)) = joined else {
+                break;
+            };
             let (url, r) = match joined {
                 Ok(done) => done,
                 Err(e) => {

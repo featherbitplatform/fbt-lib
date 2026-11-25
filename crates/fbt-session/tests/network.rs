@@ -657,3 +657,176 @@ async fn dht_state_survives_rebuild() {
     assert_eq!(before.id_v6, after.id_v6, "the IPv6 node id changed");
     s.shutdown().await;
 }
+
+/// Reads an HTTP request head (through the blank line) from `s`; false on
+/// EOF.
+async fn read_head(s: &mut TcpStream) -> bool {
+    let mut buf = [0u8; 2048];
+    let mut seen = Vec::new();
+    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+        match s.read(&mut buf).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+    }
+    true
+}
+
+/// A valid announce reply with no peers, then closes the connection.
+async fn write_announce_reply(s: &mut TcpStream) {
+    let body = b"d8:intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = s.write_all(head.as_bytes()).await;
+    let _ = s.write_all(body).await;
+    let _ = s.shutdown().await;
+}
+
+/// Reads `s` until the peer closes it (or the connection errors).
+async fn read_to_eof(s: &mut TcpStream) {
+    let mut buf = [0u8; 1024];
+    while let Ok(n) = s.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+/// A stopped announce in flight when a proxy is set must be abandoned with
+/// the stack it started on: its cloned client would otherwise finish the
+/// request (DNS and TCP connect included) directly after
+/// `set_network_settings` returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopped_announce_is_abandoned_by_a_network_change() {
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (held_tx, held_rx) = oneshot::channel();
+    let (closed_tx, closed_rx) = oneshot::channel();
+    let mut started_tx = Some(started_tx);
+    let mut held_tx = Some(held_tx);
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            if !read_head(&mut s).await {
+                continue;
+            }
+            if first {
+                // The `started` announce: answered, so the URL gets the
+                // `stopped` one when the torrent pauses.
+                first = false;
+                write_announce_reply(&mut s).await;
+                if let Some(tx) = started_tx.take() {
+                    let _ = tx.send(());
+                }
+                continue;
+            }
+            // The `stopped` announce: held until the change takes the
+            // client that sent it with it.
+            if let Some(tx) = held_tx.take() {
+                let _ = tx.send(());
+            }
+            read_to_eof(&mut s).await;
+            let _ = closed_tx.send(());
+            return;
+        }
+    });
+
+    let (mut m, payload) = torrent();
+    m.trackers = vec![vec![format!("http://{addr}/announce")]];
+    let (seed, handle) = seeder_with(settings(), &m, &payload).await;
+    tokio::time::timeout(T, started_rx)
+        .await
+        .expect("the tracker was never asked")
+        .unwrap();
+
+    // Pause: the stopped announce goes out and the tracker holds it.
+    handle.pause().await.unwrap();
+    tokio::time::timeout(T, held_rx)
+        .await
+        .expect("the stopped announce was never sent")
+        .unwrap();
+
+    // A proxy while it is held: the request goes with the old stack, so the
+    // tracker sees the connection closed well before `STOPPED_TIMEOUT` (5 s)
+    // rather than the request finishing on the old proxy-less client.
+    let mut net = seed.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    seed.set_network_settings(net).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), closed_rx)
+        .await
+        .expect("the stopped request outlived the change")
+        .unwrap();
+    seed.shutdown().await;
+}
+
+/// A walk abandoned by a network change reports no tracker error for it: the
+/// walk restarted against the closed stack would fail at once and blame the
+/// tracker for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_walk_reports_no_tracker_error() {
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (held_tx, held_rx) = oneshot::channel();
+    let mut held_tx = Some(held_tx);
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            if !read_head(&mut s).await {
+                continue;
+            }
+            if first {
+                // The walk hangs here until the change abandons it.
+                first = false;
+                if let Some(tx) = held_tx.take() {
+                    let _ = tx.send(());
+                }
+                read_to_eof(&mut s).await;
+                continue;
+            }
+            // The walk the change restarted on the new stack is answered.
+            write_announce_reply(&mut s).await;
+        }
+    });
+
+    let (mut m, payload) = torrent();
+    m.trackers = vec![vec![format!("http://{addr}/announce")]];
+    let (seed, _) = seeder_with(settings(), &m, &payload).await;
+    let mut events = seed.subscribe(EventMask::ALL);
+    tokio::time::timeout(T, held_rx)
+        .await
+        .expect("the tracker was never asked")
+        .unwrap();
+
+    let mut net = seed.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    seed.set_network_settings(net).await.unwrap();
+
+    // The walk restarts on the new stack and is answered; the abandoned one
+    // must report nothing.
+    let deadline = tokio::time::Instant::now() + T;
+    loop {
+        let ev = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("the walk never reached the tracker again")
+            .expect("the events ended");
+        match ev {
+            Event::TrackerError { url, message, .. } => {
+                panic!("the abandoned walk reported a tracker error for {url}: {message}");
+            }
+            Event::TrackerReply { .. } => break,
+            _ => {}
+        }
+    }
+    seed.shutdown().await;
+}
