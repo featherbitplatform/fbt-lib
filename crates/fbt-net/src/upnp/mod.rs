@@ -13,6 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use fbt_core::audit;
+// audit: outbound on the SSDP socket is recorded in search
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
@@ -206,6 +207,7 @@ async fn search(ssdp: SocketAddr, http_timeout: Duration) -> Result<Igd, UpnpErr
         SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
     };
+    // audit: outbound on this socket is recorded in search
     let sock = UdpSocket::bind(bind).await.map_err(HttpError::Io)?;
     let mut buf = vec![0u8; ssdp::MAX_DATAGRAM + 1];
     let mut last_rejection = None;

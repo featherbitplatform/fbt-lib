@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
+// audit: outbound on the socket is recorded in Sender::send_to
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, watch};
 
@@ -90,6 +91,7 @@ struct Counters {
 }
 
 /// The non-blocking send clone; `None` once the socket is closed.
+// audit: sends through this half are recorded in Sender::send_to
 type SendHalf = Arc<Mutex<Option<std::net::UdpSocket>>>;
 
 #[derive(Debug)]
@@ -111,6 +113,7 @@ struct Inner {
 }
 
 impl Inner {
+    // audit: sends through this half are recorded in Sender::send_to
     fn new(send: std::net::UdpSocket, local: SocketAddr, relay: Option<SocketAddr>) -> Inner {
         Inner {
             send: Arc::new(Mutex::new(Some(send))),
@@ -237,6 +240,7 @@ fn canonical(a: SocketAddr) -> SocketAddr {
 }
 
 /// Binds a non-blocking UDP socket on `addr` (IPv6-only for IPv6).
+// audit: outbound on the socket is recorded in Sender::send_to
 fn bind_std(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv6() {
@@ -286,6 +290,7 @@ impl SharedUdpSocket {
         // fails until the first readiness event, which a fresh socket lacks
         let send = std_sock.try_clone()?;
         send.set_nonblocking(true)?;
+        // audit: outbound on this socket is recorded in Sender::send_to
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local = socket.local_addr()?;
         let inner = Arc::new(Inner::new(send, local, relay));
@@ -353,6 +358,7 @@ impl SharedUdpSocket {
     }
 }
 
+// audit: the recv half only receives; outbound is recorded in Sender::send_to
 async fn receive_loop(socket: Arc<UdpSocket>, inner: Weak<Inner>, stop: Arc<Notify>) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut errors = 0u32;

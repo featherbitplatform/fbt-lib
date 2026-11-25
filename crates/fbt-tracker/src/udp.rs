@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_net::proxy::{ProxyConfig, ProxyKind};
+// audit: outbound on the socket is recorded in Endpoint::send (or the demux)
 use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
@@ -150,6 +151,7 @@ type ParseFn<'a, T> = &'a (dyn Fn(&[u8], u32, bool) -> Result<T, TrackerError> +
 
 /// A bound socket plus its receive task; the task dies with this value.
 struct Sock {
+    // audit: outbound is recorded in Endpoint::send (or the demux)
     socket: Arc<UdpSocket>,
     pending: Pending,
     task: JoinHandle<()>,
@@ -164,11 +166,14 @@ impl Drop for Sock {
 impl Sock {
     fn bind(v6: bool) -> std::io::Result<Sock> {
         let std_sock = if v6 {
+            // audit: outbound on this socket is recorded in Endpoint::send
             std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))?
         } else {
+            // audit: outbound on this socket is recorded in Endpoint::send
             std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?
         };
         std_sock.set_nonblocking(true)?;
+        // audit: outbound on this socket is recorded in Endpoint::send
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let pending: Pending = Arc::default();
         let task = tokio::spawn(recv_loop(socket.clone(), pending.clone()));
@@ -180,6 +185,7 @@ impl Sock {
     }
 }
 
+// audit: the socket only receives; outbound is recorded in Endpoint::send
 async fn recv_loop(socket: Arc<UdpSocket>, pending: Pending) {
     let mut buf = vec![0u8; 65536];
     loop {

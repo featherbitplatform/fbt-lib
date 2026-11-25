@@ -69,7 +69,8 @@ pub enum ProxyKind {
 pub struct ProxyConfig {
     /// The proxy protocol; [`ProxyKind::None`] (the default) dials directly.
     pub kind: ProxyKind,
-    /// Proxy host name or IP address.
+    /// Proxy host name or IP address, unbracketed (an IPv6 literal is spelled
+    /// bare; [`validate`](ProxyConfig::validate) rejects brackets).
     pub host: String,
     /// Proxy port (default 1080).
     pub port: u16,
@@ -126,15 +127,21 @@ impl fmt::Debug for ProxyConfig {
 
 impl ProxyConfig {
     /// Checks the fields a proxy needs: unless `kind` is [`ProxyKind::None`],
-    /// `host` is non-empty and `port` non-zero, and the credentials can be
-    /// sent: for SOCKS5 a `username` needs a `password`, each of 1 to 255
-    /// bytes (RFC 1929); for HTTP Basic the `username` has no `:`.
+    /// `host` is non-empty, not bracketed, and `port` non-zero, and the
+    /// credentials can be sent: for SOCKS5 a `username` needs a `password`,
+    /// each of 1 to 255 bytes (RFC 1929); for HTTP Basic the `username` has
+    /// no `:`. A bracketed host is an IPv6 literal spelled for a URI; handed
+    /// to the resolver as-is it cannot be dialled, so it is rejected here
+    /// instead of recording a connect for a resolver call.
     pub fn validate(&self) -> Result<(), String> {
         if self.kind == ProxyKind::None {
             return Ok(());
         }
         if self.host.is_empty() {
             return Err("proxy host is empty".into());
+        }
+        if self.host.contains('[') || self.host.contains(']') {
+            return Err("proxy host contains brackets".into());
         }
         if self.port == 0 {
             return Err("proxy port is 0".into());
@@ -396,5 +403,26 @@ mod tests {
         for (i, o) in cases {
             assert_eq!(base64(i.as_bytes()), o);
         }
+    }
+
+    /// A bracketed host is an IPv6 literal spelled for a URI, not for the dial:
+    /// handed to the resolver as-is, a connect record for it would be a lie.
+    /// Reject it; a bare literal is fine.
+    #[test]
+    fn validate_rejects_bracketed_host() {
+        for kind in [ProxyKind::Socks5, ProxyKind::Http] {
+            let cfg = ProxyConfig {
+                kind,
+                host: "[2001:db8::1]".into(),
+                ..ProxyConfig::default()
+            };
+            assert!(cfg.validate().is_err(), "{kind:?}: a bracketed host");
+        }
+        let bare = ProxyConfig {
+            kind: ProxyKind::Socks5,
+            host: "2001:db8::1".into(),
+            ..ProxyConfig::default()
+        };
+        assert!(bare.validate().is_ok(), "a bare literal is dialable");
     }
 }

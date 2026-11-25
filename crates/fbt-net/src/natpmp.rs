@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use fbt_core::audit;
+// audit: outbound on the socket is recorded in exchange
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use tracing::{debug, trace};
@@ -342,6 +343,7 @@ fn parse_pcp(data: &[u8], expect: &Expect) -> Result<Reply, NatPmpError> {
 /// Send `request` on the schedule and return the first valid reply from
 /// `gateway`. Datagrams from elsewhere, and invalid ones, are ignored.
 async fn exchange(
+    // audit: outbound is recorded in exchange
     sock: &UdpSocket,
     gateway: SocketAddr,
     request: &[u8],
@@ -388,6 +390,7 @@ async fn exchange(
 
 /// The local IPv4 address the OS would use to reach `gateway`.
 async fn local_v4(gateway: SocketAddr) -> Result<Ipv4Addr, NatPmpError> {
+    // audit: no packet is sent from this socket; the connect below pins no route
     let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     // audit: a UDP connect only pins the default destination; no packet is sent
     probe.connect(gateway).await?;
@@ -445,6 +448,7 @@ async fn request(
     prev: Option<&Mapping>,
 ) -> Result<Mapping, NatPmpError> {
     let gw = SocketAddr::new(IpAddr::V4(gateway), port);
+    // audit: outbound on this socket is recorded in exchange
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     match prev.map(|m| m.method) {
         None | Some(MapMethod::Pcp) => {
@@ -479,6 +483,7 @@ async fn request(
 }
 
 async fn natpmp_map(
+    // audit: outbound is recorded in exchange
     sock: &UdpSocket,
     gw: SocketAddr,
     p: MapProtocol,

@@ -1,6 +1,6 @@
-//! The TCP connector under the HTTP clients: hyper's own [`HttpConnector`], resolving
-//! through a resolver that can refuse an address inside the local network before dialling
-//! it, or a tunnel through a SOCKS5 or HTTP CONNECT proxy.
+//! The TCP connector under the HTTP clients: hyper's own connector, resolving
+//! through a resolver that can refuse an address inside the local network before
+//! dialling it, or a tunnel through a SOCKS5 or HTTP CONNECT proxy.
 
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -17,6 +17,7 @@ use fbt_core::audit;
 use fbt_net::addr::is_internal;
 use fbt_net::proxy::{ProxyConfig, ProxyKind, ProxyTarget, connect_tcp};
 use hyper::Uri;
+// audit: dials through it record in call (IP literal) and in GuardedResolver (names)
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::rt::TokioIo;
@@ -187,6 +188,7 @@ impl tower_service::Service<Name> for GuardedResolver {
 pub(crate) enum ProxyConnector {
     /// hyper's connector (`enforce_http(false)`, so TLS can wrap it), resolving through
     /// [`GuardedResolver`].
+    // audit: dials through it record in call (IP literal) and in GuardedResolver (names)
     Direct(HttpConnector<GuardedResolver>),
     /// Through `proxy`, the whole exchange bounded by `timeout`. With `guard`, a host name is
     /// resolved and judged here when the proxy would not resolve it, so the address the proxy
@@ -222,6 +224,7 @@ impl ProxyConnector {
                 where_to_look,
             },
             _ => {
+                // audit: dials through it record in call (IP literal) and in GuardedResolver (names)
                 let mut http = HttpConnector::new_with_resolver(GuardedResolver::new(
                     deny_internal,
                     where_to_look,
@@ -265,6 +268,18 @@ impl tower_service::Service<Uri> for ProxyConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         match self {
             ProxyConnector::Direct(http) => {
+                // Hyper dials an IP-literal URI without asking the resolver, so the
+                // resolver's Lookup record cannot cover it: record the connect here,
+                // or a direct dial to an address would leave an empty capture.
+                if let Some(host) = uri.host() {
+                    let bare = without_brackets(host);
+                    if let Ok(ip) = bare.parse::<IpAddr>() {
+                        audit::record(audit::Outbound::TcpConnect(SocketAddr::new(
+                            ip,
+                            port_of(&uri),
+                        )));
+                    }
+                }
                 let connecting = http.call(uri);
                 Box::pin(async move { connecting.await.map_err(Into::into) })
             }
@@ -397,6 +412,7 @@ impl StubResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_service::Service;
 
     #[test]
     fn ports_default_by_scheme() {
@@ -484,5 +500,61 @@ mod tests {
         assert_eq!(without_brackets("[2001:db8::1]"), "2001:db8::1");
         assert_eq!(without_brackets("example.com"), "example.com");
         assert_eq!(without_brackets("[::1"), "[::1");
+    }
+
+    /// Hyper dials an IP-literal URI without asking the resolver, so the
+    /// resolver's Lookup record cannot cover it: the connector records the
+    /// connect itself, or a direct tracker at an address leaves an empty capture.
+    #[tokio::test]
+    async fn direct_http_dial_to_ip_literal_is_recorded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            drop(s);
+        });
+        let mut connector =
+            ProxyConnector::new(None, Duration::from_secs(5), false, Resolution::System);
+        let cap = audit::capture();
+        let uri = format!("http://{addr}/announce").parse::<Uri>().unwrap();
+        let stream = connector.call(uri).await.unwrap();
+        let recs = cap.take();
+        drop(stream);
+        drop(cap);
+        accept.await.unwrap();
+        assert!(
+            recs.contains(&audit::Outbound::TcpConnect(addr)),
+            "the direct dial to the IP literal must be recorded: {recs:?}"
+        );
+        assert!(
+            !recs
+                .iter()
+                .any(|o| matches!(o, audit::Outbound::Lookup(h) if h == "127.0.0.1")),
+            "an IP literal is not a name: nothing may be looked up: {recs:?}"
+        );
+
+        // A bracketed IPv6 literal takes the same path, brackets stripped.
+        if tokio::net::TcpListener::bind("[::1]:0").await.is_err() {
+            return; // no IPv6 loopback on this host
+        }
+        let listener6 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let addr6 = listener6.local_addr().unwrap();
+        let accept6 = tokio::spawn(async move {
+            let (s, _) = listener6.accept().await.unwrap();
+            drop(s);
+        });
+        let cap = audit::capture();
+        let uri = format!("http://[{}]:{}/announce", addr6.ip(), addr6.port())
+            .parse::<Uri>()
+            .unwrap();
+        let stream = connector.call(uri).await.unwrap();
+        let recs = cap.take();
+        drop(stream);
+        drop(cap);
+        accept6.await.unwrap();
+        assert!(
+            recs.contains(&audit::Outbound::TcpConnect(addr6)),
+            "the bracketed IPv6 literal must be recorded: {recs:?}"
+        );
     }
 }

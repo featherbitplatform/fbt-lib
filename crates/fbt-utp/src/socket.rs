@@ -24,6 +24,7 @@ use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use rand::RngExt as _;
 use tokio::io::ReadBuf;
+// audit: outbound on the socket is recorded in OwnedSender::send_to (or the demux)
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 
@@ -810,6 +811,7 @@ impl DatagramHandler for Handler {
 /// tokio's `try_send_to` fails until the first readiness event).
 #[derive(Debug)]
 struct OwnedSender {
+    // audit: outbound is recorded in OwnedSender::send_to
     socket: std::net::UdpSocket,
     local: SocketAddr,
 }
@@ -875,10 +877,12 @@ impl UtpSocket {
     /// which ends on [`UtpSocket::shutdown`] or when the last handle drops.
     /// Buffers are clamped as in [`UtpSocket::new`].
     pub async fn bind(addr: SocketAddr, cfg: UtpConfig) -> io::Result<UtpSocket> {
+        // audit: outbound on this socket is recorded in OwnedSender::send_to
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
         let send = std_sock.try_clone()?;
         send.set_nonblocking(true)?;
+        // audit: outbound on this socket is recorded in OwnedSender::send_to
         let socket = UdpSocket::from_std(std_sock)?;
         let local = socket.local_addr()?;
         let stop = Arc::new(Notify::new());
@@ -1057,6 +1061,7 @@ async fn timer_loop(shared: Weak<Shared>, wake: Arc<Notify>) {
     }
 }
 
+// audit: the recv half only receives; outbound is recorded in OwnedSender::send_to
 async fn receive_loop(socket: UdpSocket, shared: Weak<Shared>, stop: Arc<Notify>) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut errors = 0u32;

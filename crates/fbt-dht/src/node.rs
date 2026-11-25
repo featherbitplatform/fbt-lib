@@ -19,6 +19,7 @@ use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use rand::Rng;
 use rand::rngs::StdRng;
+// audit: outbound on these sockets is recorded in StdSender::send_to (or the demux)
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -421,6 +422,7 @@ pub(crate) fn backoff(base: Duration, max: Duration, attempt: u32) -> Duration {
 }
 
 /// A non-blocking IPv4 socket.
+// audit: outbound on the socket is recorded in StdSender::send_to
 fn bind_v4(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     if !addr.is_ipv4() {
         return Err(io::Error::new(
@@ -428,12 +430,14 @@ fn bind_v4(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
             "bind_v4 is not IPv4",
         ));
     }
+    // audit: outbound on this socket is recorded in StdSender::send_to
     let s = std::net::UdpSocket::bind(addr)?;
     s.set_nonblocking(true)?;
     Ok(s)
 }
 
 /// A non-blocking IPv6-only socket, so an IPv4 socket can share its port.
+// audit: outbound on the socket is recorded in StdSender::send_to
 fn bind_v6(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     if !addr.is_ipv6() {
@@ -452,17 +456,20 @@ fn bind_v6(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
 /// The receiving half (registered with tokio) and a clone for sending.
 /// Sends go straight to the non-blocking socket, so the actor never waits
 /// on write readiness; a full send buffer drops the datagram, as UDP may.
+// audit: the send half is recorded in StdSender::send_to; the recv half only receives
 fn split(s: std::net::UdpSocket) -> io::Result<(UdpSocket, std::net::UdpSocket)> {
     let send = s.try_clone()?;
     // the clone shares the file status on Unix but not necessarily on
     // Windows: never let a send block the actor
     send.set_nonblocking(true)?;
+    // audit: outbound on the send half is recorded in StdSender::send_to
     Ok((UdpSocket::from_std(s)?, send))
 }
 
 /// A [`DatagramSender`] over a standalone non-blocking socket.
 #[derive(Debug)]
 struct StdSender {
+    // audit: outbound is recorded in StdSender::send_to
     sock: std::net::UdpSocket,
     local: SocketAddr,
 }
@@ -512,7 +519,9 @@ impl DatagramHandler for DhtInput {
 /// Where the actor's datagrams come from: its own sockets (standalone) or
 /// the [`DhtInput`] queue (shared sockets).
 struct Inbound {
+    // audit: the recv half only receives; outbound is recorded in StdSender::send_to
     v4: Option<UdpSocket>,
+    // audit: the recv half only receives; outbound is recorded in StdSender::send_to
     v6: Option<UdpSocket>,
     input: Option<mpsc::Receiver<InputDatagram>>,
 }
@@ -539,6 +548,7 @@ impl Dht {
         }
         let (recv_v4, send_v4) = sock_v4.unzip();
         let (recv_v6, send_v6) = sock_v6.unzip();
+        // audit: the sender it wraps records in StdSender::send_to
         let wrap = |s: std::net::UdpSocket| -> Result<Arc<dyn DatagramSender>, DhtError> {
             let local = s.local_addr().map_err(DhtError::Bind)?;
             Ok(Arc::new(StdSender { sock: s, local }))
@@ -1058,6 +1068,7 @@ fn after(now: Instant, d: Duration) -> Instant {
     now.checked_add(d.min(MAX_DELAY)).unwrap_or(now)
 }
 
+// audit: the recv half only receives; outbound is recorded in StdSender::send_to
 async fn recv(sock: &Option<UdpSocket>, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
     match sock {
         Some(s) => s.recv_from(buf).await,
