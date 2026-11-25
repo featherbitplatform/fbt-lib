@@ -453,6 +453,53 @@ async fn a_flapping_proxy_is_not_retried_at_the_base_interval() {
     s.shutdown().await;
 }
 
+/// A TCP dial that gets through says nothing about the UDP relay: a proxy
+/// that relays TCP fine but grants a UDP association only to drop it at once
+/// keeps its `Unreachable` state and its place in the backoff. A peer dial
+/// through the proxy succeeds (the TCP side is fine), but it must not wake
+/// the health task to re-probe the relay, which is the one thing that is
+/// broken (F1). With a long `proxy_retry_base` the scheduled probe is far
+/// away, so the state must stay `Unreachable` and the stack must not be
+/// rebuilt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tcp_dial_success_does_not_reset_the_proxy_backoff() {
+    let fake = FakeSocks5::start(Script::DropAssociation).await;
+    let (m, payload) = torrent();
+    let (seed, _) = seeder(&m, &payload).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    // Long, so the scheduled probe cannot be what moves the state here.
+    st.proxy_retry_base = Duration::from_secs(30);
+    st.proxy_retry_max = Duration::from_secs(60);
+    let l = leecher(st, &m, payload.len()).await;
+    assert!(
+        wait_until(
+            || matches!(l.session.proxy_state(), ProxyState::Unreachable { .. }),
+            T
+        )
+        .await,
+        "the association was not dropped: {:?}",
+        l.session.proxy_state()
+    );
+    let generation = l.session.net_generation();
+    // A peer dial through the proxy: the TCP side is fine, so it succeeds.
+    l.handle.add_peer(seed.local_addr()).await.unwrap();
+    // A successful TCP dial must not repair a lost relay.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        matches!(l.session.proxy_state(), ProxyState::Unreachable { .. }),
+        "a TCP dial success repaired a lost relay: {:?}",
+        l.session.proxy_state()
+    );
+    assert_eq!(
+        l.session.net_generation(),
+        generation,
+        "a TCP dial success rebuilt the stack"
+    );
+    l.session.shutdown().await;
+    seed.shutdown().await;
+}
+
 /// A dial the proxy refused while its relay is healthy moves the state to
 /// `Unreachable`, but the next successful probe does not rebuild the stack
 /// (I4): the live relay was never lost, so rebuilding it would tear down
@@ -542,6 +589,49 @@ async fn a_new_reason_under_the_same_state_does_not_emit() {
         "an Unreachable with a new reason was reported as a state change"
     );
     s.shutdown().await;
+}
+
+/// Switching to another down proxy starts the backoff over: after several
+/// failed probes of `P` (which inflate `attempt`), a change to `Q` is probed
+/// after `proxy_retry_base`, not after the delay the old schedule had
+/// reached (F4). The probe dials the proxy, so `Q`'s parked-connection count
+/// (a gate that never opens) shows the probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settings_change_restarts_the_backoff() {
+    let mut st = dial_tcp(settings());
+    // Short, so the probes fail promptly; the base is a fraction of the
+    // delay an inflated `attempt` would reach.
+    st.connect_timeout = Duration::from_millis(100);
+    st.proxy_retry_base = Duration::from_millis(100);
+    st.proxy_retry_max = Duration::from_secs(10);
+    st.proxy = proxy(ProxyKind::Socks5, closed_port());
+    let s = Session::new(st).await.unwrap();
+    assert!(matches!(s.proxy_state(), ProxyState::Unreachable { .. }));
+    // Let `P` fail a few times: 100 ms, 200 ms, 400 ms -> `attempt` is 3 and
+    // the next scheduled probe is 800 ms away.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // A proxy that accepts and answers nothing: every probe dials it and is
+    // parked at the gate, so `waiting` counts the probes.
+    let (q, gate) = FakeSocks5::start_gated(Script::Silent).await;
+    let mut net = s.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, q.addr());
+    s.set_network_settings(net).await.unwrap();
+    // The change classified `Q` once already.
+    assert!(
+        wait_until(|| gate.waiting() >= 1, T).await,
+        "the change did not probe Q"
+    );
+    let after_change = gate.waiting();
+    // A fresh schedule probes `Q` after `base` (100 ms), not after 800 ms:
+    // within 600 ms there must be a second probe.
+    assert!(
+        wait_until(|| gate.waiting() > after_change, Duration::from_millis(600)).await,
+        "Q was not probed after the base delay ({} probes): the old backoff was kept",
+        gate.waiting()
+    );
+    s.shutdown().await;
+    drop(q);
 }
 
 /// A proxy that was unreachable is re-probed until it answers: when it comes

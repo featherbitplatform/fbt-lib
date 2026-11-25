@@ -350,7 +350,8 @@ impl Shared {
     pub(crate) fn test(settings: Settings, stack: Arc<NetStack>, cache_size: u64) -> Arc<Shared> {
         let (events, _) = broadcast::channel(64);
         let (net_gen, _) = watch::channel(stack.generation);
-        let proxy_health = ProxyHealth::new(ProxyState::NotSet, events.clone());
+        let proxy_health =
+            ProxyHealth::new(ProxyState::NotSet, events.clone(), net_gen.subscribe());
         Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -745,7 +746,7 @@ impl SessionInner {
             stack
                 .udp
                 .iter()
-                .map(|u| watch_relay_lost(u, Arc::downgrade(shared), stop.clone())),
+                .map(|u| watch_relay_lost(u, Arc::downgrade(shared), stop.clone(), generation)),
         );
         stack.add_tasks(tasks);
     }
@@ -1052,8 +1053,8 @@ impl Session {
         let (proxy_state, relay) = classify(&settings).await;
         let stack =
             Arc::new(NetStack::build(&settings, &net, &addrs, dht_state.clone(), 1, relay).await?);
-        let proxy_health = ProxyHealth::new(proxy_state, events.clone());
         let (net_gen, _) = watch::channel(1u64);
+        let proxy_health = ProxyHealth::new(proxy_state, events.clone(), net_gen.subscribe());
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
@@ -1862,6 +1863,7 @@ fn watch_relay_lost(
     u: &SharedUdpSocket,
     shared: std::sync::Weak<Shared>,
     mut stop: watch::Receiver<bool>,
+    generation: u64,
 ) -> JoinHandle<()> {
     let mut lost = u.relay_lost();
     tokio::spawn(async move {
@@ -1884,9 +1886,10 @@ fn watch_relay_lost(
         warn!("{message}");
         shared.emit(Event::ProxyError { message });
         // Superseded by the state (F5): the health task re-probes from here.
-        shared.proxy_health.set(ProxyState::unreachable(
-            "the proxy closed the UDP association",
-        ));
+        // The report carries its stack's generation, so a relay lost on a
+        // stack the session has already replaced cannot move the new one's
+        // state (I1-sub).
+        shared.proxy_health.relay_lost(generation);
     })
 }
 

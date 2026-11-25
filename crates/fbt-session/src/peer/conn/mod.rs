@@ -257,14 +257,17 @@ async fn connect(
             {
                 Ok(s) => {
                     // A dial that got through says the proxy is up: probe
-                    // now rather than wait out the backoff.
-                    ctx.health.dial_succeeded();
+                    // now rather than wait out the backoff. The report is
+                    // stamped with the stack this dial read, so a success on
+                    // a replaced stack is dropped (I1-sub).
+                    ctx.health.dial_succeeded(ctx.net_generation);
                     Ok(PeerTransport::Tcp(s))
                 }
                 Err(e) => {
                     // A failure about the proxy moves its state (never a
                     // dial for the target); the dial path never blocks on it.
-                    ctx.health.dial_failed(&e);
+                    // The report carries this dial's generation.
+                    ctx.health.dial_failed(ctx.net_generation, &e);
                     Err((io(e.to_string()), true))
                 }
             }

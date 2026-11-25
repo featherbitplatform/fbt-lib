@@ -127,6 +127,7 @@ fn start_hashes(
         health: crate::proxy_health::ProxyHealth::new(
             crate::event::ProxyState::NotSet,
             tokio::sync::broadcast::channel(1).0,
+            net_gen.subscribe(),
         ),
     };
     tokio::spawn(run_peer(ours, None, addr(), ctx, crx));
@@ -1343,6 +1344,7 @@ fn direct(settings: Settings, down: u64, up: u64) -> Direct {
         health: crate::proxy_health::ProxyHealth::new(
             crate::event::ProxyState::NotSet,
             tokio::sync::broadcast::channel(1).0,
+            net_gen.subscribe(),
         ),
     };
     let theirs = Handshake {
