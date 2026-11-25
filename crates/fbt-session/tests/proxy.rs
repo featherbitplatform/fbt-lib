@@ -634,6 +634,76 @@ async fn a_settings_change_restarts_the_backoff() {
     drop(q);
 }
 
+/// Switching to a second proxy that fails with the *identical* reason is a
+/// settings change all the same: the state does not change, so no event is
+/// emitted, but the task must still see it and probe the new proxy after
+/// `proxy_retry_base`, not after the deadline the old proxy's backoff had
+/// reached (N1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settings_change_to_the_same_failure_restarts_the_backoff() {
+    let mut st = dial_tcp(settings());
+    // Short, so a probe fails promptly; the base is a fraction of the delay
+    // an inflated `attempt` reaches.
+    st.connect_timeout = Duration::from_millis(100);
+    st.proxy_retry_base = Duration::from_millis(100);
+    st.proxy_retry_max = Duration::from_secs(10);
+    // A proxy that accepts and answers nothing: every probe fails with
+    // "proxy timed out", which is exactly how the next one fails too.
+    let (p, _gate_p) = FakeSocks5::start_gated(Script::Silent).await;
+    st.proxy = proxy(ProxyKind::Socks5, p.addr());
+    let s = Session::new(st).await.unwrap();
+    let reason = match s.proxy_state() {
+        ProxyState::Unreachable { reason } => reason,
+        other => panic!("expected Unreachable, got {other:?}"),
+    };
+    assert_eq!(reason, "proxy timed out");
+    // Let the backoff grow: probes about 100 ms, 200 ms, 400 ms and 800 ms
+    // apart, so the running wait is seconds away.
+    tokio::time::sleep(Duration::from_millis(4300)).await;
+
+    let (q, gate_q) = FakeSocks5::start_gated(Script::Silent).await;
+    let mut events = s.subscribe(EventMask::ALL);
+    let mut net = s.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, q.addr());
+    s.set_network_settings(net).await.unwrap();
+    // The same state, word for word: the change is invisible in it.
+    match s.proxy_state() {
+        ProxyState::Unreachable { reason } => assert_eq!(reason, "proxy timed out"),
+        other => panic!("expected Unreachable, got {other:?}"),
+    }
+    // The change probed Q once by itself.
+    assert!(
+        wait_until(|| gate_q.waiting() >= 1, T).await,
+        "the change did not probe Q"
+    );
+    let after_change = gate_q.waiting();
+    // A fresh schedule probes Q after `base` (100 ms); the old one still had
+    // seconds to run.
+    assert!(
+        wait_until(
+            || gate_q.waiting() > after_change,
+            Duration::from_millis(600)
+        )
+        .await,
+        "Q was not probed after the base delay ({} probes): the identical state hid the change",
+        gate_q.waiting()
+    );
+    // The state did not change, so nothing was announced.
+    assert!(
+        next_matching(
+            &mut events,
+            |e| matches!(e, Event::ProxyStateChanged { .. }),
+            Duration::from_millis(200)
+        )
+        .await
+        .is_none(),
+        "the identical state emitted a state event"
+    );
+    s.shutdown().await;
+    drop(p);
+    drop(q);
+}
+
 /// A proxy that was unreachable is re-probed until it answers: when it comes
 /// back on the same address the state turns `Reachable`, exactly once, the
 /// relayed UDP socket replaces the missing one, and a UDP tracker announce

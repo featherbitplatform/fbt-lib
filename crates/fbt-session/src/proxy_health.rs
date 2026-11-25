@@ -8,7 +8,14 @@
 //! and a wake counter plus a [`Notify`] that wakes the health task to probe
 //! now. Setting the state compares it to the current one under one lock, so a
 //! caller that sets the same value twice emits only one
-//! `Event::ProxyStateChanged`.
+//! `Event::ProxyStateChanged`; the `watch` is notified for every recorded
+//! state, though, so a settings change that lands in the same state still
+//! reaches the task (N1).
+//!
+//! A relay loss is pinned to the stack that lost it: a `Reachable` for that
+//! stack is refused (the loss is reported once, so a dead relay reported
+//! reachable would never be retried, P1) and the relay-loss cause outlives a
+//! later failed probe of it (N2).
 //!
 //! The task probes the *stored* network settings
 //! ([`SessionInner::network`]), and applies a result only while they still
@@ -119,6 +126,15 @@ enum RetryCause {
 struct Inner {
     state: ProxyState,
     cause: RetryCause,
+    /// The stack generation whose relay was reported lost, if any. It pins
+    /// two things to that stack: a `Reachable` recorded for it is refused
+    /// (a relay loss is reported once, so a dead relay reported reachable
+    /// would never be retried: the DHT, uTP and UDP trackers would stay off
+    /// for good, P1), and the relay-loss cause is kept while the state stays
+    /// retried (a failed probe of the same stack says no more about the
+    /// relay, so a TCP dial success must not re-arm the wake, N2). A newer
+    /// stack (a rebuild's generation) is not pinned.
+    relay_lost: Option<u64>,
 }
 
 /// The session's proxy health: the state now, a `watch` of state changes,
@@ -161,6 +177,7 @@ impl ProxyHealth {
             inner: Mutex::new(Inner {
                 state,
                 cause: RetryCause::Dial,
+                relay_lost: None,
             }),
             changed,
             probe_now: Notify::new(),
@@ -179,44 +196,79 @@ impl ProxyHealth {
             .clone()
     }
 
-    /// Records `state` (a probe's or a dial's result), waking subscribers and
-    /// emitting [`Event::ProxyStateChanged`], but only when the state's
-    /// *variant* differs from the state now: the comparison, the store and
-    /// the emit happen under one lock, so a value set twice emits nothing and
-    /// two setters racing on the same state emit once.
+    /// Records `state` (a probe's or a dial's result), emitting
+    /// [`Event::ProxyStateChanged`] only when the state's *variant* differs
+    /// from the state now: the comparison, the store and the emit happen
+    /// under one lock, so a value set twice emits nothing and two setters
+    /// racing on the same state emit once.
+    ///
+    /// The `watch` is notified on *every* recorded state, equal or not, so a
+    /// settings change that lands in the same variant with an identical
+    /// reason still reaches the health task instead of leaving it on the
+    /// previous proxy's deadline (N1). Only the event stays variant-change
+    /// only.
     ///
     /// Two `Unreachable`s that differ only in their reason update the stored
     /// state (so [`state`](Self::state) reports the latest reason) without
-    /// emitting: reaching the same state again is not a state change.
+    /// emitting: reaching the same state again is not a state change. A
+    /// `Reachable` for the stack whose relay was reported lost is refused
+    /// (P1).
     pub(crate) fn set(&self, state: ProxyState) {
-        self.update(state, RetryCause::Dial);
+        self.record(state, RetryCause::Dial, None);
     }
 
     /// The relay of the stack built as `generation` was lost: moves the state
     /// to `Unreachable` with the relay cause, so a later successful TCP dial
-    /// does not wake the task (a TCP dial says nothing about the relay, F1).
-    /// A report from a stack that is no longer the current one is dropped
-    /// (I1-sub).
+    /// does not wake the task (a TCP dial says nothing about the relay, F1)
+    /// and a `Reachable` for that same stack is refused (P1). The cause
+    /// outlives a later failed probe of the same stack (N2). A report from a
+    /// stack that is no longer the current one is dropped (I1-sub).
     pub(crate) fn relay_lost(&self, generation: u64) {
         if generation != self.generation() {
             return;
         }
-        self.update(
+        self.record(
             ProxyState::unreachable(RELAY_LOST_REASON),
             RetryCause::RelayLost,
+            Some(generation),
         );
     }
 
-    /// The common store: records `state` and `cause` under one lock and emits
-    /// only on a variant change.
-    fn update(&self, state: ProxyState, cause: RetryCause) {
+    /// The common store: records `state`, why it is retried (`cause`) and,
+    /// for a relay-loss report, the `lost` stack generation to pin, under one
+    /// lock.
+    fn record(&self, state: ProxyState, cause: RetryCause, lost: Option<u64>) {
+        let current = self.generation();
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        inner.cause = cause;
-        if inner.state == state {
+        // The stack's relay is gone and the loss is reported once: reporting
+        // the proxy reachable for that same stack would leave the session
+        // with the DHT, uTP and UDP trackers off and no retry ever (P1).
+        if state == ProxyState::Reachable && inner.relay_lost == Some(current) {
             return;
         }
+        // While the state stays retried for the same stack, the relay loss is
+        // still why: a failed probe (or a proxy-unreachable dial report) about
+        // the same stack says no more about the relay than the loss did, so a
+        // TCP dial success must still not wake a probe (N2).
+        inner.cause = if state.retried() && inner.relay_lost == Some(current) {
+            RetryCause::RelayLost
+        } else {
+            cause
+        };
+        // The pin follows the stack: a relay-loss report pins the generation
+        // it came from, and a state that leaves the retried variants
+        // (reachable, or no proxy) releases it.
+        inner.relay_lost = match lost {
+            Some(generation) => Some(generation),
+            None if state.retried() => inner.relay_lost,
+            None => None,
+        };
         let emits = std::mem::discriminant(&inner.state) != std::mem::discriminant(&state);
         inner.state = state.clone();
+        // Notified even when the value is equal (as a settings change landing
+        // in the same state is): the health task must never wait out the
+        // previous proxy's deadline for a change it cannot see in the state
+        // (N1).
         self.changed.send_replace(state.clone());
         if !emits {
             return;
@@ -485,7 +537,10 @@ async fn run(inner: Weak<SessionInner>, health: Arc<ProxyHealth>, base: Duration
 /// Nothing is set when the settings changed since the probe was taken: the
 /// result is applied only while the stored settings still equal the ones
 /// probed (`set_if_current`), so a probe of an *old* proxy cannot overwrite
-/// the state of the one the user has just selected.
+/// the state of the one the user has just selected. A rebuild records
+/// `Reachable` in [`apply_change`](SessionInner::apply_change) itself, before
+/// it wires the new stack's relay watcher, so nothing here can report a lost
+/// relay reachable (P1).
 async fn probe_once(inner: &Arc<SessionInner>) {
     let net = inner.network();
     let mut settings = (*inner.shared.settings).clone();
@@ -500,10 +555,13 @@ async fn probe_once(inner: &Arc<SessionInner>) {
         // announces) and only make sure the state is `Reachable`.
         Some(_) if inner.relay_is_live() => inner.set_if_current(&net, ProxyState::Reachable).await,
         Some(relay) => match inner.rebuild_for_relay(net.clone(), relay).await {
-            Ok(true) => inner.set_if_current(&net, ProxyState::Reachable).await,
-            // A settings change landed since the probe: it owns the stack and
-            // the state.
-            Ok(false) => {}
+            // The rebuild records `Reachable` itself, *before* it wires the
+            // new stack's relay watcher: a relay that is lost at once moves
+            // the state back to `Unreachable` and is retried, and nothing here
+            // can write `Reachable` over it (P1). `Ok(false)` is a settings
+            // change that landed since the probe: it owns the stack and the
+            // state.
+            Ok(_) => {}
             Err(SessionError::Shutdown) => {}
             Err(e) => {
                 warn!(error = %e, "cannot rebuild the network stack for the relayed proxy");
@@ -526,8 +584,34 @@ mod tests {
     }
 
     fn health(state: ProxyState, generation: u64) -> Arc<ProxyHealth> {
+        health_with_gen(state, generation).0
+    }
+
+    /// A health that keeps the generation channel, so a test can install a
+    /// newer stack (what a rebuild does) and see the pin move with it.
+    fn health_with_gen(
+        state: ProxyState,
+        generation: u64,
+    ) -> (Arc<ProxyHealth>, watch::Sender<u64>) {
         let (net_gen, _) = watch::channel(generation);
-        ProxyHealth::new(state, events(), net_gen.subscribe())
+        (
+            ProxyHealth::new(state, events(), net_gen.subscribe()),
+            net_gen,
+        )
+    }
+
+    /// A health that keeps the event channel, so a test can assert what it
+    /// emits (and what it does not).
+    fn health_with_events(
+        state: ProxyState,
+        generation: u64,
+    ) -> (Arc<ProxyHealth>, broadcast::Sender<Event>) {
+        let (net_gen, _) = watch::channel(generation);
+        let events = events();
+        (
+            ProxyHealth::new(state, events.clone(), net_gen.subscribe()),
+            events,
+        )
     }
 
     #[test]
@@ -593,6 +677,97 @@ mod tests {
         assert!(
             h.wakes() > before,
             "a dial success did not wake a failed dial"
+        );
+    }
+
+    /// A relay loss is reported once, so a `Reachable` that lands afterwards
+    /// for the same stack would leave the session reporting a dead relay as
+    /// reachable, with the DHT, uTP and UDP trackers off and no retry ever
+    /// (P1). A newer stack (the rebuild a retry makes) is a new relay and may
+    /// be reachable.
+    #[test]
+    fn a_lost_relay_is_not_reported_reachable() {
+        let (h, net_gen) = health_with_gen(ProxyState::Reachable, 5);
+        h.relay_lost(5);
+        assert!(
+            matches!(h.state(), ProxyState::Unreachable { .. }),
+            "the relay loss did not move the state"
+        );
+        // The late `Reachable` the tail of a rebuild used to write over it.
+        h.set(ProxyState::Reachable);
+        assert!(
+            matches!(h.state(), ProxyState::Unreachable { .. }),
+            "a lost relay was reported reachable"
+        );
+        // The retry rebuilds the stack: its relay is not the lost one.
+        net_gen.send_replace(7);
+        h.set(ProxyState::Reachable);
+        assert_eq!(
+            h.state(),
+            ProxyState::Reachable,
+            "a newer stack's relay stayed pinned"
+        );
+    }
+
+    /// The relay-loss cause outlives a later failed probe (or a
+    /// proxy-unreachable dial report): while the state stays retried for the
+    /// same stack, a TCP dial success still says nothing about the relay and
+    /// must not wake a probe (N2). A stack that replaces it (a rebuild) drops
+    /// the cause with the pin.
+    #[test]
+    fn a_failed_probe_does_not_re_arm_the_relay_loss_wake() {
+        let (h, net_gen) = health_with_gen(ProxyState::Reachable, 1);
+        h.relay_lost(1);
+        // A failed probe of the same proxy records another reason under the
+        // same variant.
+        h.set(ProxyState::unreachable("proxy timed out"));
+        assert!(
+            matches!(h.state(), ProxyState::Unreachable { .. }),
+            "a failed probe left the retried state"
+        );
+        let before = h.wakes();
+        h.dial_succeeded(1);
+        assert_eq!(
+            h.wakes(),
+            before,
+            "a failed probe re-armed the dial-success wake"
+        );
+
+        // The retry rebuilt the stack: a fresh dial failure is a dial one.
+        net_gen.send_replace(3);
+        h.set(ProxyState::Reachable);
+        h.dial_failed(3, &ProxyError::Unreachable(io::Error::other("refused")));
+        let before = h.wakes();
+        h.dial_succeeded(3);
+        assert!(
+            h.wakes() > before,
+            "a new retry was not woken after the relay cause was dropped"
+        );
+    }
+
+    /// The state store notifies the `wait` on every recorded state, even one
+    /// equal to the stored one: a settings change that lands in the same
+    /// variant with the same reason (two proxies failing identically) must
+    /// not leave the task waiting out the old proxy's deadline (N1). The
+    /// event stays variant-change only: no duplicate `ProxyStateChanged`.
+    #[test]
+    fn a_settings_change_in_the_same_state_still_notifies() {
+        let state = ProxyState::unreachable("proxy timed out");
+        let (h, events) = health_with_events(state.clone(), 1);
+        let wait = h.subscribe();
+        let mut emitted = events.subscribe();
+        assert!(!wait.has_changed().unwrap(), "nothing was recorded yet");
+        h.set(state);
+        assert!(
+            wait.has_changed().unwrap(),
+            "an unchanged state did not notify the wait"
+        );
+        assert!(
+            matches!(
+                emitted.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "an unchanged state emitted a duplicate event"
         );
     }
 

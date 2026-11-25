@@ -947,10 +947,12 @@ impl SessionInner {
         }
         *self.network.write().unwrap_or_else(PoisonError::into_inner) = net.clone();
         self.shared.set_net(Arc::clone(&stack));
-        self.wire(&stack);
-        // The state follows the stack just built; a value set twice (the
-        // health path re-affirming `Reachable`) emits nothing.
+        // The state follows the stack just built, and it is recorded *before*
+        // `wire` spawns the new stack's relay watcher: a relay lost at once
+        // then moves the state to `Unreachable` and is retried, and nothing
+        // after this point writes `Reachable` over it (P1).
         self.shared.proxy_health.set(state);
+        self.wire(&stack);
         // 5. Re-announce at once.
         for h in self.handles() {
             h.network_ready(generation);
