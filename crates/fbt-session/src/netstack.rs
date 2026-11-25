@@ -135,10 +135,12 @@ impl NetStack {
     /// Builds the stack for `generation` as `net` says: binds `addrs` (the
     /// addresses the previous stack had bound, or [`Settings::listen_addrs`]
     /// at the session's start), opens the UDP side (the one socket of the
-    /// SOCKS5 relay `relay` when given, else the shared sockets), starts the
-    /// DHT on `dht_state` and the uTP sockets, and creates the tracker
-    /// client, LSD and port mapping. The caller does the UDP association and
-    /// passes its socket, so it can classify a failure.
+    /// SOCKS5 relay `relay` when given, else the shared sockets only when the
+    /// session has no proxy: any proxy that does not relay UDP leaves no UDP
+    /// socket at all), starts the DHT on `dht_state` (only when a UDP socket
+    /// exists) and the uTP sockets, and creates the tracker client, LSD and
+    /// port mapping. The caller classifies the proxy and passes its relay
+    /// socket, so a failure is a state, not a build error.
     ///
     /// Must run inside a tokio runtime.
     pub(crate) async fn build(
@@ -158,17 +160,23 @@ impl NetStack {
             effective.enable_outgoing_utp = false;
         }
         let applied = effective.network();
-        let relay_udp = relay.is_some();
-        let (endpoints, listen_errors) = bind_all(&effective, &applied, addrs, !relay_udp).await?;
+        // Any proxy that does not relay UDP turns UDP off entirely: no socket
+        // is bound (so no DHT, no uTP, no UDP trackers, and nothing sends
+        // from the host's own address), by the 3.3 ruling. A direct session
+        // binds the shared sockets; a relayed proxy's one socket comes from
+        // its association instead.
+        let bind_udp = relay.is_none() && effective.proxy.kind == ProxyKind::None;
+        let (endpoints, listen_errors) = bind_all(&effective, &applied, addrs, bind_udp).await?;
         let local_addrs: Vec<SocketAddr> = endpoints.iter().map(|e| e.addr).collect();
         let udp: Vec<SharedUdpSocket> = match relay {
             Some(assoc) => vec![bind_relay(&local_addrs, assoc)?],
-            None => {
+            None if bind_udp => {
                 let mut udp: Vec<SharedUdpSocket> =
                     endpoints.iter().filter_map(|e| e.udp.clone()).collect();
                 udp.extend(fallback_udp(&endpoints));
                 udp
             }
+            None => Vec::new(),
         };
         let utp = utp_sockets(&effective, applied.enable_incoming_utp, &udp);
         let senders: Vec<Arc<dyn DatagramSender>> =
@@ -191,7 +199,7 @@ impl NetStack {
         for u in &udp {
             u.set_handler(PacketKind::Tracker, Arc::clone(&tracker_input));
         }
-        let dht = if applied.dht_enabled {
+        let dht = if applied.dht_enabled && !udp.is_empty() {
             start_dht(&effective, &udp, dht_state.as_deref()).await
         } else {
             None

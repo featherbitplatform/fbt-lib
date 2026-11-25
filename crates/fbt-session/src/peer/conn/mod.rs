@@ -43,6 +43,7 @@ use super::transport::{PeerTransport, Transport};
 use crate::bandwidth::{Bandwidth, BucketPair};
 use crate::net::ExternalIp;
 use crate::picker::PeerKey;
+use crate::proxy_health::ProxyHealth;
 use crate::settings::Settings;
 use state::Conn;
 
@@ -121,6 +122,9 @@ pub(crate) struct PeerCtx {
     /// peers through (or none); `proxy_peers` and `kind` decide whether a
     /// TCP dial goes through it.
     pub proxy: ProxyConfig,
+    /// The session's proxy health: a proxied dial reports what it saw, so a
+    /// proxy that is down or refuses login is noticed from a peer dial too.
+    pub health: Arc<ProxyHealth>,
 }
 
 /// A peer connection's stream: MSE (RC4 or plaintext after the MSE
@@ -251,8 +255,18 @@ async fn connect(
             )
             .await
             {
-                Ok(s) => Ok(PeerTransport::Tcp(s)),
-                Err(e) => Err((io(e.to_string()), true)),
+                Ok(s) => {
+                    // A dial that got through says the proxy is up: probe
+                    // now rather than wait out the backoff.
+                    ctx.health.dial_succeeded();
+                    Ok(PeerTransport::Tcp(s))
+                }
+                Err(e) => {
+                    // A failure about the proxy moves its state (never a
+                    // dial for the target); the dial path never blocks on it.
+                    ctx.health.dial_failed(&e);
+                    Err((io(e.to_string()), true))
+                }
             }
         }
         Transport::Tcp => match timeout(settings.connect_timeout, TcpStream::connect(addr)).await {

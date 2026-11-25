@@ -15,12 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fake_http_proxy::FakeHttpProxy;
-use fake_socks5::{FakeSocks5, Script};
+use fake_socks5::{FakeSocks5, Script, closed_port};
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::{MemStorage, Storage};
 use fbt_session::{
-    AddTorrent, Event, EventMask, EventStream, ProxyConfig, ProxyKind, Session, SessionError,
-    Settings, TorrentHandle, TorrentState, Transport,
+    AddTorrent, DisconnectReason, Event, EventMask, EventStream, ProxyConfig, ProxyKind,
+    ProxyState, Session, SessionError, Settings, TorrentHandle, TorrentState, Transport,
 };
 use support::*;
 
@@ -247,15 +247,329 @@ async fn udp_from_non_relay_is_dropped() {
     l.session.shutdown().await;
 }
 
+/// A SOCKS5 proxy that takes TCP but refuses the UDP association does not
+/// fail `Session::new` any more (F2): the session starts with no UDP socket
+/// at all (no DHT, no uTP, no UDP trackers), reports `UdpNotRelayed` and
+/// still downloads through the proxy over TCP.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failed_association_fails_session_new() {
-    let fake = FakeSocks5::start(Script::Refuse(1)).await;
-    let mut st = settings();
+async fn session_starts_when_udp_is_not_relayed() {
+    let fake = FakeSocks5::start(Script::NoUdp(7)).await;
+    let (m, payload) = torrent();
+    let (seed, _) = seeder(&m, &payload).await;
+    let mut st = dial_tcp(settings());
+    st.dht_enabled = true;
+    st.dht_bootstrap_nodes = Vec::new();
     st.proxy = proxy(ProxyKind::Socks5, fake.addr());
-    match Session::new(st).await {
-        Err(SessionError::Proxy(fbt_session::ProxyError::Refused(1))) => {}
-        other => panic!("expected SessionError::Proxy, got {:?}", other.map(|_| ())),
+    let l = leecher(st, &m, payload.len()).await;
+    assert_eq!(l.session.proxy_state(), ProxyState::UdpNotRelayed);
+    assert!(
+        l.session.dht_stats().is_none(),
+        "the DHT runs under a proxy that does not relay UDP"
+    );
+    assert!(
+        l.session.demux_stats().is_empty(),
+        "a proxied session binds no UDP socket"
+    );
+    l.handle.add_peer(seed.local_addr()).await.unwrap();
+    l.finish(&payload).await;
+    assert!(
+        fake.connects().contains(&seed.local_addr().to_string()),
+        "CONNECTs: {:?}",
+        fake.connects()
+    );
+    l.session.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// A proxy nothing listens on does not fail `Session::new` either: the
+/// session starts, reports `Unreachable` with a non-empty reason, and a peer
+/// dial goes through the proxy (and so fails) rather than connecting
+/// directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_starts_with_proxy_unreachable() {
+    let (m, payload) = torrent();
+    let (seed, seed_handle) = seeder(&m, &payload).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, closed_port());
+    let mut l = leecher(st, &m, payload.len()).await;
+    match l.session.proxy_state() {
+        ProxyState::Unreachable { reason } => assert!(!reason.is_empty(), "empty reason"),
+        other => panic!("expected Unreachable, got {other:?}"),
     }
+    l.handle.add_peer(seed.local_addr()).await.unwrap();
+    assert!(
+        next_matching(
+            &mut l.events,
+            |e| matches!(e, Event::PeerConnected { .. }),
+            Duration::from_secs(1)
+        )
+        .await
+        .is_none(),
+        "a peer connected while the proxy is unreachable"
+    );
+    assert_eq!(
+        seed_handle.status().num_peers,
+        0,
+        "the seeder saw a direct connection"
+    );
+    l.session.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// A proxy that wants credentials this client does not have is its own
+/// state, not `Unreachable`: it answered, it just refused the login.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn login_refused_is_its_own_state() {
+    let fake = FakeSocks5::start(Script::RequireAuth("u".to_owned(), "p".to_owned())).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    st.proxy.username = Some("u".to_owned());
+    st.proxy.password = Some("wrong".to_owned());
+    let s = Session::new(st).await.unwrap();
+    assert_eq!(s.proxy_state(), ProxyState::LoginRefused);
+    s.shutdown().await;
+}
+
+/// A proxy that was unreachable is re-probed until it answers: when it comes
+/// back on the same address the state turns `Reachable`, the relayed UDP
+/// socket replaces the missing one, and a UDP tracker announce through the
+/// relay is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn association_returns_after_proxy_comes_back() {
+    let addr = closed_port();
+    let tracker = FakeTracker::udp(Reply::Peers).await;
+    let tracker_addr = tracker.url.trim_start_matches("udp://").to_owned();
+    let (mut m, payload) = torrent();
+    m.trackers = vec![vec![tracker.url.clone()]];
+    let mut st = dial_tcp(settings());
+    st.tracker_retry_base = Duration::from_millis(100);
+    st.proxy = proxy(ProxyKind::Socks5, addr);
+    let mut l = leecher(st, &m, payload.len()).await;
+    match l.session.proxy_state() {
+        ProxyState::Unreachable { .. } => {}
+        other => panic!("expected Unreachable, got {other:?}"),
+    }
+    // The proxy comes back on the same address.
+    let fake = FakeSocks5::start_on(addr, Script::Ok).await;
+    let came_back = next_matching(
+        &mut l.events,
+        |e| {
+            matches!(
+                e,
+                Event::ProxyStateChanged {
+                    state: ProxyState::Reachable
+                }
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(came_back.is_some(), "the proxy did not come back");
+    assert_eq!(l.session.proxy_state(), ProxyState::Reachable);
+    assert!(!l.session.demux_stats()[0].1.relay_lost);
+    // The rebuilt stack announces to the UDP tracker through the relay.
+    let reply = next_matching(
+        &mut l.events,
+        |e| matches!(e, Event::TrackerReply { .. }),
+        T,
+    )
+    .await;
+    assert!(reply.is_some(), "no UDP tracker announce through the relay");
+    assert!(
+        fake.udp_targets().contains(&tracker_addr),
+        "{:?}",
+        fake.udp_targets()
+    );
+    l.session.shutdown().await;
+}
+
+/// A proxy that is up and then goes away: the relay is lost, the state turns
+/// `Unreachable` with exactly one legacy `Event::ProxyError`, and when the
+/// proxy comes back the state returns to `Reachable` without closing the
+/// connected TCP peers (the proxy did not change).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_loss_then_recovery() {
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let addr = fake.addr();
+    let (m, payload) = torrent();
+    let (seed, _) = seeder(&m, &payload).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, addr);
+    let mut l = leecher(st, &m, payload.len()).await;
+    assert_eq!(l.session.proxy_state(), ProxyState::Reachable);
+    l.handle.add_peer(seed.local_addr()).await.unwrap();
+    assert!(
+        next_matching(
+            &mut l.events,
+            |e| matches!(e, Event::PeerConnected { .. }),
+            T
+        )
+        .await
+        .is_some(),
+        "the proxied peer never connected"
+    );
+
+    // The proxy goes away; its task abort closes the relay's control
+    // connection.
+    drop(fake);
+    match next_matching(
+        &mut l.events,
+        |e| matches!(e, Event::ProxyError { .. }),
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Some(Event::ProxyError { message }) => assert!(message.contains("UDP"), "{message}"),
+        other => panic!("no ProxyError on the relay loss: {other:?}"),
+    }
+    assert!(
+        next_matching(
+            &mut l.events,
+            |e| matches!(
+                e,
+                Event::ProxyStateChanged {
+                    state: ProxyState::Unreachable { .. }
+                }
+            ),
+            T
+        )
+        .await
+        .is_some(),
+        "the state did not go Unreachable"
+    );
+    assert!(
+        next_matching(
+            &mut l.events,
+            |e| matches!(e, Event::ProxyError { .. }),
+            Duration::from_millis(500)
+        )
+        .await
+        .is_none(),
+        "a second ProxyError"
+    );
+
+    // The proxy comes back on the same address.
+    let fake = FakeSocks5::start_on(addr, Script::Ok).await;
+    assert!(
+        next_matching(
+            &mut l.events,
+            |e| matches!(
+                e,
+                Event::ProxyStateChanged {
+                    state: ProxyState::Reachable
+                }
+            ),
+            Duration::from_secs(5)
+        )
+        .await
+        .is_some(),
+        "the relay did not come back"
+    );
+    assert!(
+        next_matching(
+            &mut l.events,
+            |e| matches!(
+                e,
+                Event::PeerDisconnected {
+                    reason: DisconnectReason::NetworkChanged,
+                    ..
+                }
+            ),
+            Duration::from_millis(500)
+        )
+        .await
+        .is_none(),
+        "the relay rebuild closed a TCP peer as a network change"
+    );
+    l.session.shutdown().await;
+    seed.shutdown().await;
+    drop(fake);
+}
+
+/// Once the state is `Reachable`, peer dials that succeed and dials the proxy
+/// refuses for the *target* (a closed loopback port: `REP 5`) say nothing
+/// about the proxy: no further `ProxyStateChanged` is emitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_events_only_on_change() {
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let (m, payload) = torrent();
+    let (seed, _) = seeder(&m, &payload).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    let mut l = leecher(st, &m, payload.len()).await;
+    assert_eq!(l.session.proxy_state(), ProxyState::Reachable);
+    // A dial that gets through.
+    l.handle.add_peer(seed.local_addr()).await.unwrap();
+    assert!(
+        next_matching(
+            &mut l.events,
+            |e| matches!(e, Event::PeerConnected { .. }),
+            T
+        )
+        .await
+        .is_some()
+    );
+    // Dials the proxy refuses for the target (the address is closed).
+    for _ in 0..2 {
+        l.handle.add_peer(closed_port()).await.unwrap();
+    }
+    assert_eq!(l.session.proxy_state(), ProxyState::Reachable);
+    assert!(
+        next_matching(
+            &mut l.events,
+            |e| matches!(e, Event::ProxyStateChanged { .. }),
+            Duration::from_millis(500)
+        )
+        .await
+        .is_none(),
+        "the state changed with nothing wrong with the proxy"
+    );
+    l.session.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// Removing the proxy reports `NotSet`, once, and the session goes back to
+/// direct operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_proxy_is_not_set() {
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    let s = Session::new(st).await.unwrap();
+    let mut events = s.subscribe(EventMask::STATUS);
+    assert_eq!(s.proxy_state(), ProxyState::Reachable);
+    let mut net = s.network_settings();
+    net.proxy = ProxyConfig::default();
+    s.set_network_settings(net).await.unwrap();
+    assert_eq!(s.proxy_state(), ProxyState::NotSet);
+    match next_matching(
+        &mut events,
+        |e| {
+            matches!(
+                e,
+                Event::ProxyStateChanged {
+                    state: ProxyState::NotSet
+                }
+            )
+        },
+        T,
+    )
+    .await
+    {
+        Some(Event::ProxyStateChanged { state }) => assert_eq!(state, ProxyState::NotSet),
+        other => panic!("no ProxyStateChanged(NotSet): {other:?}"),
+    }
+    assert!(
+        next_matching(
+            &mut events,
+            |e| matches!(e, Event::ProxyStateChanged { .. }),
+            Duration::from_millis(500)
+        )
+        .await
+        .is_none(),
+        "a second ProxyStateChanged"
+    );
+    s.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

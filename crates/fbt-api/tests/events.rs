@@ -522,4 +522,66 @@ fn events_route_is_documented() {
     let get = &doc["paths"]["/api/v1/events"]["get"];
     assert!(get.is_object(), "{doc}");
     assert!(get["responses"]["200"]["content"]["text/event-stream"].is_object());
+    // The proxy health event and its states are in the document.
+    let schemas = serde_json::to_string(&doc["components"]["schemas"]).expect("schemas");
+    assert!(
+        schemas.contains("proxy_state_changed"),
+        "the proxy state event is not in the document"
+    );
+    for state in [
+        "not_set",
+        "reachable",
+        "udp_not_relayed",
+        "unreachable",
+        "login_refused",
+    ] {
+        assert!(
+            schemas.contains(state),
+            "the proxy state {state} is not in the document"
+        );
+    }
+}
+
+/// A change of the session's proxy reaches an open event stream as a
+/// `proxy_state_changed` event.
+#[tokio::test]
+async fn proxy_state_change_reaches_the_stream() {
+    let (session, _server, base, token) = api().await;
+    let (status, _, sse) = Sse::open(&format!("{base}/api/v1/events"), Some(token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut sse = sse.expect("stream");
+
+    // A SOCKS5 proxy nothing listens on: the session classifies it
+    // unreachable (the dial is refused at once).
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = l.local_addr().expect("addr");
+        drop(l);
+        addr
+    };
+    let mut proxy = fbt::ProxyConfig::default();
+    proxy.kind = fbt::ProxyKind::Socks5;
+    proxy.host = dead.ip().to_string();
+    proxy.port = dead.port();
+    let mut net = session.network_settings();
+    net.proxy = proxy;
+    session
+        .set_network_settings(net)
+        .await
+        .expect("the change applies");
+
+    let got = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some((event, data)) = sse.next().await {
+            if event == "proxy_state_changed" {
+                return Some(data);
+            }
+        }
+        None
+    })
+    .await
+    .expect("an event within 10 s");
+    let data = got.expect("a proxy_state_changed event");
+    assert_eq!(data["state"], "unreachable", "{data}");
+    assert!(data["reason"].is_string(), "{data}");
+    session.shutdown().await;
 }

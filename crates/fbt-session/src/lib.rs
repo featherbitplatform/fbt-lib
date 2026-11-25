@@ -79,6 +79,7 @@ mod net;
 mod netstack;
 mod peer;
 pub mod picker;
+mod proxy_health;
 mod queue;
 pub mod rate;
 mod resume;
@@ -93,7 +94,7 @@ pub use bandwidth::{MixedMode, PeerClassLimits, RateLimit};
 pub use bans::BlockReason;
 pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::{SessionError, StreamError};
-pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
+pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource, ProxyState};
 pub use fbt_dht::{DhtError, DhtSamples, DhtScrape, DhtStats, MutableItem, NodeId, NodeInfo};
 pub use fbt_net::ipfilter::IpFilter;
 /// The most rules an [`IpFilter`] holds (`fbt_net::ipfilter::MAX_RANGES`).

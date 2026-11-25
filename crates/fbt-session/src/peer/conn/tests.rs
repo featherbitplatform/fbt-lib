@@ -124,6 +124,10 @@ fn start_hashes(
         net_generation: 1,
         net_changed,
         proxy: fbt_net::proxy::ProxyConfig::default(),
+        health: crate::proxy_health::ProxyHealth::new(
+            crate::event::ProxyState::NotSet,
+            tokio::sync::broadcast::channel(1).0,
+        ),
     };
     tokio::spawn(run_peer(ours, None, addr(), ctx, crx));
     Harness {
@@ -1336,6 +1340,10 @@ fn direct(settings: Settings, down: u64, up: u64) -> Direct {
         net_generation: 1,
         net_changed,
         proxy: fbt_net::proxy::ProxyConfig::default(),
+        health: crate::proxy_health::ProxyHealth::new(
+            crate::event::ProxyState::NotSet,
+            tokio::sync::broadcast::channel(1).0,
+        ),
     };
     let theirs = Handshake {
         reserved: reserved(true, false, false),

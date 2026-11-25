@@ -395,22 +395,30 @@ pub struct Settings {
     ///   (outgoing uTP, the DHT, UDP trackers) through one UDP ASSOCIATE.
     ///   The session then binds TCP listeners only, plus one relayed UDP
     ///   socket on a free port; the DHT runs over the relay's address
-    ///   family only (IPv4 in practice). If the
-    ///   association cannot be made, [`Session::new`](crate::Session::new)
-    ///   fails with [`SessionError::Proxy`](crate::SessionError::Proxy).
+    ///   family only (IPv4 in practice). If the association cannot be made
+    ///   the session still starts, without any UDP socket at all, and
+    ///   reports it through [`Session::proxy_state`](crate::Session::proxy_state)
+    ///   (`Unreachable` or `UdpNotRelayed`); the DHT, uTP and UDP trackers
+    ///   do not run until it can.
     /// - An HTTP proxy with `proxy_peers` dials peers over TCP only
-    ///   (`enable_outgoing_utp` is treated as off); the DHT still runs
-    ///   directly unless `dht_enabled` is off. With `enable_outgoing_tcp`
-    ///   off as well, the session cannot dial peers at all;
-    ///   [`Session::new`](crate::Session::new) logs a warning.
-    /// - UDP tracker and DHT bootstrap host names are resolved locally
-    ///   whatever `proxy_hostnames` says, and LSD, UPnP and NAT-PMP stay
-    ///   direct on the local network.
+    ///   (`enable_outgoing_utp` is treated as off). An HTTP proxy cannot
+    ///   carry UDP at all, so the DHT, uTP and UDP trackers do not run while
+    ///   one is set, whatever [`dht_enabled`](Self::dht_enabled) says. With
+    ///   `enable_outgoing_tcp` off as well, the session cannot dial peers at
+    ///   all; [`Session::new`](crate::Session::new) logs a warning.
+    /// - The proxy's own host name is the one lookup a proxied session
+    ///   makes; UDP tracker and DHT bootstrap host names go to the proxy by
+    ///   name under SOCKS5, and LSD, UPnP and NAT-PMP turn off while a proxy
+    ///   is set.
     ///
-    /// Listening is unchanged: incoming connections never use the proxy.
+    /// Listening is unchanged: incoming connections never use the proxy (and
+    /// an HTTP proxy, or a SOCKS5 one that does not relay UDP, turns incoming
+    /// TCP and uTP off through the network switches, see
+    /// [`NetworkSettings`]).
+    ///
     /// [`Session::new`](crate::Session::new) logs a warning for each
-    /// enabled feature that bypasses the proxy (with an HTTP proxy the
-    /// DHT, which names every torrent's info hash, and uTP; with any proxy
+    /// enabled feature that bypasses the proxy (with an HTTP proxy the DHT,
+    /// which names every torrent's info hash, and uTP; with any proxy
     /// LSD, UPnP and NAT-PMP): turn them off for a session whose traffic
     /// should all go through the proxy. There is no single proxy-only
     /// switch yet.
@@ -418,6 +426,16 @@ pub struct Settings {
     /// Serialising the settings (the `serde` feature) writes the proxy
     /// password in clear text.
     pub proxy: ProxyConfig,
+    /// How long the session's proxy health task waits before re-probing an
+    /// unreachable or login-refused proxy, doubling each attempt up to
+    /// [`proxy_retry_max`](Self::proxy_retry_max) (1 s). A test knob.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub proxy_retry_base: Duration,
+    /// The longest wait between proxy re-probes (60 s). A test knob.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub proxy_retry_max: Duration,
     /// How many auto-managed torrents run at once; the rest wait as
     /// [`TorrentState::Queued`](crate::TorrentState::Queued). Changed at
     /// runtime with
@@ -462,11 +480,16 @@ impl Settings {
             ("cache_expiry", self.cache_expiry),
             ("snub_timeout", self.snub_timeout),
             ("nat_retry_base", self.nat_retry_base),
+            ("proxy_retry_base", self.proxy_retry_base),
+            ("proxy_retry_max", self.proxy_retry_max),
         ];
         for (name, d) in non_zero {
             if d.is_zero() {
                 return Err(format!("{name} must be greater than zero"));
             }
+        }
+        if self.proxy_retry_base > self.proxy_retry_max {
+            return Err("proxy_retry_base must not exceed proxy_retry_max".to_owned());
         }
         if self.optimistic_unchoke_interval < self.rechoke_interval {
             return Err("optimistic_unchoke_interval must be at least rechoke_interval".to_owned());
@@ -711,6 +734,8 @@ impl Default for Settings {
             mixed_mode: MixedMode::default(),
             read_ahead: ReadAhead::default(),
             proxy: ProxyConfig::default(),
+            proxy_retry_base: Duration::from_secs(1),
+            proxy_retry_max: Duration::from_secs(60),
             queue: QueueSettings::default(),
             seed_ratio_limit: None,
             seed_time_limit: None,

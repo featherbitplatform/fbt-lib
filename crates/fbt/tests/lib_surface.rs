@@ -161,6 +161,20 @@ fn surface_compiles() {
         SessionError::Proxy(e),
         SessionError::Proxy(fbt::ProxyError::Timeout),
     ];
+    // The proxy health state and the event that announces it.
+    let states = [
+        fbt::ProxyState::NotSet,
+        fbt::ProxyState::Reachable,
+        fbt::ProxyState::UdpNotRelayed,
+        fbt::ProxyState::Unreachable {
+            reason: String::new(),
+        },
+        fbt::ProxyState::LoginRefused,
+    ];
+    assert!(states.iter().all(|s| s == s));
+    let _ = Event::ProxyStateChanged {
+        state: fbt::ProxyState::NotSet,
+    };
     let _: [usize; 6] = [
         fbt::MAX_RESUME_BYTES,
         fbt::MAX_RESUME_ITEMS,
@@ -483,4 +497,5 @@ async fn detail_methods(s: &Session, h: &TorrentHandle) {
     let _: bool = s.is_shut_down();
     let _: NetworkSettings = s.network_settings();
     let _: Result<(), SessionError> = s.set_network_settings(NetworkSettings::default()).await;
+    let _: fbt::ProxyState = s.proxy_state();
 }

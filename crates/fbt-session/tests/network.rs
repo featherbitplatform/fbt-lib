@@ -597,43 +597,53 @@ async fn concurrent_proxy_changes_close_direct_peers() {
     seed.shutdown().await;
 }
 
-/// A change whose new stack cannot be built leaves the session on the
-/// closed stack with nothing listening; setting the previous value again
-/// must rebuild the network rather than short-circuit as a no-op.
+/// A change to a proxy that is down does not fail any more (F2): the session
+/// keeps listening (with no UDP socket), reports `Unreachable` and, when the
+/// value changes back, rebuilds the direct network with `NotSet`. A later
+/// change is never swallowed as a no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn retry_after_failed_change_restores_network() {
+async fn change_to_unreachable_proxy_keeps_listening() {
+    use fbt_session::ProxyState;
+
     let s = Session::new(settings()).await.unwrap();
     let good = s.network_settings();
-    assert_ne!(s.local_addr().port(), 0, "nothing listening to start with");
+    let port = s.local_addr().port();
+    assert_ne!(port, 0, "nothing listening to start with");
 
-    // A proxy address nothing listens on: the SOCKS5 association cannot be
-    // taken, so the change fails.
+    // A proxy address nothing listens on: the session starts a stack with no
+    // UDP socket and reports Unreachable, rather than failing the change.
     let dead = {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap()
     };
     let mut bad = good.clone();
     bad.proxy = proxy(ProxyKind::Socks5, dead);
-    match s.set_network_settings(bad).await {
-        Err(SessionError::Proxy(_)) => {}
-        other => panic!("expected a proxy error, got {other:?}"),
-    }
-    // The stored value is unchanged, and the stack is the closed one (no
-    // listener).
-    assert_eq!(s.network_settings(), good, "the failed change was stored");
-    assert_eq!(
-        s.local_addr().port(),
-        0,
-        "the failed change left the stack open"
+    s.set_network_settings(bad.clone()).await.unwrap();
+    assert_eq!(s.network_settings(), bad, "the change was not stored");
+    assert!(
+        matches!(s.proxy_state(), ProxyState::Unreachable { .. }),
+        "{:?}",
+        s.proxy_state()
     );
-
-    // Setting the previous value again must build the network back.
-    s.set_network_settings(good.clone()).await.unwrap();
-    assert_eq!(s.network_settings(), good);
-    assert_ne!(s.local_addr().port(), 0, "the session has no network");
+    // Still listening on the same port, but with no UDP socket at all.
+    assert_eq!(s.local_addr().port(), port, "the port changed");
+    assert!(
+        s.demux_stats().is_empty(),
+        "a proxied session bound a UDP socket"
+    );
     TcpStream::connect(s.local_addr())
         .await
-        .expect("not accepting again");
+        .expect("not accepting after the change");
+
+    // Back to direct: the network and the state come back.
+    s.set_network_settings(good.clone()).await.unwrap();
+    assert_eq!(s.network_settings(), good);
+    assert_eq!(s.proxy_state(), ProxyState::NotSet);
+    assert!(
+        !s.demux_stats().is_empty(),
+        "no UDP socket after going direct"
+    );
+    assert_eq!(s.local_addr().port(), port, "the port changed");
     s.shutdown().await;
 }
 

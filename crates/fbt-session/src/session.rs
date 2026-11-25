@@ -11,7 +11,7 @@ use fbt_dht::{Dht, DhtError, DhtSamples, DhtScrape, DhtStats, MutableItem, NodeI
 use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::demux::{DemuxStats, SharedUdpSocket};
 use fbt_net::ipfilter::IpFilter;
-use fbt_net::proxy::{ProxyKind, Socks5Udp, udp_associate};
+use fbt_net::proxy::{ProxyKind, Socks5Udp};
 use fbt_wire::req2_hash;
 use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -21,10 +21,11 @@ use crate::bandwidth::{Bandwidth, PeerClassLimits, RateLimit};
 use crate::bans::{BanList, BlockReason};
 use crate::disk::DiskPool;
 use crate::error::SessionError;
-use crate::event::{Event, EventMask, EventStream, ExternalIpSource};
+use crate::event::{Event, EventMask, EventStream, ExternalIpSource, ProxyState};
 use crate::listener::ListenerState;
 use crate::net::{ExternalIp, ListenError, spawn_lsd_task, spawn_nat_task};
 use crate::netstack::NetStack;
+use crate::proxy_health::{ProxyHealth, classify, spawn as spawn_proxy_health};
 use crate::queue::{QueueEntry, QueueSettings, is_slow, plan, running_since};
 use crate::resume::{ResumeError, ResumeState, SessionState, decode_resume};
 use crate::settings::{NetworkSettings, Settings};
@@ -210,6 +211,10 @@ pub(crate) struct Shared {
     /// a dial or a handshake can notice a change without taking the lock.
     net_gen: watch::Sender<u64>,
     pub events: broadcast::Sender<Event>,
+    /// The proxy's health: its state, the `watch` of changes and the task
+    /// that re-probes it. Read by [`Session::proxy_state`]; set by the
+    /// session's classification, the relay watcher and peer dials.
+    pub proxy_health: Arc<ProxyHealth>,
     pub shutdown: AtomicBool,
     /// Peer tasks alive across the session (connecting or connected).
     pub global_peers: AtomicUsize,
@@ -345,12 +350,14 @@ impl Shared {
     pub(crate) fn test(settings: Settings, stack: Arc<NetStack>, cache_size: u64) -> Arc<Shared> {
         let (events, _) = broadcast::channel(64);
         let (net_gen, _) = watch::channel(stack.generation);
+        let proxy_health = ProxyHealth::new(ProxyState::NotSet, events.clone());
         Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
             net: RwLock::new(stack),
             net_gen,
             events,
+            proxy_health,
             shutdown: AtomicBool::new(false),
             global_peers: AtomicUsize::new(0),
             half_open: AtomicUsize::new(0),
@@ -744,7 +751,7 @@ impl SessionInner {
     }
 
     /// The network settings as the caller set them.
-    fn network(&self) -> NetworkSettings {
+    pub(crate) fn network(&self) -> NetworkSettings {
         self.network
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -769,7 +776,54 @@ impl SessionInner {
     /// 4. Build the new stack for the next generation on the addresses the
     ///    old one had bound (so the listen ports stay) and install it.
     /// 5. Every torrent re-announces to its trackers and the DHT at once.
+    ///
+    /// The proxy is classified under the lock (F2): a proxy that is down or
+    /// does not relay UDP leaves the stack with no UDP socket and does not
+    /// fail the change. The state is set from the classification, so
+    /// [`Session::proxy_state`] follows every change.
     async fn rebuild(self: &Arc<Self>, net: NetworkSettings) -> Result<(), SessionError> {
+        // The user path: derive `close_tcp` from the proxy change, no force,
+        // no association in hand, and no "same settings" requirement.
+        self.apply_change(net, None, false, None, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// The health task's path: rebuild the stack with an association it has
+    /// already taken, for the settings it probed. `close_tcp` is false (the
+    /// proxy did not change, so connected TCP peers stay) and the rebuild is
+    /// forced (the value is unchanged, and the missing UDP socket is the
+    /// point). Under the lock the stored settings must still equal `net`: a
+    /// user change since the probe wins and this result is dropped (the
+    /// returned `false`).
+    pub(crate) async fn rebuild_for_relay(
+        self: &Arc<Self>,
+        net: NetworkSettings,
+        relay: Socks5Udp,
+    ) -> Result<bool, SessionError> {
+        self.apply_change(net, Some(false), true, Some(relay), true)
+            .await
+    }
+
+    /// The work behind [`rebuild`](Self::rebuild) and
+    /// [`rebuild_for_relay`](Self::rebuild_for_relay).
+    ///
+    /// `close_tcp` is `None` to derive it from whether the proxy changed
+    /// (the user path) or `Some(..)` to fix it. `force` skips the no-op
+    /// shortcut (the health path applies a value equal to the stored one).
+    /// `relay` is an association the caller already took; `None` classifies
+    /// the proxy here. `require_same` drops the change (returning `false`)
+    /// unless the stored settings still equal `net` (the health path: a user
+    /// change since the probe wins). Returns whether a new stack was
+    /// installed.
+    async fn apply_change(
+        self: &Arc<Self>,
+        net: NetworkSettings,
+        close_tcp: Option<bool>,
+        force: bool,
+        relay: Option<Socks5Udp>,
+        require_same: bool,
+    ) -> Result<bool, SessionError> {
         // The proxy's own rules, and every transport off, are checked here
         // as `Session::new` checks them, on the settings the session would
         // have.
@@ -784,17 +838,22 @@ impl SessionInner {
         // now: a concurrent change may have applied (and may have left the
         // closed stack installed) since the caller read it.
         let current = self.network();
+        // The health path re-applies the value it probed; if the user has
+        // changed it since, their change wins and this one is dropped.
+        if require_same && current != net {
+            return Ok(false);
+        }
         // Setting the value the session already has is a no-op only while
         // the stack that value describes is the live one: after a change
         // that failed, the closed stack is still installed and the value
         // has to be applied again to get a network back.
-        if current == net && !self.shared.net().closed {
-            return Ok(());
+        if !force && current == net && !self.shared.net().closed {
+            return Ok(false);
         }
         // With the proxy changed, every connection must be redialled through
         // the new one; without it, only the connections still being
         // established are closed (a connected TCP peer keeps running).
-        let close_tcp = current.proxy != net.proxy;
+        let close_tcp = close_tcp.unwrap_or(current.proxy != net.proxy);
         let old = self.shared.net();
         // The closed stack gets a generation of its own, and the new stack
         // the one after: anything stamped on the closed stack (a dial or an
@@ -829,19 +888,13 @@ impl SessionInner {
         // included, through the generation they recorded).
         self.close_generation(generation, close_tcp).await;
         // 4. Build the new stack and install it (unless the session is
-        // shutting down: then nothing must stay open). The proxy's UDP
-        // association is taken here, so `build` knows to bind UDP.
-        let relay = match relay_socket(&probe).await {
-            Ok(r) => r,
-            Err(e) => {
-                // A change that fails while the session is going away is a
-                // shutdown, not a proxy error.
-                return Err(if self.shared.is_shutdown() {
-                    SessionError::Shutdown
-                } else {
-                    e
-                });
-            }
+        // shutting down: then nothing must stay open). The proxy is
+        // classified here when the caller did not bring an association: a
+        // proxy that is down, or that does not relay UDP, leaves no UDP
+        // socket and does not fail the change (F2).
+        let (state, relay) = match relay {
+            Some(assoc) => (ProxyState::Reachable, Some(assoc)),
+            None => classify(&probe).await,
         };
         let stack = match NetStack::build(
             &self.shared.settings,
@@ -868,11 +921,14 @@ impl SessionInner {
         *self.network.write().unwrap_or_else(PoisonError::into_inner) = net.clone();
         self.shared.set_net(Arc::clone(&stack));
         self.wire(&stack);
+        // The state follows the stack just built; a value set twice (the
+        // health path re-affirming `Reachable`) emits nothing.
+        self.shared.proxy_health.set(state);
         // 5. Re-announce at once.
         for h in self.handles() {
             h.network_ready(generation);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Closes every torrent's connections of an older generation, awaited as
@@ -923,11 +979,11 @@ impl Session {
     /// [`listen_errors`](Self::listen_errors).
     ///
     /// Fails with [`SessionError::InvalidSettings`] for settings it cannot
-    /// work with (see [`Settings`]), with [`SessionError::Bind`] (the
-    /// first error) when no address binds, and with [`SessionError::Proxy`]
-    /// when a SOCKS5 [`Settings::proxy`] cannot open its UDP association
-    /// (the session then binds TCP listeners only and one relayed UDP
-    /// socket; see [`Settings::proxy`]).
+    /// work with (see [`Settings`]) and with [`SessionError::Bind`] (the
+    /// first error) when no address binds. It does not fail because the
+    /// proxy is down or will not relay UDP: the session starts, reports the
+    /// state through [`proxy_state`](Self::proxy_state) and runs with no UDP
+    /// socket at all, retrying or waiting for a settings change (F2, F5).
     pub async fn new(mut settings: Settings) -> Result<Session, SessionError> {
         settings.validate().map_err(SessionError::InvalidSettings)?;
         let proxy = &settings.proxy;
@@ -960,14 +1016,17 @@ impl Session {
         let external_ip = Arc::new(ExternalIp::new(events.clone()));
         let queue = Mutex::new(settings.queue.clone());
         // Everything a session sends with lives in one stack, built here as
-        // generation 1. The proxy's UDP association (a failure still fails
-        // `new` in this task) is taken first, so `build` knows to bind UDP.
+        // generation 1. The proxy is classified first (F2), so `build` knows
+        // whether to bind UDP (a relay that came back) or nothing (a proxy
+        // that is down or does not relay UDP): the session never fails to
+        // start because the proxy is down.
         let net = settings.network();
         let addrs = settings.listen_addrs.clone();
         let dht_state = settings.dht_state.clone();
-        let relay = relay_socket(&settings).await?;
+        let (proxy_state, relay) = classify(&settings).await;
         let stack =
             Arc::new(NetStack::build(&settings, &net, &addrs, dht_state.clone(), 1, relay).await?);
+        let proxy_health = ProxyHealth::new(proxy_state, events.clone());
         let (net_gen, _) = watch::channel(1u64);
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
@@ -975,6 +1034,7 @@ impl Session {
             net: RwLock::new(Arc::clone(&stack)),
             net_gen,
             events,
+            proxy_health: Arc::clone(&proxy_health),
             shutdown: AtomicBool::new(false),
             global_peers: AtomicUsize::new(0),
             half_open: AtomicUsize::new(0),
@@ -1001,11 +1061,14 @@ impl Session {
         // all stopped with the stack (or the session).
         inner.wire(&stack);
         let queue_task = tokio::spawn(run_queue(Arc::downgrade(&inner), Arc::clone(&shared)));
+        // The proxy health: re-probes a proxy that is down and rebuilds the
+        // stack when a relayed one comes back. Stopped with the session.
+        let health_task = spawn_proxy_health(Arc::downgrade(&inner), proxy_health);
         inner
             .listeners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(queue_task);
+            .extend([queue_task, health_task]);
         Ok(Session { inner })
     }
 
@@ -1017,6 +1080,19 @@ impl Session {
         self.inner.network()
     }
 
+    /// The health of the session's proxy ([`Settings::proxy`]): `NotSet`
+    /// without one, `Reachable` when it answered (with its UDP association
+    /// where UDP has to be relayed), `UdpNotRelayed` when it answers TCP but
+    /// will not relay UDP, `LoginRefused` when it refused the credentials,
+    /// and `Unreachable` when it could not be reached. A proxy is re-probed
+    /// with a backoff from
+    /// [`Settings::proxy_retry_base`] to [`Settings::proxy_retry_max`] while
+    /// it is `Unreachable` or `LoginRefused`; every change is also announced
+    /// as [`Event::ProxyStateChanged`].
+    pub fn proxy_state(&self) -> ProxyState {
+        self.inner.shared.proxy_health.state()
+    }
+
     /// Replaces the session's network settings (the proxy and the network
     /// switches) at runtime, without a restart and without any direct
     /// connection in between: the change installs a closed stack first, tears
@@ -1025,6 +1101,10 @@ impl Session {
     /// when the proxy changed),
     /// then builds and installs the new stack on the addresses the old one
     /// had bound (so the listen ports stay) and re-announces every torrent.
+    /// The proxy is classified for the new stack (F2), so a proxy that is
+    /// down or will not relay UDP does not fail the change; the new state is
+    /// reported through [`proxy_state`](Self::proxy_state) and, when it
+    /// differs, [`Event::ProxyStateChanged`].
     ///
     /// Fails with [`SessionError::InvalidSettings`] (the proxy's own
     /// [`validate`](fbt_net::proxy::ProxyConfig::validate), or a switch
@@ -1718,25 +1798,6 @@ async fn run_queue(inner: std::sync::Weak<SessionInner>, shared: Arc<Shared>) {
     }
 }
 
-/// The session's one UDP socket behind a SOCKS5 proxy: the UDP association
-/// (bounded by `connect_timeout`) the caller classifies, or `None` when the
-/// proxy does not relay UDP. Built before the stack, so `NetStack::build`
-/// knows to bind only TCP and relay all UDP through it. Fails with
-/// [`SessionError::Proxy`].
-async fn relay_socket(settings: &Settings) -> Result<Option<Socks5Udp>, SessionError> {
-    let proxy = &settings.proxy;
-    // SOCKS5 relays all UDP through one association: one socket cannot be
-    // half proxied.
-    let relay_udp = proxy.kind == ProxyKind::Socks5 && (proxy.proxy_peers || proxy.proxy_trackers);
-    if !relay_udp {
-        return Ok(None);
-    }
-    let assoc = udp_associate(proxy, settings.connect_timeout)
-        .await
-        .map_err(SessionError::Proxy)?;
-    Ok(Some(assoc))
-}
-
 /// A DHT failure as a session error: a DHT shut down with the session is
 /// [`SessionError::Shutdown`], as for [`Session::dht_state`].
 fn dht_error(e: DhtError) -> SessionError {
@@ -1748,8 +1809,12 @@ fn dht_error(e: DhtError) -> SessionError {
 
 /// Warns and emits [`Event::ProxyError`] once when the relayed UDP socket
 /// `u` loses its SOCKS5 association (the proxy closed the control
-/// connection): from then on the DHT, uTP and UDP trackers fail until the
-/// session restarts. Ends with the socket or the session.
+/// connection), and moves the proxy state to
+/// [`Unreachable`](ProxyState::Unreachable): from then on the DHT, uTP and
+/// UDP trackers fail until the relay comes back (the health task re-probes
+/// and rebuilds the stack) or the session is restarted. The legacy event
+/// fires exactly once; the state change is what drives the recovery. Ends
+/// with the socket or the session.
 fn watch_relay_lost(
     u: &SharedUdpSocket,
     shared: std::sync::Weak<Shared>,
@@ -1771,10 +1836,14 @@ fn watch_relay_lost(
             return;
         }
         let message = "the SOCKS5 proxy closed the UDP association: the DHT, uTP and \
-                       UDP trackers stop working until the session restarts"
+                       UDP trackers stop working"
             .to_owned();
         warn!("{message}");
         shared.emit(Event::ProxyError { message });
+        // Superseded by the state (F5): the health task re-probes from here.
+        shared.proxy_health.set(ProxyState::unreachable(
+            "the proxy closed the UDP association",
+        ));
     })
 }
 

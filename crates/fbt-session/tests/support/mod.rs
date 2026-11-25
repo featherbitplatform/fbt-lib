@@ -53,6 +53,10 @@ pub fn test_settings() -> Settings {
     s.queue.active_downloads = None;
     s.queue.active_seeds = None;
     s.queue.active_limit = None;
+    // The proxy health task re-probes fast, so a test that flaps a proxy does
+    // not wait out the production backoff.
+    s.proxy_retry_base = Duration::from_millis(50);
+    s.proxy_retry_max = Duration::from_millis(400);
     s
 }
 

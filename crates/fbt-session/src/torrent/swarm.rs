@@ -108,6 +108,7 @@ impl Actor {
             net_generation: stack.generation,
             net_changed: self.shared.net_changed(),
             proxy: stack.net.proxy.clone(),
+            health: Arc::clone(&self.shared.proxy_health),
         }
     }
 
@@ -1107,18 +1108,21 @@ pub(super) mod tests {
     }
 
     /// A uTP fallback queued while outgoing uTP was on must not be dialled
-    /// over uTP on a stack that forbids it: an HTTP proxy carrying peers
-    /// turns outgoing uTP off in the applied switches, yet a uTP socket is
-    /// still built on every UDP socket, so `utp_for` hands one out. Nothing
-    /// may be dialled over a transport the stack does not allow, whatever
-    /// queued the fallback.
+    /// over uTP on a stack that forbids it: `utp_sockets` builds a uTP socket
+    /// on every shared UDP socket whatever the switches say, so a direct
+    /// stack with outgoing uTP off still has one to hand out. Nothing may be
+    /// dialled over a transport the stack does not allow, whatever queued the
+    /// fallback. (A proxy that does not relay UDP binds no UDP socket at all,
+    /// so the leak it used to pin cannot happen through one any more; the
+    /// switch is the shape left that still has a socket to hand out.)
     #[tokio::test]
     async fn no_utp_fallback_on_a_stack_that_forbids_outgoing_utp() {
         use crate::settings::NetworkSettings;
 
         let mut a = actor_with(&[16_384], 16_384, 0);
-        // A stack of the shape a proxy change builds: an HTTP proxy carrying
-        // peers, over loopback listeners and no DHT, LSD, UPnP or NAT-PMP.
+        // A direct stack, outgoing uTP off, over loopback listeners and no
+        // DHT, LSD, UPnP or NAT-PMP: it binds the shared UDP sockets and so
+        // builds a uTP socket, while `enable_outgoing_utp` is off.
         let settings = crate::settings::Settings {
             listen_addrs: vec![SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))],
             dht_enabled: false,
@@ -1128,19 +1132,13 @@ pub(super) mod tests {
             enable_natpmp: false,
             ..crate::settings::Settings::default()
         };
-        // `ProxyConfig` is `#[non_exhaustive]` in fbt-net: built field by
-        // field, not as a literal.
-        let mut proxy_cfg = crate::ProxyConfig::default();
-        proxy_cfg.kind = crate::ProxyKind::Http;
-        proxy_cfg.host = "127.0.0.1".to_owned();
-        proxy_cfg.proxy_peers = true;
         let net = NetworkSettings {
-            proxy: proxy_cfg,
+            enable_outgoing_utp: false,
             ..settings.network()
         };
         let stack = NetStack::build(&settings, &net, &settings.listen_addrs, None, 2, None)
             .await
-            .expect("the proxy stack");
+            .expect("the stack");
         // The leak's shape: outgoing uTP off, but a uTP socket to hand out.
         let target = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
         assert!(

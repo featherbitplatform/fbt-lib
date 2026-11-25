@@ -377,21 +377,30 @@
 //! [`Settings::proxy`] ([`ProxyConfig`]) sends peer connections, web seeds
 //! and trackers through a SOCKS5 or HTTP `CONNECT` proxy ([`ProxyKind`]),
 //! with `proxy_peers`, `proxy_trackers` and `proxy_hostnames` choosing what
-//! goes through it (all on). Listening is unchanged. The caveats:
+//! goes through it (all on). Listening is unchanged. A session starts and
+//! keeps running whatever the proxy's health:
+//! [`Session::network_settings`] and [`Session::set_network_settings`]
+//! change the proxy and the network switches at runtime without a restart,
+//! and [`Session::proxy_state`] (announced as
+//! [`Event::ProxyStateChanged`]) reports whether it is reachable. The
+//! caveats:
 //!
 //! - SOCKS5 proxies all UDP or none: with `proxy_peers` or
 //!   `proxy_trackers`, outgoing uTP, the DHT and UDP trackers all go through
-//!   one UDP ASSOCIATE. The session then listens on TCP only, the DHT runs
-//!   over the relay's address family only (IPv4 in practice), and incoming
-//!   uTP arrives only as the relay forwards it.
-//! - An HTTP proxy cannot carry UDP: with `proxy_peers` outgoing uTP is off,
-//!   with `proxy_trackers` UDP trackers fail, and the DHT runs directly
-//!   unless [`Settings::dht_enabled`] is off.
-//! - Many HTTP proxies refuse `CONNECT` to port 80, so plain-HTTP trackers
-//!   may fail through them.
-//! - UDP tracker and DHT bootstrap host names are resolved locally whatever
-//!   `proxy_hostnames` says, and LSD, UPnP and NAT-PMP stay direct on the
-//!   local network.
+//!   one UDP ASSOCIATE. The session then listens on TCP only, and the DHT
+//!   runs over the relay's address family only (IPv4 in practice).
+//! - An HTTP proxy cannot carry UDP, and neither can a SOCKS5 one that will
+//!   not relay it: while such a proxy is set the session opens no UDP socket
+//!   at all, so the DHT, uTP and UDP trackers do not run (whatever
+//!   [`Settings::dht_enabled`] says), and UDP tracker announces fail. An
+//!   HTTP proxy with `proxy_peers` also dials peers over TCP only.
+//! - A proxy that is down, or refuses login, does not stop the session: a
+//!   peer dial goes through the proxy and fails rather than connecting
+//!   directly, [`Session::proxy_state`] says so, and the proxy is re-probed
+//!   with a backoff until it comes back.
+//! - The proxy's own host name is the one lookup a proxied session makes;
+//!   UDP tracker and DHT bootstrap host names go to the proxy by name under
+//!   SOCKS5, and LSD, UPnP and NAT-PMP turn off while a proxy is set.
 //!
 //! # IP filter and bans
 //!
@@ -473,10 +482,10 @@ pub use fbt_session::{
     MAX_IP_FILTER_RANGES, MAX_METADATA_SIZE, MAX_RESUME_BYTES, MAX_RESUME_ITEMS, MAX_RESUME_PEERS,
     MAX_SESSION_TORRENTS, MapMethod, MapProtocol, MixedMode, MoveMode, MutableItem,
     NetworkSettings, NodeId, NodeInfo, PeerClassLimits, PeerSource, PeerStatus, Priority,
-    ProxyConfig, ProxyError, ProxyKind, QueueSettings, RateLimit, ReadAhead, RemoveMode,
-    ResumeError, SeedChokingAlgorithm, Session, SessionError, SessionState, Settings, StorageError,
-    StreamError, TorrentHandle, TorrentSource, TorrentState, TorrentStatus, TrackerStatus,
-    Transport,
+    ProxyConfig, ProxyError, ProxyKind, ProxyState, QueueSettings, RateLimit, ReadAhead,
+    RemoveMode, ResumeError, SeedChokingAlgorithm, Session, SessionError, SessionState, Settings,
+    StorageError, StreamError, TorrentHandle, TorrentSource, TorrentState, TorrentStatus,
+    TrackerStatus, Transport,
 };
 pub use fbt_tracker::{RedirectPolicy, TrackerConfig, TrackerError};
 
