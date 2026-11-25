@@ -5,9 +5,10 @@
 //! exchange runs under the caller's timeout.
 
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fbt_core::audit;
 use tokio::io::AsyncReadExt;
@@ -17,7 +18,7 @@ mod http;
 mod socks5;
 
 pub use http::{MAX_CONNECT_HEAD, parse_connect_head};
-pub use socks5::{decode_udp, encode_udp, parse_socks5_reply};
+pub use socks5::{decode_udp, encode_udp, encode_udp_host, parse_socks5_reply};
 
 /// Which kind of proxy [`ProxyConfig`] names.
 #[non_exhaustive]
@@ -53,12 +54,13 @@ pub enum ProxyKind {
 ///   TCP connections only: UDP tracker host names and DHT bootstrap host names
 ///   are resolved locally. Local service discovery (LSD), UPnP and NAT-PMP
 ///   stay direct on the local network and are never proxied.
-/// - **No proxy-only mode.** Whatever the proxy cannot carry goes direct,
-///   from the host's own address: with an HTTP proxy the DHT (which names
-///   every torrent's info hash to other nodes) and incoming uTP (outgoing
-///   too, without `proxy_peers`); with any proxy LSD, UPnP and NAT-PMP. The
-///   session logs a warning for each one enabled; turn them off in its
-///   settings to keep all traffic on the proxy.
+/// - **No proxy-only mode by default.** Whatever the proxy cannot carry goes
+///   direct, from the host's own address: with an HTTP proxy the DHT (which
+///   names every torrent's info hash to other nodes) and incoming uTP
+///   (outgoing too, without `proxy_peers`); with any proxy LSD, UPnP and
+///   NAT-PMP. The session logs a warning for each one enabled; turn them off
+///   in its settings to keep all traffic on the proxy, or set
+///   [`proxy_only`](Self::proxy_only) to have every bypass treated as off.
 ///
 /// `Debug` prints the password as `"***"`; serialising (the `serde`
 /// feature) writes it in clear text.
@@ -93,6 +95,18 @@ pub struct ProxyConfig {
     /// local network. With it false, names are resolved here and judged then (see
     /// `RedirectPolicy` in the `fbt-tracker` crate).
     pub proxy_hostnames: bool,
+    /// Keep every bypass off: nothing leaves from the host's own address.
+    ///
+    /// With it (and a proxy), the session treats `proxy_peers`,
+    /// `proxy_trackers` and `proxy_hostnames` as on and everything that would
+    /// otherwise go direct as off (the DHT, local service discovery, UPnP,
+    /// NAT-PMP, incoming TCP and uTP, outgoing uTP), whatever the switches on
+    /// this config say. What the proxy cannot carry therefore does not run:
+    /// with an HTTP proxy, no DHT and no uTP at all, and UDP trackers fail.
+    /// The stored switches are untouched, so they come back as they were set
+    /// once the proxy is removed. Ignored with [`ProxyKind::None`], which has
+    /// no proxy to send through.
+    pub proxy_only: bool,
 }
 
 impl Default for ProxyConfig {
@@ -106,6 +120,7 @@ impl Default for ProxyConfig {
             proxy_peers: true,
             proxy_trackers: true,
             proxy_hostnames: true,
+            proxy_only: false,
         }
     }
 }
@@ -121,6 +136,7 @@ impl fmt::Debug for ProxyConfig {
             .field("proxy_peers", &self.proxy_peers)
             .field("proxy_trackers", &self.proxy_trackers)
             .field("proxy_hostnames", &self.proxy_hostnames)
+            .field("proxy_only", &self.proxy_only)
             .finish()
     }
 }
@@ -186,7 +202,13 @@ pub enum ProxyError {
     /// A socket error, or the proxy closed the connection.
     #[error("proxy I/O error: {0}")]
     Io(#[from] io::Error),
-    /// The exchange did not finish within the timeout.
+    /// The proxy was not reached: the TCP dial to it failed, or the timeout
+    /// ran out before it connected. The inner error is an `io::Error` of kind
+    /// [`io::ErrorKind::TimedOut`] when it was the timeout.
+    #[error("cannot reach the proxy: {0}")]
+    Unreachable(io::Error),
+    /// The exchange did not finish within the timeout, after the proxy had
+    /// accepted the connection.
     #[error("proxy timed out")]
     Timeout,
     /// The proxy rejected the credentials, or wanted some and none were set.
@@ -209,41 +231,136 @@ pub enum ProxyError {
 /// Opens a TCP connection to `target` through the proxy `cfg` names, the whole
 /// exchange (dial, negotiation, reply) bounded by `timeout`. With
 /// [`ProxyKind::None`] it dials `target` directly.
+///
+/// The dial to the proxy is its own phase: a failure there, or the timeout
+/// running out before the proxy accepted the connection, is
+/// [`ProxyError::Unreachable`]. [`ProxyError::Timeout`] means only that the
+/// exchange after that did not finish in the time left.
 pub async fn connect_tcp(
     cfg: &ProxyConfig,
     target: ProxyTarget,
     timeout: Duration,
 ) -> Result<TcpStream, ProxyError> {
-    match tokio::time::timeout(timeout, connect_inner(cfg, target)).await {
-        Ok(r) => r,
-        Err(_) => Err(ProxyError::Timeout),
-    }
-}
-
-async fn connect_inner(cfg: &ProxyConfig, target: ProxyTarget) -> Result<TcpStream, ProxyError> {
-    let target = prepare_target(cfg, target).await?;
+    let deadline = Instant::now() + timeout;
     match cfg.kind {
-        ProxyKind::None => Ok(match target {
-            ProxyTarget::Addr(a) => {
-                audit::record(audit::Outbound::TcpConnect(a));
-                TcpStream::connect(a).await?
+        ProxyKind::None => {
+            let target = prepare_target(cfg, target).await?;
+            match within(deadline, dial_direct(target)).await {
+                Some(r) => r,
+                None => Err(ProxyError::Timeout),
             }
-            ProxyTarget::Host(h, p) => {
-                audit::record(audit::Outbound::Lookup(h.clone()));
-                TcpStream::connect((h.as_str(), p)).await?
-            }
-        }),
+        }
         ProxyKind::Socks5 => {
-            let mut s = dial_proxy(cfg).await?;
-            socks5::negotiate(&mut s, cfg).await?;
-            socks5::request(&mut s, socks5::CMD_CONNECT, &target).await?;
+            let target = prepare_target_within(cfg, target, deadline).await?;
+            let mut s = dial_proxy(cfg, deadline).await?;
+            handshake(deadline, socks5_connect(&mut s, cfg, &target)).await?;
             Ok(s)
         }
         ProxyKind::Http => {
-            let mut s = dial_proxy(cfg).await?;
-            http::connect(&mut s, cfg, &target).await?;
+            let target = prepare_target_within(cfg, target, deadline).await?;
+            let mut s = dial_proxy(cfg, deadline).await?;
+            handshake(deadline, http::connect(&mut s, cfg, &target)).await?;
             Ok(s)
         }
+    }
+}
+
+/// Negotiates and sends a SOCKS5 `CONNECT` for `target`.
+async fn socks5_connect(
+    s: &mut TcpStream,
+    cfg: &ProxyConfig,
+    target: &ProxyTarget,
+) -> Result<(), ProxyError> {
+    socks5::negotiate(s, cfg).await?;
+    socks5::request(s, socks5::CMD_CONNECT, target)
+        .await
+        .map(|_| ())
+}
+
+/// Dials `target` directly, recording what leaves the host.
+async fn dial_direct(target: ProxyTarget) -> Result<TcpStream, ProxyError> {
+    Ok(match target {
+        ProxyTarget::Addr(a) => {
+            audit::record(audit::Outbound::TcpConnect(a));
+            TcpStream::connect(a).await?
+        }
+        ProxyTarget::Host(h, p) => {
+            audit::record(audit::Outbound::Lookup(h.clone()));
+            TcpStream::connect((h.as_str(), p)).await?
+        }
+    })
+}
+
+/// Checks that the proxy `cfg` names can be used at all, within `timeout`: a
+/// SOCKS5 proxy is dialled, greeted and authenticated and the connection is
+/// then closed; an HTTP proxy is only dialled, because HTTP has no login check
+/// without a `CONNECT`; [`ProxyKind::None`] is `Ok(())` without a socket.
+///
+/// A dial failure or a dial timeout is [`ProxyError::Unreachable`]; what comes
+/// after the proxy accepted the connection (a rejected greeting or login) is
+/// reported as it is, and only an unfinished exchange costs
+/// [`ProxyError::Timeout`].
+pub async fn probe(cfg: &ProxyConfig, timeout: Duration) -> Result<(), ProxyError> {
+    if cfg.kind == ProxyKind::None {
+        return Ok(());
+    }
+    let deadline = Instant::now() + timeout;
+    let mut s = dial_proxy(cfg, deadline).await?;
+    if cfg.kind == ProxyKind::Socks5 {
+        handshake(deadline, socks5::negotiate(&mut s, cfg)).await?;
+    }
+    Ok(())
+}
+
+/// Whether `e`, from [`udp_associate`], means the proxy will not relay UDP
+/// rather than that it is not usable: it refused the association
+/// ([`ProxyError::Refused`]) or cannot carry one ([`ProxyError::Unsupported`],
+/// which is also any proxy kind but SOCKS5, and a relay named by domain). In
+/// every case the greeting and login had succeeded, so the proxy itself is
+/// reachable and only its UDP association is missing: it is a property of the
+/// proxy, not something a retry will change.
+pub fn udp_not_relayed(e: &ProxyError) -> bool {
+    matches!(e, ProxyError::Refused(_) | ProxyError::Unsupported)
+}
+
+/// Runs `fut` with the time left until `deadline`; `None` when it ran out.
+async fn within<F: Future>(deadline: Instant, fut: F) -> Option<F::Output> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    tokio::time::timeout(left, fut).await.ok()
+}
+
+/// The handshake phase of a proxied exchange, bounded by the time left until
+/// `deadline`: the proxy has accepted the connection, so running out of time
+/// is [`ProxyError::Timeout`] and not a reachability failure.
+async fn handshake<F>(deadline: Instant, fut: F) -> Result<(), ProxyError>
+where
+    F: Future<Output = Result<(), ProxyError>>,
+{
+    match within(deadline, fut).await {
+        Some(r) => r,
+        None => Err(ProxyError::Timeout),
+    }
+}
+
+/// The timeout of something that happens before the proxy accepted the
+/// connection: the proxy has not been reached, so it is
+/// [`ProxyError::Unreachable`] with a timed-out `io::Error`.
+fn unreachable_timeout(msg: &'static str) -> ProxyError {
+    ProxyError::Unreachable(io::Error::new(io::ErrorKind::TimedOut, msg))
+}
+
+/// [`prepare_target`] with the time left until `deadline`. Resolving a target
+/// name here (only when the proxy should not) and the dial that follows are
+/// both part of the dial phase, so running out of time is
+/// [`ProxyError::Unreachable`].
+async fn prepare_target_within(
+    cfg: &ProxyConfig,
+    target: ProxyTarget,
+    deadline: Instant,
+) -> Result<ProxyTarget, ProxyError> {
+    match within(deadline, prepare_target(cfg, target)).await {
+        Some(r) => r,
+        None => Err(unreachable_timeout("preparing the target timed out")),
     }
 }
 
@@ -290,11 +407,18 @@ fn is_host_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
 }
 
-async fn dial_proxy(cfg: &ProxyConfig) -> Result<TcpStream, ProxyError> {
+/// Dials the proxy itself, within the time left until `deadline`. Every
+/// failure here is [`ProxyError::Unreachable`]: nothing about the proxy has
+/// been learned except that it cannot be reached.
+async fn dial_proxy(cfg: &ProxyConfig, deadline: Instant) -> Result<TcpStream, ProxyError> {
     cfg.validate()
         .map_err(|_| ProxyError::Protocol("invalid proxy configuration"))?;
     audit::record(dial_outbound(&cfg.host, cfg.port));
-    Ok(TcpStream::connect((cfg.host.as_str(), cfg.port)).await?)
+    match within(deadline, TcpStream::connect((cfg.host.as_str(), cfg.port))).await {
+        Some(Ok(s)) => Ok(s),
+        Some(Err(e)) => Err(ProxyError::Unreachable(e)),
+        None => Err(unreachable_timeout("connecting to the proxy timed out")),
+    }
 }
 
 /// The record of a dial to `host`: the connect for an IP literal, the lookup
@@ -342,28 +466,40 @@ impl Socks5Udp {
 /// [`ProxyKind::Socks5`], or a relay named by domain, is
 /// [`ProxyError::Unsupported`]. A relay of `0.0.0.0` (or `::`) means the
 /// proxy's own address.
+///
+/// As with [`connect_tcp`], a dial failure or a dial timeout is
+/// [`ProxyError::Unreachable`], and [`ProxyError::Timeout`] means only that the
+/// exchange after the proxy accepted the connection did not finish in the time
+/// left.
 pub async fn udp_associate(cfg: &ProxyConfig, timeout: Duration) -> Result<Socks5Udp, ProxyError> {
     if cfg.kind != ProxyKind::Socks5 {
         return Err(ProxyError::Unsupported);
     }
-    let inner = async {
-        let mut control = dial_proxy(cfg).await?;
-        socks5::negotiate(&mut control, cfg).await?;
-        // DST.ADDR 0.0.0.0:0: the client's UDP address is not known yet.
-        let any = ProxyTarget::Addr(SocketAddr::from(([0, 0, 0, 0], 0)));
-        let bnd = socks5::request(&mut control, socks5::CMD_UDP_ASSOCIATE, &any).await?;
-        let Some(mut relay) = bnd else {
-            return Err(ProxyError::Unsupported);
-        };
-        if relay.ip().is_unspecified() {
-            relay.set_ip(control.peer_addr()?.ip());
-        }
-        Ok(Socks5Udp { control, relay })
+    let deadline = Instant::now() + timeout;
+    let mut control = dial_proxy(cfg, deadline).await?;
+    let bnd = match within(deadline, associate_request(&mut control, cfg)).await {
+        Some(r) => r?,
+        None => return Err(ProxyError::Timeout),
     };
-    match tokio::time::timeout(timeout, inner).await {
-        Ok(r) => r,
-        Err(_) => Err(ProxyError::Timeout),
+    let Some(mut relay) = bnd else {
+        return Err(ProxyError::Unsupported);
+    };
+    if relay.ip().is_unspecified() {
+        relay.set_ip(control.peer_addr()?.ip());
     }
+    Ok(Socks5Udp { control, relay })
+}
+
+/// Greets and authenticates, then asks for a UDP association; returns the
+/// bound address the proxy names (`None` when it named a domain).
+async fn associate_request(
+    control: &mut TcpStream,
+    cfg: &ProxyConfig,
+) -> Result<Option<SocketAddr>, ProxyError> {
+    socks5::negotiate(control, cfg).await?;
+    // DST.ADDR 0.0.0.0:0: the client's UDP address is not known yet.
+    let any = ProxyTarget::Addr(SocketAddr::from(([0, 0, 0, 0], 0)));
+    socks5::request(control, socks5::CMD_UDP_ASSOCIATE, &any).await
 }
 
 /// Standard base64 with padding (RFC 4648), for `Proxy-Authorization: Basic`.

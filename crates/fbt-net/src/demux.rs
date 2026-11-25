@@ -20,7 +20,7 @@ use fbt_core::udp::{DatagramHandler, DatagramSender};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, watch};
 
-use crate::proxy::{Socks5Udp, decode_udp, encode_udp};
+use crate::proxy::{Socks5Udp, decode_udp, encode_udp, encode_udp_host};
 
 /// The receive buffer: the largest possible UDP payload.
 pub const MAX_DATAGRAM: usize = 65_536;
@@ -231,6 +231,28 @@ impl DatagramSender for Sender {
                 Ok(data.len())
             }
         }
+    }
+
+    // audit: a relayed name send records its UdpSend to the relay below, a direct socket sends none
+    fn send_to_host(&self, data: &[u8], host: &str, port: u16) -> io::Result<usize> {
+        let Some(relay) = self.relay else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a direct socket does not send to a host name",
+            ));
+        };
+        // The name is framed before the socket is taken, so a name no proxy
+        // may be given costs nothing.
+        let mut framed = Vec::with_capacity(data.len().saturating_add(262));
+        encode_udp_host(host, port, data, &mut framed)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let guard = self.socket.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(s) = guard.as_ref() else {
+            return Err(io::ErrorKind::NotConnected.into());
+        };
+        audit::record(audit::Outbound::UdpSend(relay));
+        s.send_to(&framed, relay)?;
+        Ok(data.len())
     }
 }
 

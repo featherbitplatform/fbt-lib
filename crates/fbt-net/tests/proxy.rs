@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use fbt_net::proxy::{
     MAX_CONNECT_HEAD, ProxyConfig, ProxyError, ProxyKind, ProxyTarget, connect_tcp, decode_udp,
-    encode_udp, parse_connect_head, udp_associate,
+    encode_udp, encode_udp_host, parse_connect_head, probe, udp_associate, udp_not_relayed,
 };
 use proptest::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,7 +15,7 @@ mod fake_http_proxy;
 mod fake_socks5;
 
 use fake_http_proxy::{FakeHttpProxy, Script as HttpScript};
-use fake_socks5::{FakeSocks5, Script};
+use fake_socks5::{FakeSocks5, Script, closed_port};
 
 const T: Duration = Duration::from_secs(5);
 
@@ -25,6 +25,37 @@ fn cfg(kind: ProxyKind, addr: SocketAddr) -> ProxyConfig {
     c.host = addr.ip().to_string();
     c.port = addr.port();
     c
+}
+
+/// A SOCKS5 config pointing at `addr`.
+fn socks5(addr: SocketAddr) -> ProxyConfig {
+    cfg(ProxyKind::Socks5, addr)
+}
+
+/// A target nothing listens on: loopback, port 9.
+fn addr_target() -> ProxyTarget {
+    ProxyTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 9)))
+}
+
+/// A SOCKS5 config pointing at a fresh fake running `script`; keep the fake
+/// alive for as long as its address is used.
+async fn socks5_fake(script: Script) -> (FakeSocks5, ProxyConfig) {
+    let fake = FakeSocks5::start(script).await;
+    let c = socks5(fake.addr());
+    (fake, c)
+}
+
+/// A listener that accepts every connection and never says a word.
+async fn silent_listener() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let _keep = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    addr
 }
 
 /// A TCP server on loopback that says `hello` and then echoes.
@@ -260,14 +291,7 @@ async fn closed_mid_handshake() {
 #[tokio::test]
 async fn silent_proxy_times_out() {
     // Accepts and never says a word.
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    let _keep = tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Ok((s, _)) = l.accept().await {
-            held.push(s);
-        }
-    });
+    let addr = silent_listener().await;
     let target = ProxyTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 9)));
     for kind in [ProxyKind::Socks5, ProxyKind::Http] {
         let c = cfg(kind, addr);
@@ -642,5 +666,145 @@ async fn audit_records_direct_and_proxied_dials() {
             .iter()
             .any(|o| matches!(o, Outbound::Lookup(h) if h == "example.invalid")),
         "the proxy resolves the target name, not us: {recs:?}"
+    );
+}
+
+/// A closed port is no proxy at all: the dial is what failed, so both the
+/// connect and the probe report a reachability failure, which is not the
+/// timeout of a proxy that accepted and went quiet.
+#[tokio::test]
+async fn dial_to_closed_port_is_unreachable() {
+    let cfg = socks5(closed_port());
+    assert!(matches!(
+        connect_tcp(&cfg, addr_target(), T).await,
+        Err(ProxyError::Unreachable(_))
+    ));
+    assert!(matches!(
+        probe(&cfg, T).await,
+        Err(ProxyError::Unreachable(_))
+    ));
+}
+
+/// A proxy that wants credentials and gets the wrong ones is reachable: the
+/// probe reports the login, not a reachability failure, and the right
+/// password goes through.
+#[tokio::test]
+async fn probe_reports_login_refused() {
+    let (_fake, mut c) = socks5_fake(Script::RequireAuth("u".into(), "p".into())).await;
+    c.username = Some("u".into());
+    c.password = Some("wrong".into());
+    assert!(matches!(probe(&c, T).await, Err(ProxyError::AuthFailed)));
+    c.password = Some("p".into());
+    probe(&c, T).await.unwrap();
+}
+
+/// An HTTP proxy has no login check without a CONNECT, so a probe dials and
+/// stops there: a listener that accepts and never answers still probes fine,
+/// nothing is ever CONNECTed, and a port nothing listens on is still a
+/// reachability failure.
+#[tokio::test]
+async fn http_probe_dials_only() {
+    let fake = FakeHttpProxy::start(HttpScript::Ok).await;
+    probe(&cfg(ProxyKind::Http, fake.addr()), T).await.unwrap();
+    assert!(fake.connects().is_empty());
+    probe(&cfg(ProxyKind::Http, silent_listener().await), T)
+        .await
+        .unwrap();
+    assert!(matches!(
+        probe(&cfg(ProxyKind::Http, fake_http_proxy::closed_port()), T).await,
+        Err(ProxyError::Unreachable(_))
+    ));
+}
+
+/// A proxy that greeted and authenticated us and then refused the association
+/// is reachable: only its UDP relay is missing, which is a property of the
+/// proxy and not something a retry fixes. A dial failure and a proxy that went
+/// quiet after accepting are not that.
+#[tokio::test]
+async fn udp_associate_refused_is_not_relayed() {
+    let (_fake, c) = socks5_fake(Script::NoUdp(7)).await;
+    let e = udp_associate(&c, T).await.unwrap_err();
+    assert!(matches!(e, ProxyError::Refused(7)), "{e:?}");
+    assert!(udp_not_relayed(&e));
+    let e = udp_associate(&socks5(silent_listener().await), Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, ProxyError::Timeout), "{e:?}");
+    assert!(!udp_not_relayed(&e));
+    let e = udp_associate(&socks5(closed_port()), T).await.unwrap_err();
+    assert!(matches!(e, ProxyError::Unreachable(_)), "{e:?}");
+    assert!(!udp_not_relayed(&e));
+}
+
+/// A datagram to a domain is framed for the proxy to resolve (`ATYP = 3`),
+/// and only a name a length byte and the alphabet can carry is ever written.
+#[test]
+fn encode_udp_host_frames_domain() {
+    let mut out = Vec::new();
+    encode_udp_host("tracker.invalid", 6969, b"x", &mut out).unwrap();
+    assert_eq!(
+        out,
+        [
+            &[0, 0, 0, 3, 15][..],
+            b"tracker.invalid",
+            &[0x1b, 0x39],
+            b"x"
+        ]
+        .concat()
+    );
+    for bad in [
+        "",
+        "a b",
+        &"a".repeat(256),
+        "a\r\nX-Evil: 1",
+        "w\u{fc}rld.example",
+        "[::1]",
+    ] {
+        assert!(
+            matches!(
+                encode_udp_host(bad, 1, b"", &mut out),
+                Err(ProxyError::Protocol(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    // A rejected name writes nothing: the caller's buffer keeps what it had.
+    out.clear();
+    out.push(0xaa);
+    assert!(encode_udp_host("a b", 1, b"", &mut out).is_err());
+    assert_eq!(out, vec![0xaa]);
+    // The longest name a length byte can carry is still framed.
+    let host = "a".repeat(255);
+    encode_udp_host(&host, 1, b"", &mut out).unwrap();
+    assert_eq!(out.len(), 4 + 1 + 255 + 2);
+}
+
+/// `proxy_only` defaults off, survives a round trip through serde, reads its
+/// default from a document that does not name it, shows in `Debug`, and is
+/// nothing `validate` looks at.
+#[cfg(feature = "serde")]
+#[test]
+fn proxy_only_defaults_off_and_round_trips() {
+    assert!(!ProxyConfig::default().proxy_only);
+    let mut c = ProxyConfig::default();
+    c.kind = ProxyKind::Socks5;
+    c.host = "127.0.0.1".into();
+    c.proxy_only = true;
+    assert!(c.validate().is_ok(), "proxy_only is not validated");
+    assert!(
+        format!("{c:?}").contains("proxy_only: true"),
+        "Debug shows it: {c:?}"
+    );
+    let json = serde_json::to_string(&c).unwrap();
+    assert!(json.contains("\"proxy_only\":true"), "{json}");
+    assert_eq!(serde_json::from_str::<ProxyConfig>(&json).unwrap(), c);
+    let mut doc = serde_json::to_value(ProxyConfig::default()).unwrap();
+    assert_eq!(doc.get("proxy_only"), Some(&false.into()), "{doc}");
+    doc.as_object_mut().unwrap().remove("proxy_only");
+    assert!(
+        !serde_json::from_value::<ProxyConfig>(doc)
+            .unwrap()
+            .proxy_only,
+        "a document without the key reads the default"
     );
 }
