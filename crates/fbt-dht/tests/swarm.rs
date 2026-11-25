@@ -797,3 +797,35 @@ async fn put_without_a_token_is_refused() {
     );
     shutdown(&nodes).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_lookup_is_recorded() {
+    use fbt_core::audit::{self, Outbound};
+    let seed = Dht::spawn(cfg("127.0.0.1:0")).await.unwrap();
+    let port = seed.local_addrs()[0].port();
+    let mut c = cfg("127.0.0.1:0");
+    c.bootstrap = vec![format!("localhost:{port}")];
+    // The capture is process-wide: install it before the node spawns, so the
+    // first bootstrap attempt (which runs as soon as the actor starts)
+    // records into it. Parallel tests add their own records; the lookup is
+    // asserted by name, and no other test bootstraps from a name.
+    let cap = audit::capture();
+    let node = Dht::spawn(c).await.unwrap();
+    let mut seen = false;
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !seen && tokio::time::Instant::now() < end {
+        seen = cap
+            .take()
+            .iter()
+            .any(|o| matches!(o, Outbound::Lookup(h) if h == "localhost"));
+        if !seen {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+    drop(cap);
+    assert!(
+        seen,
+        "the bootstrap entry's name must be looked up and recorded"
+    );
+    shutdown(&[seed, node]).await;
+}

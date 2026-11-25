@@ -42,6 +42,10 @@ cargo test --workspace
 cargo deny --all-features check
 bash dev/check-pure-rust.sh   # pure-rust build has no ring, cc or other C-building crate
 
+# Outbound audit gate: every outbound socket op in the engine crates reports to the fbt-core
+# audit hook; CHECK_OUTBOUND_SKIP (comma-separated) skips crates not audited yet
+CHECK_OUTBOUND_SKIP=fbt-session bash dev/check-outbound.sh
+
 # Reproduce and deflake an intermittent test (Unix only). Builds one test target through cargo's JSON,
 # runs <test-name> <runs> times 4 at a time (STRESS_PARALLEL), kills a repetition past STRESS_TIMEOUT
 # seconds along with everything it forked, prints `stress: N/N passed` and keeps every log in

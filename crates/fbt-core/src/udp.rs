@@ -12,6 +12,20 @@ pub trait DatagramSender: Send + Sync + std::fmt::Debug + 'static {
     fn local_addr(&self) -> SocketAddr;
     /// Sends one datagram to `to`; returns the bytes sent.
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize>;
+    /// Sends one datagram to the host name `host` and port, leaving the name
+    /// for whoever carries it to resolve.
+    ///
+    /// The default refuses with [`io::ErrorKind::Unsupported`]: a socket that
+    /// sends where it likes would have to resolve the name here, which a
+    /// session under a proxy must never do. Only a sender that hands the name
+    /// to a proxy (a SOCKS5 UDP relay) carries it.
+    // audit: this trait only sends; the socket that implements it records where it reaches
+    fn send_to_host(&self, _data: &[u8], _host: &str, _port: u16) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this socket cannot send to a host name",
+        ))
+    }
 }
 
 /// Receives the datagrams of one packet kind.

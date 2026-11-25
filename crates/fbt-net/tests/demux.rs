@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 use fbt_core::udp::DatagramHandler;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
 
+#[path = "support/fake_socks5.rs"]
+mod fake_socks5;
+
 #[derive(Debug, Default)]
 struct Recorder(Mutex<Vec<(SocketAddr, Vec<u8>)>>);
 
@@ -140,5 +143,88 @@ async fn close_releases_the_port_and_fails_sends() {
     assert!(
         wait_for(|| UdpSocket::bind(addr).is_ok()).await,
         "the port must be free after close"
+    );
+}
+
+#[tokio::test]
+async fn relayed_send_records_the_relay_only() {
+    use fbt_core::audit::{self, Outbound};
+    use fbt_net::proxy::{ProxyConfig, ProxyKind, udp_associate};
+
+    let proxy = fake_socks5::FakeSocks5::start(fake_socks5::Script::Ok).await;
+    let mut cfg = ProxyConfig::default();
+    cfg.kind = ProxyKind::Socks5;
+    cfg.host = proxy.addr().ip().to_string();
+    cfg.port = proxy.addr().port();
+    let assoc = udp_associate(&cfg, Duration::from_secs(5)).await.unwrap();
+    let relay = assoc.relay();
+
+    let sock = SharedUdpSocket::bind_relayed(lo(), assoc).unwrap();
+    let tx = sock.sender();
+    let nominal: SocketAddr = "192.0.2.1:6881".parse().unwrap();
+
+    // The datagram goes to the relay framed; the audit sees the relay only.
+    // Parallel tests may add their own records; the relay and the nominal
+    // target are known only to this test.
+    let cap = audit::capture();
+    tx.send_to(b"x", nominal).unwrap();
+    let recs = cap.take();
+    drop(cap);
+    assert!(recs.contains(&Outbound::UdpSend(relay)), "{recs:?}");
+    assert!(
+        !recs
+            .iter()
+            .any(|o| matches!(o, Outbound::UdpSend(a) if *a == nominal)),
+        "a relayed send is recorded to the relay, not the nominal target: {recs:?}"
+    );
+}
+
+#[tokio::test]
+async fn relayed_socket_sends_to_host() {
+    use fbt_core::audit::{self, Outbound};
+    use fbt_net::proxy::{ProxyConfig, ProxyKind, udp_associate};
+
+    let proxy = fake_socks5::FakeSocks5::start(fake_socks5::Script::RecordOnly).await;
+    let mut cfg = ProxyConfig::default();
+    cfg.kind = ProxyKind::Socks5;
+    cfg.host = proxy.addr().ip().to_string();
+    cfg.port = proxy.addr().port();
+    let assoc = udp_associate(&cfg, Duration::from_secs(5)).await.unwrap();
+    let relay = assoc.relay();
+
+    let relayed = SharedUdpSocket::bind_relayed(lo(), assoc).unwrap();
+    let direct = SharedUdpSocket::bind(lo()).unwrap();
+
+    // The name goes to the relay framed for the proxy to resolve (the fake
+    // logs the target it was asked for and never forwards), and the send is
+    // recorded to the relay, not to anything the name stands for.
+    let cap = audit::capture();
+    let sent = relayed
+        .sender()
+        .send_to_host(b"hi", "tracker.invalid", 6969)
+        .unwrap();
+    let recs = cap.take();
+    drop(cap);
+    assert_eq!(sent, 2, "the bytes sent are the payload's");
+    assert!(recs.contains(&Outbound::UdpSend(relay)), "{recs:?}");
+    assert!(
+        wait_for(|| proxy.udp_targets() == vec!["tracker.invalid:6969".to_string()]).await,
+        "the relay is asked for the name, not an address: {:?}",
+        proxy.udp_targets()
+    );
+
+    // A direct socket cannot do this: it would have to resolve the name here.
+    let e = direct
+        .sender()
+        .send_to_host(b"hi", "tracker.invalid", 6969)
+        .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+
+    // A name no proxy may be given is refused before anything is sent.
+    let e = relayed.sender().send_to_host(b"hi", "a b", 1).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        proxy.udp_targets(),
+        vec!["tracker.invalid:6969".to_string()]
     );
 }

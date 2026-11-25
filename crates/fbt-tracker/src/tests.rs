@@ -486,6 +486,7 @@ async fn scrape_caps_hashes() {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     });
+    // audit: a test fake; its sends are not engine outbound
     let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let udp_addr = udp.local_addr().unwrap();
     let hashes = vec![[7u8; 20]; MAX_SCRAPE_HASHES + 1];

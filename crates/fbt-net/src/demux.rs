@@ -14,11 +14,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
+use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
+// audit: outbound on the socket is recorded in Sender::send_to
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, watch};
 
-use crate::proxy::{Socks5Udp, decode_udp, encode_udp};
+use crate::proxy::{Socks5Udp, decode_udp, encode_udp, encode_udp_host};
 
 /// The receive buffer: the largest possible UDP payload.
 pub const MAX_DATAGRAM: usize = 65_536;
@@ -89,6 +91,7 @@ struct Counters {
 }
 
 /// The non-blocking send clone; `None` once the socket is closed.
+// audit: sends through this half are recorded in Sender::send_to
 type SendHalf = Arc<Mutex<Option<std::net::UdpSocket>>>;
 
 #[derive(Debug)]
@@ -110,6 +113,7 @@ struct Inner {
 }
 
 impl Inner {
+    // audit: sends through this half are recorded in Sender::send_to
     fn new(send: std::net::UdpSocket, local: SocketAddr, relay: Option<SocketAddr>) -> Inner {
         Inner {
             send: Arc::new(Mutex::new(Some(send))),
@@ -215,14 +219,40 @@ impl DatagramSender for Sender {
             return Err(io::ErrorKind::NotConnected.into());
         };
         match self.relay {
-            None => s.send_to(data, to),
+            None => {
+                audit::record(audit::Outbound::UdpSend(to));
+                s.send_to(data, to)
+            }
             Some(relay) => {
                 let mut framed = Vec::with_capacity(data.len().saturating_add(22));
                 encode_udp(to, data, &mut framed);
+                audit::record(audit::Outbound::UdpSend(relay));
                 s.send_to(&framed, relay)?;
                 Ok(data.len())
             }
         }
+    }
+
+    // audit: a relayed name send records its UdpSend to the relay below, a direct socket sends none
+    fn send_to_host(&self, data: &[u8], host: &str, port: u16) -> io::Result<usize> {
+        let Some(relay) = self.relay else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a direct socket does not send to a host name",
+            ));
+        };
+        // The name is framed before the socket is taken, so a name no proxy
+        // may be given costs nothing.
+        let mut framed = Vec::with_capacity(data.len().saturating_add(262));
+        encode_udp_host(host, port, data, &mut framed)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let guard = self.socket.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(s) = guard.as_ref() else {
+            return Err(io::ErrorKind::NotConnected.into());
+        };
+        audit::record(audit::Outbound::UdpSend(relay));
+        s.send_to(&framed, relay)?;
+        Ok(data.len())
     }
 }
 
@@ -232,6 +262,7 @@ fn canonical(a: SocketAddr) -> SocketAddr {
 }
 
 /// Binds a non-blocking UDP socket on `addr` (IPv6-only for IPv6).
+// audit: outbound on the socket is recorded in Sender::send_to
 fn bind_std(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv6() {
@@ -281,6 +312,7 @@ impl SharedUdpSocket {
         // fails until the first readiness event, which a fresh socket lacks
         let send = std_sock.try_clone()?;
         send.set_nonblocking(true)?;
+        // audit: outbound on this socket is recorded in Sender::send_to
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local = socket.local_addr()?;
         let inner = Arc::new(Inner::new(send, local, relay));
@@ -348,6 +380,7 @@ impl SharedUdpSocket {
     }
 }
 
+// audit: the recv half only receives; outbound is recorded in Sender::send_to
 async fn receive_loop(socket: Arc<UdpSocket>, inner: Weak<Inner>, stop: Arc<Notify>) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut errors = 0u32;
