@@ -15,6 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use rand::Rng;
 use rand::rngs::StdRng;
@@ -472,6 +473,7 @@ impl DatagramSender for StdSender {
     }
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
+        audit::record(audit::Outbound::UdpSend(to));
         self.sock.send_to(data, to)
     }
 }
@@ -1275,6 +1277,7 @@ impl Actor {
         let Some(s) = sock else {
             return false;
         };
+        // audit: the sender records in its concrete send_to (StdSender or the demux)
         match s.send_to(bytes, to) {
             Ok(_) => true,
             Err(e) => {
@@ -1749,6 +1752,22 @@ impl Actor {
         }
     }
 }
+/// The name of a `host:port` bootstrap entry: the part before the port,
+/// with brackets off an IPv6 literal. `None` for IP literals (there is no
+/// name handed to the resolver) and for entries without a numeric port.
+fn bootstrap_name(e: &str) -> Option<String> {
+    let host = match e.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        Some(_) => return None,
+        None => e,
+    };
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<IpAddr>().is_err().then(|| bare.to_owned())
+}
+
 /// One bootstrap attempt: resolve the entries, ask every seed (and every
 /// restored node) for nodes near our id, then run a `find_node` lookup for
 /// our id from what they returned. Nodes enter the tables only by answering.
@@ -1760,6 +1779,9 @@ async fn bootstrap(
 ) {
     let mut routers = Vec::new();
     for e in &entries {
+        if let Some(name) = bootstrap_name(e) {
+            audit::record(audit::Outbound::Lookup(name));
+        }
         match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(e.as_str())).await {
             Ok(Ok(found)) => routers.extend(found.take(MAX_RESOLVED)),
             Ok(Err(err)) => debug!(entry = %e, error = %err, "DHT: bootstrap entry skipped"),

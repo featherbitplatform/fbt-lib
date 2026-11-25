@@ -20,6 +20,7 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use rand::RngExt as _;
 use tokio::io::ReadBuf;
@@ -306,6 +307,7 @@ impl Shared {
 
     fn send_all(&self, to: SocketAddr, out: &[Vec<u8>]) {
         for d in out {
+            // audit: the sender records in its concrete send_to (OwnedSender or the demux)
             match self.sender.send_to(d, to) {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -818,6 +820,7 @@ impl DatagramSender for OwnedSender {
     }
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
+        audit::record(audit::Outbound::UdpSend(to));
         self.socket.send_to(data, to)
     }
 }

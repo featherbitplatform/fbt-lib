@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+#[doc(hidden)]
+pub mod audit;
 mod bitfield;
 pub mod compact;
 mod info_hash;

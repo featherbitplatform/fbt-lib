@@ -10,6 +10,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use fbt_core::audit;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use tracing::{debug, trace};
@@ -348,6 +349,7 @@ async fn exchange(
 ) -> Result<Reply, NatPmpError> {
     let mut buf = [0u8; RECV_BUF];
     for wait in RETRY_WAITS {
+        audit::record(audit::Outbound::UdpSend(gateway));
         sock.send_to(request, gateway).await?;
         let deadline = Instant::now() + wait;
         loop {
@@ -387,6 +389,7 @@ async fn exchange(
 /// The local IPv4 address the OS would use to reach `gateway`.
 async fn local_v4(gateway: SocketAddr) -> Result<Ipv4Addr, NatPmpError> {
     let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    // audit: a UDP connect only pins the default destination; no packet is sent
     probe.connect(gateway).await?;
     match probe.local_addr()?.ip() {
         IpAddr::V4(ip) => Ok(ip),

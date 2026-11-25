@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 use fbt_core::udp::DatagramHandler;
 use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
 
+#[path = "support/fake_socks5.rs"]
+mod fake_socks5;
+
 #[derive(Debug, Default)]
 struct Recorder(Mutex<Vec<(SocketAddr, Vec<u8>)>>);
 
@@ -140,5 +143,38 @@ async fn close_releases_the_port_and_fails_sends() {
     assert!(
         wait_for(|| UdpSocket::bind(addr).is_ok()).await,
         "the port must be free after close"
+    );
+}
+
+#[tokio::test]
+async fn relayed_send_records_the_relay_only() {
+    use fbt_core::audit::{self, Outbound};
+    use fbt_net::proxy::{ProxyConfig, ProxyKind, udp_associate};
+
+    let proxy = fake_socks5::FakeSocks5::start(fake_socks5::Script::Ok).await;
+    let mut cfg = ProxyConfig::default();
+    cfg.kind = ProxyKind::Socks5;
+    cfg.host = proxy.addr().ip().to_string();
+    cfg.port = proxy.addr().port();
+    let assoc = udp_associate(&cfg, Duration::from_secs(5)).await.unwrap();
+    let relay = assoc.relay();
+
+    let sock = SharedUdpSocket::bind_relayed(lo(), assoc).unwrap();
+    let tx = sock.sender();
+    let nominal: SocketAddr = "192.0.2.1:6881".parse().unwrap();
+
+    // The datagram goes to the relay framed; the audit sees the relay only.
+    // Parallel tests may add their own records; the relay and the nominal
+    // target are known only to this test.
+    let cap = audit::capture();
+    tx.send_to(b"x", nominal).unwrap();
+    let recs = cap.take();
+    drop(cap);
+    assert!(recs.contains(&Outbound::UdpSend(relay)), "{recs:?}");
+    assert!(
+        !recs
+            .iter()
+            .any(|o| matches!(o, Outbound::UdpSend(a) if *a == nominal)),
+        "a relayed send is recorded to the relay, not the nominal target: {recs:?}"
     );
 }

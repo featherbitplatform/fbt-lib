@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_net::proxy::{ProxyConfig, ProxyKind};
 use tokio::net::UdpSocket;
@@ -237,7 +238,11 @@ impl Endpoint<'_> {
     /// lost packet: the retransmit timer covers it.
     async fn send(&self, dgram: &[u8], addr: SocketAddr) -> std::io::Result<()> {
         match self {
-            Endpoint::Own(s) => s.socket.send_to(dgram, addr).await.map(|_| ()),
+            Endpoint::Own(s) => {
+                audit::record(audit::Outbound::UdpSend(addr));
+                s.socket.send_to(dgram, addr).await.map(|_| ())
+            }
+            // audit: the shared sender is the fbt-net demux, which records
             Endpoint::Shared(s, _) => match s.send_to(dgram, addr) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
                 r => r.map(|_| ()),
@@ -487,6 +492,7 @@ impl UdpClient {
         }
         let (host, port) = parse_udp_url(url)?;
         // The host comes from a hostile torrent: bound the lookup.
+        audit::record(audit::Outbound::Lookup(host.clone()));
         let addrs: Vec<SocketAddr> = match tokio::time::timeout(
             self.dns_timeout,
             tokio::net::lookup_host((host.as_str(), port)),
@@ -549,6 +555,7 @@ impl UdpClient {
         loop {
             let (cid, from_cache) = match cached.take() {
                 Some(id) => (id, true),
+                // audit: the connection-id datagram leaves through the endpoint send
                 None => (self.connect(sock, addr).await?, false),
             };
             let tid = new_tid(sock.pending());
@@ -1154,5 +1161,44 @@ mod tests {
             Err(TrackerError::Failure(m)) if m == "nope"
         ));
         assert!(parse_udp_scrape(&announce_reply(&tid, &[]), 7, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_udp_tracker_lookup_is_recorded() {
+        use fbt_core::audit::{self, Outbound};
+        let url = fake(|b, _, _| {
+            if is_connect(b) {
+                vec![connect_reply(&b[12..16], CID)]
+            } else {
+                vec![announce_reply(&b[12..16], &PEERS)]
+            }
+        })
+        .await;
+        // The fake listens on 127.0.0.1; ask for it by name, so the announce
+        // hands the name to the system resolver.
+        let port = url
+            .strip_prefix("udp://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .rsplit_once(':')
+            .unwrap()
+            .1;
+        let url = format!("udp://localhost:{port}/announce");
+        let nominal: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        // Parallel tests may add their own records; the nominal address is
+        // known only to this test, and the lookup is asserted by name.
+        let cap = audit::capture();
+        let r = client().announce(&url, &request()).await.unwrap();
+        let recs = cap.take();
+        drop(cap);
+        assert!(!r.peers.is_empty());
+        assert!(
+            recs.contains(&Outbound::Lookup("localhost".to_owned())),
+            "{recs:?}"
+        );
+        assert!(recs.contains(&Outbound::UdpSend(nominal)), "{recs:?}");
     }
 }

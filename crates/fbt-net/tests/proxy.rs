@@ -593,3 +593,54 @@ async fn overlong_username_is_a_protocol_error() {
     let err = connect_tcp(&c, target, T).await.unwrap_err();
     assert!(matches!(err, ProxyError::Protocol(_)), "{err:?}");
 }
+
+#[tokio::test]
+async fn audit_records_direct_and_proxied_dials() {
+    use fbt_core::audit::{self, Outbound};
+    let listener = echo_server().await;
+    let proxy = FakeSocks5::start(Script::Ok).await;
+    let mut proxied = cfg(ProxyKind::Socks5, proxy.addr());
+    proxied.proxy_hostnames = true;
+    let target = ProxyTarget::Host("example.invalid".into(), 80);
+
+    // The capture is process-wide and parallel tests dial their own proxies:
+    // assert the records only this test can make (its listener and its fake
+    // are unknown to them), and the absence of the lookup this dial must not
+    // make.
+    let cap = audit::capture();
+    let mut s = connect_tcp(
+        &cfg(ProxyKind::None, listener),
+        ProxyTarget::Addr(listener),
+        T,
+    )
+    .await
+    .unwrap();
+    check_echo(&mut s).await;
+    let recs = cap.take();
+    drop(cap);
+    assert!(
+        recs.contains(&Outbound::TcpConnect(listener)),
+        "direct dial to the address: {recs:?}"
+    );
+
+    let cap = audit::capture();
+    // The fake cannot dial example.invalid, so the tunnel is refused: the
+    // audit is about what we did here, not what the proxy did there.
+    let err = connect_tcp(&proxied, target, T).await.unwrap_err();
+    let recs = cap.take();
+    drop(cap);
+    assert!(
+        matches!(err, ProxyError::Refused(_) | ProxyError::Timeout),
+        "{err:?}"
+    );
+    assert!(
+        recs.contains(&Outbound::TcpConnect(proxy.addr())),
+        "proxied dial to the proxy: {recs:?}"
+    );
+    assert!(
+        !recs
+            .iter()
+            .any(|o| matches!(o, Outbound::Lookup(h) if h == "example.invalid")),
+        "the proxy resolves the target name, not us: {recs:?}"
+    );
+}

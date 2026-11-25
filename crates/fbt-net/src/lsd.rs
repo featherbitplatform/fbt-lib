@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use fbt_core::audit;
 use fbt_core::rate::IpRateLimiter;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use tokio::net::UdpSocket;
@@ -321,6 +322,7 @@ impl DatagramSender for UdpSender {
     }
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
+        audit::record(audit::Outbound::UdpSend(to));
         self.socket.send_to(data, to)
     }
 }
@@ -446,6 +448,7 @@ impl Lsd {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             for (sender, dest) in dests.iter() {
+                // audit: the DatagramSender records in its concrete send_to
                 if let Err(e) = sender.send_to(&msg.encode(*dest), *dest) {
                     debug!(%dest, error = %e, "LSD announce failed");
                 }

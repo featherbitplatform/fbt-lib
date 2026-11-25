@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
+use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, watch};
@@ -215,10 +216,14 @@ impl DatagramSender for Sender {
             return Err(io::ErrorKind::NotConnected.into());
         };
         match self.relay {
-            None => s.send_to(data, to),
+            None => {
+                audit::record(audit::Outbound::UdpSend(to));
+                s.send_to(data, to)
+            }
             Some(relay) => {
                 let mut framed = Vec::with_capacity(data.len().saturating_add(22));
                 encode_udp(to, data, &mut framed);
+                audit::record(audit::Outbound::UdpSend(relay));
                 s.send_to(&framed, relay)?;
                 Ok(data.len())
             }

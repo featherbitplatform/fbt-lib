@@ -9,6 +9,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use fbt_core::audit;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
@@ -216,8 +217,14 @@ async fn connect_inner(cfg: &ProxyConfig, target: ProxyTarget) -> Result<TcpStre
     let target = prepare_target(cfg, target).await?;
     match cfg.kind {
         ProxyKind::None => Ok(match target {
-            ProxyTarget::Addr(a) => TcpStream::connect(a).await?,
-            ProxyTarget::Host(h, p) => TcpStream::connect((h.as_str(), p)).await?,
+            ProxyTarget::Addr(a) => {
+                audit::record(audit::Outbound::TcpConnect(a));
+                TcpStream::connect(a).await?
+            }
+            ProxyTarget::Host(h, p) => {
+                audit::record(audit::Outbound::Lookup(h.clone()));
+                TcpStream::connect((h.as_str(), p)).await?
+            }
         }),
         ProxyKind::Socks5 => {
             let mut s = dial_proxy(cfg).await?;
@@ -261,6 +268,7 @@ async fn prepare_target(cfg: &ProxyConfig, target: ProxyTarget) -> Result<ProxyT
     if cfg.kind == ProxyKind::None || cfg.proxy_hostnames {
         return Ok(ProxyTarget::Host(host, port));
     }
+    audit::record(audit::Outbound::Lookup(host.clone()));
     match tokio::net::lookup_host((host.as_str(), port)).await?.next() {
         Some(a) => Ok(ProxyTarget::Addr(a)),
         None => Err(ProxyError::Io(io::Error::new(
@@ -278,7 +286,21 @@ fn is_host_byte(b: u8) -> bool {
 async fn dial_proxy(cfg: &ProxyConfig) -> Result<TcpStream, ProxyError> {
     cfg.validate()
         .map_err(|_| ProxyError::Protocol("invalid proxy configuration"))?;
+    audit::record(dial_outbound(&cfg.host, cfg.port));
     Ok(TcpStream::connect((cfg.host.as_str(), cfg.port)).await?)
+}
+
+/// The record of a dial to `host`: the connect for an IP literal, the lookup
+/// for a name. The proxy's own name is the one a proxied session looks up.
+fn dial_outbound(host: &str, port: u16) -> audit::Outbound {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<IpAddr>() {
+        Ok(ip) => audit::Outbound::TcpConnect(SocketAddr::new(ip, port)),
+        Err(_) => audit::Outbound::Lookup(host.to_owned()),
+    }
 }
 
 /// A SOCKS5 UDP association: datagrams framed with [`encode_udp`] and sent to

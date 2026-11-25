@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use fbt_core::audit;
 use fbt_net::addr::is_internal;
 use fbt_net::proxy::{ProxyConfig, ProxyKind, ProxyTarget, connect_tcp};
 use hyper::Uri;
@@ -79,6 +80,7 @@ impl Resolution {
                 }
             };
         }
+        audit::record(audit::Outbound::Lookup(host.to_owned()));
         let found = tokio::net::lookup_host((host, port)).await?;
         if !deny_internal {
             // Nothing is judged: every answer stays dialable, as it always was.

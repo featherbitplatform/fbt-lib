@@ -12,6 +12,7 @@ mod xml;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use fbt_core::audit;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
@@ -210,6 +211,7 @@ async fn search(ssdp: SocketAddr, http_timeout: Duration) -> Result<Igd, UpnpErr
     let mut last_rejection = None;
     for _ in 0..SEARCH_ROUNDS {
         for st in SEARCH_TARGETS {
+            audit::record(audit::Outbound::UdpSend(ssdp));
             if let Err(e) = sock.send_to(&ssdp::search_request(st), ssdp).await {
                 tracing::debug!("ssdp send failed: {e}");
             }
