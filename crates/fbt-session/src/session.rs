@@ -12,7 +12,6 @@ use fbt_metainfo::{Magnet, Metainfo};
 use fbt_net::demux::{DemuxStats, SharedUdpSocket};
 use fbt_net::ipfilter::IpFilter;
 use fbt_net::proxy::{ProxyKind, Socks5Udp, udp_associate};
-use fbt_utp::UtpSocket;
 use fbt_wire::req2_hash;
 use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -285,12 +284,6 @@ impl Shared {
         self.net_gen.send_replace(stack.generation);
     }
 
-    /// The uTP socket to dial `peer` from: the first of its address family,
-    /// as for the DHT and UDP trackers. `None` without one.
-    pub(crate) fn utp_for(&self, peer: &SocketAddr) -> Option<UtpSocket> {
-        self.net().utp_for(peer)
-    }
-
     pub(crate) fn emit(&self, ev: Event) {
         // No subscribers is fine.
         let _ = self.events.send(ev);
@@ -461,6 +454,11 @@ pub(crate) struct SessionInner {
     /// runtime changes apply one after the other and one never races the
     /// shutdown.
     change: tokio::sync::Mutex<()>,
+    /// The DHT's state to hand to the next stack: the session's
+    /// [`Settings::dht_state`] at first, then whatever the last stack's DHT
+    /// gave up. Kept here (not in the settings) so a change that fails
+    /// after the old stack is gone still carries it to the next attempt.
+    dht_state: Mutex<Option<Vec<u8>>>,
 }
 
 impl SessionInner {
@@ -688,6 +686,7 @@ impl SessionInner {
     fn wire(self: &Arc<Self>, stack: &Arc<NetStack>) {
         let shared = &self.shared;
         let stop = stack.stop_receiver();
+        let generation = stack.generation;
         let mut tasks: Vec<JoinHandle<()>> = stack
             .take_tcp()
             .into_iter()
@@ -697,6 +696,7 @@ impl SessionInner {
                     Arc::clone(&self.listener_state),
                     Arc::downgrade(self),
                     Arc::clone(shared),
+                    generation,
                     stop.clone(),
                 )
             })
@@ -708,6 +708,7 @@ impl SessionInner {
                     Arc::clone(&self.listener_state),
                     Arc::downgrade(self),
                     Arc::clone(shared),
+                    generation,
                     stop.clone(),
                 )
             }));
@@ -760,19 +761,15 @@ impl SessionInner {
     /// 2. Shut the old stack down (its listeners, LSD, port mapping, DHT,
     ///    uTP and UDP sockets; the DHT's state is kept), dropping its
     ///    tracker client and connection pool.
-    /// 3. With `close_tcp` (the proxy changed), every torrent closes its
-    ///    peers, web seed and tracker requests with
+    /// 3. With the proxy changed, every torrent closes its peers, web seed
+    ///    and tracker requests with
     ///    [`DisconnectReason::NetworkChanged`](crate::DisconnectReason::NetworkChanged),
     ///    awaited as
     ///    [`set_ip_filter`](Session::set_ip_filter) awaits `filter_changed`.
     /// 4. Build the new stack for the next generation on the addresses the
     ///    old one had bound (so the listen ports stay) and install it.
     /// 5. Every torrent re-announces to its trackers and the DHT at once.
-    async fn rebuild(
-        self: &Arc<Self>,
-        net: NetworkSettings,
-        close_tcp: bool,
-    ) -> Result<(), SessionError> {
+    async fn rebuild(self: &Arc<Self>, net: NetworkSettings) -> Result<(), SessionError> {
         // The proxy's own rules, and every transport off, are checked here
         // as `Session::new` checks them, on the settings the session would
         // have.
@@ -783,8 +780,28 @@ impl SessionInner {
         if self.shared.is_shutdown() {
             return Err(SessionError::Shutdown);
         }
+        // Both decisions are made under the lock, against the value stored
+        // now: a concurrent change may have applied (and may have left the
+        // closed stack installed) since the caller read it.
+        let current = self.network();
+        // Setting the value the session already has is a no-op only while
+        // the stack that value describes is the live one: after a change
+        // that failed, the closed stack is still installed and the value
+        // has to be applied again to get a network back.
+        if current == net && !self.shared.net().closed {
+            return Ok(());
+        }
+        // With the proxy changed, every connection must be redialled through
+        // the new one; without it, only the connections still being
+        // established are closed (a connected TCP peer keeps running).
+        let close_tcp = current.proxy != net.proxy;
         let old = self.shared.net();
-        let generation = old.generation + 1;
+        // The closed stack gets a generation of its own, and the new stack
+        // the one after: anything stamped on the closed stack (a dial or an
+        // accepted connection that read it) is then older than the current
+        // generation and is closed.
+        let closed_generation = old.generation + 1;
+        let generation = closed_generation + 1;
         // The addresses the old stack had bound, so a rebuild keeps the
         // listen ports (a closed stack has none, so fall back to the
         // settings: the retry after a failed change rebinds them).
@@ -792,11 +809,21 @@ impl SessionInner {
         if addrs.is_empty() {
             addrs = self.shared.settings.listen_addrs.clone();
         }
-        let dht_state = self.shared.settings.dht_state.clone();
         // 1. A closed stack first: nothing more uses the old one.
-        self.shared.set_net(Arc::new(NetStack::closed(generation)));
-        // 2. Tear the old one down, keeping the DHT's state for the new one.
-        let kept_dht = old.shutdown().await.or(dht_state);
+        self.shared
+            .set_net(Arc::new(NetStack::closed(closed_generation)));
+        // 2. Tear the old one down, keeping the DHT's state for the new one
+        // (and for a later attempt, if this one fails).
+        let stored = self
+            .dht_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let kept_dht = old.shutdown().await.or(stored);
+        *self
+            .dht_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = kept_dht.clone();
         // 3. With the proxy gone or changed, the connections of older
         // generations are closed at once (handshaking and dialling ones
         // included, through the generation they recorded).
@@ -939,7 +966,8 @@ impl Session {
         let addrs = settings.listen_addrs.clone();
         let dht_state = settings.dht_state.clone();
         let relay = relay_socket(&settings).await?;
-        let stack = Arc::new(NetStack::build(&settings, &net, &addrs, dht_state, 1, relay).await?);
+        let stack =
+            Arc::new(NetStack::build(&settings, &net, &addrs, dht_state.clone(), 1, relay).await?);
         let (net_gen, _) = watch::channel(1u64);
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
@@ -967,6 +995,7 @@ impl Session {
             registry: Mutex::new(Registry::default()),
             listeners: Mutex::new(Vec::new()),
             change: tokio::sync::Mutex::new(()),
+            dht_state: Mutex::new(dht_state),
         });
         // The accept loops, LSD and port-mapping routers and the watchers,
         // all stopped with the stack (or the session).
@@ -1006,14 +1035,7 @@ impl Session {
         if self.inner.shared.is_shutdown() {
             return Err(SessionError::Shutdown);
         }
-        if self.inner.network() == net {
-            return Ok(());
-        }
-        // With the proxy changed, every connection must be redialled through
-        // the new one; without it, only the connections still being
-        // established are closed (a connected TCP peer keeps running).
-        let close_tcp = self.inner.network().proxy != net.proxy;
-        self.inner.rebuild(net, close_tcp).await
+        self.inner.rebuild(net).await
     }
 
     /// BEP 55 holepunch activity so far, over every torrent: `Rendezvous`

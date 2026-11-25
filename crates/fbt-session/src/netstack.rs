@@ -292,17 +292,15 @@ impl NetStack {
     }
 
     /// Stops this stack: signals its tasks (releasing the listeners) and
-    /// waits for them, then shuts LSD, port mapping, the DHT (returning its
-    /// state for the next stack), uTP and the UDP sockets down. Waiting for
-    /// the tasks is what frees the listen ports for the next stack to bind
-    /// again.
+    /// waits for them, takes the DHT's state for the next stack, then stops
+    /// the DHT and uTP (each of which would otherwise keep sending from
+    /// this stack's own address) and finally LSD, port mapping and the UDP
+    /// sockets under them. Waiting for the tasks is what frees the listen
+    /// ports for the next stack to bind again.
     pub(crate) async fn shutdown(&self) -> Option<Vec<u8>> {
         self.stop_tasks().await;
-        self.lsd.shutdown().await;
-        // Bounded (2 s in all): an unreachable router never holds us up.
-        if let Some(pm) = &self.portmap {
-            pm.shutdown().await;
-        }
+        // The DHT's state goes with us; the DHT itself stops at once, so
+        // nothing keeps querying directly through the change.
         let dht_state = match &self.dht {
             Some(dht) => dht.state().await.ok().map(|s| s.to_bytes()),
             None => None,
@@ -310,10 +308,15 @@ impl NetStack {
         if let Some(dht) = &self.dht {
             dht.shutdown().await;
         }
-        // The peers are gone; the uTP sockets stop before the UDP sockets
-        // under them close.
+        // uTP (and so its UDP socket) stops before LSD and port mapping,
+        // which are the slow, unroutable ones.
         for u in &self.utp {
             u.shutdown().await;
+        }
+        self.lsd.shutdown().await;
+        // Bounded (2 s in all): an unreachable router never holds us up.
+        if let Some(pm) = &self.portmap {
+            pm.shutdown().await;
         }
         for u in &self.udp {
             u.close();

@@ -10,7 +10,7 @@ mod fake_socks5;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fake_socks5::{FakeSocks5, Script};
@@ -21,7 +21,7 @@ use fbt_session::{
     Session, SessionError, Settings, TorrentHandle, TorrentState,
 };
 use support::*;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
@@ -388,6 +388,253 @@ async fn removing_proxy_restores_direct() {
     );
     l.session.shutdown().await;
     seed.shutdown().await;
+}
+
+/// A walk stuck on a hung tracker keeps the client it started with: after
+/// a proxy is set while it hangs, it must move on to the next tier through
+/// the proxy, never by dialling it directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tracker_walk_in_progress_moves_to_proxy() {
+    let fake = Arc::new(FakeSocks5::start(Script::Ok).await);
+
+    // Tier 1 accepts the announce and never answers: the walk hangs there.
+    let tier1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tier1_addr = tier1.local_addr().unwrap();
+    let (asked_tx, asked_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut s, _) = tier1.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = s.read(&mut buf).await;
+        let _ = asked_tx.send(());
+        // Holds the connection open, never answering.
+        while let Ok(n) = s.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+
+    // Tier 2 records, per request, whether the proxy relayed it: the fake
+    // records its CONNECT before it answers the greeting, and the client
+    // sends its request only after that, so reading the request first and
+    // then asking the fake is race-free.
+    let tier2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tier2_addr = tier2.local_addr().unwrap();
+    let relayed = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let seen = Arc::clone(&relayed);
+    let by_proxy = Arc::clone(&fake);
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = tier2.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let relayed = by_proxy.connects().contains(&tier2_addr.to_string());
+            seen.lock().unwrap().push(relayed);
+        }
+    });
+
+    let (mut m, payload) = torrent();
+    m.trackers = vec![
+        vec![format!("http://{tier1_addr}/announce")],
+        vec![format!("http://{tier2_addr}/announce")],
+    ];
+    let mut st = settings();
+    // Tier 1 never answers, so the walk gives up on it quickly: the move
+    // to tier 2 (directly, with the bug) happens within the test's
+    // patience.
+    st.tracker.http_timeout = Duration::from_millis(600);
+    let (seed, _) = seeder_with(st, &m, &payload).await;
+    tokio::time::timeout(T, asked_rx)
+        .await
+        .expect("tier 1 was never asked")
+        .unwrap();
+
+    // Set the proxy while the walk is in flight on tier 1.
+    let mut net = seed.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    seed.set_network_settings(net).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + T;
+    while relayed.lock().unwrap().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tier 2 was never asked after the change"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let records = relayed.lock().unwrap().clone();
+    assert!(
+        records.iter().all(|r| *r),
+        "the walk reached tier 2 directly: {records:?}"
+    );
+    seed.shutdown().await;
+}
+
+/// A connection accepted on the direct listener whose handshake is still
+/// arriving when a proxy is set must not end up as a direct peer: the
+/// routing task reading it goes with the stack it was accepted on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incoming_handshake_in_progress_is_closed_on_proxy_change() {
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let (m, payload) = torrent();
+    let (srv, _) = seeder(&m, &payload).await;
+    let mut events = srv.subscribe(EventMask::ALL);
+    let addr = srv.local_addr();
+
+    // Half a BitTorrent handshake for the seeding torrent.
+    let mut hs = Vec::new();
+    hs.push(19u8);
+    hs.extend_from_slice(b"BitTorrent protocol");
+    hs.extend_from_slice(&[0u8; 8]);
+    hs.extend_from_slice(&m.info_hashes.wire_hash());
+    hs.extend_from_slice(&[0x11; 20]);
+    let mut client = TcpStream::connect(addr).await.expect("connect");
+    client.write_all(&hs[..28]).await.expect("half a handshake");
+    // The listener has accepted and is mid-handshake.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut net = srv.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    srv.set_network_settings(net).await.unwrap();
+
+    // The rest of the handshake arrives after the change: the connection
+    // must not survive it.
+    let _ = client.write_all(&hs[28..]).await;
+    let mut buf = [0u8; 68];
+    match tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("the direct handshake finished after the change ({n} bytes)"),
+        Err(_) => panic!("the connection was left open across the change"),
+    }
+    assert!(
+        next_matching(
+            &mut events,
+            |e| matches!(e, Event::PeerConnected { .. }),
+            Duration::from_secs(1)
+        )
+        .await
+        .is_none(),
+        "a direct peer connected across the change"
+    );
+    srv.shutdown().await;
+}
+
+/// Two proxy changes at once, the second putting back the value the session
+/// had before the first. Everything the second decides from "the value the
+/// session has now" — whether it is a no-op at all, and whether the proxy
+/// changed — must be read from the value stored under the change lock, not
+/// from the one its caller read on the way in. Read outside, the no-op
+/// shortcut sees the pre-change value, treats the restore as a no-op and
+/// leaves the session on the proxy-less stack the first change installed:
+/// the caller set a proxy and the session kept connecting directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_proxy_changes_close_direct_peers() {
+    fn proxied(fake: &FakeSocks5, seed: &str) -> usize {
+        fake.connects().iter().filter(|c| **c == seed).count()
+    }
+
+    let fake = FakeSocks5::start(Script::Ok).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, fake.addr());
+    // A byte-per-second limit on loopback peers keeps the download from
+    // finishing: a finished leecher drops its seed (BEP 21 upload-only)
+    // before the change after it could redial it.
+    st.rate_limit = RateLimit::new(1, 1);
+    st.rate_limit_local_peers = true;
+
+    let (m, payload) = torrent();
+    let (seed, _) = seeder(&m, &payload).await;
+
+    // The leecher starts with the proxy on: its only peer is connected
+    // through it.
+    let mut l = leecher(st, &m, payload.len()).await;
+    l.handle.add_peer(seed.local_addr()).await.unwrap();
+    assert!(
+        event_of(&mut l, |e| matches!(e, Event::PeerConnected { .. }), T)
+            .await
+            .is_some(),
+        "the proxied connection never happened"
+    );
+    let seed_addr = seed.local_addr().to_string();
+    assert_eq!(
+        proxied(&fake, &seed_addr),
+        1,
+        "the first connection did not go through the proxy: {:?}",
+        fake.connects()
+    );
+
+    // A drops the proxy, so the session would dial the seed directly from
+    // then on; B puts the same value back. Both start before either applies:
+    // A takes the change first (and yields before storing), so B meets the
+    // value A stored, not the one it read on the way in.
+    let mut a = l.session.network_settings();
+    a.proxy = ProxyConfig::default();
+    let b = l.session.network_settings();
+    let (ra, rb) = tokio::join!(
+        l.session.set_network_settings(a),
+        l.session.set_network_settings(b.clone())
+    );
+    ra.unwrap();
+    rb.unwrap();
+    assert_eq!(
+        l.session.network_settings(),
+        b,
+        "the change that puts the proxy back was ignored"
+    );
+
+    // And the peer comes back through the proxy: whatever the first change
+    // connected directly is gone, so nothing stays connected directly while
+    // the proxy is set.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while proxied(&fake, &seed_addr) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the peer did not come back through the proxy: {:?}",
+            fake.connects()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    l.session.shutdown().await;
+    seed.shutdown().await;
+}
+
+/// A change whose new stack cannot be built leaves the session on the
+/// closed stack with nothing listening; setting the previous value again
+/// must rebuild the network rather than short-circuit as a no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_after_failed_change_restores_network() {
+    let s = Session::new(settings()).await.unwrap();
+    let good = s.network_settings();
+    assert_ne!(s.local_addr().port(), 0, "nothing listening to start with");
+
+    // A proxy address nothing listens on: the SOCKS5 association cannot be
+    // taken, so the change fails.
+    let dead = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let mut bad = good.clone();
+    bad.proxy = proxy(ProxyKind::Socks5, dead);
+    match s.set_network_settings(bad).await {
+        Err(SessionError::Proxy(_)) => {}
+        other => panic!("expected a proxy error, got {other:?}"),
+    }
+    // The stored value is unchanged, and the stack is the closed one (no
+    // listener).
+    assert_eq!(s.network_settings(), good, "the failed change was stored");
+    assert_eq!(
+        s.local_addr().port(),
+        0,
+        "the failed change left the stack open"
+    );
+
+    // Setting the previous value again must build the network back.
+    s.set_network_settings(good.clone()).await.unwrap();
+    assert_eq!(s.network_settings(), good);
+    assert_ne!(s.local_addr().port(), 0, "the session has no network");
+    TcpStream::connect(s.local_addr())
+        .await
+        .expect("not accepting again");
+    s.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

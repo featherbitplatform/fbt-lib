@@ -704,7 +704,14 @@ impl Actor {
     /// nothing to fetch or no room for it.
     fn start_web_seed(&mut self, key: PeerKey) -> bool {
         let generation = self.generation;
-        let tracker = self.shared.net().tracker.clone();
+        // One read of the stack, and nothing at all on a closed one (a
+        // change in flight): a request started now would take the closed
+        // stack's no-proxy default and look the seed's name up locally.
+        let stack = self.shared.net();
+        if stack.closed {
+            return false;
+        }
+        let tracker = stack.tracker.clone();
         let pace = self.web_seed_throttle.clone();
         let limit = pace.min_rate();
         let Some(l) = self.loaded.as_mut() else {
@@ -800,7 +807,6 @@ impl Actor {
         seed.request = seed.request.wrapping_add(1);
         let request = seed.request;
         let settings = &self.shared.settings;
-        let stack = self.shared.net();
         let origin = SeedOrigin {
             url: seed.url.clone(),
             treat_loopback_as_public: settings.web_seed_treat_loopback_as_public,
@@ -1401,6 +1407,32 @@ mod tests {
             Metainfo::from_bytes(&encode(&root.build())).unwrap(),
             payload,
         )
+    }
+
+    /// A web seed added while the network stack is closed (a change in
+    /// flight) starts nothing: no request, and so no local lookup of its
+    /// name.
+    #[tokio::test]
+    async fn no_web_seed_lookup_while_closed() {
+        let (meta, payload) = torrent(64 * 1024, 16 * 1024);
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::MemStorage::new(payload.len() as u64));
+        let mut actor = crate::torrent::data::tests::test_actor(meta, storage, 64 << 20);
+        actor
+            .shared
+            .set_net(Arc::new(crate::netstack::NetStack::closed(2)));
+        // A name only this host can resolve: asking for it would be a
+        // local lookup, which a closed stack must not cause.
+        actor
+            .add_web_seed("http://localhost:1/x/".to_owned())
+            .unwrap();
+        assert!(
+            matches!(actor.web_seeds.seeds[0].state, SeedState::Idle),
+            "a request was started while the stack was closed: {:?}",
+            actor.web_seeds.seeds[0].state
+        );
+        assert_eq!(actor.web_seeds.seeds[0].request, 0, "a request was made");
+        crate::torrent::actor::EMITTED.take();
     }
 
     /// A seed retired with a request in flight and revived at once: the

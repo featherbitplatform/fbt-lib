@@ -16,6 +16,7 @@ use super::peer::Peer;
 use super::retries::AfterFailure;
 use crate::bans::BlockReason;
 use crate::event::{Event, PeerSource};
+use crate::netstack::NetStack;
 use crate::peer::DisconnectReason;
 use crate::peer::conn::{PeerCtx, PeerStream, spawn_incoming, spawn_outgoing};
 use crate::peer::ext::ExtConfig;
@@ -69,12 +70,11 @@ impl Actor {
     // ----- connections ----------------------------------------------------------
 
     /// The context of a new peer task. Without metadata the task runs in
-    /// no-metadata mode (no layout, an empty `have`).
-    pub(super) fn ctx(&self, key: PeerKey, addr: &SocketAddr) -> PeerCtx {
-        // The stack is read once: the generation, the proxy and the
-        // addresses of the announcer all describe the same one, and the
-        // peer task notices a later change through `net_changed`.
-        let stack = self.shared.net();
+    /// no-metadata mode (no layout, an empty `have`). `stack` is the caller's
+    /// single read of the network stack: the generation, the proxy and the
+    /// addresses of the announcer all describe the same one, and the peer
+    /// task notices a later change through `net_changed`.
+    pub(super) fn ctx(&self, stack: &NetStack, key: PeerKey, addr: &SocketAddr) -> PeerCtx {
         let l = self.loaded.as_ref();
         let have = l.map_or_else(
             || Bitfield::new(0),
@@ -97,7 +97,7 @@ impl Actor {
             our_id: self.shared.peer_id,
             layout: l.map(|l| l.layout),
             have,
-            ext: self.ext_config(addr),
+            ext: self.ext_config(stack, addr),
             settings: Arc::clone(&self.shared.settings),
             events: self.peer_tx.clone(),
             encrypted: false,
@@ -113,11 +113,12 @@ impl Actor {
 
     /// What a connection to `addr` advertises. A torrent without metadata
     /// may be private; until it is known, PEX is advertised (the magnet
-    /// exception) when `pex_enabled`.
-    pub(super) fn ext_config(&self, addr: &SocketAddr) -> ExtConfig {
+    /// exception) when `pex_enabled`. `stack` is the caller's single read of
+    /// the network stack, so what is advertised matches the generation the
+    /// connection is stamped with.
+    pub(super) fn ext_config(&self, stack: &NetStack, addr: &SocketAddr) -> ExtConfig {
         // Known metadata, a v2-only torrent's waiting for layers included.
         let meta = self.known_meta();
-        let stack = self.shared.net();
         ExtConfig {
             listen_port: stack.listen_port_for(addr),
             metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),
@@ -255,19 +256,27 @@ impl Actor {
         release(&self.shared.global_peers);
     }
 
-    /// Dials `addr` over `transport` in slots already reserved.
+    /// Dials `addr` over `transport` in slots already reserved, on `stack`
+    /// (the caller's single read of the network stack). `None` when the
+    /// stack is closed (a change in flight): nothing must be dialled through
+    /// a stack the session no longer has, and the slots the caller reserved
+    /// are given back here, so the candidate stays queued for the new stack.
     fn spawn_dial(
         &mut self,
+        stack: &NetStack,
         addr: SocketAddr,
         transport: Transport,
         source: PeerSource,
-    ) -> PeerKey {
+    ) -> Option<PeerKey> {
+        if stack.closed {
+            return None;
+        }
         let utp = match transport {
-            Transport::Utp => self.shared.utp_for(&addr),
+            Transport::Utp => stack.utp_for(&addr),
             Transport::Tcp => None,
         };
         let key = self.new_key();
-        let ctx = self.ctx(key, &addr);
+        let ctx = self.ctx(stack, key, &addr);
         let net_generation = ctx.net_generation;
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();
@@ -278,12 +287,18 @@ impl Actor {
         peer.connecting = true;
         peer.have_sent = Some(have);
         self.peers.insert(key, peer);
-        key
+        Some(key)
     }
 
     /// Starts outgoing connections while every limit allows.
     pub(super) fn try_connect(&mut self) {
         while self.connectable() && !self.candidates.is_empty() {
+            // One read of the stack per dial, and nothing at all on a closed
+            // one: the candidate stays queued for the stack a change builds.
+            let stack = self.shared.net();
+            if stack.closed {
+                break;
+            }
             if !self.reserve_dial() {
                 break;
             }
@@ -319,13 +334,13 @@ impl Actor {
             let transport = self
                 .retries
                 .fallback_transport(&addr)
-                .or_else(|| self.first_transport(&addr));
+                .or_else(|| self.first_transport_in(&stack, &addr));
             let Some(transport) = transport else {
                 debug!(%addr, "no enabled transport can reach this address");
                 self.unreserve_dial();
                 continue;
             };
-            self.spawn_dial(addr, transport, source);
+            self.spawn_dial(&stack, addr, transport, source);
         }
     }
 
@@ -335,12 +350,14 @@ impl Actor {
     /// finished, or a limit is reached. Only this one attempt: see
     /// [`Peer::holepunch`]. Returns whether it dialled.
     pub(super) fn dial_holepunch(&mut self, addr: SocketAddr) -> bool {
+        // One read of the stack, and nothing on a closed one.
+        let stack = self.shared.net();
         if !self.connectable()
             || self.retries.is_never(&addr)
             || (self.upload_only_sent && self.seed_addrs.contains(&addr))
             || self.addr_busy(&addr)
             || self.metadata_ip_banned(&addr)
-            || !self.transport_usable(&addr, Transport::Utp)
+            || !self.transport_usable_in(&stack, &addr, Transport::Utp)
         {
             return false;
         }
@@ -352,7 +369,10 @@ impl Actor {
             return false;
         }
         debug!(%addr, "holepunch: dialling over uTP");
-        let key = self.spawn_dial(addr, Transport::Utp, PeerSource::Holepunch);
+        let Some(key) = self.spawn_dial(&stack, addr, Transport::Utp, PeerSource::Holepunch) else {
+            self.unreserve_dial();
+            return false;
+        };
         if let Some(p) = self.peers.get_mut(&key) {
             p.holepunch = true;
         }
@@ -402,13 +422,18 @@ impl Actor {
     /// The transport to dial `addr` over first: uTP when outgoing uTP is
     /// on, a UDP socket of the address's family exists and the address is
     /// not TCP-only (or a PEX `UTP` flag came for it since); otherwise TCP
-    /// when outgoing TCP is on. `None` when neither can reach it.
-    pub(super) fn first_transport(&self, addr: &SocketAddr) -> Option<Transport> {
+    /// when outgoing TCP is on. `None` when neither can reach it. `stack` is
+    /// the caller's read of the network stack.
+    pub(super) fn first_transport_in(
+        &self,
+        stack: &NetStack,
+        addr: &SocketAddr,
+    ) -> Option<Transport> {
         let tcp_only =
             self.retries.is_tcp_only(addr) && !self.known.get(addr).is_some_and(|k| k.utp);
-        if self.transport_usable(addr, Transport::Utp) && !tcp_only {
+        if self.transport_usable_in(stack, addr, Transport::Utp) && !tcp_only {
             Some(Transport::Utp)
-        } else if self.transport_usable(addr, Transport::Tcp) {
+        } else if self.transport_usable_in(stack, addr, Transport::Tcp) {
             Some(Transport::Tcp)
         } else {
             None
@@ -419,8 +444,7 @@ impl Actor {
     /// `addr`'s family exists. The stack's applied switches decide (the
     /// stored ones may differ, e.g. outgoing uTP off under an HTTP proxy).
     /// The closed stack of a change in flight can reach nothing.
-    fn transport_usable(&self, addr: &SocketAddr, t: Transport) -> bool {
-        let stack = self.shared.net();
+    fn transport_usable_in(&self, stack: &NetStack, addr: &SocketAddr, t: Transport) -> bool {
         if stack.closed {
             return false;
         }
@@ -428,6 +452,13 @@ impl Actor {
             Transport::Tcp => self.shared.settings.enable_outgoing_tcp,
             Transport::Utp => stack.net.enable_outgoing_utp && stack.utp_for(addr).is_some(),
         }
+    }
+
+    /// [`transport_usable_in`](Self::transport_usable_in) reading the stack
+    /// itself.
+    fn transport_usable(&self, addr: &SocketAddr, t: Transport) -> bool {
+        let stack = self.shared.net();
+        self.transport_usable_in(&stack, addr, t)
     }
 
     /// `addr`'s IP sent bad metadata and the metadata is still pending.
@@ -452,7 +483,16 @@ impl Actor {
         stream: PeerStream,
         hs: fbt_wire::Handshake,
         addr: SocketAddr,
+        generation: u64,
     ) {
+        // One read of the stack; a connection accepted on one the session
+        // has since replaced (a change in flight) is dropped, not resumed on
+        // the new stack.
+        let stack = self.shared.net();
+        if generation < stack.generation {
+            debug!(%addr, "incoming connection accepted on a replaced stack; dropping");
+            return;
+        }
         let s = &self.shared.settings;
         // While announced: through the check after a magnet's metadata too,
         // which keeps the peers it has (they catch up when it ends).
@@ -476,14 +516,16 @@ impl Actor {
             return;
         }
         let key = self.new_key();
-        let mut ctx = self.ctx(key, &addr);
+        let mut ctx = self.ctx(&stack, key, &addr);
         // The hash the peer named (v1 or truncated v2: the listener found
         // this torrent by it) is the one we answer with.
         ctx.info_hash = hs.info_hash;
         ctx.encrypted = stream.is_encrypted();
         ctx.transport = stream.get_ref().kind();
         let transport = ctx.transport;
-        let net_generation = ctx.net_generation;
+        // The accept-time generation, not this read's: the connection
+        // belongs to the stack it arrived on.
+        ctx.net_generation = generation;
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();
         let tx = spawn_incoming(stream, hs, addr, ctx);
@@ -495,7 +537,7 @@ impl Actor {
             transport,
             PeerSource::Incoming,
         );
-        peer.net_generation = net_generation;
+        peer.net_generation = generation;
         peer.have_sent = Some(have);
         self.peers.insert(key, peer);
     }
@@ -1019,6 +1061,38 @@ pub(super) mod tests {
         a.phase = Phase::Ready;
         a.paused = false;
         a
+    }
+
+    /// A dial whose stack snapshot is the closed stack of a change in
+    /// flight must not connect: the closed stack knows no proxy, so a
+    /// connection made on it goes direct. The queued address is kept for
+    /// the new stack.
+    #[tokio::test]
+    async fn no_dial_on_the_closed_stack() {
+        let mut a = actor_with(&[16_384], 16_384, 0);
+        a.shared
+            .set_net(Arc::new(crate::netstack::NetStack::closed(2)));
+        // A dial handed the closed stack's snapshot.
+        let stack = a.shared.net();
+        assert!(
+            a.spawn_dial(
+                &stack,
+                addr(1),
+                Transport::Tcp,
+                crate::event::PeerSource::Tracker
+            )
+            .is_none(),
+            "a dial was started on the closed stack"
+        );
+        assert!(a.peers.is_empty(), "a dial was started on the closed stack");
+        // A queued address stays queued for the new stack.
+        a.on_found_peers(crate::event::PeerSource::Tracker, vec![addr(2)]);
+        assert!(a.peers.is_empty(), "a dial was started on the closed stack");
+        assert_eq!(
+            a.candidates.len(),
+            1,
+            "the address was dropped instead of kept for the new stack"
+        );
     }
 
     /// A TCP connection that got through after a failed uTP connect clears

@@ -118,6 +118,10 @@ pub(crate) enum Cmd {
         stream: Box<PeerStream>,
         handshake: Handshake,
         addr: SocketAddr,
+        /// The network stack generation the connection was accepted on
+        /// (stamped at accept, not read here): an accept must not be
+        /// attributed to a stack that has since been replaced.
+        generation: u64,
     },
     Shutdown(oneshot::Sender<()>),
     /// Stops as `Shutdown` does, then answers with the resume data.
@@ -745,12 +749,15 @@ impl TorrentHandle {
     }
 
     /// Hands an accepted connection to the actor without waiting; false if
-    /// its queue is full or it is gone.
+    /// its queue is full or it is gone. `generation` is the stack the
+    /// connection was accepted on; the actor drops it if the session has
+    /// moved on.
     pub(crate) fn offer_incoming(
         &self,
         stream: PeerStream,
         handshake: Handshake,
         addr: SocketAddr,
+        generation: u64,
     ) -> bool {
         self.inner
             .cmds
@@ -758,6 +765,7 @@ impl TorrentHandle {
                 stream: Box::new(stream),
                 handshake,
                 addr,
+                generation,
             })
             .is_ok()
     }

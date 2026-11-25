@@ -481,4 +481,6 @@ async fn detail_methods(s: &Session, h: &TorrentHandle) {
     let _: PeerClassLimits = s.peer_class_limits();
     let _: QueueSettings = s.queue_settings();
     let _: bool = s.is_shut_down();
+    let _: NetworkSettings = s.network_settings();
+    let _: Result<(), SessionError> = s.set_network_settings(NetworkSettings::default()).await;
 }
