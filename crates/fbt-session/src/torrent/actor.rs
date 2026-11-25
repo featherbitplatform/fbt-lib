@@ -514,22 +514,10 @@ impl Actor {
         })
         .unzip();
         // A magnet's privacy is unknown yet: it runs one until it is known.
-        let private = loaded.as_ref().is_some_and(|l| l.meta.info.private);
-        let (dht_announcer, dht_rx) = shared
-            .dht
-            .clone()
-            .filter(|_| !private)
-            .map(|dht| {
-                dht::spawn(DhtParams {
-                    dht,
-                    info_hashes: wire_hashes(&ih),
-                    port: shared.listen_port,
-                    interval: shared.settings.dht_announce_interval,
-                    signals: signals.subscribe(),
-                    status: status_tx.subscribe(),
-                })
-            })
-            .unzip();
+        // The DHT announcer is started after the actor is built (it reads
+        // the current stack, see `restart_dht_announcer`).
+        let dht_announcer = None;
+        let dht_rx = None;
         let cache = PieceCache::new(Arc::clone(&shared.cache), shared.settings.cache_expiry);
         let piece_reads = PieceReads::new(Arc::clone(&shared.cache));
         let mut actor = Actor {
@@ -625,7 +613,39 @@ impl Actor {
         if actor.loaded.is_none() {
             actor.last_state = actor.state();
         }
+        // The DHT announcer of the current stack (none when the torrent is
+        // private or the DHT is off).
+        actor.restart_dht_announcer();
         actor
+    }
+
+    /// (Re)starts the DHT announcer on the current stack: drops the old one
+    /// (aborting its tasks) and spawns one for the stack's DHT, unless the
+    /// torrent is (known to be) private. A stack change brings a new DHT,
+    /// so the announcer is rebuilt with it; a fresh one announces at once
+    /// (it has no last-announce time yet).
+    pub(super) fn restart_dht_announcer(&mut self) {
+        let stack = self.shared.net();
+        let (announcer, rx) = if self.is_private() {
+            (None, None)
+        } else {
+            stack
+                .dht
+                .clone()
+                .map(|dht| {
+                    dht::spawn(DhtParams {
+                        dht,
+                        info_hashes: wire_hashes(&self.ih),
+                        port: stack.listen_port,
+                        interval: self.shared.settings.dht_announce_interval,
+                        signals: self.signals.subscribe(),
+                        status: self.status_tx.subscribe(),
+                    })
+                })
+                .unzip()
+        };
+        self.dht_announcer = announcer;
+        self.dht_rx = rx;
     }
 
     pub(super) async fn run(mut self) {
@@ -1161,6 +1181,7 @@ impl Actor {
     fn lsd_tick(&self) {
         if self.connectable() && !self.is_private() {
             self.shared
+                .net()
                 .lsd
                 .want(&wire_hashes(&self.ih), std::time::Instant::now());
         }

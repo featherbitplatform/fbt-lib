@@ -266,7 +266,6 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
                 info_hash,
                 scrapes: info_hash == scrape_hash,
                 key,
-                client: p.shared.tracker.clone(),
                 tiers: tiers.clone(),
                 shared: Arc::clone(&p.shared),
                 status: p.status.clone(),
@@ -310,7 +309,6 @@ struct Task {
     /// wire hash.
     scrapes: bool,
     key: u32,
-    client: TrackerClient,
     tiers: Tiers,
     shared: Arc<Shared>,
     status: watch::Receiver<TorrentStatus>,
@@ -413,8 +411,13 @@ impl Task {
             if self.scrapes && !sig.exit && sig.scrapes != self.scrapes_seen {
                 self.scrapes_seen = sig.scrapes;
                 let urls = self.tiers.firsts();
+                // The current stack's tracker client, read at each use: a
+                // stack change replaces it whole (with its connection pool
+                // and its proxy), so a request is never sent through a stack
+                // the session no longer has.
+                let client = self.shared.net().tracker.clone();
                 self.scrape = Some(start_scrape(
-                    &self.client,
+                    &client,
                     &self.shared,
                     self.ih,
                     self.info_hash,
@@ -548,8 +551,9 @@ impl Task {
         let req = self.request_template(event, checking_left);
         // Where a scrape asked for during the walk goes.
         let scrape_urls = self.tiers.firsts();
+        let client = self.shared.net().tracker.clone();
         let walk = walk(
-            &self.client,
+            &client,
             &mut self.tiers,
             req,
             started_urls,
@@ -588,8 +592,9 @@ impl Task {
                     }
                     if self.scrapes && now.scrapes != self.scrapes_seen {
                         self.scrapes_seen = now.scrapes;
+                        let client = self.shared.net().tracker.clone();
                         self.scrape = Some(start_scrape(
-                            &self.client,
+                            &client,
                             &self.shared,
                             self.ih,
                             self.info_hash,
@@ -606,13 +611,14 @@ impl Task {
     /// is [`NO_METADATA_LEFT`], `stopped` included.
     fn request_template(&self, event: AnnounceEvent, checking_left: u64) -> AnnounceRequest {
         let st = self.status.borrow();
+        let stack = self.shared.net();
         let left = announce_left(&st, checking_left);
         AnnounceRequest {
             info_hash: self.info_hash,
             peer_id: self.shared.peer_id,
-            port: self.shared.listen_port,
-            port_v4: self.shared.listen_port_v4,
-            port_v6: self.shared.listen_port_v6,
+            port: stack.listen_port,
+            port_v4: stack.listen_port_v4,
+            port_v6: stack.listen_port_v6,
             uploaded: st.total_uploaded,
             downloaded: st.total_downloaded,
             left,
@@ -633,7 +639,7 @@ impl Task {
         for url in urls {
             let mut req = request_for(url, &base, &self.tracker_ids);
             req.num_want = Some(0);
-            let client = self.client.clone();
+            let client = self.shared.net().tracker.clone();
             let task_url = url.clone();
             let handle = set.spawn(async move {
                 let r = client.announce(&task_url, &req).await;

@@ -704,7 +704,7 @@ impl Actor {
     /// nothing to fetch or no room for it.
     fn start_web_seed(&mut self, key: PeerKey) -> bool {
         let generation = self.generation;
-        let tracker = self.shared.tracker.clone();
+        let tracker = self.shared.net().tracker.clone();
         let pace = self.web_seed_throttle.clone();
         let limit = pace.min_rate();
         let Some(l) = self.loaded.as_mut() else {
@@ -800,10 +800,11 @@ impl Actor {
         seed.request = seed.request.wrapping_add(1);
         let request = seed.request;
         let settings = &self.shared.settings;
+        let stack = self.shared.net();
         let origin = SeedOrigin {
             url: seed.url.clone(),
             treat_loopback_as_public: settings.web_seed_treat_loopback_as_public,
-            proxy_resolves_names: names_go_to_the_proxy(&settings.proxy),
+            proxy_resolves_names: names_go_to_the_proxy(&stack.net.proxy),
             dns_timeout: settings.tracker.http_timeout,
             known: seed.allow_internal,
         };

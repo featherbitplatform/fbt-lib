@@ -588,12 +588,9 @@ impl Actor {
 pub(super) mod tests {
     use std::net::SocketAddr;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{OnceLock, Weak};
 
-    use fbt_core::PeerId;
-    use fbt_tracker::TrackerClient;
-    use tokio::sync::{broadcast, mpsc, watch};
+    use tokio::sync::{mpsc, watch};
 
     use super::*;
     use crate::session::{AddTorrent, Priority, Shared};
@@ -619,33 +616,13 @@ pub(super) mod tests {
             cache_expiry: std::time::Duration::from_secs(600),
             ..Settings::default()
         };
-        let tracker = TrackerClient::new(settings.tracker.clone()).expect("tracker client");
-        let shared = Arc::new(Shared {
-            settings: Arc::new(settings),
-            peer_id: PeerId::generate(),
-            listen_port: 6881,
-            listen_port_v4: Some(6881),
-            listen_port_v6: None,
-            tracker,
-            events: broadcast::channel(64).0,
-            shutdown: AtomicBool::new(false),
-            global_peers: AtomicUsize::new(0),
-            half_open: AtomicUsize::new(0),
-            dht: None,
-            dht_addrs: Vec::new(),
-            utp: Vec::new(),
-            disk: crate::disk::DiskPool::new(1, 1),
-            cache: Arc::new(crate::storage::cache::CacheBudget::new(cache_size)),
-            bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
-            holepunch: Default::default(),
-            lsd: crate::net::LsdHub::disabled(),
-            portmap: None,
-            external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
-            ip_filter: Default::default(),
-            bans: Default::default(),
-            queue: Default::default(),
-            queue_dirty: Default::default(),
-        });
+        let stack = Arc::new(crate::netstack::NetStack::offline(
+            &settings,
+            6881,
+            Some(6881),
+            None,
+        ));
+        let shared = Shared::test(settings, stack, cache_size);
         let mut add = AddTorrent::new(meta, PathBuf::from("unused"));
         add.storage = Some(Arc::clone(&storage));
         let ih = add.source.info_hashes();

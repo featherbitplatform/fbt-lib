@@ -545,6 +545,39 @@ impl Settings {
         self.read_ahead.validate()
     }
 
+    /// The runtime network settings this session starts with: the proxy and
+    /// the proxy-related switches (`dht_enabled`, `enable_lsd`,
+    /// `enable_upnp`, `enable_natpmp`, `enable_incoming_tcp`,
+    /// `enable_incoming_utp`, `enable_outgoing_utp`). The inverse of
+    /// [`set_network`](Self::set_network); what
+    /// [`Session::network_settings`](crate::Session::network_settings)
+    /// reports.
+    pub fn network(&self) -> NetworkSettings {
+        NetworkSettings {
+            proxy: self.proxy.clone(),
+            dht_enabled: self.dht_enabled,
+            enable_lsd: self.enable_lsd,
+            enable_upnp: self.enable_upnp,
+            enable_natpmp: self.enable_natpmp,
+            enable_incoming_tcp: self.enable_incoming_tcp,
+            enable_incoming_utp: self.enable_incoming_utp,
+            enable_outgoing_utp: self.enable_outgoing_utp,
+        }
+    }
+
+    /// Assigns the fields [`network`](Self::network) reads; everything else
+    /// is left as it is.
+    pub fn set_network(&mut self, net: NetworkSettings) {
+        self.proxy = net.proxy;
+        self.dht_enabled = net.dht_enabled;
+        self.enable_lsd = net.enable_lsd;
+        self.enable_upnp = net.enable_upnp;
+        self.enable_natpmp = net.enable_natpmp;
+        self.enable_incoming_tcp = net.enable_incoming_tcp;
+        self.enable_incoming_utp = net.enable_incoming_utp;
+        self.enable_outgoing_utp = net.enable_outgoing_utp;
+    }
+
     /// The enabled features that send from the real address whatever
     /// [`proxy`](Self::proxy) says; empty without a proxy. Under an HTTP
     /// proxy (or a SOCKS5 one that carries neither peers nor trackers, so
@@ -686,9 +719,78 @@ impl Default for Settings {
     }
 }
 
+/// The network settings a session can change while it runs: the
+/// [`Settings::proxy`] and exactly the switches that decide whether traffic
+/// goes through it ([`Settings::dht_enabled`], [`Settings::enable_lsd`],
+/// [`Settings::enable_upnp`], [`Settings::enable_natpmp`],
+/// [`Settings::enable_incoming_tcp`], [`Settings::enable_incoming_utp`],
+/// [`Settings::enable_outgoing_utp`]).
+///
+/// [`Session::set_network_settings`](crate::Session::set_network_settings)
+/// applies a value at once, rebuilding the session's network stack: listeners
+/// and UDP sockets are rebound on the same ports, and with a different
+/// [`proxy`](Self::proxy) every peer connection, web seed request and tracker
+/// request of the old stack is closed with
+/// [`DisconnectReason::NetworkChanged`](crate::DisconnectReason::NetworkChanged).
+/// [`Settings::network`] and [`Settings::set_network`] convert to and from
+/// the flat [`Settings`] fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[non_exhaustive]
+pub struct NetworkSettings {
+    /// The proxy, as [`Settings::proxy`].
+    pub proxy: ProxyConfig,
+    /// Run a DHT node, as [`Settings::dht_enabled`].
+    pub dht_enabled: bool,
+    /// Local service discovery, as [`Settings::enable_lsd`].
+    pub enable_lsd: bool,
+    /// UPnP port mapping, as [`Settings::enable_upnp`].
+    pub enable_upnp: bool,
+    /// NAT-PMP/PCP port mapping, as [`Settings::enable_natpmp`].
+    pub enable_natpmp: bool,
+    /// Accept incoming TCP connections, as
+    /// [`Settings::enable_incoming_tcp`].
+    pub enable_incoming_tcp: bool,
+    /// Accept incoming uTP connections, as
+    /// [`Settings::enable_incoming_utp`].
+    pub enable_incoming_utp: bool,
+    /// Dial peers over uTP, as [`Settings::enable_outgoing_utp`].
+    pub enable_outgoing_utp: bool,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Settings::default().network()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_round_trips_through_settings() {
+        let mut s = Settings {
+            dht_enabled: false,
+            enable_lsd: false,
+            enable_upnp: false,
+            enable_natpmp: false,
+            enable_incoming_tcp: false,
+            enable_incoming_utp: false,
+            enable_outgoing_utp: false,
+            ..Settings::default()
+        };
+        s.proxy.kind = ProxyKind::Socks5;
+        s.proxy.host = "proxy.example".to_owned();
+        let net = s.network();
+        let mut back = Settings::default();
+        back.set_network(net.clone());
+        assert_eq!(back.network(), net);
+        assert_eq!(back.proxy.kind, ProxyKind::Socks5);
+        // `Default` equals the default settings' network.
+        assert_eq!(NetworkSettings::default(), Settings::default().network());
+    }
 
     #[test]
     fn features_bypassing_the_proxy_are_listed() {

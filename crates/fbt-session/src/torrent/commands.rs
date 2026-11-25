@@ -162,6 +162,17 @@ impl Actor {
                 self.on_filter_changed();
                 let _ = tx.send(());
             }
+            Cmd::NetworkChanged {
+                generation,
+                close_tcp,
+                tx,
+            } => {
+                self.on_network_changed(generation, close_tcp);
+                let _ = tx.send(());
+            }
+            Cmd::NetworkReady(generation) => {
+                self.on_network_ready(generation);
+            }
             Cmd::BansChanged => {
                 self.close_blocked();
             }

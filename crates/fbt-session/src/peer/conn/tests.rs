@@ -42,6 +42,9 @@ struct Harness {
     remote: DuplexStream,
     events: mpsc::Receiver<PeerEvent>,
     cmds: mpsc::Sender<PeerCommand>,
+    /// Kept so the peer task's stack-change watch stays open (a dropped
+    /// sender reads as a change).
+    _net_gen: watch::Sender<u64>,
 }
 
 /// Starts an outgoing-style peer task over a duplex pipe.
@@ -100,6 +103,7 @@ fn start_hashes(
     let (ours, remote) = tokio::io::duplex(1 << 20);
     let (etx, events) = mpsc::channel(1024);
     let (cmds, crx) = mpsc::channel(256);
+    let (net_gen, net_changed) = watch::channel(1u64);
     let ctx = PeerCtx {
         key: KEY,
         info_hash: HASH,
@@ -117,12 +121,16 @@ fn start_hashes(
         external_ip: Arc::new(crate::net::ExternalIp::new(
             tokio::sync::broadcast::channel(1).0,
         )),
+        net_generation: 1,
+        net_changed,
+        proxy: fbt_net::proxy::ProxyConfig::default(),
     };
     tokio::spawn(run_peer(ours, None, addr(), ctx, crx));
     Harness {
         remote,
         events,
         cmds,
+        _net_gen: net_gen,
     }
 }
 
@@ -181,6 +189,7 @@ impl Harness {
             Remote {
                 events: self.events,
                 cmds: self.cmds,
+                _net_gen: self._net_gen,
             },
             ours,
         )
@@ -198,6 +207,9 @@ impl Harness {
 struct Remote {
     events: mpsc::Receiver<PeerEvent>,
     cmds: mpsc::Sender<PeerCommand>,
+    /// Kept so the peer task's stack-change watch stays open until the
+    /// test's handshake has finished (a dropped sender reads as a change).
+    _net_gen: watch::Sender<u64>,
 }
 
 impl Remote {
@@ -283,6 +295,7 @@ async fn handshake_timeout_disconnects() {
     let (reason, _) = Remote {
         events: h.events,
         cmds: h.cmds,
+        _net_gen: h._net_gen,
     }
     .disconnected()
     .await;
@@ -1288,6 +1301,8 @@ struct Direct {
     _remote: DuplexStream,
     events: mpsc::Receiver<PeerEvent>,
     bandwidth: Arc<crate::bandwidth::Bandwidth>,
+    /// Kept so the watch stays open.
+    _net_gen: watch::Sender<u64>,
 }
 
 fn direct(settings: Settings, down: u64, up: u64) -> Direct {
@@ -1300,6 +1315,7 @@ fn direct(settings: Settings, down: u64, up: u64) -> Direct {
         tcp: RateLimit::new(down, up),
         ..PeerClassLimits::default()
     });
+    let (net_gen, net_changed) = watch::channel(1u64);
     let ctx = PeerCtx {
         key: KEY,
         info_hash: HASH,
@@ -1317,6 +1333,9 @@ fn direct(settings: Settings, down: u64, up: u64) -> Direct {
         external_ip: Arc::new(crate::net::ExternalIp::new(
             tokio::sync::broadcast::channel(1).0,
         )),
+        net_generation: 1,
+        net_changed,
+        proxy: fbt_net::proxy::ProxyConfig::default(),
     };
     let theirs = Handshake {
         reserved: reserved(true, false, false),
@@ -1331,6 +1350,7 @@ fn direct(settings: Settings, down: u64, up: u64) -> Direct {
         _remote: remote,
         events,
         bandwidth,
+        _net_gen: net_gen,
     }
 }
 

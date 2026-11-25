@@ -88,6 +88,21 @@ pub(crate) enum Cmd {
     FoundPeers(PeerSource, Vec<SocketAddr>),
     /// The session's IP filter changed: close the peers it blocks now.
     FilterChanged(oneshot::Sender<()>),
+    /// The session's network stack changed: close the connections of older
+    /// generations (all of them with `close_tcp`; with a change that is not
+    /// the proxy, only the ones still being established), with
+    /// [`DisconnectReason::NetworkChanged`](crate::DisconnectReason::NetworkChanged),
+    /// and answer once done. The answer is what makes the change safe: the
+    /// new stack is built only after every connection of the old one is
+    /// gone.
+    NetworkChanged {
+        generation: u64,
+        close_tcp: bool,
+        tx: oneshot::Sender<()>,
+    },
+    /// A new stack (generation `generation`) is installed: restart the DHT
+    /// announcer and re-announce to the trackers and the DHT at once.
+    NetworkReady(u64),
     /// Another torrent smart-banned a peer: close the peers the session's
     /// bans now block. Sent without waiting for an answer.
     BansChanged,
@@ -760,6 +775,35 @@ impl TorrentHandle {
     /// peers the new filter blocks.
     pub(crate) async fn filter_changed(&self) -> Result<(), SessionError> {
         self.call(Cmd::FilterChanged).await
+    }
+
+    /// Tells the actor the session's network stack changed; returns once it
+    /// closed the connections of older generations.
+    pub(crate) async fn network_changed(
+        &self,
+        generation: u64,
+        close_tcp: bool,
+    ) -> Result<(), SessionError> {
+        self.call(|tx| Cmd::NetworkChanged {
+            generation,
+            close_tcp,
+            tx,
+        })
+        .await
+    }
+
+    /// Tells the actor, without waiting, that stack `generation` is
+    /// installed, so it re-announces. If its queue is full the command is
+    /// sent from a task of its own, so the caller never waits.
+    pub(crate) fn network_ready(&self, generation: u64) {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) =
+            self.inner.cmds.try_send(Cmd::NetworkReady(generation))
+        {
+            let cmds = self.inner.cmds.clone();
+            tokio::spawn(async move {
+                let _ = cmds.send(cmd).await;
+            });
+        }
     }
 
     /// Tells the actor, without waiting, that a ban was added elsewhere in

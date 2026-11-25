@@ -14,8 +14,8 @@ use fbt::{
 use fbt::{BlockReason, FileStatus, IpFilter, MoveMode, PeerStatus, QueueSettings, TrackerStatus};
 use fbt::{
     CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
-    PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
-    StorageError, StreamError,
+    NetworkSettings, PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead,
+    SeedChokingAlgorithm, StorageError, StreamError,
 };
 use fbt::{
     CreateError, CreateTorrent, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES,
@@ -94,6 +94,7 @@ fn names(
     _: Option<BlockReason>,
     _: Option<MoveMode>,
     _: Option<QueueSettings>,
+    _: Option<NetworkSettings>,
 ) {
 }
 
@@ -134,6 +135,22 @@ fn surface_compiles() {
         (p.kind, p.host, p.port, p.username, p.password);
     let _: (bool, bool, bool) = (p.proxy_peers, p.proxy_trackers, p.proxy_hostnames);
     let _: Result<(), String> = ProxyConfig::default().validate();
+    // The runtime network settings and their conversion to and from `Settings`.
+    let n = NetworkSettings::default();
+    let _: (ProxyConfig, bool, bool, bool, bool, bool, bool, bool) = (
+        n.proxy,
+        n.dht_enabled,
+        n.enable_lsd,
+        n.enable_upnp,
+        n.enable_natpmp,
+        n.enable_incoming_tcp,
+        n.enable_incoming_utp,
+        n.enable_outgoing_utp,
+    );
+    assert_eq!(NetworkSettings::default(), Settings::default().network());
+    let mut conv = Settings::default();
+    conv.set_network(NetworkSettings::default());
+    assert_eq!(conv.network(), NetworkSettings::default());
     // Where a redirect may take a fetch: the default follows as it always did; a web seed
     // on a public address sets `allow_internal` false.
     let p = fbt::RedirectPolicy::default();

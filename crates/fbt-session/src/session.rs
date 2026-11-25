@@ -1,25 +1,20 @@
 //! The session: torrent registry, peer listener, events and limits.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
-use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_core::{InfoHashes, PeerId};
-use fbt_dht::{
-    Dht, DhtConfig, DhtError, DhtSamples, DhtScrape, DhtState, DhtStats, MutableItem, NodeId,
-};
+use fbt_dht::{Dht, DhtError, DhtSamples, DhtScrape, DhtStats, MutableItem, NodeId};
 use fbt_metainfo::{Magnet, Metainfo};
-use fbt_net::PortMapper;
-use fbt_net::demux::{DemuxStats, PacketKind, SharedUdpSocket};
+use fbt_net::demux::{DemuxStats, SharedUdpSocket};
 use fbt_net::ipfilter::IpFilter;
-use fbt_net::proxy::{ProxyError, ProxyKind, udp_associate};
-use fbt_tracker::TrackerClient;
+use fbt_net::proxy::{ProxyKind, Socks5Udp, udp_associate};
 use fbt_utp::UtpSocket;
 use fbt_wire::req2_hash;
-use tokio::sync::{Notify, broadcast, oneshot};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -29,13 +24,11 @@ use crate::disk::DiskPool;
 use crate::error::SessionError;
 use crate::event::{Event, EventMask, EventStream, ExternalIpSource};
 use crate::listener::ListenerState;
-use crate::net::{
-    Endpoint, ExternalIp, ListenError, LsdHub, bind_all, spawn_lsd_task, spawn_nat_task,
-    start_port_mapping, utp_for, utp_sockets,
-};
+use crate::net::{ExternalIp, ListenError, spawn_lsd_task, spawn_nat_task};
+use crate::netstack::NetStack;
 use crate::queue::{QueueEntry, QueueSettings, is_slow, plan, running_since};
 use crate::resume::{ResumeError, ResumeState, SessionState, decode_resume};
-use crate::settings::Settings;
+use crate::settings::{NetworkSettings, Settings};
 use crate::status::TorrentStatus;
 use crate::storage::cache::{CacheBudget, CacheStats};
 use crate::storage::{FsStorage, Storage};
@@ -207,29 +200,22 @@ impl AddTorrent {
 pub(crate) struct Shared {
     pub settings: Arc<Settings>,
     pub peer_id: PeerId,
-    /// Port of the first peer listener: announced over HTTP and to the DHT.
-    pub listen_port: u16,
-    /// Port of the first IPv4 listener, `None` without one: UDP announces
-    /// over IPv4 and IPv4 peers' extension handshakes carry it.
-    pub listen_port_v4: Option<u16>,
-    /// Port of the first IPv6 listener, likewise for IPv6.
-    pub listen_port_v6: Option<u16>,
-    /// Shared by every torrent's announcer.
-    pub tracker: TrackerClient,
+    /// The current network stack: every socket the session sends from (the
+    /// shared UDP sockets, uTP, the DHT, the tracker client), LSD, port
+    /// mapping, the listeners and their accept loops, stamped with a
+    /// generation. [`Session::set_network_settings`] replaces it whole; read
+    /// it once per use through [`net`](Self::net) and keep the `Arc` for the
+    /// duration of what reads it.
+    pub net: RwLock<Arc<NetStack>>,
+    /// The generation of [`net`](Self::net), carried on a `watch` channel so
+    /// a dial or a handshake can notice a change without taking the lock.
+    net_gen: watch::Sender<u64>,
     pub events: broadcast::Sender<Event>,
     pub shutdown: AtomicBool,
     /// Peer tasks alive across the session (connecting or connected).
     pub global_peers: AtomicUsize,
     /// Outgoing connections still connecting or handshaking.
     pub half_open: AtomicUsize,
-    /// The session-wide DHT node; `None` with `dht_enabled` off.
-    pub dht: Option<Dht>,
-    /// The DHT's UDP sockets; `Port` messages carry the port of the one
-    /// matching the peer's address family ([`dht_port_for`]).
-    pub dht_addrs: Vec<SocketAddr>,
-    /// One uTP socket per shared UDP socket, in the same order (the
-    /// endpoints', then the per-family fallbacks).
-    pub utp: Vec<UtpSocket>,
     /// Runs every storage job and bounds the concurrent checks.
     pub disk: DiskPool,
     /// The byte budget every torrent's write-back cache draws from.
@@ -238,11 +224,6 @@ pub(crate) struct Shared {
     pub bandwidth: Arc<Bandwidth>,
     /// BEP 55 holepunch activity, for [`Session::holepunch_stats`].
     pub holepunch: HolepunchCounters,
-    /// Local service discovery (BEP 14): the instance and its announce
-    /// bookkeeping.
-    pub lsd: LsdHub,
-    /// UPnP and PCP/NAT-PMP port mapping; `None` with both off.
-    pub portmap: Option<PortMapper>,
     /// The external address as the router and peers report it.
     pub external_ip: Arc<ExternalIp>,
     /// The session's IP filter ([`Session::set_ip_filter`]); swapped whole,
@@ -285,22 +266,29 @@ pub(crate) fn dht_port_for(dht_addrs: &[SocketAddr], peer: &SocketAddr) -> Optio
 }
 
 impl Shared {
-    /// The listen port of `peer`'s address family (an IPv4-mapped IPv6
-    /// peer counts as IPv4): the port our listener of the family the
-    /// connection runs over has, else the first listener's.
-    pub(crate) fn listen_port_for(&self, peer: &SocketAddr) -> u16 {
-        let family = if peer.ip().to_canonical().is_ipv4() {
-            self.listen_port_v4
-        } else {
-            self.listen_port_v6
-        };
-        family.unwrap_or(self.listen_port)
+    /// The current network stack.
+    pub(crate) fn net(&self) -> Arc<NetStack> {
+        Arc::clone(&self.net.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// A receiver that fires on every stack change, carrying the new
+    /// generation.
+    pub(crate) fn net_changed(&self) -> watch::Receiver<u64> {
+        self.net_gen.subscribe()
+    }
+
+    /// Installs `stack` as the current one and announces its generation.
+    /// The caller serialises changes; the stack's own generation must be
+    /// newer than the current one.
+    pub(crate) fn set_net(&self, stack: Arc<NetStack>) {
+        *self.net.write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&stack);
+        self.net_gen.send_replace(stack.generation);
     }
 
     /// The uTP socket to dial `peer` from: the first of its address family,
     /// as for the DHT and UDP trackers. `None` without one.
-    pub(crate) fn utp_for(&self, peer: &SocketAddr) -> Option<&UtpSocket> {
-        utp_for(&self.utp, peer)
+    pub(crate) fn utp_for(&self, peer: &SocketAddr) -> Option<UtpSocket> {
+        self.net().utp_for(peer)
     }
 
     pub(crate) fn emit(&self, ev: Event) {
@@ -353,6 +341,36 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+}
+
+/// A `Shared` for unit tests of the torrent actors and the session helpers:
+/// `settings`, the given `stack` (usually [`NetStack::offline`]) and a cache
+/// budget of `cache_size`; nothing here opens a socket.
+#[cfg(test)]
+impl Shared {
+    pub(crate) fn test(settings: Settings, stack: Arc<NetStack>, cache_size: u64) -> Arc<Shared> {
+        let (events, _) = broadcast::channel(64);
+        let (net_gen, _) = watch::channel(stack.generation);
+        Arc::new(Shared {
+            settings: Arc::new(settings),
+            peer_id: PeerId::generate(),
+            net: RwLock::new(stack),
+            net_gen,
+            events,
+            shutdown: AtomicBool::new(false),
+            global_peers: AtomicUsize::new(0),
+            half_open: AtomicUsize::new(0),
+            disk: DiskPool::new(1, 1),
+            cache: Arc::new(CacheBudget::new(cache_size)),
+            bandwidth: Arc::new(Bandwidth::new(&Settings::default())),
+            holepunch: HolepunchCounters::default(),
+            external_ip: Arc::new(ExternalIp::new(broadcast::channel(1).0)),
+            ip_filter: RwLock::new(Arc::new(IpFilter::default())),
+            bans: Mutex::new(BanList::default()),
+            queue: Mutex::new(QueueSettings::default()),
+            queue_dirty: Notify::new(),
+        })
     }
 }
 
@@ -429,18 +447,20 @@ pub(crate) struct Registry {
 #[derive(Debug)]
 pub(crate) struct SessionInner {
     pub shared: Arc<Shared>,
-    /// The TCP listeners' addresses, in settings order.
-    local_addrs: Vec<SocketAddr>,
-    listen_errors: Vec<ListenError>,
-    /// Every shared UDP socket (the endpoints', then the per-family
-    /// fallbacks), closed at shutdown.
-    udp: Vec<SharedUdpSocket>,
+    /// The network settings as the caller set them ([`Session::network_settings`]),
+    /// which the applied stack may differ from (an HTTP proxy carrying peers
+    /// turns outgoing uTP off in the stack only).
+    network: RwLock<NetworkSettings>,
     /// Shared by every accept loop of the session.
     listener_state: Arc<ListenerState>,
     registry: Mutex<Registry>,
-    /// One TCP accept loop per listener (with `enable_incoming_tcp`) and
-    /// one uTP accept loop per uTP socket (with `enable_incoming_utp`).
+    /// The session-level tasks (the queue scheduler); the network stack
+    /// holds its own.
     listeners: Mutex<Vec<JoinHandle<()>>>,
+    /// Serialises [`rebuild`](Self::rebuild) and the teardown, so two
+    /// runtime changes apply one after the other and one never races the
+    /// shutdown.
+    change: tokio::sync::Mutex<()>,
 }
 
 impl SessionInner {
@@ -654,7 +674,7 @@ impl SessionInner {
         self.shared.queue_dirty.notify_one();
     }
 
-    /// Stops every accept loop (dropping its listener).
+    /// Stops the session-level tasks (the queue scheduler).
     fn stop_listeners(&self) {
         let tasks = std::mem::take(&mut *self.listeners.lock().unwrap_or_else(|e| e.into_inner()));
         for t in tasks {
@@ -662,26 +682,200 @@ impl SessionInner {
         }
     }
 
-    /// Resets every uTP connection and stops the uTP sockets' tasks.
-    fn shutdown_utp(&self) {
-        for u in &self.shared.utp {
-            u.shutdown_now();
+    /// Spawns `stack`'s accept loops and routers, so its listeners accept
+    /// and its LSD and port-mapping reports reach torrents. Each task stops
+    /// when the stack (or the session) is shut down.
+    fn wire(self: &Arc<Self>, stack: &Arc<NetStack>) {
+        let shared = &self.shared;
+        let stop = stack.stop_receiver();
+        let mut tasks: Vec<JoinHandle<()>> = stack
+            .take_tcp()
+            .into_iter()
+            .map(|tcp| {
+                crate::listener::spawn(
+                    tcp,
+                    Arc::clone(&self.listener_state),
+                    Arc::downgrade(self),
+                    Arc::clone(shared),
+                    stop.clone(),
+                )
+            })
+            .collect();
+        if stack.net.enable_incoming_utp {
+            tasks.extend(stack.utp.iter().map(|u| {
+                crate::listener::spawn_utp(
+                    u.clone(),
+                    Arc::clone(&self.listener_state),
+                    Arc::downgrade(self),
+                    Arc::clone(shared),
+                    stop.clone(),
+                )
+            }));
+        }
+        if let Some(found) = stack.take_lsd_found() {
+            tasks.push(spawn_lsd_task(
+                found,
+                Arc::downgrade(self),
+                Arc::downgrade(stack),
+                stop.clone(),
+            ));
+        }
+        if let Some(rx) = stack.take_map_events() {
+            tasks.push(spawn_nat_task(rx, Arc::downgrade(shared), stop.clone()));
+        }
+        if let Some(dht) = &stack.dht {
+            tasks.push(watch_bootstrap(dht, Arc::downgrade(shared), stop.clone()));
+            tasks.push(watch_dht_external_ip(
+                dht,
+                Arc::downgrade(shared),
+                stop.clone(),
+            ));
+        }
+        // The relayed socket's association monitor; a direct socket's is
+        // never signalled.
+        tasks.extend(
+            stack
+                .udp
+                .iter()
+                .map(|u| watch_relay_lost(u, Arc::downgrade(shared), stop.clone())),
+        );
+        stack.add_tasks(tasks);
+    }
+
+    /// The network settings as the caller set them.
+    fn network(&self) -> NetworkSettings {
+        self.network
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Applies `net` as the session's network settings: the steps that make
+    /// the change safe (the order is the guarantee). Under the change lock
+    /// (so two changes apply one after the other, and the shutdown never
+    /// races one):
+    ///
+    /// 1. Install a closed stack: from here no new dial, announce, web seed
+    ///    request or datagram read uses the old one.
+    /// 2. Shut the old stack down (its listeners, LSD, port mapping, DHT,
+    ///    uTP and UDP sockets; the DHT's state is kept), dropping its
+    ///    tracker client and connection pool.
+    /// 3. With `close_tcp` (the proxy changed), every torrent closes its
+    ///    peers, web seed and tracker requests with
+    ///    [`DisconnectReason::NetworkChanged`](crate::DisconnectReason::NetworkChanged),
+    ///    awaited as
+    ///    [`set_ip_filter`](Session::set_ip_filter) awaits `filter_changed`.
+    /// 4. Build the new stack for the next generation on the addresses the
+    ///    old one had bound (so the listen ports stay) and install it.
+    /// 5. Every torrent re-announces to its trackers and the DHT at once.
+    async fn rebuild(
+        self: &Arc<Self>,
+        net: NetworkSettings,
+        close_tcp: bool,
+    ) -> Result<(), SessionError> {
+        // The proxy's own rules, and every transport off, are checked here
+        // as `Session::new` checks them, on the settings the session would
+        // have.
+        let mut probe = (*self.shared.settings).clone();
+        probe.set_network(net.clone());
+        probe.validate().map_err(SessionError::InvalidSettings)?;
+        let _guard = self.change.lock().await;
+        if self.shared.is_shutdown() {
+            return Err(SessionError::Shutdown);
+        }
+        let old = self.shared.net();
+        let generation = old.generation + 1;
+        // The addresses the old stack had bound, so a rebuild keeps the
+        // listen ports (a closed stack has none, so fall back to the
+        // settings: the retry after a failed change rebinds them).
+        let mut addrs = old.local_addrs.clone();
+        if addrs.is_empty() {
+            addrs = self.shared.settings.listen_addrs.clone();
+        }
+        let dht_state = self.shared.settings.dht_state.clone();
+        // 1. A closed stack first: nothing more uses the old one.
+        self.shared.set_net(Arc::new(NetStack::closed(generation)));
+        // 2. Tear the old one down, keeping the DHT's state for the new one.
+        let kept_dht = old.shutdown().await.or(dht_state);
+        // 3. With the proxy gone or changed, the connections of older
+        // generations are closed at once (handshaking and dialling ones
+        // included, through the generation they recorded).
+        self.close_generation(generation, close_tcp).await;
+        // 4. Build the new stack and install it (unless the session is
+        // shutting down: then nothing must stay open). The proxy's UDP
+        // association is taken here, so `build` knows to bind UDP.
+        let relay = match relay_socket(&probe).await {
+            Ok(r) => r,
+            Err(e) => {
+                // A change that fails while the session is going away is a
+                // shutdown, not a proxy error.
+                return Err(if self.shared.is_shutdown() {
+                    SessionError::Shutdown
+                } else {
+                    e
+                });
+            }
+        };
+        let stack = match NetStack::build(
+            &self.shared.settings,
+            &net,
+            &addrs,
+            kept_dht,
+            generation,
+            relay,
+        )
+        .await
+        {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                if self.shared.is_shutdown() {
+                    return Err(SessionError::Shutdown);
+                }
+                return Err(e);
+            }
+        };
+        if self.shared.is_shutdown() {
+            stack.abort();
+            return Err(SessionError::Shutdown);
+        }
+        *self.network.write().unwrap_or_else(PoisonError::into_inner) = net.clone();
+        self.shared.set_net(Arc::clone(&stack));
+        self.wire(&stack);
+        // 5. Re-announce at once.
+        for h in self.handles() {
+            h.network_ready(generation);
+        }
+        Ok(())
+    }
+
+    /// Closes every torrent's connections of an older generation, awaited as
+    /// [`set_ip_filter`](Session::set_ip_filter) awaits `filter_changed`.
+    /// With `close_tcp` (the proxy changed) all of them (every connection
+    /// must be redialled through it); otherwise only the connections still
+    /// being established (a dial or handshake the new stack must not
+    /// finish).
+    async fn close_generation(&self, generation: u64, close_tcp: bool) {
+        for h in self.handles() {
+            // A torrent that is gone has nothing to close.
+            let _ = h.network_changed(generation, close_tcp).await;
         }
     }
 
-    /// Closes every shared UDP socket, freeing its port.
-    fn close_udp(&self) {
-        for u in &self.udp {
-            u.close();
-        }
+    /// Every torrent handle, in queue order.
+    fn handles(&self) -> Vec<TorrentHandle> {
+        let reg = self.registry();
+        reg.order
+            .iter()
+            .filter_map(|ih| reg.torrents.get(ih))
+            .map(|e| e.handle.clone())
+            .collect()
     }
 }
 
 impl Drop for SessionInner {
     fn drop(&mut self) {
         self.stop_listeners();
-        self.shutdown_utp();
-        self.close_udp();
+        self.shared.net().abort();
     }
 }
 
@@ -710,10 +904,6 @@ impl Session {
     pub async fn new(mut settings: Settings) -> Result<Session, SessionError> {
         settings.validate().map_err(SessionError::InvalidSettings)?;
         let proxy = &settings.proxy;
-        // SOCKS5 relays all UDP through one association: one socket cannot
-        // be half proxied.
-        let relay_udp =
-            proxy.kind == ProxyKind::Socks5 && (proxy.proxy_peers || proxy.proxy_trackers);
         // An HTTP proxy cannot carry uTP.
         if proxy.kind == ProxyKind::Http && proxy.proxy_peers {
             if !settings.enable_outgoing_tcp {
@@ -732,52 +922,7 @@ impl Session {
                  all traffic on the proxy)"
             );
         }
-        let (endpoints, listen_errors) = bind_all(&settings, !relay_udp).await?;
-        let local_addrs: Vec<SocketAddr> = endpoints.iter().map(|e| e.addr).collect();
-        let udp: Vec<SharedUdpSocket> = if relay_udp {
-            vec![bind_relay(&settings, &local_addrs).await?]
-        } else {
-            let mut udp: Vec<SharedUdpSocket> =
-                endpoints.iter().filter_map(|e| e.udp.clone()).collect();
-            udp.extend(fallback_udp(&endpoints));
-            udp
-        };
-        let utp = utp_sockets(&settings, &udp);
-        let senders: Vec<Arc<dyn DatagramSender>> =
-            udp.iter().map(SharedUdpSocket::sender).collect();
-        let tracker = match TrackerClient::new_with(
-            settings.tracker.clone(),
-            senders,
-            Some(settings.proxy.clone()),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                for u in &utp {
-                    u.shutdown_now();
-                }
-                udp.iter().for_each(SharedUdpSocket::close);
-                return Err(SessionError::Tracker(e));
-            }
-        };
-        let tracker_input = tracker.udp_handler();
-        for u in &udp {
-            u.set_handler(PacketKind::Tracker, Arc::clone(&tracker_input));
-        }
         let (events, _) = broadcast::channel(settings.event_queue);
-        let dht = if settings.dht_enabled {
-            start_dht(&settings, &udp).await
-        } else {
-            None
-        };
-        let dht_addrs = dht.as_ref().map(Dht::local_addrs).unwrap_or_default();
-        let listen_port = local_addrs.first().map_or(0, SocketAddr::port);
-        let first_port = |v4: bool| {
-            local_addrs
-                .iter()
-                .find(|a| a.is_ipv4() == v4)
-                .map(SocketAddr::port)
-        };
-        let (listen_port_v4, listen_port_v6) = (first_port(true), first_port(false));
         // One for every accept loop, so all of them together allow only
         // `max_peers_global` pending handshakes.
         let listener_state = Arc::new(ListenerState::new(settings.max_peers_global));
@@ -785,89 +930,90 @@ impl Session {
         let cache = Arc::new(CacheBudget::new(settings.cache_size));
         let bandwidth = Arc::new(Bandwidth::new(&settings));
         bandwidth.spawn_rebalance();
-        let (lsd, lsd_found) = LsdHub::start(&settings);
-        let (portmap, map_events) = start_port_mapping(&settings, &local_addrs).unzip();
         let external_ip = Arc::new(ExternalIp::new(events.clone()));
         let queue = Mutex::new(settings.queue.clone());
+        // Everything a session sends with lives in one stack, built here as
+        // generation 1. The proxy's UDP association (a failure still fails
+        // `new` in this task) is taken first, so `build` knows to bind UDP.
+        let net = settings.network();
+        let addrs = settings.listen_addrs.clone();
+        let dht_state = settings.dht_state.clone();
+        let relay = relay_socket(&settings).await?;
+        let stack = Arc::new(NetStack::build(&settings, &net, &addrs, dht_state, 1, relay).await?);
+        let (net_gen, _) = watch::channel(1u64);
         let shared = Arc::new(Shared {
             settings: Arc::new(settings),
             peer_id: PeerId::generate(),
-            listen_port,
-            listen_port_v4,
-            listen_port_v6,
-            tracker,
+            net: RwLock::new(Arc::clone(&stack)),
+            net_gen,
             events,
             shutdown: AtomicBool::new(false),
             global_peers: AtomicUsize::new(0),
             half_open: AtomicUsize::new(0),
-            dht,
-            dht_addrs,
-            utp,
             disk,
             cache,
             bandwidth,
             holepunch: HolepunchCounters::default(),
-            lsd,
-            portmap,
             external_ip,
             ip_filter: RwLock::new(Arc::new(IpFilter::default())),
             bans: Mutex::new(BanList::default()),
             queue,
             queue_dirty: Notify::new(),
         });
-        if let Some(dht) = &shared.dht {
-            watch_bootstrap(dht, Arc::downgrade(&shared));
-            watch_dht_external_ip(dht, Arc::downgrade(&shared));
-        }
-        if relay_udp {
-            for u in &udp {
-                watch_relay_lost(u, Arc::downgrade(&shared));
-            }
-        }
         let inner = Arc::new(SessionInner {
             shared: Arc::clone(&shared),
-            local_addrs,
-            listen_errors,
-            udp,
+            network: RwLock::new(net),
             listener_state,
             registry: Mutex::new(Registry::default()),
             listeners: Mutex::new(Vec::new()),
+            change: tokio::sync::Mutex::new(()),
         });
-        // No TCP listeners with `enable_incoming_tcp` off.
-        let mut tasks: Vec<JoinHandle<()>> = endpoints
-            .into_iter()
-            .filter_map(|e| e.tcp)
-            .map(|tcp| {
-                crate::listener::spawn(
-                    tcp,
-                    Arc::clone(&inner.listener_state),
-                    Arc::downgrade(&inner),
-                    Arc::clone(&shared),
-                )
-            })
-            .collect();
-        if shared.settings.enable_incoming_utp {
-            tasks.extend(shared.utp.iter().map(|u| {
-                crate::listener::spawn_utp(
-                    u.clone(),
-                    Arc::clone(&inner.listener_state),
-                    Arc::downgrade(&inner),
-                    Arc::clone(&shared),
-                )
-            }));
-        }
-        if let Some(found) = lsd_found {
-            tasks.push(spawn_lsd_task(found, Arc::downgrade(&inner)));
-        }
-        if let Some(rx) = map_events {
-            tasks.push(spawn_nat_task(rx, Arc::downgrade(&shared)));
-        }
-        tasks.push(tokio::spawn(run_queue(
-            Arc::downgrade(&inner),
-            Arc::clone(&shared),
-        )));
-        *inner.listeners.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
+        // The accept loops, LSD and port-mapping routers and the watchers,
+        // all stopped with the stack (or the session).
+        inner.wire(&stack);
+        let queue_task = tokio::spawn(run_queue(Arc::downgrade(&inner), Arc::clone(&shared)));
+        inner
+            .listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(queue_task);
         Ok(Session { inner })
+    }
+
+    /// The network settings as the caller set them
+    /// ([`network_settings`](Self::network_settings)): the stored switches,
+    /// which the applied stack may differ from (an HTTP proxy carrying peers
+    /// turns outgoing uTP off in the stack only).
+    pub fn network_settings(&self) -> NetworkSettings {
+        self.inner.network()
+    }
+
+    /// Replaces the session's network settings (the proxy and the network
+    /// switches) at runtime, without a restart and without any direct
+    /// connection in between: the change installs a closed stack first, tears
+    /// the old one down, closes the connections of older generations (all of
+    /// them with [`DisconnectReason::NetworkChanged`](crate::DisconnectReason::NetworkChanged)
+    /// when the proxy changed),
+    /// then builds and installs the new stack on the addresses the old one
+    /// had bound (so the listen ports stay) and re-announces every torrent.
+    ///
+    /// Fails with [`SessionError::InvalidSettings`] (the proxy's own
+    /// [`validate`](fbt_net::proxy::ProxyConfig::validate), or a switch
+    /// combination the session cannot work with) and with
+    /// [`SessionError::Shutdown`] once the session has shut down. Setting a
+    /// value equal to the current one is a no-op.
+    pub async fn set_network_settings(&self, net: NetworkSettings) -> Result<(), SessionError> {
+        if self.inner.shared.is_shutdown() {
+            return Err(SessionError::Shutdown);
+        }
+        if self.inner.network() == net {
+            return Ok(());
+        }
+        // With the proxy changed, every connection must be redialled through
+        // the new one; without it, only the connections still being
+        // established are closed (a connected TCP peer keeps running).
+        let close_tcp = self.inner.network().proxy != net.proxy;
+        self.inner.rebuild(net, close_tcp).await
     }
 
     /// BEP 55 holepunch activity so far, over every torrent: `Rendezvous`
@@ -886,7 +1032,7 @@ impl Session {
 
     /// The session's DHT node, `None` with [`Settings::dht_enabled`] off.
     pub fn dht_stats(&self) -> Option<DhtStats> {
-        self.inner.shared.dht.as_ref().map(Dht::stats)
+        self.inner.shared.net().dht.as_ref().map(Dht::stats)
     }
 
     /// The best estimate of our external address: what the router reported
@@ -895,10 +1041,11 @@ impl Session {
     /// them knows. [`Event::ExternalIpChanged`] reports each source's news.
     pub fn external_ip(&self) -> Option<std::net::IpAddr> {
         let shared = &self.inner.shared;
+        let stack = shared.net();
         shared
             .external_ip
             .mapped()
-            .or_else(|| shared.dht.as_ref().and_then(|d| d.stats().external_ip))
+            .or_else(|| stack.dht.as_ref().and_then(|d| d.stats().external_ip))
             .or_else(|| shared.external_ip.peers_estimate())
     }
 
@@ -910,7 +1057,8 @@ impl Session {
     /// Fails with [`SessionError::Shutdown`] once the session (and its
     /// DHT) has shut down.
     pub async fn dht_state(&self) -> Result<Option<Vec<u8>>, SessionError> {
-        let Some(dht) = &self.inner.shared.dht else {
+        let stack = self.inner.shared.net();
+        let Some(dht) = &stack.dht else {
             return Ok(None);
         };
         let state = dht.state().await.map_err(|_| SessionError::Shutdown)?;
@@ -926,7 +1074,8 @@ impl Session {
     /// ask: not the same as zero seeds and peers) and
     /// [`SessionError::Shutdown`] once the session has shut down.
     pub async fn dht_scrape(&self, info_hash: [u8; 20]) -> Result<DhtScrape, SessionError> {
-        let dht = self.dht()?;
+        let stack = self.inner.shared.net();
+        let dht = stack.dht.as_ref().ok_or(SessionError::DhtDisabled)?;
         dht.scrape(info_hash).await.map_err(dht_error)
     }
 
@@ -944,7 +1093,8 @@ impl Session {
         node: SocketAddr,
         target: [u8; 20],
     ) -> Result<DhtSamples, SessionError> {
-        let dht = self.dht()?;
+        let stack = self.inner.shared.net();
+        let dht = stack.dht.as_ref().ok_or(SessionError::DhtDisabled)?;
         dht.sample_infohashes(node, NodeId(target))
             .await
             .map_err(dht_error)
@@ -961,7 +1111,8 @@ impl Session {
         &self,
         target: [u8; 20],
     ) -> Result<Option<Vec<u8>>, SessionError> {
-        let dht = self.dht()?;
+        let stack = self.inner.shared.net();
+        let dht = stack.dht.as_ref().ok_or(SessionError::DhtDisabled)?;
         dht.get_immutable(target).await.map_err(dht_error)
     }
 
@@ -977,7 +1128,8 @@ impl Session {
         &self,
         value: Vec<u8>,
     ) -> Result<([u8; 20], usize), SessionError> {
-        let dht = self.dht()?;
+        let stack = self.inner.shared.net();
+        let dht = stack.dht.as_ref().ok_or(SessionError::DhtDisabled)?;
         dht.put_immutable(value).await.map_err(dht_error)
     }
 
@@ -992,7 +1144,8 @@ impl Session {
         public_key: [u8; 32],
         salt: &[u8],
     ) -> Result<Option<MutableItem>, SessionError> {
-        let dht = self.dht()?;
+        let stack = self.inner.shared.net();
+        let dht = stack.dht.as_ref().ok_or(SessionError::DhtDisabled)?;
         dht.get_mutable(public_key, salt).await.map_err(dht_error)
     }
 
@@ -1013,18 +1166,11 @@ impl Session {
         seq: i64,
         cas: Option<i64>,
     ) -> Result<usize, SessionError> {
-        let dht = self.dht()?;
+        let stack = self.inner.shared.net();
+        let dht = stack.dht.as_ref().ok_or(SessionError::DhtDisabled)?;
         dht.put_mutable(secret_seed, salt, value, seq, cas)
             .await
             .map_err(dht_error)
-    }
-
-    fn dht(&self) -> Result<&Dht, SessionError> {
-        self.inner
-            .shared
-            .dht
-            .as_ref()
-            .ok_or(SessionError::DhtDisabled)
     }
 
     /// Bytes held by the write-back cache of every torrent, against
@@ -1136,24 +1282,25 @@ impl Session {
     /// [`local_addrs`](Self::local_addrs)).
     pub fn local_addr(&self) -> SocketAddr {
         // `Session::new` fails unless at least one listener bound.
-        self.inner
-            .local_addrs
+        self.local_addrs()
             .first()
             .copied()
             .unwrap_or_else(|| SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)))
     }
 
     /// The addresses the peer listeners are bound to, in
-    /// [`Settings::listen_addrs`] order, without the ones that failed.
+    /// [`Settings::listen_addrs`] order, without the ones that failed. A
+    /// runtime change rebinds the same addresses, so the ports stay.
     pub fn local_addrs(&self) -> Vec<SocketAddr> {
-        self.inner.local_addrs.clone()
+        self.inner.shared.net().local_addrs.clone()
     }
 
     /// The listen addresses that could not be bound, fully or only on
-    /// their UDP side, when the session started. They are not events:
-    /// binding happens in [`Session::new`], before anyone can subscribe.
+    /// their UDP side, by the current stack. They are not events: binding
+    /// happens in [`Session::new`] (and in a runtime change), before anyone
+    /// can subscribe.
     pub fn listen_errors(&self) -> Vec<ListenError> {
-        self.inner.listen_errors.clone()
+        self.inner.shared.net().listen_errors.clone()
     }
 
     /// Datagram counts of each shared UDP socket, by its address. For
@@ -1161,6 +1308,8 @@ impl Session {
     #[doc(hidden)]
     pub fn demux_stats(&self) -> Vec<(SocketAddr, DemuxStats)> {
         self.inner
+            .shared
+            .net()
             .udp
             .iter()
             .map(|u| (u.local_addr(), u.stats()))
@@ -1430,7 +1579,10 @@ impl Session {
 
     /// The shutdown; with `save`, each torrent's resume data after its
     /// final flush and the DHT state before the DHT stops. `None` if the
-    /// session was already shut down.
+    /// session was already shut down. Takes the change lock, so it never
+    /// races a runtime change under way: it waits for the change to finish
+    /// (bounded by `connect_timeout`) and then shuts the installed stack
+    /// down.
     async fn shutdown_inner(
         &self,
         save: bool,
@@ -1439,6 +1591,9 @@ impl Session {
             return None;
         }
         self.inner.stop_listeners();
+        // A change in flight sees the shutdown flag, aborts the stack it
+        // built and returns; the lock makes this wait for that.
+        let _guard = self.inner.change.lock().await;
         let handles: Vec<TorrentHandle> = {
             let mut reg = self.inner.registry();
             let reg = &mut *reg;
@@ -1485,24 +1640,14 @@ impl Session {
                 let _ = rx.await;
             }
         }
-        self.inner.shared.lsd.shutdown().await;
-        // Bounded (2 s in all): an unreachable router never holds us up.
-        if let Some(pm) = &self.inner.shared.portmap {
-            pm.shutdown().await;
+        // Every socket the session sends from lives in the stack: shutting
+        // it down stops the accept loops (freeing the ports), LSD, port
+        // mapping, the DHT (returning its state for `save`) and uTP, and
+        // closes the shared UDP sockets.
+        let dht_state = self.inner.shared.net().shutdown().await;
+        if save {
+            state.dht = dht_state;
         }
-        if let Some(dht) = &self.inner.shared.dht {
-            if save {
-                state.dht = dht.state().await.ok().map(|s| s.to_bytes());
-            }
-            dht.shutdown().await;
-        }
-        // The peers are gone; the uTP sockets stop before the UDP sockets
-        // under them close.
-        for u in &self.inner.shared.utp {
-            u.shutdown().await;
-        }
-        // Last: the `stopped` announces and the DHT used these sockets.
-        self.inner.close_udp();
         Some((state, failed))
     }
 }
@@ -1551,106 +1696,23 @@ async fn run_queue(inner: std::sync::Weak<SessionInner>, shared: Arc<Shared>) {
     }
 }
 
-/// The one UDP socket of a session behind a SOCKS5 proxy: a UDP association
-/// (bounded by `connect_timeout`) and a socket relayed through it, on a free
-/// port of the first listen IP of the relay's family (IPv4 in practice),
-/// else the unspecified address. Fails with [`SessionError::Proxy`].
-async fn bind_relay(
-    settings: &Settings,
-    local_addrs: &[SocketAddr],
-) -> Result<SharedUdpSocket, SessionError> {
-    let assoc = udp_associate(&settings.proxy, settings.connect_timeout)
+/// The session's one UDP socket behind a SOCKS5 proxy: the UDP association
+/// (bounded by `connect_timeout`) the caller classifies, or `None` when the
+/// proxy does not relay UDP. Built before the stack, so `NetStack::build`
+/// knows to bind only TCP and relay all UDP through it. Fails with
+/// [`SessionError::Proxy`].
+async fn relay_socket(settings: &Settings) -> Result<Option<Socks5Udp>, SessionError> {
+    let proxy = &settings.proxy;
+    // SOCKS5 relays all UDP through one association: one socket cannot be
+    // half proxied.
+    let relay_udp = proxy.kind == ProxyKind::Socks5 && (proxy.proxy_peers || proxy.proxy_trackers);
+    if !relay_udp {
+        return Ok(None);
+    }
+    let assoc = udp_associate(proxy, settings.connect_timeout)
         .await
         .map_err(SessionError::Proxy)?;
-    let v4 = assoc.relay().is_ipv4();
-    let ip = local_addrs.iter().find(|a| a.is_ipv4() == v4).map_or(
-        if v4 {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-        } else {
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-        },
-        SocketAddr::ip,
-    );
-    SharedUdpSocket::bind_relayed(SocketAddr::new(ip, 0), assoc)
-        .map_err(|e| SessionError::Proxy(ProxyError::Io(e)))
-}
-
-/// A UDP socket on a free port for each address family that has a
-/// listener but no shared UDP socket (its port was taken), on the IP of the
-/// family's first listener, so the DHT and UDP trackers still run over that
-/// family. One that cannot be bound is logged and left out.
-fn fallback_udp(endpoints: &[Endpoint]) -> Vec<SharedUdpSocket> {
-    let mut out = Vec::new();
-    for v4 in [true, false] {
-        let mut family = endpoints.iter().filter(|e| e.addr.is_ipv4() == v4);
-        let Some(first) = family.clone().next() else {
-            continue;
-        };
-        if family.any(|e| e.udp.is_some()) {
-            continue;
-        }
-        let addr = SocketAddr::new(first.addr.ip(), 0);
-        match SharedUdpSocket::bind(addr) {
-            Ok(u) => {
-                warn!(
-                    listener = %first.addr,
-                    udp = %u.local_addr(),
-                    "UDP port taken; the DHT and UDP trackers use a free port"
-                );
-                out.push(u);
-            }
-            Err(e) => warn!(%addr, error = %e, "cannot bind a UDP socket for this family"),
-        }
-    }
-    out
-}
-
-/// Starts the session's DHT on the shared UDP sockets, the first one of
-/// each address family, and registers it as their DHT handler (so replies
-/// leave from the address a query reached). A DHT that cannot start at all
-/// (no socket, say) is logged and left out.
-async fn start_dht(settings: &Settings, udp: &[SharedUdpSocket]) -> Option<Dht> {
-    let state = settings
-        .dht_state
-        .as_deref()
-        .and_then(|b| match DhtState::from_bytes(b) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                warn!(error = %e, "ignoring the saved DHT state; starting fresh");
-                None
-            }
-        });
-    let mut c = DhtConfig::default();
-    c.bootstrap = settings.dht_bootstrap_nodes.clone();
-    c.read_only = settings.dht_read_only;
-    c.state = state;
-    c.query_timeout = settings.dht_query_timeout;
-    c.query_rate_per_ip = settings.dht_query_rate_per_ip;
-    // At most one socket per family: the first one wins.
-    let mut sockets: Vec<&SharedUdpSocket> = Vec::new();
-    for u in udp {
-        if !sockets
-            .iter()
-            .any(|s| s.local_addr().is_ipv4() == u.local_addr().is_ipv4())
-        {
-            sockets.push(u);
-        }
-    }
-    let senders = sockets.iter().map(|s| s.sender()).collect();
-    let r = Dht::spawn_on(c, senders).await.map(|(dht, input)| {
-        let input: Arc<dyn DatagramHandler> = Arc::new(input);
-        for s in &sockets {
-            s.set_handler(PacketKind::Dht, Arc::clone(&input));
-        }
-        dht
-    });
-    match r {
-        Ok(d) => Some(d),
-        Err(e) => {
-            warn!(error = %e, "cannot start the DHT; running without it");
-            None
-        }
-    }
+    Ok(Some(assoc))
 }
 
 /// A DHT failure as a session error: a DHT shut down with the session is
@@ -1666,10 +1728,18 @@ fn dht_error(e: DhtError) -> SessionError {
 /// `u` loses its SOCKS5 association (the proxy closed the control
 /// connection): from then on the DHT, uTP and UDP trackers fail until the
 /// session restarts. Ends with the socket or the session.
-fn watch_relay_lost(u: &SharedUdpSocket, shared: std::sync::Weak<Shared>) {
+fn watch_relay_lost(
+    u: &SharedUdpSocket,
+    shared: std::sync::Weak<Shared>,
+    mut stop: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     let mut lost = u.relay_lost();
     tokio::spawn(async move {
-        if lost.wait_for(|l| *l).await.is_err() {
+        let lost = tokio::select! {
+            r = lost.wait_for(|l| *l) => r.is_ok(),
+            _ = stop.changed() => return,
+        };
+        if !lost {
             return;
         }
         let Some(shared) = shared.upgrade() else {
@@ -1683,33 +1753,51 @@ fn watch_relay_lost(u: &SharedUdpSocket, shared: std::sync::Weak<Shared>) {
             .to_owned();
         warn!("{message}");
         shared.emit(Event::ProxyError { message });
-    });
+    })
 }
 
 /// Emits [`Event::DhtBootstrapped`] the first time the DHT's routing table
 /// fills, then ends; also ends with the DHT or the session.
-fn watch_bootstrap(dht: &Dht, shared: std::sync::Weak<Shared>) {
+fn watch_bootstrap(
+    dht: &Dht,
+    shared: std::sync::Weak<Shared>,
+    mut stop: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     let mut stats = dht.subscribe_stats();
     tokio::spawn(async move {
-        let Ok(s) = stats.wait_for(|s| s.bootstrapped).await else {
-            return;
+        let bootstrapped = tokio::select! {
+            r = stats.wait_for(|s| s.bootstrapped) => match r {
+                Ok(s) => s.nodes_v4.saturating_add(s.nodes_v6),
+                Err(_) => return,
+            },
+            _ = stop.changed() => return,
         };
-        let nodes = s.nodes_v4.saturating_add(s.nodes_v6);
-        drop(s);
         if let Some(shared) = shared.upgrade() {
-            shared.emit(Event::DhtBootstrapped { nodes });
+            shared.emit(Event::DhtBootstrapped {
+                nodes: bootstrapped,
+            });
         }
-    });
+    })
 }
 
 /// Emits [`Event::ExternalIpChanged`] with [`ExternalIpSource::Dht`] each
 /// time the DHT's votes settle on a new address; ends with the DHT or the
 /// session.
-fn watch_dht_external_ip(dht: &Dht, shared: std::sync::Weak<Shared>) {
+fn watch_dht_external_ip(
+    dht: &Dht,
+    shared: std::sync::Weak<Shared>,
+    mut stop: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     let mut stats = dht.subscribe_stats();
     tokio::spawn(async move {
         let mut last = None;
-        while stats.changed().await.is_ok() {
+        loop {
+            tokio::select! {
+                r = stats.changed() => if r.is_err() {
+                    return;
+                },
+                _ = stop.changed() => return,
+            }
             let ip = stats.borrow_and_update().external_ip;
             if ip.is_none() || ip == last {
                 continue;
@@ -1723,7 +1811,7 @@ fn watch_dht_external_ip(dht: &Dht, shared: std::sync::Weak<Shared>) {
                 source: ExternalIpSource::Dht,
             });
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -1732,42 +1820,22 @@ mod tests {
 
     #[test]
     fn listen_port_follows_the_peers_family() {
-        let shared = |v4: Option<u16>, v6: Option<u16>| Shared {
-            settings: Arc::new(Settings::default()),
-            peer_id: PeerId::generate(),
-            listen_port: 7000,
-            listen_port_v4: v4,
-            listen_port_v6: v6,
-            tracker: TrackerClient::new(Default::default()).unwrap(),
-            events: broadcast::channel(1).0,
-            shutdown: AtomicBool::new(false),
-            global_peers: AtomicUsize::new(0),
-            half_open: AtomicUsize::new(0),
-            dht: None,
-            dht_addrs: Vec::new(),
-            utp: Vec::new(),
-            disk: crate::disk::DiskPool::new(1, 1),
-            cache: Arc::new(crate::storage::cache::CacheBudget::new(0)),
-            bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
-            holepunch: HolepunchCounters::default(),
-            lsd: LsdHub::disabled(),
-            portmap: None,
-            external_ip: Arc::new(ExternalIp::new(broadcast::channel(1).0)),
-            ip_filter: RwLock::new(Arc::new(IpFilter::default())),
-            bans: Mutex::new(BanList::default()),
-            queue: Mutex::new(QueueSettings::default()),
-            queue_dirty: Notify::new(),
+        let stack = |v4: Option<u16>, v6: Option<u16>| {
+            Arc::new(NetStack::offline(&Settings::default(), 7000, v4, v6))
         };
+        let shared =
+            |v4: Option<u16>, v6: Option<u16>| Shared::test(Settings::default(), stack(v4, v6), 0);
         let peer4: SocketAddr = "10.0.0.1:6881".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:6881".parse().unwrap();
         let peer6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
         let both = shared(Some(7000), Some(7001));
-        assert_eq!(both.listen_port_for(&peer4), 7000);
-        assert_eq!(both.listen_port_for(&mapped), 7000);
-        assert_eq!(both.listen_port_for(&peer6), 7001);
+        let net = both.net();
+        assert_eq!(net.listen_port_for(&peer4), 7000);
+        assert_eq!(net.listen_port_for(&mapped), 7000);
+        assert_eq!(net.listen_port_for(&peer6), 7001);
         // No listener of the family: the first listener's port.
         let v6_only = shared(None, Some(7000));
-        assert_eq!(v6_only.listen_port_for(&peer4), 7000);
+        assert_eq!(v6_only.net().listen_port_for(&peer4), 7000);
     }
 
     #[test]

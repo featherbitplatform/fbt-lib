@@ -71,6 +71,10 @@ impl Actor {
     /// The context of a new peer task. Without metadata the task runs in
     /// no-metadata mode (no layout, an empty `have`).
     pub(super) fn ctx(&self, key: PeerKey, addr: &SocketAddr) -> PeerCtx {
+        // The stack is read once: the generation, the proxy and the
+        // addresses of the announcer all describe the same one, and the
+        // peer task notices a later change through `net_changed`.
+        let stack = self.shared.net();
         let l = self.loaded.as_ref();
         let have = l.map_or_else(
             || Bitfield::new(0),
@@ -101,6 +105,9 @@ impl Actor {
             bandwidth: Arc::clone(&self.shared.bandwidth),
             torrent_rate: self.rate.clone(),
             external_ip: Arc::clone(&self.shared.external_ip),
+            net_generation: stack.generation,
+            net_changed: self.shared.net_changed(),
+            proxy: stack.net.proxy.clone(),
         }
     }
 
@@ -110,28 +117,37 @@ impl Actor {
     pub(super) fn ext_config(&self, addr: &SocketAddr) -> ExtConfig {
         // Known metadata, a v2-only torrent's waiting for layers included.
         let meta = self.known_meta();
+        let stack = self.shared.net();
         ExtConfig {
-            listen_port: self.shared.listen_port_for(addr),
+            listen_port: stack.listen_port_for(addr),
             metadata_size: meta.and_then(|m| u32::try_from(m.raw_info().len()).ok()),
             pex: self.shared.settings.pex_enabled && !meta.is_some_and(|m| m.info.private),
             // No DHT bit or `Port` for a private torrent (a magnet's
             // privacy is unknown until its metadata: it advertises both).
-            dht_port: dht_port_for(&self.shared.dht_addrs, addr).filter(|_| !self.is_private()),
+            dht_port: dht_port_for(&stack.dht_addrs, addr).filter(|_| !self.is_private()),
             reqq: u32::try_from(self.shared.settings.max_incoming_requests).unwrap_or(u32::MAX),
             upload_only: self.upload_only_sent,
-            holepunch: self.holepunch_active(),
+            holepunch: stack.net.enable_outgoing_utp
+                && stack.net.enable_incoming_utp
+                && !stack.utp.is_empty()
+                && self.holepunch_enabled(),
         }
     }
 
     /// BEP 55 holepunch runs: enabled, uTP on in both directions with a
     /// socket to use, and the torrent not (known to be) private.
     pub(super) fn holepunch_active(&self) -> bool {
-        let s = &self.shared.settings;
-        s.enable_holepunch
-            && s.enable_outgoing_utp
-            && s.enable_incoming_utp
-            && !self.shared.utp.is_empty()
-            && !self.is_private()
+        let stack = self.shared.net();
+        stack.net.enable_outgoing_utp
+            && stack.net.enable_incoming_utp
+            && !stack.utp.is_empty()
+            && self.holepunch_enabled()
+    }
+
+    /// The settings side of [`holepunch_active`](Self::holepunch_active),
+    /// which does not depend on the network stack.
+    fn holepunch_enabled(&self) -> bool {
+        self.shared.settings.enable_holepunch && !self.is_private()
     }
 
     pub(super) fn new_key(&mut self) -> PeerKey {
@@ -247,15 +263,17 @@ impl Actor {
         source: PeerSource,
     ) -> PeerKey {
         let utp = match transport {
-            Transport::Utp => self.shared.utp_for(&addr).cloned(),
+            Transport::Utp => self.shared.utp_for(&addr),
             Transport::Tcp => None,
         };
         let key = self.new_key();
         let ctx = self.ctx(key, &addr);
+        let net_generation = ctx.net_generation;
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();
         let tx = spawn_outgoing(addr, ctx, self.mse_provide(&addr), transport, utp);
         let mut peer = Peer::new(addr, tx, self.generation, num_pieces, transport, source);
+        peer.net_generation = net_generation;
         peer.outgoing = true;
         peer.connecting = true;
         peer.have_sent = Some(have);
@@ -398,12 +416,17 @@ impl Actor {
     }
 
     /// `t` is enabled for outgoing connections and, for uTP, a socket of
-    /// `addr`'s family exists.
+    /// `addr`'s family exists. The stack's applied switches decide (the
+    /// stored ones may differ, e.g. outgoing uTP off under an HTTP proxy).
+    /// The closed stack of a change in flight can reach nothing.
     fn transport_usable(&self, addr: &SocketAddr, t: Transport) -> bool {
-        let s = &self.shared.settings;
+        let stack = self.shared.net();
+        if stack.closed {
+            return false;
+        }
         match t {
-            Transport::Tcp => s.enable_outgoing_tcp,
-            Transport::Utp => s.enable_outgoing_utp && self.shared.utp_for(addr).is_some(),
+            Transport::Tcp => self.shared.settings.enable_outgoing_tcp,
+            Transport::Utp => stack.net.enable_outgoing_utp && stack.utp_for(addr).is_some(),
         }
     }
 
@@ -460,6 +483,7 @@ impl Actor {
         ctx.encrypted = stream.is_encrypted();
         ctx.transport = stream.get_ref().kind();
         let transport = ctx.transport;
+        let net_generation = ctx.net_generation;
         let have = ctx.have.clone();
         let num_pieces = ctx.have.len();
         let tx = spawn_incoming(stream, hs, addr, ctx);
@@ -471,6 +495,7 @@ impl Actor {
             transport,
             PeerSource::Incoming,
         );
+        peer.net_generation = net_generation;
         peer.have_sent = Some(have);
         self.peers.insert(key, peer);
     }
@@ -616,6 +641,48 @@ impl Actor {
         self.candidates.clear();
     }
 
+    /// The session's network stack changed: closes the connections of
+    /// generations below `generation` with
+    /// [`DisconnectReason::NetworkChanged`]. With `close_tcp` (the proxy
+    /// changed) that is every connection; otherwise only the ones still
+    /// being established, whose dial or handshake the new stack must not
+    /// finish. Web seed requests of older generations are cancelled too (a
+    /// newer one re-fetches what they held). The actors of the closed peers
+    /// report their end; their addresses stay dialable on the new stack.
+    pub(super) fn on_network_changed(&mut self, generation: u64, close_tcp: bool) {
+        let keys: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.tx.is_some())
+            .filter(|(_, p)| p.net_generation < generation)
+            .filter(|(_, p)| close_tcp || !p.connected)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in keys {
+            if let Some(p) = self.peers.get_mut(&key) {
+                p.close_reason = Some(DisconnectReason::NetworkChanged);
+            }
+            self.close_peer(key);
+        }
+        if close_tcp {
+            self.cancel_web_seeds();
+            self.candidates.clear();
+        }
+    }
+
+    /// A new stack is installed: queues every known address again, so a peer
+    /// that was closed for the change (or dropped from the candidates) is
+    /// dialled through it, and re-announces at once.
+    pub(super) fn on_network_ready(&mut self, generation: u64) {
+        debug!(generation, "new network stack; re-announcing");
+        self.requeue_known();
+        self.signal(|s| {
+            s.reannounces = s.reannounces.wrapping_add(1);
+            true
+        });
+        self.restart_dht_announcer();
+    }
+
     /// Bookkeeping for a finished handshake: slots, retries and the
     /// duplicate peer-id guard. Says whether the connection stays (the
     /// caller then catches it up on our pieces) and whether it took over
@@ -720,7 +787,15 @@ impl Actor {
             release(&self.shared.half_open);
         }
         release(&self.shared.global_peers);
-        if matches!(reason, DisconnectReason::Blocked(_)) {
+        if reason == DisconnectReason::NetworkChanged {
+            // The stack changed under it: not a failure, and the address
+            // stays dialable (`on_network_ready` queues every known one
+            // again). A connected one is closed only for a proxy change
+            // (`close_tcp`), and is redialled the same way.
+            if p.outgoing && !p.connected {
+                self.retries.clear_transport_failed(&p.addr);
+            }
+        } else if matches!(reason, DisconnectReason::Blocked(_)) {
             // We refused it: no fallback, retry or rendezvous. An address
             // the filter or a ban blocks is not queued again while it is;
             // one refused for the per-IP limit may be, once there is room.
@@ -840,11 +915,7 @@ pub(super) mod tests {
     /// The session state of a test actor, with a cache budget of
     /// `cache_size`.
     fn shared(cache_size: u64) -> Arc<crate::session::Shared> {
-        use std::sync::atomic::{AtomicBool, AtomicUsize};
-
-        use fbt_tracker::TrackerClient;
-        use tokio::sync::broadcast;
-
+        use crate::netstack::NetStack;
         use crate::session::Shared;
         use crate::settings::Settings;
 
@@ -853,33 +924,8 @@ pub(super) mod tests {
             dht_bootstrap_nodes: Vec::new(),
             ..Settings::default()
         };
-        let tracker = TrackerClient::new(settings.tracker.clone()).expect("tracker client");
-        Arc::new(Shared {
-            settings: Arc::new(settings),
-            peer_id: PeerId::generate(),
-            listen_port: 6881,
-            listen_port_v4: Some(6881),
-            listen_port_v6: None,
-            tracker,
-            events: broadcast::channel(64).0,
-            shutdown: AtomicBool::new(false),
-            global_peers: AtomicUsize::new(0),
-            half_open: AtomicUsize::new(0),
-            dht: None,
-            dht_addrs: Vec::new(),
-            utp: Vec::new(),
-            disk: crate::disk::DiskPool::new(1, 1),
-            cache: Arc::new(crate::storage::cache::CacheBudget::new(cache_size)),
-            bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
-            holepunch: Default::default(),
-            lsd: crate::net::LsdHub::disabled(),
-            portmap: None,
-            external_ip: Arc::new(crate::net::ExternalIp::new(broadcast::channel(1).0)),
-            ip_filter: Default::default(),
-            bans: Default::default(),
-            queue: Default::default(),
-            queue_dirty: Default::default(),
-        })
+        let stack = Arc::new(NetStack::offline(&settings, 6881, Some(6881), None));
+        Shared::test(settings, stack, cache_size)
     }
 
     /// An actor for `meta` on `storage`, as spawned (checking).

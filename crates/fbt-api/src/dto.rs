@@ -1016,7 +1016,7 @@ pub(crate) enum EventDto {
         /// Why: `self_connection`, `info_hash_mismatch`,
         /// `handshake_timeout`, `idle_timeout`, `encryption`, `protocol`,
         /// `io`, `closed`, `shutdown`, `duplicate`, `bad_metadata`,
-        /// `upload_only`, `blocked` or `unknown`.
+        /// `upload_only`, `blocked`, `network_changed` or `unknown`.
         reason: &'static str,
         /// Details: the error text, or for `blocked` the block reason.
         detail: Option<String>,
@@ -1171,6 +1171,7 @@ fn disconnect_reason(reason: &DisconnectReason) -> (&'static str, Option<String>
         DisconnectReason::BadMetadata => ("bad_metadata", None),
         DisconnectReason::UploadOnly => ("upload_only", None),
         DisconnectReason::Blocked(r) => ("blocked", Some(block_reason(*r).to_owned())),
+        DisconnectReason::NetworkChanged => ("network_changed", None),
         // A reason a later `fbt` adds.
         _ => ("unknown", None),
     }

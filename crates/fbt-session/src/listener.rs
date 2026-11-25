@@ -15,7 +15,7 @@ use fbt_wire::{
 };
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 use tracing::debug;
@@ -174,17 +174,23 @@ fn refused(shared: &Shared, state: &ListenerState, addr: SocketAddr) -> bool {
     true
 }
 
-/// Runs one TCP accept loop until the session goes away or the task is
-/// aborted.
+/// Runs one TCP accept loop until the session goes away, its stack shuts
+/// down or the task is aborted. `stop` fires when the stack this listener
+/// belongs to is replaced or shut down: the loop returns and drops the
+/// listener, releasing the port the next stack binds again.
 pub(crate) fn spawn(
     listener: TcpListener,
     state: Arc<ListenerState>,
     session: Weak<SessionInner>,
     shared: Arc<Shared>,
+    mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let (stream, addr) = match listener.accept().await {
+            let (stream, addr) = match tokio::select! {
+                _ = stop.changed() => return,
+                r = listener.accept() => r,
+            } {
                 Ok(c) => c,
                 Err(e) => {
                     debug!(error = %e, "accept failed");
@@ -214,17 +220,23 @@ pub(crate) fn spawn(
 
 /// Runs one uTP accept loop on `socket` until the socket shuts down, the
 /// session goes away or the task is aborted. Accepted streams take a
-/// pending-handshake permit from the same `state` as TCP ones.
+/// pending-handshake permit from the same `state` as TCP ones. `stop` fires
+/// when the stack this socket belongs to is replaced or shut down.
 pub(crate) fn spawn_utp(
     socket: UtpSocket,
     state: Arc<ListenerState>,
     session: Weak<SessionInner>,
     shared: Arc<Shared>,
+    mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             // The only error is the socket shutting down.
-            let Ok((stream, addr)) = socket.accept().await else {
+            let accepted = tokio::select! {
+                _ = stop.changed() => return,
+                r = socket.accept() => r,
+            };
+            let Ok((stream, addr)) = accepted else {
                 return;
             };
             if session.strong_count() == 0 || shared.is_shutdown() {
