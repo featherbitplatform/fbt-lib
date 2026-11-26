@@ -6,8 +6,10 @@
 //! uses for direct HTTP connections, which `fbt-net` cannot depend on.
 //!
 //! The proxy's own name is recorded once as the `Lookup` a proxied session
-//! makes ([`resolve_proxy`]), and each attempt dials an address that name
-//! already resolved to, so the attempts carry no record of their own.
+//! makes ([`resolve_proxy`]), and every attempt records the `TcpConnect` for
+//! the address it dials ([`connect_attempt`]): a lookup records the name
+//! alone, so the address the name actually resolved to would otherwise be
+//! invisible to the outbound audit.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -50,19 +52,23 @@ pub(crate) async fn dial_addrs(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
 /// One attempt in flight.
 type Dial = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>;
 
-/// Starts one attempt on `addr`. A test can hold it open with
-/// [`hang_connect`], the position a blackholed route holds an attempt in
-/// production, so the next address is proved to be tried without waiting on a
-/// real timeout.
+/// Starts one attempt on `addr`: the connect is recorded first, in the same
+/// step as the dial, because the name's `Lookup` records the name alone. A
+/// test can hold the attempt open with [`hang_connect`], the position a
+/// blackholed route holds an attempt in production, so the next address is
+/// proved to be tried without waiting on a real timeout.
 fn connect_attempt(addr: SocketAddr) -> Dial {
     Box::pin(async move {
-        // (tests) A connect a test asked to hold open, before any dial.
+        // audit: each attempt dials the address the proxy's name resolved to,
+        // which the name's `Lookup` alone does not show.
+        audit::record(audit::Outbound::TcpConnect(addr));
+        // (tests) A connect a test asked to hold open, after the record.
         #[cfg(test)]
         if let Some(gate) = take_hang_gate(addr) {
             gate.park().await;
             return Err(io::Error::other("hung connect released"));
         }
-        // audit: the proxy's own name is the Lookup recorded before resolving
+        // audit: recorded above, before the test hook that compiles out
         TcpStream::connect(addr).await
     })
 }
@@ -240,6 +246,16 @@ mod tests {
         SocketAddr::from((Ipv6Addr::LOCALHOST, port))
     }
 
+    /// A loopback address nothing listens on: bind an ephemeral port and let
+    /// it go. Every test takes its own, so a gate keyed by address belongs to
+    /// one test only.
+    async fn closed_loopback() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind(v4(0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
     /// The families are interleaved, beginning with the family of the
     /// resolver's first answer (RFC 8305 section 4).
     #[test]
@@ -264,7 +280,7 @@ mod tests {
         let live = listener.local_addr().unwrap();
         // A first address the resolver answered with: loopback, nothing
         // listens, and the gate parks the attempt before any dial.
-        let hung = v4(1);
+        let hung = closed_loopback().await;
         let gate = hang_connect(hung);
 
         let started = Instant::now();
@@ -278,5 +294,89 @@ mod tests {
         );
         drop(dialled);
         gate.release();
+    }
+
+    /// Every address refused: the dial returns the last error it saw, and it
+    /// does so promptly rather than waiting the deadline out.
+    #[tokio::test]
+    async fn every_address_refused_returns_the_last_error_promptly() {
+        let (a, b) = (closed_loopback().await, closed_loopback().await);
+        let started = Instant::now();
+        let e = tokio::time::timeout(Duration::from_secs(5), dial_addrs(&[a, b]))
+            .await
+            .expect("the dial did not finish inside 5 s")
+            .expect_err("the dial succeeded against closed ports");
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the dial waited the deadline out"
+        );
+    }
+
+    /// A name dial records exactly one `Lookup` (the proxy's name) and one
+    /// `TcpConnect` per address the name resolved to: the lookup records the
+    /// name alone, so the attempts' connects are what shows the addresses.
+    #[tokio::test]
+    async fn a_name_dial_records_the_lookup_and_each_attempt() {
+        // A port nothing listens on, so every attempt is refused and the dial
+        // runs its whole schedule rather than stopping at a success.
+        let port = closed_loopback().await.port();
+        let expected: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", port))
+            .await
+            .expect("localhost did not resolve")
+            .collect();
+        assert!(!expected.is_empty(), "localhost resolved to nothing");
+
+        let cap = fbt_core::audit::capture();
+        // `localhost` resolves to `::1` and `127.0.0.1` (both refused here).
+        // Hold the first attempt open so it can neither succeed (which would
+        // skip the rest) nor be skipped, then release it a stagger later, once
+        // the next address has been started, so the dial finishes.
+        let addrs = resolve_proxy("localhost", port)
+            .await
+            .expect("localhost did not resolve");
+        let gate = hang_connect(expected[0]);
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            gate.release();
+        };
+        let (dialled, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), dial_addrs(&addrs)),
+            release,
+        );
+        let recs = cap.take();
+        drop(cap);
+        assert!(
+            dialled.is_ok(),
+            "the dial did not finish once the first attempt was released"
+        );
+
+        let lookups: Vec<&str> = recs
+            .iter()
+            .filter_map(|o| match o {
+                fbt_core::audit::Outbound::Lookup(h) => Some(h.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lookups,
+            ["localhost"],
+            "the name is the one lookup: {recs:?}"
+        );
+
+        // One connect per attempt: the addresses the name resolved to. Other
+        // tests in this binary dial their own ports, filtered out here.
+        let mut connects: Vec<SocketAddr> = recs
+            .iter()
+            .filter_map(|o| match o {
+                fbt_core::audit::Outbound::TcpConnect(a) if a.port() == port => Some(*a),
+                _ => None,
+            })
+            .collect();
+        connects.sort();
+        connects.dedup();
+        let mut want = expected.clone();
+        want.sort();
+        assert_eq!(connects, want, "one connect per attempted address");
     }
 }

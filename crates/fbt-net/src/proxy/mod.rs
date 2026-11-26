@@ -483,12 +483,19 @@ async fn dial_proxy(cfg: &ProxyConfig, deadline: Instant) -> Result<TcpStream, P
                     ));
                 }
             };
-            match within(deadline, dial::dial_addrs(&addrs)).await {
-                Some(Ok(s)) => Ok(s),
-                Some(Err(e)) => Err(ProxyError::Unreachable(e)),
-                None => Err(unreachable_timeout("connecting to the proxy timed out")),
-            }
+            dial_resolved(&addrs, deadline).await
         }
+    }
+}
+
+/// Dials the addresses a proxy name resolved to, within `deadline`: the last
+/// failure is [`ProxyError::Unreachable`], keeping its cause (an empty
+/// resolution is a `NotFound`), and running out of time is the dial timeout.
+async fn dial_resolved(addrs: &[SocketAddr], deadline: Instant) -> Result<TcpStream, ProxyError> {
+    match within(deadline, dial::dial_addrs(addrs)).await {
+        Some(Ok(s)) => Ok(s),
+        Some(Err(e)) => Err(ProxyError::Unreachable(e)),
+        None => Err(unreachable_timeout("connecting to the proxy timed out")),
     }
 }
 
@@ -618,5 +625,16 @@ mod tests {
             ..ProxyConfig::default()
         };
         assert!(bare.validate().is_ok(), "a bare literal is dialable");
+    }
+
+    /// A name that resolved to no address is a reachability failure whose
+    /// cause is `NotFound`, not a timeout and not a silent success.
+    #[tokio::test]
+    async fn an_empty_resolution_is_unreachable_not_found() {
+        let deadline = deadline_in(Duration::from_secs(5));
+        match dial_resolved(&[], deadline).await {
+            Err(ProxyError::Unreachable(e)) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+            other => panic!("expected Unreachable/NotFound, got {other:?}"),
+        }
     }
 }

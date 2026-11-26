@@ -104,7 +104,12 @@ fn torrent() -> Metainfo {
 /// A session running `proxy`, with the one torrent added and its peer queued
 /// for a dial.
 async fn start(proxy: ProxyConfig) -> (Session, TorrentHandle) {
-    let mut s = settings();
+    start_with(settings(), proxy).await
+}
+
+/// [`start`] over explicit settings, for the one test that needs a longer
+/// `connect_timeout`.
+async fn start_with(mut s: Settings, proxy: ProxyConfig) -> (Session, TorrentHandle) {
     s.proxy = proxy;
     let session = Session::new(s).await.unwrap();
     let mut p = AddTorrent::new(torrent(), PathBuf::from("unused"));
@@ -436,7 +441,14 @@ async fn switching_to_proxy_opens_nothing_direct() {
 async fn proxy_host_name_is_the_only_lookup() {
     let cap = audit::capture();
     let fake = FakeSocks5::start(Script::RecordOnly).await;
-    let (session, _handle) = start(proxy_by_name("localhost", fake.addr().port())).await;
+    // On Windows `localhost` resolves to `::1` first, while the fake listens on
+    // IPv4 only, so the stagger spends its first attempt on `::1` (a refused
+    // connect there takes about 2 s on Windows) before the IPv4 attempt 250 ms
+    // in. This one test gets a 3 s `connect_timeout` as margin for that first
+    // attempt plus the SOCKS5 handshake; the stagger is what makes it pass.
+    let mut s = settings();
+    s.connect_timeout = Duration::from_secs(3);
+    let (session, _handle) = start_with(s, proxy_by_name("localhost", fake.addr().port())).await;
 
     assert!(
         wait_logged(
