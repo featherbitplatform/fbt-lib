@@ -302,13 +302,19 @@ mod tests {
     async fn every_address_refused_returns_the_last_error_promptly() {
         let (a, b) = (closed_loopback().await, closed_loopback().await);
         let started = Instant::now();
-        let e = tokio::time::timeout(Duration::from_secs(5), dial_addrs(&[a, b]))
+        // The dial is bounded by this deadline: 30 s, so the bound below is
+        // what catches a dial that waits the schedule out.
+        let e = tokio::time::timeout(Duration::from_secs(30), dial_addrs(&[a, b]))
             .await
-            .expect("the dial did not finish inside 5 s")
+            .expect("the dial did not finish inside 30 s")
             .expect_err("the dial succeeded against closed ports");
         assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+        // Not tighter: a refused connect to a closed loopback port takes about
+        // 2 s on Windows, for IPv4 as for ::1 (the SYN is retried after the
+        // RST), so 10 s leaves room for that while still failing a dial that
+        // waits out the 30 s deadline.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(10),
             "the dial waited the deadline out"
         );
     }
