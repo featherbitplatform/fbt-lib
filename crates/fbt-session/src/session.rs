@@ -25,7 +25,7 @@ use crate::event::{Event, EventMask, EventStream, ExternalIpSource, ProxyState};
 use crate::listener::ListenerState;
 use crate::net::{ExternalIp, ListenError, spawn_lsd_task, spawn_nat_task};
 use crate::netstack::NetStack;
-use crate::proxy_health::{ProxyHealth, classify, spawn as spawn_proxy_health};
+use crate::proxy_health::{ProxyHealth, build_failed_state, classify, spawn as spawn_proxy_health};
 use crate::queue::{QueueEntry, QueueSettings, is_slow, plan, running_since};
 use crate::resume::{ResumeError, ResumeState, SessionState, decode_resume};
 use crate::settings::{NetworkSettings, Settings};
@@ -818,24 +818,26 @@ impl SessionInner {
             .map(|_| ())
     }
 
-    /// The health task's path: rebuild the stack with an association it has
-    /// already taken, for the settings it probed. `close_tcp` is false (the
-    /// proxy did not change, so connected TCP peers stay) and the rebuild is
-    /// forced (the value is unchanged, and the missing UDP socket is the
-    /// point). Under the lock the stored settings must still equal `net`: a
-    /// user change since the probe wins and this result is dropped (the
-    /// returned `false`).
-    pub(crate) async fn rebuild_for_relay(
+    /// The health task's path: rebuild the stack for the settings it probed,
+    /// with the association it has already taken (`relay`, `Some` only for a
+    /// proxy that relays UDP). It runs both for a relay that came back and for
+    /// a *closed* stack left behind by a change that could not build its own,
+    /// whatever the proxy kind (I1), so `relay` is an `Option`. `close_tcp` is
+    /// false (the proxy did not change, so connected TCP peers stay) and the
+    /// rebuild is forced (the value is unchanged, and the missing UDP socket
+    /// is the point). Under the lock the stored settings must still equal
+    /// `net`: a user change since the probe wins and this result is dropped
+    /// (the returned `false`).
+    pub(crate) async fn rebuild_for_health(
         self: &Arc<Self>,
         net: NetworkSettings,
-        relay: Socks5Udp,
+        relay: Option<Socks5Udp>,
     ) -> Result<bool, SessionError> {
-        self.apply_change(net, Some(false), true, Some(relay), true)
-            .await
+        self.apply_change(net, Some(false), true, relay, true).await
     }
 
     /// The work behind [`rebuild`](Self::rebuild) and
-    /// [`rebuild_for_relay`](Self::rebuild_for_relay).
+    /// [`rebuild_for_health`](Self::rebuild_for_health).
     ///
     /// `close_tcp` is `None` to derive it from whether the proxy changed
     /// (the user path) or `Some(..)` to fix it. `force` skips the no-op
@@ -940,6 +942,14 @@ impl SessionInner {
                 if self.shared.is_shutdown() {
                     return Err(SessionError::Shutdown);
                 }
+                // The closed stack stays installed with the previous settings
+                // stored, so nothing sends until a later change or the health
+                // task applies them again. The failure is recorded as a
+                // *retried* state naming it, whatever the proxy kind: the
+                // health task probes the stored settings and rebuilds their
+                // stack, instead of the session sitting dead with the proxy
+                // still reported healthy and no retry ever (I1).
+                self.shared.proxy_health.set(build_failed_state(&e));
                 return Err(e);
             }
         };
@@ -1117,11 +1127,12 @@ impl Session {
     /// without one, `Reachable` when it answered (with its UDP association
     /// where UDP has to be relayed), `UdpNotRelayed` when it answers TCP but
     /// will not relay UDP, `LoginRefused` when it refused the credentials,
-    /// and `Unreachable` when it could not be reached. A proxy is re-probed
-    /// with a backoff from
-    /// [`Settings::proxy_retry_base`] to [`Settings::proxy_retry_max`] while
-    /// it is `Unreachable` or `LoginRefused`; every change is also announced
-    /// as [`Event::ProxyStateChanged`].
+    /// and `Unreachable` when it could not be reached: a failed probe, or a
+    /// network change whose stack could not be built, whose reason names the
+    /// local failure. A proxy is re-probed with a backoff from
+    /// `Settings::proxy_retry_base` to `Settings::proxy_retry_max` while it is
+    /// `Unreachable` or `LoginRefused`; every change is also announced as
+    /// [`Event::ProxyStateChanged`].
     pub fn proxy_state(&self) -> ProxyState {
         self.inner.shared.proxy_health.state()
     }
@@ -1146,11 +1157,14 @@ impl Session {
     /// value equal to the current one is a no-op.
     ///
     /// A change that fails while building the new stack (a listen address
-    /// that cannot be bound) leaves the closed stack installed and the
-    /// *previous* settings stored: the proxy the caller asked for was never
-    /// applied. The health task keeps probing that previous value and -- when
-    /// the previous proxy relays UDP -- rebuilds the stack with its relay, so
-    /// the previous proxy is restored without another change.
+    /// that cannot be bound, or the relayed socket) leaves the closed stack
+    /// installed and the *previous* settings stored: the proxy the caller
+    /// asked for was never applied, and nothing sends in the meantime. The
+    /// failure is reported as an [`Unreachable`](ProxyState::Unreachable)
+    /// state whose reason names it, whatever the proxy kind, so the health
+    /// task probes the previous value again with its backoff and rebuilds the
+    /// stack from it (with the previous proxy's relay where there is one):
+    /// the session comes back on its own, without another change.
     pub async fn set_network_settings(&self, net: NetworkSettings) -> Result<(), SessionError> {
         if self.inner.shared.is_shutdown() {
             return Err(SessionError::Shutdown);

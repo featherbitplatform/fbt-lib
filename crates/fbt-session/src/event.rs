@@ -70,10 +70,10 @@ pub enum ProxyState {
     /// trackers do not run. This is a property of the proxy, not something a
     /// retry changes, so it is checked again only on a settings change.
     UdpNotRelayed,
-    /// The proxy could not be reached: the dial to it failed or timed out.
-    /// Re-probed with a backoff from
-    /// [`Settings::proxy_retry_base`](crate::Settings::proxy_retry_base) up
-    /// to [`Settings::proxy_retry_max`](crate::Settings::proxy_retry_max).
+    /// The proxy could not be reached: the dial to it failed or timed out,
+    /// or a network change could not build its stack (a listen address that
+    /// cannot be bound), which the reason names. Re-probed with a backoff
+    /// from `Settings::proxy_retry_base` up to `Settings::proxy_retry_max`.
     Unreachable {
         /// Why, made display-safe and bounded (at most 200 characters).
         reason: String,

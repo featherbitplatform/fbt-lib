@@ -1073,3 +1073,133 @@ async fn refused_tunnel_is_a_proxy_error() {
     }
     assert!(tracker.announces().is_empty());
 }
+
+/// Takes the listen address `addr` the moment it is free: binds it in a loop
+/// (failing while the session still holds it) and returns the listener as the
+/// task's value, so the port stays taken until the returned handle is
+/// awaited and its value dropped. `got` fires once the port is held.
+async fn hold_port(
+    addr: SocketAddr,
+    got: tokio::sync::oneshot::Sender<()>,
+) -> tokio::net::TcpListener {
+    loop {
+        if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+            let _ = got.send(());
+            return listener;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// A change whose new stack cannot be built (the listen port is taken between
+/// the old stack's release and the rebind) is not silent: the state turns
+/// `Unreachable` with a reason naming the local failure, the change is
+/// announced, and the health task rebuilds the stack from the stored settings
+/// (the previous proxy) once the port is free again (I1). Without it the
+/// session sat on the closed stack with no network, reporting the *previous*
+/// proxy healthy and retrying nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_that_cannot_rebind_is_reported_and_retried() {
+    let old = FakeSocks5::start(Script::Ok).await;
+    // The new proxy answers, but only once the test opens its gate: the
+    // change is then parked past the release of the listen port and before
+    // the rebind, which is the moment the port is free for the taking.
+    let (new, gate) = FakeSocks5::start_gated(Script::Ok).await;
+    let mut st = dial_tcp(settings());
+    st.proxy = proxy(ProxyKind::Socks5, old.addr());
+    let s = Session::new(st).await.unwrap();
+    assert_eq!(s.proxy_state(), ProxyState::Reachable);
+    let addr = s.local_addr();
+    let mut events = s.subscribe(EventMask::ALL);
+
+    let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+    let holder = tokio::spawn(hold_port(addr, got_tx));
+    let mut net = s.network_settings();
+    net.proxy = proxy(ProxyKind::Socks5, new.addr());
+    let switching = s.clone();
+    let change = tokio::spawn(async move { switching.set_network_settings(net).await });
+
+    // The change is in its classification of the new proxy, which the gate
+    // parks: the old stack's listener is gone by now.
+    assert!(
+        wait_until(|| gate.waiting() >= 1, T).await,
+        "the change never probed the new proxy"
+    );
+    // The port is held before the parked change is let go, so the rebind
+    // cannot succeed.
+    got_rx.await.expect("the holder never took the port");
+    gate.release();
+    let err = change
+        .await
+        .expect("the change task panicked")
+        .expect_err("the change succeeded with the listen port taken");
+    assert!(matches!(err, SessionError::Bind(_)), "{err:?}");
+
+    // The local failure is reported as a retried state, with a reason naming
+    // it, and announced.
+    let reason = match s.proxy_state() {
+        ProxyState::Unreachable { reason } => reason,
+        other => panic!("expected Unreachable, got {other:?}"),
+    };
+    assert!(
+        reason.contains("could not be built"),
+        "the reason does not name the local failure: {reason}"
+    );
+    assert!(
+        next_matching(
+            &mut events,
+            |e| matches!(
+                e,
+                Event::ProxyStateChanged {
+                    state: ProxyState::Unreachable { .. }
+                }
+            ),
+            T
+        )
+        .await
+        .is_some(),
+        "the failed change was not announced"
+    );
+
+    // Freeing the port, the health task rebuilds the stored settings (the
+    // previous, healthy proxy) within the backoff, and the state is back.
+    let generation = s.net_generation();
+    let held = holder.await.expect("the holder panicked");
+    drop(held);
+    assert!(
+        wait_until(
+            || s.proxy_state() == ProxyState::Reachable,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the session did not recover: {:?}",
+        s.proxy_state()
+    );
+    assert!(
+        s.net_generation() > generation,
+        "the stack was not rebuilt (generation {generation} -> {})",
+        s.net_generation()
+    );
+    assert!(
+        next_matching(
+            &mut events,
+            |e| matches!(
+                e,
+                Event::ProxyStateChanged {
+                    state: ProxyState::Reachable
+                }
+            ),
+            T
+        )
+        .await
+        .is_some(),
+        "the recovery was not announced"
+    );
+    // The recovered stack listens again.
+    assert!(
+        tokio::net::TcpStream::connect(s.local_addr()).await.is_ok(),
+        "the rebuilt stack does not listen on {}",
+        s.local_addr()
+    );
+    s.shutdown().await;
+}

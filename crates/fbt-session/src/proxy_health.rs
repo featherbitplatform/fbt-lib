@@ -24,6 +24,10 @@
 //! dropped. A change that fails in `NetStack::build` never stores its
 //! settings, so the task keeps probing the *previous* proxy and may restore
 //! that stack (see [`Session::set_network_settings`](crate::Session::set_network_settings)).
+//! The change itself records that failure as a retried state
+//! ([`build_failed_state`]), so the task probes the previous settings again
+//! and rebuilds their stack instead of the session sitting on the closed one
+//! with no network and no retry (I1).
 //!
 //! Two things keep the backoff honest. `attempt` is reset only by a long
 //! healthy stretch or by a change of the proxy probed, never by a successful
@@ -111,6 +115,20 @@ pub(crate) async fn classify(settings: &Settings) -> (ProxyState, Option<Socks5U
             Err(e) => (state_of(&e), None),
         }
     }
+}
+
+/// The state a change that could not build its stack leaves: `Unreachable`
+/// with a display-safe reason naming the local failure, whatever the proxy
+/// kind (a proxy that is down or rules UDP out is a state, not a build
+/// error, so a build failure is always local: a listen address that cannot
+/// be bound, or a relayed socket that cannot be opened).
+///
+/// It is a *retried* state on purpose: the health task probes the stored
+/// settings again with its backoff and rebuilds the stack from them, so a
+/// session whose change failed does not sit on the closed stack reporting
+/// the proxy healthy with no network and no retry (I1).
+pub(crate) fn build_failed_state(e: &SessionError) -> ProxyState {
+    ProxyState::unreachable(&format!("the network stack could not be built: {e}"))
 }
 
 /// The wait before the `attempt`th re-probe (`attempt` counting from 0,
@@ -412,11 +430,11 @@ fn restarts_wait(
 }
 
 /// Spawns the session's proxy health task: it re-probes an unreachable or
-/// login-refused proxy with a backoff from
-/// [`Settings::proxy_retry_base`] to [`Settings::proxy_retry_max`] and, when
-/// a proxy that relays UDP comes back, rebuilds the network stack with its
-/// UDP association. Ends with the session (its handle is aborted with the
-/// session's other tasks).
+/// login-refused proxy with a backoff from `Settings::proxy_retry_base` to
+/// `Settings::proxy_retry_max` and, when a proxy that relays UDP comes back
+/// (or a closed stack is left behind by a failed change), rebuilds the
+/// network stack from the stored settings. Ends with the session (its handle
+/// is aborted with the session's other tasks).
 ///
 /// The retry bounds are read once, here, so the task never needs the session
 /// alive to learn them: it holds only a [`Weak`] between wakes, so a session
@@ -547,6 +565,12 @@ async fn run(inner: Weak<SessionInner>, health: Arc<ProxyHealth>, base: Duration
 /// stay); a relay the live stack still has is left alone, so a spurious dial
 /// failure cannot tear down a healthy stack.
 ///
+/// A closed stack is rebuilt whatever the proxy kind: a change that failed to
+/// build its stack left the closed one installed and a retried state
+/// ([`build_failed_state`]), and only applying the stored settings again gets
+/// a network back (I1). The relay the classification took, when it took one,
+/// goes with the rebuild; a proxy that needs none is applied as it is.
+///
 /// Nothing is set when the settings changed since the probe was taken: the
 /// result is applied only while the stored settings still equal the ones
 /// probed (`set_if_current`), so a probe of an *old* proxy cannot overwrite
@@ -559,16 +583,22 @@ async fn probe_once(inner: &Arc<SessionInner>) {
     let mut settings = (*inner.shared.settings).clone();
     settings.set_network(net.clone());
     let (state, relay) = classify(&settings).await;
+    // The stack installed now is the closed placeholder: a change that could
+    // not build its own left it behind, and no state but a rebuilt stack
+    // brings a network back (I1).
+    let closed = inner.shared.net().closed;
     match relay {
-        // A reachable proxy that carries TCP only (or a failure): just the
-        // state, and only while the settings are still the probed ones.
-        None => inner.set_if_current(&net, state).await,
+        // A reachable proxy that carries TCP only (or a failure), on a live
+        // stack: just the state, and only while the settings are still the
+        // probed ones.
+        None if !closed => inner.set_if_current(&net, state).await,
         // The proxy relays UDP and the live stack still has its relay: leave
         // the stack alone (a rebuild would churn uTP, the DHT and the
         // announces) and only make sure the state is `Reachable`.
         Some(_) if inner.relay_is_live() => inner.set_if_current(&net, ProxyState::Reachable).await,
-        Some(relay) => match inner.rebuild_for_relay(net.clone(), relay).await {
-            // The rebuild records `Reachable` itself, *before* it wires the
+        relay => match inner.rebuild_for_health(net.clone(), relay).await {
+            // The rebuild records `Reachable` (or the classification's state,
+            // for a proxy that relays nothing) itself, *before* it wires the
             // new stack's relay watcher: a relay that is lost at once moves
             // the state back to `Unreachable` and is retried, and nothing here
             // can write `Reachable` over it (P1). `Ok(false)` is a settings
@@ -577,8 +607,10 @@ async fn probe_once(inner: &Arc<SessionInner>) {
             Ok(_) => {}
             Err(SessionError::Shutdown) => {}
             Err(e) => {
-                warn!(error = %e, "cannot rebuild the network stack for the relayed proxy");
-                let state = ProxyState::unreachable(&e.to_string());
+                warn!(error = %e, "cannot rebuild the network stack for the probed settings");
+                // The same state `apply_change` recorded: the stack could not
+                // be built again, so the session keeps retrying.
+                let state = build_failed_state(&e);
                 inner.set_if_current(&net, state).await;
             }
         },
