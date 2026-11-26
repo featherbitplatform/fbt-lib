@@ -377,8 +377,10 @@
 //! [`Settings::proxy`] ([`ProxyConfig`]) sends peer connections, web seeds
 //! and trackers through a SOCKS5 or HTTP `CONNECT` proxy ([`ProxyKind`]),
 //! with `proxy_peers`, `proxy_trackers` and `proxy_hostnames` choosing what
-//! goes through it (all on). Listening is unchanged. A session starts and
-//! keeps running whatever the proxy's health:
+//! goes through it (all on), and [`ProxyConfig::proxy_only`] keeps every
+//! bypass off, so nothing leaves this host except through the proxy.
+//! Listening is unchanged. A session starts and keeps running whatever the
+//! proxy's health:
 //! [`Session::network_settings`] and [`Session::set_network_settings`]
 //! change the proxy and the network switches at runtime without a restart,
 //! and [`Session::proxy_state`] (announced as
@@ -398,9 +400,13 @@
 //!   peer dial goes through the proxy and fails rather than connecting
 //!   directly, [`Session::proxy_state`] says so, and the proxy is re-probed
 //!   with a backoff until it comes back.
-//! - The proxy's own host name is the one lookup a proxied session makes;
-//!   UDP tracker and DHT bootstrap host names go to the proxy by name under
-//!   SOCKS5, and LSD, UPnP and NAT-PMP turn off while a proxy is set.
+//! - The proxy's own host name is the one lookup a proxied session makes
+//!   locally: UDP tracker host names go to a SOCKS5 relay by name, and a DHT
+//!   bootstrap host name is never resolved here (the DHT is built with
+//!   `resolve_bootstrap_names` false under any proxy, so it bootstraps from
+//!   IP literals, a saved state and the nodes it reaches). LSD, UPnP and
+//!   NAT-PMP stay direct on the local network whatever the proxy is;
+//!   [`ProxyConfig::proxy_only`] is the switch that turns them off.
 //!
 //! # IP filter and bans
 //!
