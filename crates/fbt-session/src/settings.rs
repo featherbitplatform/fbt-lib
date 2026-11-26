@@ -439,7 +439,7 @@ pub struct Settings {
     pub proxy: ProxyConfig,
     /// How long the session's proxy health task waits before re-probing an
     /// unreachable or login-refused proxy, doubling each attempt up to
-    /// [`proxy_retry_max`](Self::proxy_retry_max) (1 s). A test knob.
+    /// `proxy_retry_max` (1 s). A test knob.
     #[doc(hidden)]
     #[cfg_attr(feature = "serde", serde(skip))]
     pub proxy_retry_base: Duration,
@@ -806,7 +806,7 @@ impl NetworkSettings {
     /// Otherwise `self` is returned unchanged, except the 0.12.0 rule: an
     /// HTTP proxy with `proxy_peers` turns `enable_outgoing_utp` off (an HTTP
     /// proxy carries peer connections over TCP only). What the proxy cannot
-    /// carry and needs UDP for — the DHT, uTP and UDP trackers — does not run
+    /// carry and needs UDP for, the DHT, uTP and UDP trackers, does not run
     /// at all under a proxy that relays no UDP: the session binds no UDP
     /// socket for it, so those switches only ever *add* the UDP socket a
     /// relayed proxy provides, they never make anything go direct. Only LSD,

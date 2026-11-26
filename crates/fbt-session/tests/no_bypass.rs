@@ -130,8 +130,8 @@ fn only_proxy(cap: &[Outbound], proxy: SocketAddr, relay: Option<SocketAddr>) {
 }
 
 /// A loopback listener that accepts and never answers, counting what it has
-/// accepted: work that stays in flight — an announce waiting for its reply, a
-/// peer handshake — for as long as the test runs, so the switching test has
+/// accepted: work that stays in flight (an announce waiting for its reply, a
+/// peer handshake) for as long as the test runs, so the switching test has
 /// direct work live at the moment of the switch (N3). Returns its address and
 /// the count of connections it has accepted. Nothing here ever leaves the host.
 async fn silent_listener() -> (SocketAddr, Arc<AtomicUsize>) {

@@ -2043,7 +2043,7 @@ fn dial_ctx(
 /// A dial spawned just before the stack is replaced can be polled first, and
 /// its future can be ready at once: the change must win over it anyway, so
 /// nothing is opened on the replaced stack (M1). The dial is ready
-/// immediately, so an unbiased `select!` picks it about half the time — the
+/// immediately, so an unbiased `select!` picks it about half the time; the
 /// loop makes a regression certain to be caught rather than a coin toss.
 #[tokio::test]
 async fn a_changed_generation_wins_over_a_ready_dial() {
@@ -2061,7 +2061,7 @@ async fn a_changed_generation_wins_over_a_ready_dial() {
 /// A dial whose stack was replaced before it was polled opens nothing:
 /// `connect` reads the generation immediately before it dials, so a peer
 /// dial spawned just before a change and polled after it never opens a direct
-/// TCP connection on the stack that is gone (M1) — and records none.
+/// TCP connection on the stack that is gone (M1), and records none.
 #[tokio::test]
 async fn a_dial_on_a_replaced_stack_is_not_made() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

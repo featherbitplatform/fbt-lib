@@ -64,8 +64,8 @@ pub enum ProxyKind {
 ///   nodes it reaches. Local service discovery (LSD), UPnP and NAT-PMP stay
 ///   direct on the local network and are never proxied.
 /// - **No proxy-only mode by default.** What the proxy cannot carry and needs
-///   UDP for — the DHT (which names every torrent's info hash to other
-///   nodes), outgoing uTP and UDP trackers — does not run at all under a proxy
+///   UDP for, the DHT (which names every torrent's info hash to other
+///   nodes), outgoing uTP and UDP trackers, does not run at all under a proxy
 ///   that relays no UDP: the session binds no UDP socket for it, so those
 ///   switches never make anything go direct. Only LSD, UPnP and NAT-PMP send
 ///   from the host's own address under any proxy. The session logs a warning
@@ -102,8 +102,8 @@ pub struct ProxyConfig {
     /// Let the proxy resolve host names instead of resolving them locally.
     ///
     /// A web seed's redirect guard follows suit: with this true, a redirect target that is a
-    /// host name is not looked up or judged locally at all — the proxy resolves it and decides
-    /// where it goes — and only a target spelled as an address is refused for being inside the
+    /// host name is not looked up or judged locally at all: the proxy resolves it and decides
+    /// where it goes, and only a target spelled as an address is refused for being inside the
     /// local network. With it false, names are resolved here and judged then (see
     /// `RedirectPolicy` in the `fbt-tracker` crate).
     pub proxy_hostnames: bool,

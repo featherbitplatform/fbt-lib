@@ -520,8 +520,8 @@ async fn incoming_handshake_in_progress_is_closed_on_proxy_change() {
 
 /// Two proxy changes at once, the second putting back the value the session
 /// had before the first. Everything the second decides from "the value the
-/// session has now" — whether it is a no-op at all, and whether the proxy
-/// changed — must be read from the value stored under the change lock, not
+/// session has now", whether it is a no-op at all, and whether the proxy
+/// changed, must be read from the value stored under the change lock, not
 /// from the one its caller read on the way in. Read outside, the no-op
 /// shortcut sees the pre-change value, treats the restore as a no-op and
 /// leaves the session on the proxy-less stack the first change installed:

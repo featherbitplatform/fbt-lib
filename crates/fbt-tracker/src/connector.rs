@@ -36,10 +36,10 @@ const MAX_GUARDED_ADDRESSES: usize = 64;
 /// hyper-util's legacy connection pool finishes a losing connect in a background task the
 /// session's own handles cannot abort (N3): a request that was already in flight when its stack
 /// was torn down can still be polled afterwards, and would then resolve a name and dial the
-/// address itself — directly, past whatever proxy replaced the stack. The connector reads this
+/// address itself, directly, past whatever proxy replaced the stack. The connector reads this
 /// flag immediately before it resolves anything, and again immediately before **every single
 /// dial** it makes (N1): a name can answer with several addresses and a dial can be attempted
-/// one address after another, so a check made once — before the first of them — leaves every
+/// one address after another, so a check made once, before the first of them, leaves every
 /// later dial to run on the replaced stack. It is created once per client and shared by every
 /// connector that client builds.
 #[derive(Clone, Debug, Default)]
@@ -389,8 +389,8 @@ impl tower_service::Service<Uri> for ProxyConnector {
 /// only before the first of them: a name can answer with several addresses, and a dialler that
 /// resolved once and then connected to the answers itself would run the attempt after a failure,
 /// or the one its own happy-eyeballs delay starts, without ever looking at the flag again. The
-/// connect is recorded in the same step, so every direct dial — by name or by IP literal,
-/// successful or not — is visible to the outbound audit.
+/// connect is recorded in the same step, so every direct dial, by name or by IP literal,
+/// successful or not, is visible to the outbound audit.
 ///
 /// The attempts are staggered rather than sequential: the next address is tried as soon as the
 /// previous attempt fails or [`STAGGER`] after it started, whichever is first, and the earlier
@@ -566,14 +566,14 @@ async fn staggered(
 
 /// (tests) Dials a test has asked to hold open, keyed by address. Lets a multi-address dial be
 /// held after its first attempt has started, so a test can replace the stack mid-dial and see
-/// what the rest of the list does (N1) — without a packet leaving the machine and without
+/// what the rest of the list does (N1), without a packet leaving the machine and without
 /// depending on a platform's listen-backlog behaviour.
 #[cfg(test)]
 static DIAL_GATES: Mutex<Vec<(SocketAddr, DialGate)>> = Mutex::new(Vec::new());
 
 /// (tests) Connects a test has asked to hold open, keyed by address. Unlike the dial gates,
 /// which park *before* the flag is read, a hang gate parks *after* it: the attempt has passed
-/// its closed check and recorded its connect, and now sits inside a slow dial — the position
+/// its closed check and recorded its connect, and now sits inside a slow dial, the position
 /// a blackholed route holds an attempt in production (N1).
 #[cfg(test)]
 static HANG_GATES: Mutex<Vec<(SocketAddr, DialGate)>> = Mutex::new(Vec::new());
@@ -634,7 +634,7 @@ pub(crate) fn gate_dial(addr: SocketAddr) -> DialGate {
 
 /// (tests) Registers a hang gate for the next connect to `addr` and returns it: the attempt
 /// passes its closed check and records its connect, then parks at the gate until
-/// [`DialGate::release`] — inside the dial, not before it — so a test can hold an attempt in
+/// [`DialGate::release`], inside the dial, not before it, so a test can hold an attempt in
 /// flight while the stack is replaced and see what the rest of the staggered dial does (N1).
 /// The release fails the attempt rather than opening a socket, so no packet leaves the
 /// machine (N2).
@@ -791,7 +791,7 @@ mod tests {
 
     /// Waits (bounded) until `cond` holds, giving the other tasks a turn between polls: at
     /// most 1000 polls, then a failure that names what never happened. An unbounded sleep
-    /// loop would instead spin forever — a paused clock auto-advances it — so a regression
+    /// loop would instead spin forever (a paused clock auto-advances it), so a regression
     /// that stops the awaited event fails the test rather than hanging it.
     async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         for _ in 0..1000 {
@@ -894,7 +894,7 @@ mod tests {
     /// A connect the pool started but did not win can be polled after its
     /// stack was replaced (hyper-util finishes a losing connect in a task the
     /// session cannot abort: N3). The connector reads the closed flag when the
-    /// future is polled — not when it is made — so the replaced stack neither
+    /// future is polled (not when it is made), so the replaced stack neither
     /// resolves a name nor dials an address, directly or through the proxy.
     #[tokio::test]
     async fn a_replaced_stack_resolves_and_dials_nothing() {
@@ -1065,12 +1065,12 @@ mod tests {
     }
 
     /// A name that answers with two addresses is dialled with the flag read before *each*
-    /// attempt: hyper's own connector resolves once and then dials the answers itself — the next
-    /// address after a failure, or after its happy-eyeballs delay — leaving every later dial
+    /// attempt: hyper's own connector resolves once and then dials the answers itself, the next
+    /// address after a failure, or after its happy-eyeballs delay, leaving every later dial
     /// nothing to check against a stack that was replaced meanwhile (N1). Holds the first attempt
     /// open (its dial parked at a gate: see [`gate_dial`]), replaces the stack while it is in
-    /// flight, and asserts that **nothing at all** is recorded afterwards — not the address that
-    /// was already in flight, and not the second, which is never dialled — and that the dial
+    /// flight, and asserts that **nothing at all** is recorded afterwards: not the address that
+    /// was already in flight, and not the second, which is never dialled, and that the dial
     /// fails (R1 b).
     ///
     /// Both addresses are loopback and on the port the URI carries: nothing listens on the first
@@ -1157,8 +1157,8 @@ mod tests {
     /// not spend the whole request budget before the other family is tried (RFC 8305, R1 a).
     ///
     /// Both addresses are loopback and on the port the URI carries: the second is a live
-    /// listener, the first is loopback too but its dial is held open by a gate — a hung
-    /// attempt — so nothing leaves the machine. The hung attempt is the IPv6 loopback, held
+    /// listener, the first is loopback too but its dial is held open by a gate, a hung
+    /// attempt, so nothing leaves the machine. The hung attempt is the IPv6 loopback, held
     /// *before* its dial, so it never dials and the test runs on a host with no IPv6 loopback
     /// at all; the live listener is IPv4.
     #[tokio::test]
@@ -1283,13 +1283,13 @@ mod tests {
         );
     }
 
-    /// A stack replaced while a connect is *in flight* — the attempt already passed its closed
-    /// check and sits inside a slow dial — starts no further attempt: the stagger timer must
+    /// A stack replaced while a connect is *in flight*: the attempt already passed its closed
+    /// check and sits inside a slow dial, starts no further attempt: the stagger timer must
     /// not dial the next address once the stack it belongs to is replaced (N1). The attempt is
     /// held at a hang gate *after* the check and the record (see [`hang_connect`]), so the
     /// switch lands in the only gap the dial gates cannot cover: while an attempt is inside its
     /// connect, with the stagger still owing the next address. The second attempt is proved
-    /// started — it parks at its own dial gate, before its check — and is released to be
+    /// started, it parks at its own dial gate, before its check, and is released to be
     /// refused there, so the test cannot pass if the stagger never runs. Both attempts are
     /// released before the dial is awaited, each fails or is refused before any dial, no
     /// packet leaves the machine (N2), and the dial ends in an error either way.
