@@ -379,8 +379,8 @@
 //! with `proxy_peers`, `proxy_trackers` and `proxy_hostnames` choosing what
 //! goes through it (all on), and [`ProxyConfig::proxy_only`] keeps every
 //! bypass off, so nothing leaves this host except through the proxy.
-//! Listening is unchanged. A session starts and keeps running whatever the
-//! proxy's health:
+//! Listening is unchanged unless [`ProxyConfig::proxy_only`] is set. A
+//! session starts and keeps running whatever the proxy's health:
 //! [`Session::network_settings`] and [`Session::set_network_settings`]
 //! change the proxy and the network switches at runtime without a restart,
 //! and [`Session::proxy_state`] (announced as
@@ -390,10 +390,15 @@
 //! - SOCKS5 proxies all UDP or none: with `proxy_peers` or
 //!   `proxy_trackers`, outgoing uTP, the DHT and UDP trackers all go through
 //!   one UDP ASSOCIATE. The session then listens on TCP only, and the DHT
-//!   runs over the relay's address family only (IPv4 in practice).
-//! - An HTTP proxy cannot carry UDP, and neither can a SOCKS5 one that will
-//!   not relay it: while such a proxy is set the session opens no UDP socket
-//!   at all, so the DHT, uTP and UDP trackers do not run (whatever
+//!   runs over the relay's address family only (IPv4 in practice). With
+//!   `proxy_peers` and `proxy_trackers` both off the proxy carries none of
+//!   it, and the session binds no UDP socket at all.
+//! - A proxy that relays no UDP leaves the session with no UDP socket at
+//!   all: an HTTP proxy, a SOCKS5 one with both `proxy_peers` and
+//!   `proxy_trackers` off, or one that refuses UDP ASSOCIATE. A proxy that
+//!   is unreachable or refuses the login does the same while it is down (the
+//!   session keeps running, see below). While the session has no UDP socket
+//!   the DHT, uTP and UDP trackers do not run (whatever
 //!   [`Settings::dht_enabled`] says), and UDP tracker announces fail. An
 //!   HTTP proxy with `proxy_peers` also dials peers over TCP only.
 //! - A proxy that is down, or refuses login, does not stop the session: a
