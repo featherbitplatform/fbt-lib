@@ -2,7 +2,6 @@
 //! an address inside the local network before dialling it, or tunnels through a SOCKS5 or HTTP
 //! CONNECT proxy.
 
-#[cfg(test)]
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
@@ -382,52 +381,177 @@ impl tower_service::Service<Uri> for ProxyConnector {
     }
 }
 
-/// Dials `addrs` one after another until one connects, each attempt bounded by `timeout`.
+/// Dials `addrs`, staggering the attempts (RFC 8305) so that one family that blackholes does
+/// not hold up the other, and bounded as a whole by `budget`.
 ///
-/// This connector opens every direct connection itself, so the check that a replaced stack
-/// dials nothing stands **immediately before each connect** (N1), in the same poll as the dial
-/// and not only before the first of them: a name's answers are tried one at a time, and a
-/// dialler that resolved once and then connected to the answers itself would run every later
-/// attempt — the next address after a failure, or after its own happy-eyeballs delay — without
-/// ever looking at the flag again. No happy eyeballs here: a second address is tried only once
-/// the first has failed or timed out. The connect is recorded in the same step, so every
-/// direct dial — by name or by IP literal, successful or not — is visible to the outbound
-/// audit.
+/// This connector opens every direct connection itself, so the check that a replaced stack dials
+/// nothing stands **immediately before each connect** (N1), in the same step as the dial and not
+/// only before the first of them: a name can answer with several addresses, and a dialler that
+/// resolved once and then connected to the answers itself would run the attempt after a failure,
+/// or the one its own happy-eyeballs delay starts, without ever looking at the flag again. The
+/// connect is recorded in the same step, so every direct dial — by name or by IP literal,
+/// successful or not — is visible to the outbound audit.
+///
+/// The attempts are staggered rather than sequential: the next address is tried as soon as the
+/// previous attempt fails or [`STAGGER`] after it started, whichever is first, and the earlier
+/// attempts keep running. A dual-stack name whose IPv6 route blackholes is then reached over IPv4
+/// instead of spending the whole request budget waiting out the dead family (R1). The first
+/// attempt to connect wins and the rest are dropped; a single address behaves as before.
 async fn dial_direct(
     addrs: &[SocketAddr],
-    timeout: Duration,
+    budget: Duration,
     closed: &Closed,
 ) -> Result<TokioIo<TcpStream>, BoxError> {
-    let mut last: Option<io::Error> = None;
+    let order = interleaved(addrs);
+    if order.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no address to dial").into());
+    }
+    // The whole dial shares the request's budget, so a slow first attempt does not stop the last
+    // address from being tried; no attempt carries a timeout of its own.
+    match tokio::time::timeout(budget, staggered(order, closed)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "dialling the resolved addresses timed out",
+        )
+        .into()),
+    }
+}
+
+/// How long after an attempt starts the next address is tried (RFC 8305 §3), unless the earlier
+/// attempt has already failed. The same 250 ms hyper's own connector used.
+const STAGGER: Duration = Duration::from_millis(250);
+
+/// One address's dial: it reads the flag, records the connect and dials, all in the same step
+/// (N1).
+type Dial = Pin<Box<dyn Future<Output = Result<TcpStream, BoxError>> + Send>>;
+
+/// The addresses in the order the attempts are started: the families interleaved, beginning with
+/// the family of the resolver's first answer (RFC 8305 §4).
+fn interleaved(addrs: &[SocketAddr]) -> VecDeque<SocketAddr> {
+    let mut v6: VecDeque<SocketAddr> = VecDeque::new();
+    let mut v4: VecDeque<SocketAddr> = VecDeque::new();
     for addr in addrs {
-        // Read in the same poll as the dial below: a replacement that lands between two
-        // attempts refuses the next one (N1).
+        if addr.is_ipv6() {
+            v6.push_back(*addr);
+        } else {
+            v4.push_back(*addr);
+        }
+    }
+    // The first answer's family leads; the other follows on the next attempt.
+    let (mut lead, mut follow) = if addrs.first().is_some_and(SocketAddr::is_ipv6) {
+        (v6, v4)
+    } else {
+        (v4, v6)
+    };
+    let mut out = VecDeque::with_capacity(addrs.len());
+    loop {
+        if let Some(addr) = lead.pop_front() {
+            out.push_back(addr);
+        }
+        if let Some(addr) = follow.pop_front() {
+            out.push_back(addr);
+        }
+        if lead.is_empty() && follow.is_empty() {
+            return out;
+        }
+    }
+}
+
+/// Starts one attempt on `addr`: the flag is read, the connect recorded and the dial made in the
+/// same step, so nothing can slip a replaced stack's dial between them (N1).
+fn dial_one(addr: SocketAddr, closed: Closed) -> Dial {
+    Box::pin(async move {
+        // (tests) A dial a test holds open, *before* the flag is read so that a test's ordering
+        // matches the production one: nothing stands between the check and the dial.
+        #[cfg(test)]
+        park_before_dial(addr).await;
+        // Read in the same step as the dial below: a replacement that lands between two attempts
+        // refuses the next one (N1).
         if closed.is_set() {
             return Err(closed.refuse());
         }
-        // (tests) A dial a test holds open, so it can replace the stack while this attempt is
-        // in flight.
-        #[cfg(test)]
-        park_before_dial(*addr).await;
-        // audit: recorded here, in the same poll as the dial, so a direct dial by name or by
+        // audit: recorded here, in the same step as the dial, so a direct dial by name or by
         // literal is visible to the outbound audit (a lookup records the name alone, and this
         // connector dials the answers itself).
-        audit::record(audit::Outbound::TcpConnect(*addr));
-        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(TokioIo::new(stream)),
-            Ok(Err(e)) => last = Some(e),
-            Err(_) => {
-                last = Some(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("dialling {addr} timed out"),
-                ));
-            }
-        }
-    }
-    Err(match last {
-        Some(e) => e.into(),
-        None => io::Error::new(io::ErrorKind::NotFound, "no address to dial").into(),
+        audit::record(audit::Outbound::TcpConnect(addr));
+        TcpStream::connect(addr).await.map_err(Into::into)
     })
+}
+
+/// Starts the attempts staggered (RFC 8305), keeping the earlier ones in flight, and returns the
+/// first to connect. Each attempt is [`dial_one`], so every one of them reads the flag and records
+/// its connect in the same step as the dial (N1): a replaced stack starts no further attempt, and
+/// an attempt already in flight is refused when it reaches its own check.
+async fn staggered(
+    mut pending: VecDeque<SocketAddr>,
+    closed: &Closed,
+) -> Result<TokioIo<TcpStream>, BoxError> {
+    let mut in_flight: Vec<Dial> = Vec::new();
+    let mut last: Option<BoxError> = None;
+    // The first attempt starts at once; each next one a stagger later (or as soon as the previous
+    // one fails).
+    let mut next = Some(tokio::time::Instant::now());
+    let mut timer = Box::pin(tokio::time::sleep_until(tokio::time::Instant::now()));
+
+    std::future::poll_fn(|cx| {
+        loop {
+            // Start every attempt whose turn has come. One at a time: after each start the next one
+            // is a stagger away.
+            while let Some(deadline) = next {
+                if pending.is_empty() {
+                    next = None;
+                    break;
+                }
+                if deadline > tokio::time::Instant::now() {
+                    break;
+                }
+                if let Some(addr) = pending.pop_front() {
+                    in_flight.push(dial_one(addr, closed.clone()));
+                    next = Some(tokio::time::Instant::now() + STAGGER);
+                }
+            }
+            // Poll what is in flight: the first to connect wins and the rest are dropped with the
+            // winner.
+            if !in_flight.is_empty() {
+                let mut kept: Vec<Dial> = Vec::with_capacity(in_flight.len());
+                for mut attempt in in_flight.drain(..) {
+                    match attempt.as_mut().poll(cx) {
+                        Poll::Ready(Ok(stream)) => return Poll::Ready(Ok(TokioIo::new(stream))),
+                        Poll::Ready(Err(e)) => {
+                            last = Some(e);
+                            if closed.is_set() {
+                                // An attempt refused on a replaced stack: start no further ones (N1).
+                                pending.clear();
+                                next = None;
+                            } else if !pending.is_empty() {
+                                // The previous attempt failed: the next one may start at once.
+                                next = Some(tokio::time::Instant::now());
+                            }
+                        }
+                        Poll::Pending => kept.push(attempt),
+                    }
+                }
+                in_flight = kept;
+            }
+            if in_flight.is_empty() && pending.is_empty() {
+                return Poll::Ready(Err(match last.take() {
+                    Some(e) => e,
+                    None if closed.is_set() => closed.refuse(),
+                    None => io::Error::new(io::ErrorKind::NotFound, "no address to dial").into(),
+                }));
+            }
+            // Wait for an attempt to finish, or for the next one's turn.
+            if let Some(deadline) = next {
+                timer.as_mut().reset(deadline);
+                if timer.as_mut().poll(cx).is_ready() {
+                    continue;
+                }
+            }
+            return Poll::Pending;
+        }
+    })
+    .await
 }
 
 /// (tests) Dials a test has asked to hold open, keyed by address. Lets a multi-address dial be
@@ -436,6 +560,11 @@ async fn dial_direct(
 /// depending on a platform's listen-backlog behaviour.
 #[cfg(test)]
 static DIAL_GATES: Mutex<Vec<(SocketAddr, DialGate)>> = Mutex::new(Vec::new());
+
+/// (tests) The addresses whose dials have parked, in the order they parked: a test reads this to
+/// see the order the attempts were started in, without depending on how often it polls.
+#[cfg(test)]
+static PARK_ORDER: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
 
 /// (tests) A dial that parks until the test releases it: see [`gate_dial`].
 #[cfg(test)]
@@ -486,7 +615,9 @@ pub(crate) fn gate_dial(addr: SocketAddr) -> DialGate {
     gate
 }
 
-/// (tests) Parks the dial to `addr` at its gate, if one is registered; a no-op otherwise.
+/// (tests) Parks the dial to `addr` at its gate, if one is registered; a no-op otherwise. The
+/// address is logged in [`PARK_ORDER`] as it parks, so a test can read the order the attempts
+/// were started in.
 #[cfg(test)]
 async fn park_before_dial(addr: SocketAddr) {
     let gate = {
@@ -496,6 +627,10 @@ async fn park_before_dial(addr: SocketAddr) {
             None => return,
         }
     };
+    PARK_ORDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(addr);
     gate.park().await;
 }
 
@@ -871,25 +1006,28 @@ mod tests {
         assert_eq!(stub.calls(), ["tracker.invalid"], "the name was looked up");
     }
 
-    /// A name that answers with two addresses is dialled one address at a time, with the flag
-    /// read before *each* attempt: hyper's own connector resolves once and then dials the
-    /// answers itself — the next address after a failure, or after its happy-eyeballs delay —
-    /// leaving every later dial nothing to check against a stack that was replaced meanwhile
-    /// (N1). Holds the first attempt open (its dial parked at a gate: see [`gate_dial`]),
-    /// replaces the stack while it is in flight, and asserts the second address is never
-    /// dialled and nothing is recorded after the replacement.
+    /// A name that answers with two addresses is dialled with the flag read before *each*
+    /// attempt: hyper's own connector resolves once and then dials the answers itself — the next
+    /// address after a failure, or after its happy-eyeballs delay — leaving every later dial
+    /// nothing to check against a stack that was replaced meanwhile (N1). Holds the first attempt
+    /// open (its dial parked at a gate: see [`gate_dial`]), replaces the stack while it is in
+    /// flight, and asserts that **nothing at all** is recorded afterwards — not the address that
+    /// was already in flight, and not the second, which is never dialled — and that the dial
+    /// fails (R1 b).
     ///
-    /// Both addresses are loopback and on the port the URI carries: nothing listens on the
-    /// first (IPv4), so its attempt is refused at once and the dial moves on; the second (IPv6)
-    /// is a listener a later dial would reach. No packet leaves the machine (N2).
+    /// Both addresses are loopback and on the port the URI carries: nothing listens on the first
+    /// (IPv4), so it could not connect; the second (IPv6) is a listener a later dial would reach.
+    /// The gate sits *before* the flag is read, as in production nothing stands between the check
+    /// and the dial, so the parked attempt must not record or dial once it runs on
+    /// (the Minor finding). No packet leaves the machine (N2).
     #[tokio::test]
     async fn a_second_address_is_not_dialled_once_the_stack_is_replaced() {
         let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
             return; // no IPv6 loopback on this host
         };
         let port = listener.local_addr().unwrap().port();
-        // The first attempt is refused at once only if nothing listens on the IPv4 loopback
-        // at that port: hold it briefly to be sure, and skip if some other process has it.
+        // Nothing listens on the IPv4 loopback at that port, so the first attempt could not
+        // connect: hold it briefly to be sure, and skip if some other process has it.
         let Ok(probe) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await else {
             return;
         };
@@ -919,7 +1057,7 @@ mod tests {
             .unwrap();
         let dial = tokio::spawn(connector.call(uri));
         // The first attempt is in flight (parked at its gate, nothing opened yet): replace the
-        // stack, then let it run into the refusal and on to the second address.
+        // stack, then let it run on into the refusal at its own check.
         while gate.parked() == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -932,13 +1070,210 @@ mod tests {
         );
         let recs = cap.take();
         drop(cap);
+        // Everything this dial could have recorded: the parked attempt (which must not record
+        // once it runs on) and the second address (which must never be tried). The capture is
+        // process-wide, so read only the addresses this test answers with.
+        let ours: Vec<&audit::Outbound> = recs
+            .iter()
+            .filter(|o| matches!(o, audit::Outbound::TcpConnect(a) if *a == first || *a == second))
+            .collect();
         assert!(
-            !recs.contains(&audit::Outbound::TcpConnect(second)),
-            "a replaced stack dialled a further address after its stack was replaced: {recs:?}"
+            ours.is_empty(),
+            "a replaced stack recorded a dial after its stack was replaced: {ours:?}"
         );
         assert!(
             accepted.await.unwrap().is_err(),
             "the listener accepted a direct dial a replaced stack made between two attempts"
+        );
+    }
+
+    /// A first address whose attempt hangs is not waited out: the next one is started a stagger
+    /// later and wins, so a family that blackholes (an IPv6 route that drops every packet) does
+    /// not spend the whole request budget before the other family is tried (RFC 8305, R1 a).
+    ///
+    /// Both addresses are loopback and on the port the URI carries: the second is a live listener,
+    /// the first is loopback too but its dial is held open by a gate — a hung attempt — so nothing
+    /// leaves the machine.
+    #[tokio::test]
+    async fn a_hung_first_address_does_not_hold_up_the_dial() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // no IPv6 loopback on this host
+        };
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+        });
+
+        // The first answer is IPv4 (nothing listens there) and leads; the second is the IPv6
+        // listener. Its dial is never reached, so its port need not be free.
+        let first: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+        let second: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+        let gate = gate_dial(first);
+
+        let stub = StubResolver::default();
+        stub.push(&["127.0.0.1", "::1"]);
+        let mut connector = ProxyConnector::new(
+            None,
+            Duration::from_secs(5),
+            false,
+            stub.resolution(),
+            Closed::new(),
+        );
+
+        let cap = audit::capture();
+        let uri = format!("http://tracker.invalid:{port}/announce")
+            .parse::<Uri>()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let dial = tokio::spawn(connector.call(uri));
+        // The first attempt hangs (parked at its gate): the stagger must start the second, which
+        // connects, without waiting the first one out.
+        while gate.parked() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let stream = dial
+            .await
+            .unwrap()
+            .expect("the second address must be tried while the first hangs");
+        let elapsed = started.elapsed();
+        let recs = cap.take();
+        drop(stream);
+        drop(cap);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the hung first address held up the dial for {elapsed:?}"
+        );
+        assert!(
+            recs.contains(&audit::Outbound::TcpConnect(second)),
+            "the second address must be the one that connected: {recs:?}"
+        );
+        assert!(
+            accepted.await.unwrap().is_ok(),
+            "the live second address was never dialled while the first hung"
+        );
+    }
+
+    /// A stack replaced while the first attempt hangs starts no further attempt: the second
+    /// address is neither recorded nor dialled, and the dial fails rather than opening a socket
+    /// (N1, R1 b). The gate sits before the flag is read and the dial is released by the test, so
+    /// the ordering does not depend on timing.
+    #[tokio::test]
+    async fn a_replacement_while_the_first_attempt_hangs_starts_no_further_attempt() {
+        // Dead loopback addresses: nothing listens, so a dial that does run cannot connect.
+        let Ok(dead) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let first: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+        let second: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+        let gate = gate_dial(first);
+
+        let stub = StubResolver::default();
+        stub.push(&["127.0.0.1", "::1"]);
+        let closed = Closed::new();
+        let mut connector = ProxyConnector::new(
+            None,
+            Duration::from_secs(5),
+            false,
+            stub.resolution(),
+            closed.clone(),
+        );
+
+        let cap = audit::capture();
+        let uri = format!("http://tracker.invalid:{port}/announce")
+            .parse::<Uri>()
+            .unwrap();
+        let dial = tokio::spawn(connector.call(uri));
+        while gate.parked() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Replace the stack while the first attempt hangs, then let it run on: it must refuse at
+        // its own check, and no further attempt may be started.
+        closed.set();
+        gate.release();
+
+        assert!(
+            dial.await.unwrap().is_err(),
+            "a replaced stack must not dial once its attempt is refused"
+        );
+        let recs = cap.take();
+        drop(cap);
+        let ours: Vec<&audit::Outbound> = recs
+            .iter()
+            .filter(|o| matches!(o, audit::Outbound::TcpConnect(a) if *a == first || *a == second))
+            .collect();
+        assert!(
+            ours.is_empty(),
+            "a replaced stack recorded a dial after its stack was replaced: {ours:?}"
+        );
+    }
+
+    /// The attempts are started in interleaved family order, beginning with the family of the
+    /// resolver's first answer (RFC 8305 §4, R1 c): a dual-stack name answered
+    /// `[v6a, v6b, v4a]` is tried `v6a, v4a, v6b`, so the other family is reached on the second
+    /// attempt rather than after every address of the first.
+    ///
+    /// Every attempt is gated, so no connect is ever issued and the addresses need not be
+    /// reachable: the order they park in is the order they were started in, read from
+    /// [`PARK_ORDER`] rather than inferred from timing.
+    #[tokio::test]
+    async fn addresses_are_attempted_in_interleaved_family_order() {
+        // A port to put on the stub answers; held so no parallel test can take it. Nothing is
+        // ever dialled, so nothing need listen on it.
+        let Ok(holder) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let port = holder.local_addr().unwrap().port();
+
+        let v6a = SocketAddr::new("::1".parse().unwrap(), port);
+        let v6b = SocketAddr::new("::ffff:127.0.0.1".parse().unwrap(), port);
+        let v4a: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+        // One gate per address: each attempt parks, so the order they park in is the attempt
+        // order, and nothing is dialled.
+        let gates = [gate_dial(v6a), gate_dial(v6b), gate_dial(v4a)];
+
+        let stub = StubResolver::default();
+        stub.push(&["::1", "::ffff:127.0.0.1", "127.0.0.1"]);
+        let mut connector = ProxyConnector::new(
+            None,
+            Duration::from_secs(30),
+            false,
+            stub.resolution(),
+            Closed::new(),
+        );
+
+        let uri = format!("http://tracker.invalid:{port}/announce")
+            .parse::<Uri>()
+            .unwrap();
+        let dial = tokio::spawn(connector.call(uri));
+        // Three attempts, a stagger apart: wait (bounded) until all three have parked.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let parked: usize = gates.iter().map(|g| usize::from(g.parked() > 0)).sum();
+            if parked == 3 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {parked} of the three addresses were tried in interleaved order"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let order: Vec<SocketAddr> = PARK_ORDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .filter(|a| *a == v6a || *a == v6b || *a == v4a)
+            .collect();
+        dial.abort();
+        drop(holder);
+        assert_eq!(
+            order,
+            vec![v6a, v4a, v6b],
+            "the families must be interleaved, starting with the first answer's"
         );
     }
 
