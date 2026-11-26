@@ -53,19 +53,23 @@ pub enum ProxyKind {
 /// - **Not every lookup uses the proxy.** `proxy_hostnames` covers TCP
 ///   connections. A SOCKS5 relay also carries a UDP tracker named by host
 ///   (RFC 1928 lets the UDP request header hold the name), so that name is
-///   never looked up here; an IP literal still goes to the relay as an
-///   address. A DHT bootstrap entry that is a name is resolved locally unless
-///   the DHT is told not to (`resolve_bootstrap_names` false, which a session
-///   behind a proxy sets: its DHT bootstraps from IP literals, a saved state
-///   and the nodes it reaches). Local service discovery (LSD), UPnP and
-///   NAT-PMP stay direct on the local network and are never proxied.
+///   never looked up here; an IP literal goes to the relay as an address and
+///   is never looked up either. A DHT bootstrap entry that is a name is
+///   never resolved locally by a session behind a proxy, whatever the proxy
+///   is: the session builds the DHT with `resolve_bootstrap_names` false, so
+///   a name entry is skipped (an IP-literal entry is still used, over the
+///   relay) and its bootstrap comes from the literals, a saved state and the
+///   nodes it reaches. Local service discovery (LSD), UPnP and NAT-PMP stay
+///   direct on the local network and are never proxied.
 /// - **No proxy-only mode by default.** Whatever the proxy cannot carry goes
 ///   direct, from the host's own address: with an HTTP proxy the DHT (which
 ///   names every torrent's info hash to other nodes) and incoming uTP
 ///   (outgoing too, without `proxy_peers`); with any proxy LSD, UPnP and
 ///   NAT-PMP. The session logs a warning for each one enabled; turn them off
 ///   in its settings to keep all traffic on the proxy, or set
-///   [`proxy_only`](Self::proxy_only) to have every bypass treated as off.
+///   [`proxy_only`](Self::proxy_only), the single switch that has every
+///   bypass treated as off (it also turns the three proxy switches on), so a
+///   proxy-only session warns about nothing.
 ///
 /// `Debug` prints the password as `"***"`; serialising (the `serde`
 /// feature) writes it in clear text.

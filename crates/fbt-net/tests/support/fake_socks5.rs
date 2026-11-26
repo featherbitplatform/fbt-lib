@@ -39,6 +39,11 @@ pub enum Script {
     /// CONNECT is relayed, but UDP ASSOCIATE is answered with this `REP`: the
     /// proxy takes TCP and will not relay UDP.
     NoUdp(u8),
+    /// As [`NoUdp`](Script::NoUdp): CONNECT is logged without dialling and UDP
+    /// ASSOCIATE is answered with this `REP`. For a test whose "remote" is a
+    /// documentation address or a name that must not be resolved here, and
+    /// whose proxy will not carry UDP either, so nothing may leave the host.
+    NoUdpRecordOnly(u8),
     /// The target is only logged, never reached: CONNECT is answered `REP 5`
     /// without dialling, and relayed UDP datagrams are logged and dropped. For
     /// tests whose "remote" is a documentation address or a name that must not
@@ -309,8 +314,9 @@ async fn serve(
         s.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
         return Ok(());
     }
-    if let Script::NoUdp(code) = script {
-        // CONNECT is relayed; only the UDP association is refused.
+    if let Script::NoUdp(code) | Script::NoUdpRecordOnly(code) = script {
+        // CONNECT carries on (only logged, for the record-only script); only
+        // the UDP association is refused.
         if req[1] == 3 {
             s.write_all(&reply(code, SocketAddr::from(([0, 0, 0, 0], 0))))
                 .await?;
@@ -404,7 +410,7 @@ async fn connect(
     log: Arc<Mutex<Log>>,
 ) -> std::io::Result<()> {
     log.lock().unwrap().connects.push(target.text());
-    if script == Script::RecordOnly {
+    if matches!(script, Script::RecordOnly | Script::NoUdpRecordOnly(_)) {
         // The target must not be reached, only logged.
         return s
             .write_all(&reply(5, SocketAddr::from(([0, 0, 0, 0], 0))))

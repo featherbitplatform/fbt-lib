@@ -449,8 +449,10 @@ pub(crate) struct Registry {
 pub(crate) struct SessionInner {
     pub shared: Arc<Shared>,
     /// The network settings as the caller set them ([`Session::network_settings`]),
-    /// which the applied stack may differ from (an HTTP proxy carrying peers
-    /// turns outgoing uTP off in the stack only).
+    /// which the applied stack may differ from (the session runs
+    /// [`NetworkSettings::effective`] of it: an HTTP proxy carrying peers
+    /// turns outgoing uTP off in the stack only, and a proxy-only value has
+    /// every bypass off there).
     network: RwLock<NetworkSettings>,
     /// Shared by every accept loop of the session.
     listener_state: Arc<ListenerState>,
@@ -1013,25 +1015,25 @@ impl Session {
     /// proxy is down or will not relay UDP: the session starts, reports the
     /// state through [`proxy_state`](Self::proxy_state) and runs with no UDP
     /// socket at all, retrying or waiting for a settings change (F2, F5).
-    pub async fn new(mut settings: Settings) -> Result<Session, SessionError> {
+    pub async fn new(settings: Settings) -> Result<Session, SessionError> {
         settings.validate().map_err(SessionError::InvalidSettings)?;
         let proxy = &settings.proxy;
-        // An HTTP proxy cannot carry uTP.
-        if proxy.kind == ProxyKind::Http && proxy.proxy_peers {
-            if !settings.enable_outgoing_tcp {
-                warn!(
-                    "an HTTP proxy carries peer connections over TCP only, and \
-                     enable_outgoing_tcp is off: this session cannot dial peers"
-                );
-            }
-            settings.enable_outgoing_utp = false;
+        // An HTTP proxy carries peer connections over TCP only, so it cannot
+        // dial with outgoing uTP off and nothing else on.
+        if proxy.kind == ProxyKind::Http && proxy.proxy_peers && !settings.enable_outgoing_tcp {
+            warn!(
+                "an HTTP proxy carries peer connections over TCP only, and \
+                 enable_outgoing_tcp is off: this session cannot dial peers"
+            );
         }
+        // The pitfalls still open: read on the effective settings the session
+        // runs, so a proxy-only session warns about nothing.
         for feature in settings.proxy_bypasses() {
             warn!(
                 feature,
                 "a proxy is configured, but {feature} does not go through it: \
-                 it sends from this host's own address (turn it off to keep \
-                 all traffic on the proxy)"
+                 it sends from this host's own address (turn it off, or set \
+                 proxy_only, to keep all traffic on the proxy)"
             );
         }
         let (events, _) = broadcast::channel(settings.event_queue);
@@ -1103,8 +1105,10 @@ impl Session {
 
     /// The network settings as the caller set them
     /// ([`network_settings`](Self::network_settings)): the stored switches,
-    /// which the applied stack may differ from (an HTTP proxy carrying peers
-    /// turns outgoing uTP off in the stack only).
+    /// which the applied stack may differ from (the session runs
+    /// [`NetworkSettings::effective`] of it: an HTTP proxy carrying peers
+    /// turns outgoing uTP off in the stack only, and a proxy-only value has
+    /// every bypass off there).
     pub fn network_settings(&self) -> NetworkSettings {
         self.inner.network()
     }

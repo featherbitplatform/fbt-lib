@@ -697,6 +697,7 @@ impl DatagramSender for RecordingSender {
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
         self.recent.record(to, Instant::now());
+        // audit: the wrapped sender records where the datagram reaches (the demux for a shared socket)
         self.inner.send_to(data, to)
     }
 }
@@ -793,8 +794,11 @@ pub(crate) fn fallback_udp(endpoints: &[Endpoint]) -> Vec<SharedUdpSocket> {
 
 /// Starts a DHT on the shared UDP sockets, the first one of each address
 /// family, and registers it as their DHT handler (so replies leave from the
-/// address a query reached), restoring the state in `state` when given. A
-/// DHT that cannot start at all (no socket, say) is logged and left out.
+/// address a query reached), restoring the state in `state` when given. The
+/// bootstrap entries that are host names are resolved locally only without a
+/// proxy; under one they are skipped, so no bootstrap lookup leaves the host
+/// (an IP-literal entry still works, relayed). A DHT that cannot start at all
+/// (no socket, say) is logged and left out.
 pub(crate) async fn start_dht(
     settings: &Settings,
     udp: &[SharedUdpSocket],
@@ -809,6 +813,11 @@ pub(crate) async fn start_dht(
     });
     let mut c = DhtConfig::default();
     c.bootstrap = settings.dht_bootstrap_nodes.clone();
+    // A DHT matches every reply to the address it queried, and a query sent
+    // to a name has no such address: under any proxy the bootstrap entries
+    // that are names are skipped (an IP literal is still used, relayed), so
+    // no bootstrap name is ever resolved on the host's own address (M3).
+    c.resolve_bootstrap_names = settings.proxy.kind == fbt_net::proxy::ProxyKind::None;
     c.read_only = settings.dht_read_only;
     c.state = state;
     c.query_timeout = settings.dht_query_timeout;

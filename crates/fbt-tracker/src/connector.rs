@@ -8,8 +8,10 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -32,6 +34,42 @@ type Resolving =
 /// the request instead of letting the rest go unchecked, so the check stays bounded however
 /// many addresses a hostile name hands back.
 const MAX_GUARDED_ADDRESSES: usize = 64;
+
+/// Whether the stack this connector belongs to has been replaced.
+///
+/// hyper-util's legacy connection pool finishes a losing connect in a background task the
+/// session's own handles cannot abort (N3): a request that was already in flight when its stack
+/// was torn down can still be polled afterwards, and would then resolve a name and dial the
+/// address itself — directly, past whatever proxy replaced the stack. The connector reads this
+/// flag immediately before it resolves or dials anything and refuses instead, so nothing goes
+/// out from a stack that is being replaced. It is created once per client and shared by every
+/// connector and resolver that client builds.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Closed(Arc<AtomicBool>);
+
+impl Closed {
+    pub(crate) fn new() -> Closed {
+        Closed(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Marks the stack closed: nothing else on its connectors may resolve or dial.
+    pub(crate) fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// The error a request refused on a replaced stack ends with.
+    pub(crate) fn refuse(&self) -> BoxError {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "the stack this request belongs to was replaced",
+        )
+        .into()
+    }
+}
 
 /// A host refused because it answers with an address inside the local network. It names no
 /// address on purpose: what surfaces is [`TrackerError::InternalRedirect`](crate::TrackerError::InternalRedirect),
@@ -150,13 +188,16 @@ pub(crate) struct GuardedResolver {
     /// client that asks first, where the address is the caller's own choice.
     deny_internal: bool,
     where_to_look: Resolution,
+    /// Read before the lookup runs: a replaced stack resolves nothing.
+    closed: Closed,
 }
 
 impl GuardedResolver {
-    fn new(deny_internal: bool, where_to_look: Resolution) -> GuardedResolver {
+    fn new(deny_internal: bool, where_to_look: Resolution, closed: Closed) -> GuardedResolver {
         GuardedResolver {
             deny_internal,
             where_to_look,
+            closed,
         }
     }
 }
@@ -175,6 +216,11 @@ impl tower_service::Service<Name> for GuardedResolver {
         // hyper hands a resolver the host alone and puts the URI's port back on the answers,
         // so they are asked for with none.
         Box::pin(async move {
+            // The lookup runs when this future is polled, which for a connect the pool picked
+            // up but did not win can be after its stack was replaced (N3): refuse first.
+            if this.closed.is_set() {
+                return Err(this.closed.refuse());
+            }
             this.where_to_look
                 .resolve(this.deny_internal, name.as_str(), 0)
                 .await
@@ -188,8 +234,12 @@ impl tower_service::Service<Name> for GuardedResolver {
 pub(crate) enum ProxyConnector {
     /// hyper's connector (`enforce_http(false)`, so TLS can wrap it), resolving through
     /// [`GuardedResolver`].
-    // audit: dials through it record in call (IP literal) and in GuardedResolver (names)
-    Direct(HttpConnector<GuardedResolver>),
+    Direct {
+        // audit: dials through it record in call (IP literal) and in GuardedResolver (names)
+        http: HttpConnector<GuardedResolver>,
+        /// Read before any record or dial: a replaced stack resolves and dials nothing (N3).
+        closed: Closed,
+    },
     /// Through `proxy`, the whole exchange bounded by `timeout`. With `guard`, a host name is
     /// resolved and judged here when the proxy would not resolve it, so the address the proxy
     /// is asked to dial is one that was checked; with `proxy_hostnames` the proxy resolves
@@ -203,18 +253,23 @@ pub(crate) enum ProxyConnector {
         guard: bool,
         /// Where a guarded lookup runs (the stub of it, in tests).
         where_to_look: Resolution,
+        /// Read before any record or dial: a replaced stack resolves and dials nothing (N3).
+        closed: Closed,
     },
 }
 
 impl ProxyConnector {
     /// A direct connector, or one through `proxy` when it names a proxy. `deny_internal`:
     /// this connector dials nothing inside the local network; `where_to_look` says where
-    /// host names are looked up (only tests pass anything but the system resolver).
+    /// host names are looked up (only tests pass anything but the system resolver). `closed`
+    /// is set when the stack this connector belongs to is replaced, after which it refuses to
+    /// resolve or dial anything (N3).
     pub(crate) fn new(
         proxy: Option<&ProxyConfig>,
         timeout: Duration,
         deny_internal: bool,
         where_to_look: Resolution,
+        closed: Closed,
     ) -> ProxyConnector {
         match proxy {
             Some(p) if p.kind != ProxyKind::None => ProxyConnector::Proxied {
@@ -222,15 +277,17 @@ impl ProxyConnector {
                 timeout,
                 guard: deny_internal,
                 where_to_look,
+                closed,
             },
             _ => {
                 // audit: dials through it record in call (IP literal) and in GuardedResolver (names)
                 let mut http = HttpConnector::new_with_resolver(GuardedResolver::new(
                     deny_internal,
                     where_to_look,
+                    closed.clone(),
                 ));
                 http.enforce_http(false);
-                ProxyConnector::Direct(http)
+                ProxyConnector::Direct { http, closed }
             }
         }
     }
@@ -260,38 +317,58 @@ impl tower_service::Service<Uri> for ProxyConnector {
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self {
-            ProxyConnector::Direct(http) => http.poll_ready(cx).map_err(Into::into),
+            ProxyConnector::Direct { http, .. } => http.poll_ready(cx).map_err(Into::into),
             ProxyConnector::Proxied { .. } => Poll::Ready(Ok(())),
         }
     }
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         match self {
-            ProxyConnector::Direct(http) => {
-                // Hyper dials an IP-literal URI without asking the resolver, so the
-                // resolver's Lookup record cannot cover it: record the connect here,
-                // or a direct dial to an address would leave an empty capture.
-                if let Some(host) = uri.host() {
-                    let bare = without_brackets(host);
-                    if let Ok(ip) = bare.parse::<IpAddr>() {
-                        audit::record(audit::Outbound::TcpConnect(SocketAddr::new(
-                            ip,
-                            port_of(&uri),
-                        )));
+            ProxyConnector::Direct { http, closed } => {
+                let (mut http, closed) = (http.clone(), closed.clone());
+                Box::pin(async move {
+                    // Read when this future is polled, which for a connect the pool started
+                    // but a later stack won can be after the replacement (N3): a replaced
+                    // stack must not record a connect nor dial one.
+                    if closed.is_set() {
+                        return Err(closed.refuse());
                     }
-                }
-                let connecting = http.call(uri);
-                Box::pin(async move { connecting.await.map_err(Into::into) })
+                    // Hyper dials an IP-literal URI without asking the resolver, so the
+                    // resolver's Lookup record cannot cover it: record the connect here,
+                    // or a direct dial to an address would leave an empty capture.
+                    if let Some(host) = uri.host() {
+                        let bare = without_brackets(host);
+                        if let Ok(ip) = bare.parse::<IpAddr>() {
+                            audit::record(audit::Outbound::TcpConnect(SocketAddr::new(
+                                ip,
+                                port_of(&uri),
+                            )));
+                        }
+                    }
+                    let connecting = http.call(uri);
+                    connecting.await.map_err(Into::into)
+                })
             }
             ProxyConnector::Proxied {
                 proxy,
                 timeout,
                 guard,
                 where_to_look,
+                closed,
             } => {
-                let (proxy, timeout, guard, where_to_look) =
-                    (proxy.clone(), *timeout, *guard, where_to_look.clone());
+                let (proxy, timeout, guard, where_to_look, closed) = (
+                    proxy.clone(),
+                    *timeout,
+                    *guard,
+                    where_to_look.clone(),
+                    closed.clone(),
+                );
                 Box::pin(async move {
+                    // As in the direct arm: refuse before any lookup or dial when the stack
+                    // this request belongs to has been replaced (N3).
+                    if closed.is_set() {
+                        return Err(closed.refuse());
+                    }
                     let host = uri.host().ok_or("request URI has no host")?;
                     let port = port_of(&uri);
                     // `connect_tcp` turns an IP literal into an address itself (and a literal
@@ -502,6 +579,80 @@ mod tests {
         assert_eq!(without_brackets("[::1"), "[::1");
     }
 
+    /// A connect the pool started but did not win can be polled after its
+    /// stack was replaced (hyper-util finishes a losing connect in a task the
+    /// session cannot abort: N3). The connector reads the closed flag when the
+    /// future is polled — not when it is made — so the replaced stack neither
+    /// resolves a name nor dials an address, directly or through the proxy.
+    #[tokio::test]
+    async fn a_replaced_stack_resolves_and_dials_nothing() {
+        let stub = StubResolver::default();
+        // An answer for the name, if anything were to look it up.
+        stub.push(&["127.0.0.1"]);
+        let closed = Closed::new();
+        let mut direct = ProxyConnector::new(
+            None,
+            Duration::from_secs(5),
+            false,
+            stub.resolution(),
+            closed.clone(),
+        );
+        let mut proxy = ProxyConfig::default();
+        proxy.kind = ProxyKind::Socks5;
+        proxy.host = "127.0.0.1".to_owned();
+        proxy.port = 2;
+        let mut proxied = ProxyConnector::new(
+            Some(&proxy),
+            Duration::from_secs(5),
+            false,
+            stub.resolution(),
+            closed.clone(),
+        );
+
+        // The futures exist before the replacement: hyper-util's pool hands a
+        // started-but-losing connect to the runtime exactly this way, and the
+        // stack is replaced before anything polls them.
+        let by_name = direct.call("http://tracker.invalid/announce".parse::<Uri>().unwrap());
+        let by_literal = direct.call("http://127.0.0.1:1/announce".parse::<Uri>().unwrap());
+        let through_proxy = proxied.call("http://tracker.invalid/announce".parse::<Uri>().unwrap());
+
+        let cap = audit::capture();
+        closed.set();
+        assert!(by_name.await.is_err(), "a replaced stack must not connect");
+        assert!(
+            by_literal.await.is_err(),
+            "a replaced stack must not dial an address"
+        );
+        assert!(
+            through_proxy.await.is_err(),
+            "a replaced stack must not dial the proxy"
+        );
+        let recs = cap.take();
+        drop(cap);
+        // The capture is process-wide and parallel tests dial their own
+        // listeners: assert the absence of the dials and the lookup this test
+        // would have made, and that the stub was never consulted.
+        assert!(
+            !recs.contains(&audit::Outbound::TcpConnect("127.0.0.1:1".parse().unwrap())),
+            "a replaced stack dialled an address: {recs:?}"
+        );
+        assert!(
+            !recs.contains(&audit::Outbound::TcpConnect("127.0.0.1:2".parse().unwrap())),
+            "a replaced stack dialled the proxy: {recs:?}"
+        );
+        assert!(
+            !recs
+                .iter()
+                .any(|o| matches!(o, audit::Outbound::Lookup(h) if h == "tracker.invalid")),
+            "a replaced stack looked a name up: {recs:?}"
+        );
+        assert!(
+            stub.calls().is_empty(),
+            "the name was looked up on a replaced stack: {:?}",
+            stub.calls()
+        );
+    }
+
     /// Hyper dials an IP-literal URI without asking the resolver, so the
     /// resolver's Lookup record cannot cover it: the connector records the
     /// connect itself, or a direct tracker at an address leaves an empty capture.
@@ -513,8 +664,13 @@ mod tests {
             let (s, _) = listener.accept().await.unwrap();
             drop(s);
         });
-        let mut connector =
-            ProxyConnector::new(None, Duration::from_secs(5), false, Resolution::System);
+        let mut connector = ProxyConnector::new(
+            None,
+            Duration::from_secs(5),
+            false,
+            Resolution::System,
+            Closed::new(),
+        );
         let cap = audit::capture();
         let uri = format!("http://{addr}/announce").parse::<Uri>().unwrap();
         let stream = connector.call(uri).await.unwrap();

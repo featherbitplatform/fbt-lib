@@ -49,6 +49,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use fbt_bencode::{Limits, decode_with};
+use fbt_core::audit;
 use fbt_core::{BlockRef, FileLayout, MAX_DISPLAY_CHARS, PieceLayout, display_safe};
 use fbt_metainfo::Metainfo;
 use fbt_net::addr::is_internal;
@@ -445,21 +446,25 @@ impl SeedOrigin {
         if self.proxy_resolves_names {
             return false;
         }
-        let first =
-            match tokio::time::timeout(self.dns_timeout, tokio::net::lookup_host((host, port)))
-                .await
-            {
-                // The first address of the answer: the one the fetch itself dials.
-                Ok(Ok(found)) => found.take(1).next().map(|a| a.ip()),
-                Ok(Err(e)) => {
-                    debug!(url = %self.url, error = %e, "web seed host did not resolve");
-                    None
-                }
-                Err(_) => {
-                    debug!(url = %self.url, "web seed host did not resolve in time");
-                    None
-                }
-            };
+        let first = match tokio::time::timeout(self.dns_timeout, {
+            // The origin's own host, resolved here only when the proxy
+            // does not: recorded where it leaves the host.
+            audit::record(audit::Outbound::Lookup(host.to_owned()));
+            tokio::net::lookup_host((host, port))
+        })
+        .await
+        {
+            // The first address of the answer: the one the fetch itself dials.
+            Ok(Ok(found)) => found.take(1).next().map(|a| a.ip()),
+            Ok(Err(e)) => {
+                debug!(url = %self.url, error = %e, "web seed host did not resolve");
+                None
+            }
+            Err(_) => {
+                debug!(url = %self.url, "web seed host did not resolve in time");
+                None
+            }
+        };
         let Some(first) = first else {
             // Fail closed: an origin nobody can place gets the guard a public origin gets.
             return false;

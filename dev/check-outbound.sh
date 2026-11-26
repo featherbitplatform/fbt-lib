@@ -33,7 +33,8 @@
 #
 # The scan covers $1 (default: crates), */src/*.rs: not fbt-api (the server
 # stack) and not fbt-example, plus the crates named in CHECK_OUTBOUND_SKIP
-# (comma-separated; fbt-session while its outbound is not audited yet). In
+# (comma-separated; none at present — every engine crate's outbound is
+# audited). In
 # each file the scan stops at the first inline #[cfg(test)] module — the
 # attribute line followed (blank lines aside) by `mod <name> {`; an
 # out-of-line declaration (`mod <name>;`) does not stop it, and a file that

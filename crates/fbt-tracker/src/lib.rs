@@ -101,6 +101,15 @@ impl TrackerClient {
         self.inner.udp.handler()
     }
 
+    /// Refuses every later HTTP lookup and dial on this client, including one a pooled
+    /// connection still holds from before: the session calls it when it replaces the stack this
+    /// client belongs to, because hyper-util finishes a losing connect in a task the session's
+    /// own handles cannot abort (N3). A refused request fails with an IO error rather than
+    /// reaching the network. UDP is unaffected: its sockets belong to the stack being torn down.
+    pub fn close(&self) {
+        self.inner.http.close();
+    }
+
     /// Announces to `url`, dispatching on its scheme (`http`, `https`, `udp`).
     pub async fn announce(
         &self,

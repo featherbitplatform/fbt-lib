@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fbt_core::audit;
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PeerId, PieceLayout};
 use fbt_net::proxy::{ProxyConfig, ProxyKind, ProxyTarget, connect_tcp};
 use fbt_utp::{UtpError, UtpSocket};
@@ -272,11 +273,17 @@ async fn connect(
                 }
             }
         }
-        Transport::Tcp => match timeout(settings.connect_timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => Ok(PeerTransport::Tcp(s)),
-            Ok(Err(e)) => Err((io(e.to_string()), true)),
-            Err(_) => Err((io("connect timed out".to_owned()), true)),
-        },
+        Transport::Tcp => {
+            // The one direct TCP dial the session makes for a peer: recorded
+            // where it leaves the host (the proxied arm records the proxy's
+            // address instead).
+            audit::record(audit::Outbound::TcpConnect(addr));
+            match timeout(settings.connect_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => Ok(PeerTransport::Tcp(s)),
+                Ok(Err(e)) => Err((io(e.to_string()), true)),
+                Err(_) => Err((io("connect timed out".to_owned()), true)),
+            }
+        }
         Transport::Utp => {
             let Some(socket) = utp else {
                 return Err((
@@ -291,6 +298,7 @@ async fn connect(
                 .saturating_add(Duration::from_secs(1));
             // An IPv4-mapped peer is dialled from the IPv4 socket.
             let to = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+            // audit: the uTP socket's sender records outbound in OwnedSender::send_to (or the demux)
             match timeout(bound, socket.connect(to)).await {
                 Ok(Ok(s)) => Ok(PeerTransport::Utp(s)),
                 Ok(Err(e)) => {

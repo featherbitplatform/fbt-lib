@@ -50,8 +50,9 @@ pub(crate) struct NetStack {
     /// Increments on every replacement; a dial that reads generation `g` is
     /// dropped when the session's generation is no longer `g`.
     pub generation: u64,
-    /// The network settings as applied (an HTTP proxy carrying peers turns
-    /// outgoing uTP off here, as [`Settings::proxy_bypasses`] does).
+    /// The network settings as applied (the caller's value through
+    /// [`NetworkSettings::effective`], so an HTTP proxy carrying peers turns
+    /// outgoing uTP off here, and a proxy-only value has every bypass off).
     pub net: NetworkSettings,
     /// Shared by every torrent's announcer; a request reads it at each use,
     /// so a stack change needs no announcer restart.
@@ -137,7 +138,8 @@ impl NetStack {
         }
     }
 
-    /// Builds the stack for `generation` as `net` says: binds `addrs` (the
+    /// Builds the stack for `generation` as `net` says (through
+    /// [`NetworkSettings::effective`]): binds `addrs` (the
     /// addresses the previous stack had bound, or [`Settings::listen_addrs`]
     /// at the session's start), opens the UDP side (the one socket of the
     /// SOCKS5 relay `relay` when given, else the shared sockets only when the
@@ -156,15 +158,14 @@ impl NetStack {
         generation: u64,
         relay: Option<Socks5Udp>,
     ) -> Result<NetStack, SessionError> {
-        // The effective settings: `net` decides the proxy and the switches
-        // (an HTTP proxy carrying peers turns outgoing uTP off, whatever the
-        // stored value says).
+        // The effective settings: `net` (as the caller set it) with the
+        // proxy's own rules applied, so the stack is built exactly as
+        // `Settings` validation saw it (`NetworkSettings::effective`: an HTTP
+        // proxy carrying peers turns outgoing uTP off; a proxy-only value
+        // turns every bypass off).
+        let applied = net.effective();
         let mut effective = settings.clone();
-        effective.set_network(net.clone());
-        if effective.proxy.kind == ProxyKind::Http && effective.proxy.proxy_peers {
-            effective.enable_outgoing_utp = false;
-        }
-        let applied = effective.network();
+        effective.set_network(applied.clone());
         // Any proxy that does not relay UDP turns UDP off entirely: no socket
         // is bound (so no DHT, no uTP, no UDP trackers, and nothing sends
         // from the host's own address), by the 3.3 ruling. A direct session
@@ -313,6 +314,11 @@ impl NetStack {
     /// sockets under them. Waiting for the tasks is what frees the listen
     /// ports for the next stack to bind again.
     pub(crate) async fn shutdown(&self) -> Option<Vec<u8>> {
+        // Nothing in flight on this stack may resolve or dial once it is
+        // being replaced: hyper-util's connection pool finishes a losing
+        // connect in a task the session's handles cannot abort, so the
+        // tracker client refuses before resolving or dialling instead (N3).
+        self.tracker.close();
         self.stop_tasks().await;
         // The DHT's state goes with us; the DHT itself stops at once, so
         // nothing keeps querying directly through the change.
@@ -343,6 +349,9 @@ impl NetStack {
     /// session's teardown: signals and aborts the tasks and closes the
     /// sockets at once.
     pub(crate) fn abort(&self) {
+        // As in `shutdown`: a losing connect of the pool must not resolve or
+        // dial after this stack is gone (N3).
+        self.tracker.close();
         let _ = self.stop.send(true);
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
         for t in tasks {

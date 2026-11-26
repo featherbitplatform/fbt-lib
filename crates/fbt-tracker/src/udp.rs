@@ -374,6 +374,14 @@ enum Route {
 impl Route {
     fn of(proxy: Option<&ProxyConfig>) -> Route {
         match proxy {
+            // A proxy-only session never announces UDP directly, whatever the per-kind
+            // switches say (M6): SOCKS5 relays all the UDP it carries (one socket cannot be
+            // half proxied), and an HTTP proxy, which cannot carry UDP at all, fails the
+            // tracker with `TrackerError::ProxyUnsupported` instead of going direct.
+            Some(p) if p.kind != ProxyKind::None && p.proxy_only => match p.kind {
+                ProxyKind::Socks5 => Route::Relayed,
+                _ => Route::Unsupported,
+            },
             // One socket cannot be half proxied: SOCKS5 relays all UDP.
             Some(p) if p.kind == ProxyKind::Socks5 && (p.proxy_peers || p.proxy_trackers) => {
                 Route::Relayed
@@ -485,7 +493,10 @@ impl UdpClient {
     /// binds its own socket lazily. Through a SOCKS5 `proxy` every announce
     /// takes the first shared socket (the relayed one) and none is bound;
     /// through an HTTP proxy with `proxy_trackers` announces fail with
-    /// [`TrackerError::ProxyUnsupported`].
+    /// [`TrackerError::ProxyUnsupported`]. A `proxy_only` session announces
+    /// through the proxy whatever the per-kind switches say: SOCKS5 relays
+    /// (and fails with [`TrackerError::Proxy`] if no relayed socket was
+    /// given), and an HTTP proxy fails the tracker rather than going direct.
     pub(crate) fn with_sockets(
         cfg: &TrackerConfig,
         sockets: Vec<Arc<dyn DatagramSender>>,
@@ -573,12 +584,25 @@ impl UdpClient {
             return Err(TrackerError::ProxyUnsupported);
         }
         let (host, port) = parse_udp_url(url)?;
-        if self.route == Route::Relayed
-            && let Some(target) = Target::of_name(&host, port)
-        {
-            // A name on a relayed route goes to the relay, which resolves it:
-            // it is never handed to the system resolver here, so the target
-            // is the one thing sent and waited for (no family fallback).
+        if self.route == Route::Relayed {
+            // On a relayed route nothing is resolved here: the relay takes the whole target,
+            // an IP literal as an address and a name as a name (M2). Recording a lookup for a
+            // literal would name a lookup that never happens, and a name that came back to the
+            // system resolver would defeat the relay's own resolution. The target is the one
+            // thing sent and waited for (no family fallback).
+            let target = match Target::of_name(&host, port) {
+                Some(name) => name,
+                None => {
+                    let bare = host
+                        .strip_prefix('[')
+                        .and_then(|h| h.strip_suffix(']'))
+                        .unwrap_or(&host);
+                    let ip = bare
+                        .parse::<IpAddr>()
+                        .map_err(|_| TrackerError::InvalidUrl("bad host".to_owned()))?;
+                    Target::Addr(SocketAddr::new(ip, port))
+                }
+            };
             return self.request_to(target, build, parse).await;
         }
         // The host comes from a hostile torrent: bound the lookup.
@@ -1419,6 +1443,102 @@ mod tests {
                 .any(|o| matches!(o, Outbound::Lookup(h) if h == "tracker.invalid")),
             "a relayed announce must not hand the tracker name to the resolver: {recs:?}"
         );
+    }
+
+    /// A relayed announce to an IP-literal URL goes to the relay as an
+    /// address, and nothing is looked up here (an IP literal is not a name):
+    /// recording a lookup would name a lookup that never happens.
+    #[tokio::test]
+    async fn relayed_announce_by_literal_records_no_lookup() {
+        use fbt_core::audit::{self, Outbound};
+        let relay = Arc::new(Relay::default());
+        let cl = relayed_client(relay.clone());
+        let h = cl.udp_handler();
+        let cap = audit::capture();
+        let url = "udp://192.0.2.20:6969/announce";
+        let announcing = tokio::spawn({
+            let cl = cl.clone();
+            async move { cl.announce(url, &request()).await }
+        });
+        let addr: SocketAddr = "192.0.2.20:6969".parse().unwrap();
+        let (target, dgram) = relay.wait_send(0).await;
+        assert_eq!(
+            target,
+            Target::Addr(addr),
+            "an IP literal is an address, not a name"
+        );
+        assert!(is_connect(&dgram));
+        h.handle(addr, &connect_reply(&dgram[12..16], CID));
+        let (target, dgram) = relay.wait_send(1).await;
+        assert_eq!(target, Target::Addr(addr));
+        let mut reply = announce_reply(&dgram[12..16], &PEERS);
+        reply[8..12].copy_from_slice(&1800u32.to_be_bytes());
+        h.handle(addr, &reply);
+        let resp = announcing.await.unwrap().unwrap();
+        assert_eq!(resp.peers.len(), 2);
+        let recs = cap.take();
+        drop(cap);
+        assert!(
+            !recs
+                .iter()
+                .any(|o| matches!(o, Outbound::Lookup(h) if h == "192.0.2.20")),
+            "an IP-literal tracker is never looked up: {recs:?}"
+        );
+    }
+
+    /// `proxy_only` never announces UDP directly, whatever the per-kind
+    /// switches say (M6): with SOCKS5 the route is relayed, and a request with
+    /// no relayed socket fails with [`TrackerError::Proxy`] rather than going
+    /// direct; with an HTTP proxy (which cannot carry UDP) it is unsupported.
+    #[tokio::test]
+    async fn proxy_only_never_routes_udp_direct() {
+        // The per-kind switches off: without `proxy_only` this is a direct route.
+        let mut socks5 = ProxyConfig::default();
+        socks5.kind = ProxyKind::Socks5;
+        socks5.host = "127.0.0.1".to_owned();
+        socks5.port = 1080;
+        socks5.proxy_peers = false;
+        socks5.proxy_trackers = false;
+        socks5.proxy_only = true;
+        assert_eq!(Route::of(Some(&socks5)), Route::Relayed);
+
+        let mut http = ProxyConfig::default();
+        http.kind = ProxyKind::Http;
+        http.host = "127.0.0.1".to_owned();
+        http.port = 8080;
+        http.proxy_trackers = false;
+        http.proxy_only = true;
+        assert_eq!(Route::of(Some(&http)), Route::Unsupported);
+
+        // `proxy_only` with no proxy is ignored: the route stays direct.
+        let mut none = ProxyConfig::default();
+        none.proxy_only = true;
+        assert_eq!(Route::of(Some(&none)), Route::Direct);
+
+        // A relayed route with no relayed socket fails rather than dialling
+        // the tracker directly (nothing is sent).
+        let cl = TrackerClient::new_with(
+            TrackerConfig {
+                udp_base_timeout: Duration::from_millis(50),
+                ..TrackerConfig::default()
+            },
+            Vec::new(),
+            Some(socks5),
+        )
+        .unwrap();
+        let err = cl
+            .announce("udp://192.0.2.20:6969/announce", &request())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrackerError::Proxy(_)), "{err:?}");
+
+        // An HTTP proxy-only fails the UDP tracker without sending anything.
+        let cl = TrackerClient::new_with(TrackerConfig::default(), Vec::new(), Some(http)).unwrap();
+        let err = cl
+            .announce("udp://192.0.2.20:6969/announce", &request())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrackerError::ProxyUnsupported), "{err:?}");
     }
 
     /// A relayed reply carrying another transaction id is dropped like any
