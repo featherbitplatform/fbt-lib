@@ -153,6 +153,13 @@ impl HttpClient {
     pub(crate) fn close(&self) {
         self.closed.set();
     }
+
+    /// Whether [`close`](Self::close) was called: every later lookup and dial on this client is
+    /// refused, so a caller that resolves a host name itself (a web seed's own origin, in
+    /// fbt-session) has to refuse its own lookup too.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.is_set()
+    }
     /// Three clients over the same TLS setup: announces go through `proxy` when it sets
     /// `proxy_trackers`, web seeds and their guarded redirect hops when it sets `proxy_peers`.
     /// Proxy round trips are bounded by `cfg.http_timeout`.

@@ -110,6 +110,14 @@ impl TrackerClient {
         self.inner.http.close();
     }
 
+    /// Whether [`close`](Self::close) was called on this client (or on a clone of it): every
+    /// later HTTP lookup and dial is refused, so a caller that looks a host name up itself
+    /// before fetching (fbt-session, judging a web seed's own origin) can refuse its own lookup
+    /// on a replaced stack instead of resolving on one that is gone.
+    pub fn is_closed(&self) -> bool {
+        self.inner.http.is_closed()
+    }
+
     /// Announces to `url`, dispatching on its scheme (`http`, `https`, `udp`).
     pub async fn announce(
         &self,
