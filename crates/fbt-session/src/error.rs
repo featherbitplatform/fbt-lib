@@ -58,9 +58,11 @@ pub enum SessionError {
     /// it allows (16).
     #[error("too many open file readers")]
     TooManyReaders,
-    /// The SOCKS5 UDP association [`Settings::proxy`](crate::Settings::proxy)
-    /// needs could not be made, or the socket relayed through it could not
-    /// be bound ([`ProxyError::Io`](crate::ProxyError::Io)).
+    /// The socket relayed through the SOCKS5 UDP association
+    /// [`Settings::proxy`](crate::Settings::proxy) needs could not be bound
+    /// locally ([`ProxyError::Io`](crate::ProxyError::Io)). An association
+    /// that cannot be made at all is no longer an error: the session reports
+    /// it as a [`ProxyState`](crate::ProxyState) and runs without UDP.
     #[error("proxy error: {0}")]
     Proxy(#[source] crate::ProxyError),
     /// A path given to

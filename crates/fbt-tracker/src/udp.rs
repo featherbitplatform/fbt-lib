@@ -2,16 +2,19 @@
 //!
 //! One socket per address family is bound lazily and owned by the client; a
 //! receive task routes datagrams to waiters by transaction id and drops
-//! anything short, unknown or coming from an address other than the one the
-//! request was sent to. The task is aborted when the client is dropped.
+//! anything short, unknown or from a source the waiter does not accept (the
+//! address the request went to, or any source for a request a relay sent to a
+//! name). The task is aborted when the client is dropped.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use fbt_net::proxy::{ProxyConfig, ProxyKind};
+// audit: outbound on the socket is recorded in Endpoint::send (or the demux)
 use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
@@ -111,9 +114,69 @@ pub fn parse_udp_announce(
     })
 }
 
-/// Connection ids per tracker address, valid for 60 s. Time is injected.
+/// Where one request goes: the address a host resolved to, or the name
+/// itself, which only the SOCKS5 relay resolves (RFC 1928, section 7, carries
+/// a name in the UDP request header). A name never reaches the system
+/// resolver here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Target {
+    /// One resolved address.
+    Addr(SocketAddr),
+    /// A tracker as written in its URL: the host ASCII-lowercased and the
+    /// port, so one tracker named two ways is one target.
+    Name {
+        /// The host, without brackets and lowercased.
+        host: String,
+        /// The port.
+        port: u16,
+    },
+}
+
+impl Target {
+    /// The address family the request and its reply are read as: the
+    /// address's, or IPv4 for a name, whose resolved family the relay does
+    /// not tell us before the reply arrives (the relayed socket is IPv4 in
+    /// practice, so the tracker answers IPv4 unless the relay itself carries
+    /// IPv6).
+    fn ipv6(&self) -> bool {
+        matches!(self, Target::Addr(a) if a.is_ipv6())
+    }
+
+    /// [`Target::Name`] for a URL host that is not an IP literal.
+    fn of_name(host: &str, port: u16) -> Option<Target> {
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        bare.parse::<IpAddr>().is_err().then(|| Target::Name {
+            host: bare.to_ascii_lowercase(),
+            port,
+        })
+    }
+}
+
+/// The source of the reply a waiter accepts.
+#[derive(Debug, Clone)]
+enum Source {
+    /// Exactly the address the request went to.
+    Addr(SocketAddr),
+    /// Any source: a request sent to a name went to no address at all, and
+    /// the relay reports the address it resolved to, which we never learned.
+    Any,
+}
+
+impl Source {
+    fn accepts(&self, from: SocketAddr) -> bool {
+        match self {
+            Source::Addr(addr) => *addr == from,
+            Source::Any => true,
+        }
+    }
+}
+
+/// Connection ids per target as written, valid for 60 s. Time is injected.
 pub(crate) struct ConnCache {
-    map: HashMap<SocketAddr, (u64, Instant)>,
+    map: HashMap<Target, (u64, Instant)>,
 }
 
 impl ConnCache {
@@ -123,23 +186,23 @@ impl ConnCache {
         }
     }
 
-    pub(crate) fn get(&self, addr: SocketAddr, now: Instant) -> Option<u64> {
-        let (id, at) = self.map.get(&addr)?;
+    pub(crate) fn get(&self, target: &Target, now: Instant) -> Option<u64> {
+        let (id, at) = self.map.get(target)?;
         (now.saturating_duration_since(*at) < CONNECTION_TTL).then_some(*id)
     }
 
-    pub(crate) fn put(&mut self, addr: SocketAddr, id: u64, now: Instant) {
+    pub(crate) fn put(&mut self, target: Target, id: u64, now: Instant) {
         self.map
             .retain(|_, (_, at)| now.saturating_duration_since(*at) < CONNECTION_TTL);
-        self.map.insert(addr, (id, now));
+        self.map.insert(target, (id, now));
     }
 
-    pub(crate) fn clear(&mut self, addr: SocketAddr) {
-        self.map.remove(&addr);
+    pub(crate) fn clear(&mut self, target: &Target) {
+        self.map.remove(target);
     }
 }
 
-type Pending = Arc<Mutex<HashMap<u32, (SocketAddr, oneshot::Sender<Vec<u8>>)>>>;
+type Pending = Arc<Mutex<HashMap<u32, (Source, oneshot::Sender<Vec<u8>>)>>>;
 
 /// Builds a request datagram from the connection id, the transaction id
 /// and the address family (`true` for IPv6).
@@ -149,6 +212,7 @@ type ParseFn<'a, T> = &'a (dyn Fn(&[u8], u32, bool) -> Result<T, TrackerError> +
 
 /// A bound socket plus its receive task; the task dies with this value.
 struct Sock {
+    // audit: outbound is recorded in Endpoint::send (or the demux)
     socket: Arc<UdpSocket>,
     pending: Pending,
     task: JoinHandle<()>,
@@ -163,11 +227,14 @@ impl Drop for Sock {
 impl Sock {
     fn bind(v6: bool) -> std::io::Result<Sock> {
         let std_sock = if v6 {
+            // audit: outbound on this socket is recorded in Endpoint::send
             std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))?
         } else {
+            // audit: outbound on this socket is recorded in Endpoint::send
             std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?
         };
         std_sock.set_nonblocking(true)?;
+        // audit: outbound on this socket is recorded in Endpoint::send
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let pending: Pending = Arc::default();
         let task = tokio::spawn(recv_loop(socket.clone(), pending.clone()));
@@ -179,6 +246,7 @@ impl Sock {
     }
 }
 
+// audit: the socket only receives; outbound is recorded in Endpoint::send
 async fn recv_loop(socket: Arc<UdpSocket>, pending: Pending) {
     let mut buf = vec![0u8; 65536];
     loop {
@@ -194,13 +262,14 @@ async fn recv_loop(socket: Arc<UdpSocket>, pending: Pending) {
 }
 
 /// Routes one datagram to its waiter: the transaction id must be pending and
-/// `from` must be the address the request went to; anything else is dropped.
+/// `from` must be a source that waiter accepts (the request's address, or any
+/// source for a name); anything else is dropped.
 fn deliver(pending: &Pending, from: SocketAddr, dgram: &[u8]) {
     let Some(tid) = be_u32(dgram, 4) else {
         return;
     };
     let mut map = lock(pending);
-    if map.get(&tid).is_some_and(|(addr, _)| *addr == from)
+    if map.get(&tid).is_some_and(|(src, _)| src.accepts(from))
         && let Some((_, tx)) = map.remove(&tid)
     {
         let _ = tx.send(dgram.to_vec());
@@ -233,15 +302,33 @@ impl Endpoint<'_> {
         }
     }
 
-    /// Sends one datagram. A full shared socket (`WouldBlock`) counts as a
-    /// lost packet: the retransmit timer covers it.
-    async fn send(&self, dgram: &[u8], addr: SocketAddr) -> std::io::Result<()> {
-        match self {
-            Endpoint::Own(s) => s.socket.send_to(dgram, addr).await.map(|_| ()),
-            Endpoint::Shared(s, _) => match s.send_to(dgram, addr) {
+    /// Sends one datagram to its target. A full shared socket (`WouldBlock`)
+    /// counts as a lost packet: the retransmit timer covers it.
+    async fn send(&self, dgram: &[u8], target: &Target) -> std::io::Result<()> {
+        match (self, target) {
+            (Endpoint::Own(s), Target::Addr(addr)) => {
+                audit::record(audit::Outbound::UdpSend(*addr));
+                s.socket.send_to(dgram, *addr).await.map(|_| ())
+            }
+            // audit: the shared sender is the fbt-net demux, which records
+            (Endpoint::Shared(s, _), Target::Addr(addr)) => match s.send_to(dgram, *addr) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
                 r => r.map(|_| ()),
             },
+            (Endpoint::Shared(s, _), Target::Name { host, port }) => {
+                // audit: the demux records UdpSend(relay) and frames the name
+                let sent = s.send_to_host(dgram, host, *port);
+                match sent {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                    r => r.map(|_| ()),
+                }
+            }
+            // Only a relayed route sends to a name, and it always has a shared
+            // socket; an own socket would have to resolve the name itself.
+            (Endpoint::Own(_), Target::Name { .. }) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "an own socket does not send to a host name",
+            )),
         }
     }
 }
@@ -287,6 +374,14 @@ enum Route {
 impl Route {
     fn of(proxy: Option<&ProxyConfig>) -> Route {
         match proxy {
+            // A proxy-only session never announces UDP directly, whatever the per-kind
+            // switches say (M6): SOCKS5 relays all the UDP it carries (one socket cannot be
+            // half proxied), and an HTTP proxy, which cannot carry UDP at all, fails the
+            // tracker with `TrackerError::ProxyUnsupported` instead of going direct.
+            Some(p) if p.kind != ProxyKind::None && p.proxy_only => match p.kind {
+                ProxyKind::Socks5 => Route::Relayed,
+                _ => Route::Unsupported,
+            },
             // One socket cannot be half proxied: SOCKS5 relays all UDP.
             Some(p) if p.kind == ProxyKind::Socks5 && (p.proxy_peers || p.proxy_trackers) => {
                 Route::Relayed
@@ -398,7 +493,10 @@ impl UdpClient {
     /// binds its own socket lazily. Through a SOCKS5 `proxy` every announce
     /// takes the first shared socket (the relayed one) and none is bound;
     /// through an HTTP proxy with `proxy_trackers` announces fail with
-    /// [`TrackerError::ProxyUnsupported`].
+    /// [`TrackerError::ProxyUnsupported`]. A `proxy_only` session announces
+    /// through the proxy whatever the per-kind switches say: SOCKS5 relays
+    /// (and fails with [`TrackerError::Proxy`] if no relayed socket was
+    /// given), and an HTTP proxy fails the tracker rather than going direct.
     pub(crate) fn with_sockets(
         cfg: &TrackerConfig,
         sockets: Vec<Arc<dyn DatagramSender>>,
@@ -486,7 +584,29 @@ impl UdpClient {
             return Err(TrackerError::ProxyUnsupported);
         }
         let (host, port) = parse_udp_url(url)?;
+        if self.route == Route::Relayed {
+            // On a relayed route nothing is resolved here: the relay takes the whole target,
+            // an IP literal as an address and a name as a name (M2). Recording a lookup for a
+            // literal would name a lookup that never happens, and a name that came back to the
+            // system resolver would defeat the relay's own resolution. The target is the one
+            // thing sent and waited for (no family fallback).
+            let target = match Target::of_name(&host, port) {
+                Some(name) => name,
+                None => {
+                    let bare = host
+                        .strip_prefix('[')
+                        .and_then(|h| h.strip_suffix(']'))
+                        .unwrap_or(&host);
+                    let ip = bare
+                        .parse::<IpAddr>()
+                        .map_err(|_| TrackerError::InvalidUrl("bad host".to_owned()))?;
+                    Target::Addr(SocketAddr::new(ip, port))
+                }
+            };
+            return self.request_to(target, build, parse).await;
+        }
         // The host comes from a hostile torrent: bound the lookup.
+        audit::record(audit::Outbound::Lookup(host.clone()));
         let addrs: Vec<SocketAddr> = match tokio::time::timeout(
             self.dns_timeout,
             tokio::net::lookup_host((host.as_str(), port)),
@@ -499,25 +619,26 @@ impl UdpClient {
         let first = *addrs
             .first()
             .ok_or_else(|| TrackerError::InvalidUrl("host did not resolve".to_owned()))?;
-        match self.request_to(first, build, parse).await {
+        match self.request_to(Target::Addr(first), build, parse).await {
             // Unreachable over the first family (no IPv6 route, say): one
             // address of the other family gets a chance.
             Err(e) if unreachable(&e) => match other_family(&addrs, first) {
-                Some(second) => self.request_to(second, build, parse).await,
+                Some(second) => self.request_to(Target::Addr(second), build, parse).await,
                 None => Err(e),
             },
             r => r,
         }
     }
 
-    /// One request to one resolved tracker address.
+    /// One request to one target (a resolved address, or a name the relay
+    /// resolves).
     async fn request_to<T>(
         &self,
-        addr: SocketAddr,
+        target: Target,
         build: BuildFn<'_>,
         parse: ParseFn<'_, T>,
     ) -> Result<T, TrackerError> {
-        let ipv6 = addr.is_ipv6();
+        let ipv6 = target.ipv6();
         let shared = if self.route == Route::Relayed {
             // The relay carries either family; never a direct socket.
             let relayed = self.shared_v4.as_ref().or(self.shared_v6.as_ref());
@@ -545,31 +666,34 @@ impl UdpClient {
         };
         let sock = &sock;
 
-        let mut cached = lock(&self.conns).get(addr, Instant::now());
+        let mut cached = lock(&self.conns).get(&target, Instant::now());
         loop {
             let (cid, from_cache) = match cached.take() {
                 Some(id) => (id, true),
-                None => (self.connect(sock, addr).await?, false),
+                // audit: the connection-id datagram leaves through the endpoint send
+                None => (self.connect(sock, &target).await?, false),
             };
             let tid = new_tid(sock.pending());
             let dgram = build(cid, tid, ipv6);
-            let resp = self.exchange(sock, addr, tid, &dgram).await?;
+            let resp = self.exchange(sock, &target, tid, &dgram).await?;
             match parse(&resp, tid, ipv6) {
                 // A cached connection id the tracker no longer knows:
                 // reconnect once.
                 Err(TrackerError::Failure(_)) if from_cache => {
-                    lock(&self.conns).clear(addr);
+                    lock(&self.conns).clear(&target);
                 }
                 other => return other,
             }
         }
     }
 
-    async fn connect(&self, sock: &Endpoint<'_>, addr: SocketAddr) -> Result<u64, TrackerError> {
+    async fn connect(&self, sock: &Endpoint<'_>, target: &Target) -> Result<u64, TrackerError> {
         let tid = new_tid(sock.pending());
-        let resp = self.exchange(sock, addr, tid, &build_connect(tid)).await?;
+        let resp = self
+            .exchange(sock, target, tid, &build_connect(tid))
+            .await?;
         let id = parse_connect(&resp, tid)?;
-        lock(&self.conns).put(addr, id, Instant::now());
+        lock(&self.conns).put(target.clone(), id, Instant::now());
         Ok(id)
     }
 
@@ -578,18 +702,22 @@ impl UdpClient {
     async fn exchange(
         &self,
         sock: &Endpoint<'_>,
-        addr: SocketAddr,
+        target: &Target,
         tid: u32,
         dgram: &[u8],
     ) -> Result<Vec<u8>, TrackerError> {
         let (tx, mut rx) = oneshot::channel();
-        lock(sock.pending()).insert(tid, (addr, tx));
+        let source = match target {
+            Target::Addr(addr) => Source::Addr(*addr),
+            Target::Name { .. } => Source::Any,
+        };
+        lock(sock.pending()).insert(tid, (source, tx));
         let _guard = Waiter {
             pending: sock.pending(),
             tid,
         };
         for n in 0..=self.max_retries {
-            sock.send(dgram, addr).await?;
+            sock.send(dgram, target).await?;
             let wait = self
                 .base_timeout
                 .saturating_mul(1u32 << n.min(MAX_BACKOFF_SHIFT));
@@ -794,16 +922,24 @@ mod tests {
 
     #[test]
     fn udp_connection_cache_expires_after_60s() {
-        let addr: SocketAddr = "127.0.0.1:6969".parse().unwrap();
+        let addr = Target::Addr("127.0.0.1:6969".parse::<SocketAddr>().unwrap());
         let t0 = Instant::now();
         let mut cache = ConnCache::new();
-        assert_eq!(cache.get(addr, t0), None);
-        cache.put(addr, 42, t0);
-        assert_eq!(cache.get(addr, t0 + Duration::from_secs(59)), Some(42));
-        assert_eq!(cache.get(addr, t0 + Duration::from_secs(60)), None);
-        cache.put(addr, 43, t0);
-        cache.clear(addr);
-        assert_eq!(cache.get(addr, t0), None);
+        assert_eq!(cache.get(&addr, t0), None);
+        cache.put(addr.clone(), 42, t0);
+        assert_eq!(cache.get(&addr, t0 + Duration::from_secs(59)), Some(42));
+        assert_eq!(cache.get(&addr, t0 + Duration::from_secs(60)), None);
+        cache.put(addr.clone(), 43, t0);
+        cache.clear(&addr);
+        assert_eq!(cache.get(&addr, t0), None);
+        // A name is a target of its own, keyed as written.
+        let name = Target::Name {
+            host: "tracker.invalid".to_owned(),
+            port: 6969,
+        };
+        cache.put(name.clone(), 44, t0);
+        assert_eq!(cache.get(&name, t0), Some(44));
+        assert_eq!(cache.get(&addr, t0), None);
     }
 
     #[tokio::test]
@@ -964,7 +1100,7 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         let good: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         let other: SocketAddr = "127.0.0.1:7001".parse().unwrap();
-        lock(pending).insert(5, (good, tx));
+        lock(pending).insert(5, (Source::Addr(good), tx));
         let tid = 5u32.to_be_bytes();
         h.handle(other, &connect_reply(&tid, CID));
         h.handle(good, &connect_reply(&6u32.to_be_bytes(), CID));
@@ -1154,5 +1290,307 @@ mod tests {
             Err(TrackerError::Failure(m)) if m == "nope"
         ));
         assert!(parse_udp_scrape(&announce_reply(&tid, &[]), 7, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_udp_tracker_lookup_is_recorded() {
+        use fbt_core::audit::{self, Outbound};
+        let url = fake(|b, _, _| {
+            if is_connect(b) {
+                vec![connect_reply(&b[12..16], CID)]
+            } else {
+                vec![announce_reply(&b[12..16], &PEERS)]
+            }
+        })
+        .await;
+        // The fake listens on 127.0.0.1; ask for it by name, so the announce
+        // hands the name to the system resolver.
+        let port = url
+            .strip_prefix("udp://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .rsplit_once(':')
+            .unwrap()
+            .1;
+        let url = format!("udp://localhost:{port}/announce");
+        let nominal: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        // Parallel tests may add their own records; the nominal address is
+        // known only to this test, and the lookup is asserted by name.
+        let cap = audit::capture();
+        let r = client().announce(&url, &request()).await.unwrap();
+        let recs = cap.take();
+        drop(cap);
+        assert!(!r.peers.is_empty());
+        assert!(
+            recs.contains(&Outbound::Lookup("localhost".to_owned())),
+            "{recs:?}"
+        );
+        assert!(recs.contains(&Outbound::UdpSend(nominal)), "{recs:?}");
+    }
+
+    /// A fake relayed sender: it records every datagram as the target it
+    /// left for (an address, or the name a relay resolves) and hands nothing
+    /// anywhere. The test feeds the replies to the client's handler.
+    #[derive(Debug, Default)]
+    struct Relay {
+        sends: Mutex<Vec<(Target, Vec<u8>)>>,
+    }
+
+    impl Relay {
+        /// Waits for the `n`-th datagram (0-based) and returns it.
+        async fn wait_send(&self, n: usize) -> (Target, Vec<u8>) {
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(d) = self.sends.lock().unwrap().get(n).cloned() {
+                    return d;
+                }
+                assert!(Instant::now() < end, "datagram {n} was never sent");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    impl DatagramSender for Relay {
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:1".parse().unwrap()
+        }
+
+        fn send_to(&self, data: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+            self.sends
+                .lock()
+                .unwrap()
+                .push((Target::Addr(to), data.to_vec()));
+            Ok(data.len())
+        }
+
+        fn send_to_host(&self, data: &[u8], host: &str, port: u16) -> std::io::Result<usize> {
+            self.sends.lock().unwrap().push((
+                Target::Name {
+                    host: host.to_owned(),
+                    port,
+                },
+                data.to_vec(),
+            ));
+            Ok(data.len())
+        }
+    }
+
+    /// A SOCKS5 proxy with both switches on: every UDP announce is relayed.
+    fn relayed_proxy() -> ProxyConfig {
+        let mut p = ProxyConfig::default();
+        p.kind = ProxyKind::Socks5;
+        p.host = "127.0.0.1".to_owned();
+        p.port = 1080;
+        p
+    }
+
+    fn relayed_client(relay: Arc<Relay>) -> TrackerClient {
+        TrackerClient::new_with(
+            TrackerConfig {
+                udp_base_timeout: Duration::from_millis(100),
+                ..TrackerConfig::default()
+            },
+            vec![relay],
+            Some(relayed_proxy()),
+        )
+        .unwrap()
+    }
+
+    /// A relayed announce to a URL host name never reaches the system
+    /// resolver: the name goes to the relay, which resolves it, and the reply
+    /// is matched although the address it came from was never learned here.
+    #[tokio::test]
+    async fn relayed_announce_by_name_never_resolves() {
+        use fbt_core::audit::{self, Outbound};
+        let relay = Arc::new(Relay::default());
+        let cl = relayed_client(relay.clone());
+        let h = cl.udp_handler();
+        let cap = audit::capture();
+        let url = "udp://tracker.invalid:6969/announce";
+        let announcing = tokio::spawn({
+            let cl = cl.clone();
+            async move { cl.announce(url, &request()).await }
+        });
+        let name = Target::Name {
+            host: "tracker.invalid".to_owned(),
+            port: 6969,
+        };
+        let (target, dgram) = relay.wait_send(0).await;
+        assert_eq!(target, name);
+        assert!(is_connect(&dgram));
+        // the relay reports the address it resolved the name to
+        let from: SocketAddr = "192.0.2.9:6969".parse().unwrap();
+        h.handle(from, &connect_reply(&dgram[12..16], CID));
+        let (target, dgram) = relay.wait_send(1).await;
+        assert_eq!(target, name);
+        let mut reply = announce_reply(&dgram[12..16], &PEERS);
+        reply[8..12].copy_from_slice(&1800u32.to_be_bytes());
+        h.handle(from, &reply);
+        let resp = announcing.await.unwrap().unwrap();
+        assert_eq!(resp.interval, Duration::from_secs(1800));
+        assert_eq!(resp.peers.len(), 2);
+        let recs = cap.take();
+        drop(cap);
+        // The capture is process-wide and another test in this binary looks
+        // up `localhost`: the name is asserted by name, as the DHT's
+        // bootstrap test does.
+        assert!(
+            !recs
+                .iter()
+                .any(|o| matches!(o, Outbound::Lookup(h) if h == "tracker.invalid")),
+            "a relayed announce must not hand the tracker name to the resolver: {recs:?}"
+        );
+    }
+
+    /// A relayed announce to an IP-literal URL goes to the relay as an
+    /// address, and nothing is looked up here (an IP literal is not a name):
+    /// recording a lookup would name a lookup that never happens.
+    #[tokio::test]
+    async fn relayed_announce_by_literal_records_no_lookup() {
+        use fbt_core::audit::{self, Outbound};
+        let relay = Arc::new(Relay::default());
+        let cl = relayed_client(relay.clone());
+        let h = cl.udp_handler();
+        let cap = audit::capture();
+        let url = "udp://192.0.2.20:6969/announce";
+        let announcing = tokio::spawn({
+            let cl = cl.clone();
+            async move { cl.announce(url, &request()).await }
+        });
+        let addr: SocketAddr = "192.0.2.20:6969".parse().unwrap();
+        let (target, dgram) = relay.wait_send(0).await;
+        assert_eq!(
+            target,
+            Target::Addr(addr),
+            "an IP literal is an address, not a name"
+        );
+        assert!(is_connect(&dgram));
+        h.handle(addr, &connect_reply(&dgram[12..16], CID));
+        let (target, dgram) = relay.wait_send(1).await;
+        assert_eq!(target, Target::Addr(addr));
+        let mut reply = announce_reply(&dgram[12..16], &PEERS);
+        reply[8..12].copy_from_slice(&1800u32.to_be_bytes());
+        h.handle(addr, &reply);
+        let resp = announcing.await.unwrap().unwrap();
+        assert_eq!(resp.peers.len(), 2);
+        let recs = cap.take();
+        drop(cap);
+        assert!(
+            !recs
+                .iter()
+                .any(|o| matches!(o, Outbound::Lookup(h) if h == "192.0.2.20")),
+            "an IP-literal tracker is never looked up: {recs:?}"
+        );
+    }
+
+    /// `proxy_only` never announces UDP directly, whatever the per-kind
+    /// switches say (M6): with SOCKS5 the route is relayed, and a request with
+    /// no relayed socket fails with [`TrackerError::Proxy`] rather than going
+    /// direct; with an HTTP proxy (which cannot carry UDP) it is unsupported.
+    #[tokio::test]
+    async fn proxy_only_never_routes_udp_direct() {
+        // The per-kind switches off: without `proxy_only` this is a direct route.
+        let mut socks5 = ProxyConfig::default();
+        socks5.kind = ProxyKind::Socks5;
+        socks5.host = "127.0.0.1".to_owned();
+        socks5.port = 1080;
+        socks5.proxy_peers = false;
+        socks5.proxy_trackers = false;
+        socks5.proxy_only = true;
+        assert_eq!(Route::of(Some(&socks5)), Route::Relayed);
+
+        let mut http = ProxyConfig::default();
+        http.kind = ProxyKind::Http;
+        http.host = "127.0.0.1".to_owned();
+        http.port = 8080;
+        http.proxy_trackers = false;
+        http.proxy_only = true;
+        assert_eq!(Route::of(Some(&http)), Route::Unsupported);
+
+        // `proxy_only` with no proxy is ignored: the route stays direct.
+        let mut none = ProxyConfig::default();
+        none.proxy_only = true;
+        assert_eq!(Route::of(Some(&none)), Route::Direct);
+
+        // A relayed route with no relayed socket fails rather than dialling
+        // the tracker directly (nothing is sent).
+        let cl = TrackerClient::new_with(
+            TrackerConfig {
+                udp_base_timeout: Duration::from_millis(50),
+                ..TrackerConfig::default()
+            },
+            Vec::new(),
+            Some(socks5),
+        )
+        .unwrap();
+        let err = cl
+            .announce("udp://192.0.2.20:6969/announce", &request())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrackerError::Proxy(_)), "{err:?}");
+
+        // An HTTP proxy-only fails the UDP tracker without sending anything.
+        let cl = TrackerClient::new_with(TrackerConfig::default(), Vec::new(), Some(http)).unwrap();
+        let err = cl
+            .announce("udp://192.0.2.20:6969/announce", &request())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrackerError::ProxyUnsupported), "{err:?}");
+    }
+
+    /// A relayed reply carrying another transaction id is dropped like any
+    /// spoofed datagram: the request retransmits and times out.
+    #[tokio::test]
+    async fn relayed_reply_with_wrong_tid_is_ignored() {
+        let relay = Arc::new(Relay::default());
+        let cl = relayed_client(relay.clone());
+        let h = cl.udp_handler();
+        let announcing = tokio::spawn({
+            let cl = cl.clone();
+            async move {
+                cl.announce("udp://tracker.invalid:6969/announce", &request())
+                    .await
+            }
+        });
+        let (target, dgram) = relay.wait_send(0).await;
+        assert!(matches!(target, Target::Name { .. }));
+        let mut wrong = dgram[12..16].to_vec();
+        wrong[0] ^= 0xff;
+        // A well-formed connect reply with somebody else's transaction id.
+        h.handle(
+            "192.0.2.9:6969".parse().unwrap(),
+            &connect_reply(&wrong, CID),
+        );
+        let err = announcing.await.unwrap().unwrap_err();
+        assert!(matches!(err, TrackerError::Timeout), "{err:?}");
+    }
+
+    /// A relayed request to an IP literal goes to the relay as an address,
+    /// not as a name.
+    #[tokio::test]
+    async fn relayed_literal_still_uses_send_to() {
+        let relay = Arc::new(Relay::default());
+        let cl = relayed_client(relay.clone());
+        let h = cl.udp_handler();
+        let announcing = tokio::spawn({
+            let cl = cl.clone();
+            async move {
+                cl.announce("udp://192.0.2.9:6969/announce", &request())
+                    .await
+            }
+        });
+        let from: SocketAddr = "192.0.2.9:6969".parse().unwrap();
+        let (target, dgram) = relay.wait_send(0).await;
+        assert_eq!(target, Target::Addr(from));
+        assert!(is_connect(&dgram));
+        h.handle(from, &connect_reply(&dgram[12..16], CID));
+        let (target, dgram) = relay.wait_send(1).await;
+        assert_eq!(target, Target::Addr(from));
+        h.handle(from, &announce_reply(&dgram[12..16], &PEERS));
+        let resp = announcing.await.unwrap().unwrap();
+        assert_eq!(resp.peers.len(), 2);
     }
 }

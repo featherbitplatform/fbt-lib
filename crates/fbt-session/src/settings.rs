@@ -395,29 +395,58 @@ pub struct Settings {
     ///   (outgoing uTP, the DHT, UDP trackers) through one UDP ASSOCIATE.
     ///   The session then binds TCP listeners only, plus one relayed UDP
     ///   socket on a free port; the DHT runs over the relay's address
-    ///   family only (IPv4 in practice). If the
-    ///   association cannot be made, [`Session::new`](crate::Session::new)
-    ///   fails with [`SessionError::Proxy`](crate::SessionError::Proxy).
+    ///   family only (IPv4 in practice). If the association cannot be made
+    ///   the session still starts, without any UDP socket at all, and
+    ///   reports it through [`Session::proxy_state`](crate::Session::proxy_state)
+    ///   (`Unreachable` or `UdpNotRelayed`); the DHT, uTP and UDP trackers
+    ///   do not run until it can.
     /// - An HTTP proxy with `proxy_peers` dials peers over TCP only
-    ///   (`enable_outgoing_utp` is treated as off); the DHT still runs
-    ///   directly unless `dht_enabled` is off. With `enable_outgoing_tcp`
-    ///   off as well, the session cannot dial peers at all;
-    ///   [`Session::new`](crate::Session::new) logs a warning.
-    /// - UDP tracker and DHT bootstrap host names are resolved locally
-    ///   whatever `proxy_hostnames` says, and LSD, UPnP and NAT-PMP stay
-    ///   direct on the local network.
+    ///   (`enable_outgoing_utp` is treated as off). An HTTP proxy cannot
+    ///   carry UDP at all, so the DHT, uTP and UDP trackers do not run while
+    ///   one is set, whatever [`dht_enabled`](Self::dht_enabled) says. With
+    ///   `enable_outgoing_tcp` off as well, the session cannot dial peers at
+    ///   all; [`Session::new`](crate::Session::new) logs a warning.
+    /// - The proxy's own host name is the one lookup a proxied session
+    ///   makes locally: UDP tracker host names go to the proxy by name
+    ///   under SOCKS5, an IP-literal tracker goes as an address, and a DHT
+    ///   bootstrap entry that is a name is never resolved here either (the
+    ///   DHT is built with `resolve_bootstrap_names` false under any proxy,
+    ///   so it bootstraps from IP literals, a saved state and the nodes it
+    ///   reaches).
+    /// - LSD, UPnP and NAT-PMP stay direct on the local network whatever the
+    ///   proxy is: they are never proxied, and
+    ///   [`NetworkSettings::effective`] only forces them off with
+    ///   [`proxy_only`](ProxyConfig::proxy_only).
     ///
-    /// Listening is unchanged: incoming connections never use the proxy.
-    /// [`Session::new`](crate::Session::new) logs a warning for each
-    /// enabled feature that bypasses the proxy (with an HTTP proxy the
-    /// DHT, which names every torrent's info hash, and uTP; with any proxy
-    /// LSD, UPnP and NAT-PMP): turn them off for a session whose traffic
-    /// should all go through the proxy. There is no single proxy-only
-    /// switch yet.
+    /// Listening is unchanged: incoming connections never use the proxy (and
+    /// an HTTP proxy, or a SOCKS5 one that does not relay UDP, turns incoming
+    /// TCP and uTP off through the network switches, see
+    /// [`NetworkSettings`]).
+    ///
+    /// [`proxy_only`](ProxyConfig::proxy_only) is the single switch that
+    /// keeps everything on the proxy: the session then runs the settings
+    /// [`NetworkSettings::effective`] derives from it (every bypass off, the
+    /// three proxy switches on) and warns about nothing. Without it,
+    /// [`Session::new`](crate::Session::new) logs a warning for each enabled
+    /// feature that still sends from the host's own address: LSD, UPnP and
+    /// NAT-PMP under any proxy. Turn those off, or set `proxy_only`, for a
+    /// session whose traffic should all go through the proxy. (The DHT, uTP
+    /// and UDP trackers are not listed: they need UDP, so a proxy that does
+    /// not relay UDP leaves them off rather than direct.)
     ///
     /// Serialising the settings (the `serde` feature) writes the proxy
     /// password in clear text.
     pub proxy: ProxyConfig,
+    /// How long the session's proxy health task waits before re-probing an
+    /// unreachable or login-refused proxy, doubling each attempt up to
+    /// `proxy_retry_max` (1 s). A test knob.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub proxy_retry_base: Duration,
+    /// The longest wait between proxy re-probes (60 s). A test knob.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub proxy_retry_max: Duration,
     /// How many auto-managed torrents run at once; the rest wait as
     /// [`TorrentState::Queued`](crate::TorrentState::Queued). Changed at
     /// runtime with
@@ -462,19 +491,36 @@ impl Settings {
             ("cache_expiry", self.cache_expiry),
             ("snub_timeout", self.snub_timeout),
             ("nat_retry_base", self.nat_retry_base),
+            ("proxy_retry_base", self.proxy_retry_base),
+            ("proxy_retry_max", self.proxy_retry_max),
         ];
         for (name, d) in non_zero {
             if d.is_zero() {
                 return Err(format!("{name} must be greater than zero"));
             }
         }
+        if self.proxy_retry_base > self.proxy_retry_max {
+            return Err("proxy_retry_base must not exceed proxy_retry_max".to_owned());
+        }
         if self.optimistic_unchoke_interval < self.rechoke_interval {
             return Err("optimistic_unchoke_interval must be at least rechoke_interval".to_owned());
         }
+        // The transports are validated as the session would run them: a
+        // proxy-only session has every incoming transport off whatever the
+        // fields say, so only `enable_outgoing_tcp` can carry its peers (see
+        // [`NetworkSettings::effective`]; `enable_outgoing_tcp` is a flat
+        // setting, so it is read from `self`).
+        let effective = self.network().effective();
+        if effective.proxy.kind != ProxyKind::None
+            && effective.proxy.proxy_only
+            && !self.enable_outgoing_tcp
+        {
+            return Err("a proxy-only session needs enable_outgoing_tcp".to_owned());
+        }
         if !(self.enable_outgoing_tcp
-            || self.enable_incoming_tcp
-            || self.enable_outgoing_utp
-            || self.enable_incoming_utp)
+            || effective.enable_incoming_tcp
+            || effective.enable_outgoing_utp
+            || effective.enable_incoming_utp)
         {
             return Err(
                 "enable_outgoing_tcp, enable_incoming_tcp, enable_outgoing_utp and \
@@ -545,41 +591,48 @@ impl Settings {
         self.read_ahead.validate()
     }
 
-    /// The enabled features that send from the real address whatever
-    /// [`proxy`](Self::proxy) says; empty without a proxy. Under an HTTP
-    /// proxy (or a SOCKS5 one that carries neither peers nor trackers, so
-    /// relays no UDP): the DHT, outgoing uTP (unless `proxy_peers` turns
-    /// it off) and incoming uTP. Under any proxy: LSD, UPnP and NAT-PMP.
+    /// The runtime network settings this session starts with: the proxy and
+    /// the proxy-related switches (`dht_enabled`, `enable_lsd`,
+    /// `enable_upnp`, `enable_natpmp`, `enable_incoming_tcp`,
+    /// `enable_incoming_utp`, `enable_outgoing_utp`). The inverse of
+    /// [`set_network`](Self::set_network); what
+    /// [`Session::network_settings`](crate::Session::network_settings)
+    /// reports. The session runs [`NetworkSettings::effective`] of it, which
+    /// applies the proxy's own rules (an HTTP proxy carrying peers turns
+    /// outgoing uTP off; `proxy_only` turns every bypass off).
+    pub fn network(&self) -> NetworkSettings {
+        NetworkSettings {
+            proxy: self.proxy.clone(),
+            dht_enabled: self.dht_enabled,
+            enable_lsd: self.enable_lsd,
+            enable_upnp: self.enable_upnp,
+            enable_natpmp: self.enable_natpmp,
+            enable_incoming_tcp: self.enable_incoming_tcp,
+            enable_incoming_utp: self.enable_incoming_utp,
+            enable_outgoing_utp: self.enable_outgoing_utp,
+        }
+    }
+
+    /// Assigns the fields [`network`](Self::network) reads; everything else
+    /// is left as it is.
+    pub fn set_network(&mut self, net: NetworkSettings) {
+        self.proxy = net.proxy;
+        self.dht_enabled = net.dht_enabled;
+        self.enable_lsd = net.enable_lsd;
+        self.enable_upnp = net.enable_upnp;
+        self.enable_natpmp = net.enable_natpmp;
+        self.enable_incoming_tcp = net.enable_incoming_tcp;
+        self.enable_incoming_utp = net.enable_incoming_utp;
+        self.enable_outgoing_utp = net.enable_outgoing_utp;
+    }
+
+    /// The network settings' [`proxy_bypasses`](NetworkSettings::proxy_bypasses),
+    /// read on [`effective`](NetworkSettings::effective): the features that
+    /// still send from the host's own address once the proxy's own rules are
+    /// applied, so a proxy-only session lists nothing.
     /// [`Session::new`](crate::Session::new) logs a warning for each.
     pub(crate) fn proxy_bypasses(&self) -> Vec<&'static str> {
-        let p = &self.proxy;
-        let mut out = Vec::new();
-        if p.kind == ProxyKind::None {
-            return out;
-        }
-        let relays_udp = p.kind == ProxyKind::Socks5 && (p.proxy_peers || p.proxy_trackers);
-        if !relays_udp {
-            if self.dht_enabled {
-                out.push("the DHT");
-            }
-            // An HTTP proxy carrying peers turns outgoing uTP off.
-            if self.enable_outgoing_utp && !(p.kind == ProxyKind::Http && p.proxy_peers) {
-                out.push("outgoing uTP");
-            }
-            if self.enable_incoming_utp {
-                out.push("incoming uTP");
-            }
-        }
-        for (on, name) in [
-            (self.enable_lsd, "LSD"),
-            (self.enable_upnp, "UPnP"),
-            (self.enable_natpmp, "NAT-PMP"),
-        ] {
-            if on {
-                out.push(name);
-            }
-        }
-        out
+        self.network().effective().proxy_bypasses()
     }
 }
 
@@ -678,6 +731,8 @@ impl Default for Settings {
             mixed_mode: MixedMode::default(),
             read_ahead: ReadAhead::default(),
             proxy: ProxyConfig::default(),
+            proxy_retry_base: Duration::from_secs(1),
+            proxy_retry_max: Duration::from_secs(60),
             queue: QueueSettings::default(),
             seed_ratio_limit: None,
             seed_time_limit: None,
@@ -686,44 +741,272 @@ impl Default for Settings {
     }
 }
 
+/// The network settings a session can change while it runs: the
+/// [`Settings::proxy`] and exactly the switches that decide whether traffic
+/// goes through it ([`Settings::dht_enabled`], [`Settings::enable_lsd`],
+/// [`Settings::enable_upnp`], [`Settings::enable_natpmp`],
+/// [`Settings::enable_incoming_tcp`], [`Settings::enable_incoming_utp`],
+/// [`Settings::enable_outgoing_utp`]).
+///
+/// A value is stored exactly as set and run through
+/// [`effective`](Self::effective), which applies the proxy's own rules (an
+/// HTTP proxy carrying peers turns outgoing uTP off; `proxy_only` turns every
+/// bypass off), so
+/// [`Session::network_settings`](crate::Session::network_settings) reports
+/// what was set while the session binds, listens and announces as the
+/// effective value says.
+///
+/// [`Session::set_network_settings`](crate::Session::set_network_settings)
+/// applies a value at once, rebuilding the session's network stack: listeners
+/// and UDP sockets are rebound on the same ports, and with a different
+/// [`proxy`](Self::proxy) every peer connection, web seed request and tracker
+/// request of the old stack is closed with
+/// [`DisconnectReason::NetworkChanged`](crate::DisconnectReason::NetworkChanged).
+/// [`Settings::network`] and [`Settings::set_network`] convert to and from
+/// the flat [`Settings`] fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[non_exhaustive]
+pub struct NetworkSettings {
+    /// The proxy, as [`Settings::proxy`].
+    pub proxy: ProxyConfig,
+    /// Run a DHT node, as [`Settings::dht_enabled`].
+    pub dht_enabled: bool,
+    /// Local service discovery, as [`Settings::enable_lsd`].
+    pub enable_lsd: bool,
+    /// UPnP port mapping, as [`Settings::enable_upnp`].
+    pub enable_upnp: bool,
+    /// NAT-PMP/PCP port mapping, as [`Settings::enable_natpmp`].
+    pub enable_natpmp: bool,
+    /// Accept incoming TCP connections, as
+    /// [`Settings::enable_incoming_tcp`].
+    pub enable_incoming_tcp: bool,
+    /// Accept incoming uTP connections, as
+    /// [`Settings::enable_incoming_utp`].
+    pub enable_incoming_utp: bool,
+    /// Dial peers over uTP, as [`Settings::enable_outgoing_utp`].
+    pub enable_outgoing_utp: bool,
+}
+
+impl NetworkSettings {
+    /// The settings the session actually runs on: `self` with the proxy's own
+    /// rules applied.
+    ///
+    /// With a proxy and [`proxy_only`](ProxyConfig::proxy_only) every bypass
+    /// is off, whatever the switches say: `enable_incoming_tcp`,
+    /// `enable_incoming_utp`, `enable_lsd`, `enable_upnp` and `enable_natpmp`
+    /// become false, `proxy_peers`, `proxy_trackers` and `proxy_hostnames`
+    /// true, and with an HTTP proxy (which cannot carry UDP at all)
+    /// `dht_enabled` and `enable_outgoing_utp` too. A SOCKS5 proxy relays all
+    /// UDP, so there the DHT and outgoing uTP stay as set (relayed) and only
+    /// the never-proxied local-network features and the incoming transports
+    /// go.
+    ///
+    /// Otherwise `self` is returned unchanged, except the 0.12.0 rule: an
+    /// HTTP proxy with `proxy_peers` turns `enable_outgoing_utp` off (an HTTP
+    /// proxy carries peer connections over TCP only). What the proxy cannot
+    /// carry and needs UDP for, the DHT, uTP and UDP trackers, does not run
+    /// at all under a proxy that relays no UDP: the session binds no UDP
+    /// socket for it, so those switches only ever *add* the UDP socket a
+    /// relayed proxy provides, they never make anything go direct. Only LSD,
+    /// UPnP and NAT-PMP still send from the host's own address, whatever the
+    /// proxy is (see [`proxy_bypasses`](Self::proxy_bypasses)).
+    ///
+    /// [`proxy_only`](ProxyConfig::proxy_only) with
+    /// [`ProxyKind::None`] is ignored: there is no proxy to send through. The
+    /// stored value is untouched (a switch comes back as it was set once the
+    /// proxy is removed); the session builds its stack and validates from
+    /// this, while
+    /// [`Session::network_settings`](crate::Session::network_settings) still
+    /// reports what was set.
+    pub fn effective(&self) -> NetworkSettings {
+        let mut e = self.clone();
+        if e.proxy.kind == ProxyKind::None {
+            return e;
+        }
+        if e.proxy.proxy_only {
+            e.enable_incoming_tcp = false;
+            e.enable_incoming_utp = false;
+            e.enable_lsd = false;
+            e.enable_upnp = false;
+            e.enable_natpmp = false;
+            e.proxy.proxy_peers = true;
+            e.proxy.proxy_trackers = true;
+            e.proxy.proxy_hostnames = true;
+            if e.proxy.kind == ProxyKind::Http {
+                // An HTTP proxy cannot carry UDP at all.
+                e.dht_enabled = false;
+                e.enable_outgoing_utp = false;
+            }
+        } else if e.proxy.kind == ProxyKind::Http && e.proxy.proxy_peers {
+            e.enable_outgoing_utp = false;
+        }
+        e
+    }
+
+    /// The enabled features that send from the host's own address whatever
+    /// [`proxy`](Self::proxy) says; empty without a proxy. Meant to be read
+    /// on [`effective`](Self::effective), where a proxy-only session lists
+    /// nothing.
+    ///
+    /// Only LSD, UPnP and NAT-PMP, which are never proxied. The DHT, uTP and
+    /// UDP trackers are *not* listed: they need UDP, and a proxy that carries
+    /// no UDP leaves the session with no UDP socket at all (see
+    /// [`effective`](Self::effective)), so they are off, not sent from the
+    /// host's own address.
+    pub fn proxy_bypasses(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.proxy.kind == ProxyKind::None {
+            return out;
+        }
+        for (on, name) in [
+            (self.enable_lsd, "LSD"),
+            (self.enable_upnp, "UPnP"),
+            (self.enable_natpmp, "NAT-PMP"),
+        ] {
+            if on {
+                out.push(name);
+            }
+        }
+        out
+    }
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Settings::default().network()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn network_round_trips_through_settings() {
+        let mut s = Settings {
+            dht_enabled: false,
+            enable_lsd: false,
+            enable_upnp: false,
+            enable_natpmp: false,
+            enable_incoming_tcp: false,
+            enable_incoming_utp: false,
+            enable_outgoing_utp: false,
+            ..Settings::default()
+        };
+        s.proxy.kind = ProxyKind::Socks5;
+        s.proxy.host = "proxy.example".to_owned();
+        let net = s.network();
+        let mut back = Settings::default();
+        back.set_network(net.clone());
+        assert_eq!(back.network(), net);
+        assert_eq!(back.proxy.kind, ProxyKind::Socks5);
+        // `Default` equals the default settings' network.
+        assert_eq!(NetworkSettings::default(), Settings::default().network());
+    }
+
+    /// Only the never-proxied local-network features are bypasses: the DHT, uTP and UDP
+    /// trackers need UDP, and a proxy that relays no UDP leaves the session with no UDP
+    /// socket at all, so they are off rather than direct (I3). Whatever the proxy kind or
+    /// the UDP switches say, the list is the same.
     #[test]
     fn features_bypassing_the_proxy_are_listed() {
         let mut s = Settings::default();
         assert!(s.proxy_bypasses().is_empty(), "no proxy");
         s.proxy.kind = ProxyKind::Http;
         s.proxy.host = "proxy.example".to_owned();
-        assert_eq!(
-            s.proxy_bypasses(),
-            ["the DHT", "incoming uTP", "LSD", "UPnP", "NAT-PMP"]
-        );
+        assert_eq!(s.proxy_bypasses(), ["LSD", "UPnP", "NAT-PMP"]);
+        // Whatever the UDP switches say: the DHT and uTP never bypass.
         s.proxy.proxy_peers = false;
-        assert_eq!(
-            s.proxy_bypasses(),
-            [
-                "the DHT",
-                "outgoing uTP",
-                "incoming uTP",
-                "LSD",
-                "UPnP",
-                "NAT-PMP"
-            ]
-        );
-        // SOCKS5 relays every UDP packet: only the local-network ones stay.
+        s.enable_outgoing_utp = true;
+        s.enable_incoming_utp = true;
+        s.dht_enabled = true;
+        assert_eq!(s.proxy_bypasses(), ["LSD", "UPnP", "NAT-PMP"]);
+        // SOCKS5 relays every UDP packet: the local-network features stay.
         s.proxy.kind = ProxyKind::Socks5;
         assert_eq!(s.proxy_bypasses(), ["LSD", "UPnP", "NAT-PMP"]);
         s.enable_lsd = false;
         s.enable_upnp = false;
         s.enable_natpmp = false;
         assert!(s.proxy_bypasses().is_empty());
-        // SOCKS5 carrying neither peers nor trackers relays no UDP.
+        // SOCKS5 carrying neither peers nor trackers relays no UDP: still only those.
         s.proxy.proxy_trackers = false;
-        s.dht_enabled = false;
-        s.enable_incoming_utp = false;
-        assert_eq!(s.proxy_bypasses(), ["outgoing uTP"]);
+        s.enable_lsd = true;
+        assert_eq!(s.proxy_bypasses(), ["LSD"]);
+    }
+
+    /// A proxy-only value turns every bypass off, on the effective settings
+    /// the session runs: the incoming transports and the local-network
+    /// features, with the three proxy switches on; a SOCKS5 proxy relays
+    /// UDP, so the DHT and outgoing uTP stay as set (relayed), while an HTTP
+    /// proxy carries neither and turns them off too. A proxy-only value with
+    /// no proxy is ignored.
+    #[test]
+    fn proxy_only_turns_every_bypass_off() {
+        // Everything on, so every switch `effective()` turns off is visible.
+        let mut s = Settings::default();
+        s.proxy.kind = ProxyKind::Socks5;
+        s.proxy.host = "proxy.example".to_owned();
+        s.proxy.proxy_only = true;
+        // The switches the caller asked for do not matter; force them off to
+        // show `proxy_only` turns them back on (the three proxy switches).
+        s.proxy.proxy_peers = false;
+        s.proxy.proxy_trackers = false;
+        s.proxy.proxy_hostnames = false;
+        let net = s.network();
+        let e = net.effective();
+        assert!(
+            !e.enable_incoming_tcp
+                && !e.enable_incoming_utp
+                && !e.enable_lsd
+                && !e.enable_upnp
+                && !e.enable_natpmp,
+            "{e:?}"
+        );
+        assert!(
+            e.proxy.proxy_peers && e.proxy.proxy_trackers && e.proxy.proxy_hostnames,
+            "the proxy's own switches must be on: {e:?}"
+        );
+        // A SOCKS5 proxy relays all UDP: the DHT and outgoing uTP stay as set.
+        assert!(e.dht_enabled && e.enable_outgoing_utp, "{e:?}");
+        assert!(
+            e.proxy_bypasses().is_empty(),
+            "a proxy-only session bypasses nothing: {:?}",
+            e.proxy_bypasses()
+        );
+        assert!(
+            s.proxy_bypasses().is_empty(),
+            "and the warning list is read on it: {:?}",
+            s.proxy_bypasses()
+        );
+
+        // An HTTP proxy cannot carry UDP: no DHT, no outgoing uTP.
+        s.proxy.kind = ProxyKind::Http;
+        let e = s.network().effective();
+        assert!(!e.dht_enabled && !e.enable_outgoing_utp, "{e:?}");
+        assert!(e.proxy_bypasses().is_empty(), "{e:?}");
+
+        // A proxy-only value with no proxy is ignored: the value is returned
+        // unchanged, and validation does not demand an outgoing transport.
+        s.proxy.kind = ProxyKind::None;
+        let net = s.network();
+        assert_eq!(net.effective(), net);
+        assert!(net.effective().enable_lsd, "no proxy to bypass");
+
+        // A proxy-only session with `enable_outgoing_tcp` off cannot dial at
+        // all, and says so.
+        let mut s = Settings::default();
+        s.proxy.kind = ProxyKind::Http;
+        s.proxy.host = "proxy.example".to_owned();
+        s.proxy.proxy_only = true;
+        s.enable_outgoing_tcp = false;
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "a proxy-only session needs enable_outgoing_tcp"
+        );
+        s.enable_outgoing_tcp = true;
+        assert!(s.validate().is_ok());
     }
 
     #[test]

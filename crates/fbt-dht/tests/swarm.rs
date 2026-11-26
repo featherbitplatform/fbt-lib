@@ -797,3 +797,73 @@ async fn put_without_a_token_is_refused() {
     );
     shutdown(&nodes).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_lookup_is_recorded() {
+    use fbt_core::audit::{self, Outbound};
+    let seed = Dht::spawn(cfg("127.0.0.1:0")).await.unwrap();
+    let port = seed.local_addrs()[0].port();
+    let mut c = cfg("127.0.0.1:0");
+    c.bootstrap = vec![format!("localhost:{port}")];
+    // The capture is process-wide: install it before the node spawns, so the
+    // first bootstrap attempt (which runs as soon as the actor starts)
+    // records into it. Parallel tests add their own records; the lookup is
+    // asserted by name, and no other test bootstraps from a name.
+    let cap = audit::capture();
+    let node = Dht::spawn(c).await.unwrap();
+    let mut seen = false;
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !seen && tokio::time::Instant::now() < end {
+        seen = cap
+            .take()
+            .iter()
+            .any(|o| matches!(o, Outbound::Lookup(h) if h == "localhost"));
+        if !seen {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+    drop(cap);
+    assert!(
+        seen,
+        "the bootstrap entry's name must be looked up and recorded"
+    );
+    shutdown(&[seed, node]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_skips_names_when_told() {
+    use fbt_core::audit::{self, Outbound};
+    let seed = Dht::spawn(cfg("127.0.0.1:0")).await.unwrap();
+    let port = seed.local_addrs()[0].port();
+    let mut c = cfg("127.0.0.1:0");
+    c.bootstrap = vec![
+        "router.invalid:6881".to_owned(),
+        format!("127.0.0.1:{port}"),
+    ];
+    c.resolve_bootstrap_names = false;
+    // The capture is process-wide: install it before the node spawns, so the
+    // first bootstrap attempt (which runs as soon as the actor starts)
+    // records into it. Parallel tests add their own records; the skipped name
+    // is asserted by name.
+    let cap = audit::capture();
+    let node = Dht::spawn(c).await.unwrap();
+    let joined = wait_until(Duration::from_secs(5), || {
+        let s = node.stats();
+        s.bootstrapped || s.nodes_v4 >= 1
+    })
+    .await;
+    let recs = cap.take();
+    drop(cap);
+    assert!(
+        joined,
+        "the literal bootstrap entry must still be used: {:?}",
+        node.stats()
+    );
+    assert!(
+        !recs
+            .iter()
+            .any(|o| matches!(o, Outbound::Lookup(h) if h == "router.invalid")),
+        "a skipped bootstrap name must not be looked up: {recs:?}"
+    );
+    shutdown(&[seed, node]).await;
+}

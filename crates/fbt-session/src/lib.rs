@@ -76,8 +76,10 @@ pub mod error;
 mod event;
 mod listener;
 mod net;
+mod netstack;
 mod peer;
 pub mod picker;
+mod proxy_health;
 mod queue;
 pub mod rate;
 mod resume;
@@ -92,7 +94,7 @@ pub use bandwidth::{MixedMode, PeerClassLimits, RateLimit};
 pub use bans::BlockReason;
 pub use choker::{ChokingAlgorithm, SeedChokingAlgorithm};
 pub use error::{SessionError, StreamError};
-pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource};
+pub use event::{Event, EventMask, EventStream, ExternalIpSource, PeerSource, ProxyState};
 pub use fbt_dht::{DhtError, DhtSamples, DhtScrape, DhtStats, MutableItem, NodeId, NodeInfo};
 pub use fbt_net::ipfilter::IpFilter;
 /// The most rules an [`IpFilter`] holds (`fbt_net::ipfilter::MAX_RANGES`).
@@ -111,7 +113,8 @@ pub use resume::{
 };
 pub use session::{AddTorrent, Priority, RemoveMode, Session, TorrentSource};
 pub use settings::{
-    DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, Settings,
+    DEFAULT_DHT_BOOTSTRAP, EncryptionPolicy, MAX_DISK_THREADS, MAX_METADATA_SIZE, NetworkSettings,
+    Settings,
 };
 pub use status::{FileStatus, PeerStatus, TorrentState, TorrentStatus, TrackerStatus};
 pub use storage::{CacheStats, FileStamp, MoveMode, StorageError};

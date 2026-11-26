@@ -10,8 +10,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use fbt_core::audit;
 use fbt_core::rate::IpRateLimiter;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
+// audit: outbound on the socket is recorded in UdpSender::send_to
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -311,6 +313,7 @@ pub struct Lsd {
 /// A real socket's non-blocking send half.
 #[derive(Debug)]
 struct UdpSender {
+    // audit: outbound is recorded in UdpSender::send_to
     socket: std::net::UdpSocket,
     local: SocketAddr,
 }
@@ -321,6 +324,7 @@ impl DatagramSender for UdpSender {
     }
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
+        audit::record(audit::Outbound::UdpSend(to));
         self.socket.send_to(data, to)
     }
 }
@@ -336,6 +340,7 @@ impl Lsd {
     ///
     /// Fails when no configured group could be joined.
     pub fn spawn(cfg: LsdConfig, found: mpsc::Sender<LsdPeer>) -> io::Result<Lsd> {
+        // audit: the send halves are recorded in UdpSender::send_to; the recv halves only receive
         let mut sockets: Vec<(UdpSocket, SocketAddr)> = Vec::new();
         let mut first_err: Option<io::Error> = None;
         if let Some(g) = cfg.group_v4 {
@@ -366,12 +371,14 @@ impl Lsd {
         destinations: Vec<SocketAddr>,
         found: mpsc::Sender<LsdPeer>,
     ) -> io::Result<Lsd> {
+        // audit: outbound on this socket is recorded in UdpSender::send_to
         let std_sock = std::net::UdpSocket::bind(bind)?;
         std_sock.set_nonblocking(true)?;
         let send = Arc::new(UdpSender {
             local: std_sock.local_addr()?,
             socket: std_sock.try_clone()?,
         });
+        // audit: the recv half only receives; outbound is recorded in UdpSender::send_to
         let recv = UdpSocket::from_std(std_sock)?;
         let dests: Destinations = destinations
             .into_iter()
@@ -401,6 +408,7 @@ impl Lsd {
 
     fn from_sockets(
         cfg: LsdConfig,
+        // audit: the send halves are recorded in UdpSender::send_to; the recv halves only receive
         sockets: Vec<(UdpSocket, SocketAddr)>,
         found: mpsc::Sender<LsdPeer>,
     ) -> io::Result<Lsd> {
@@ -412,6 +420,7 @@ impl Lsd {
                 local: std_sock.local_addr()?,
                 socket: std_sock.try_clone()?,
             });
+            // audit: the recv half only receives; outbound is recorded in UdpSender::send_to
             recvs.push(UdpSocket::from_std(std_sock)?);
             dests.push((send as Arc<dyn DatagramSender>, group));
         }
@@ -446,6 +455,7 @@ impl Lsd {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             for (sender, dest) in dests.iter() {
+                // audit: the DatagramSender records in its concrete send_to
                 if let Err(e) = sender.send_to(&msg.encode(*dest), *dest) {
                     debug!(%dest, error = %e, "LSD announce failed");
                 }
@@ -468,6 +478,7 @@ impl Lsd {
     }
 }
 
+// audit: the socket only receives; outbound is recorded in UdpSender::send_to
 async fn recv_loop(socket: UdpSocket, handler: Arc<dyn DatagramHandler>) {
     let mut buf = vec![0u8; RECV_BUF];
     let mut errors = 0u32;
@@ -499,6 +510,7 @@ fn new_socket(domain: socket2::Domain) -> io::Result<socket2::Socket> {
     Ok(s)
 }
 
+// audit: outbound on the joined socket is recorded in UdpSender::send_to
 fn join_v4(cfg: &LsdConfig, group: SocketAddr) -> io::Result<UdpSocket> {
     let SocketAddr::V4(g) = group else {
         return Err(io::Error::other("IPv4 group expected"));
@@ -513,9 +525,11 @@ fn join_v4(cfg: &LsdConfig, group: SocketAddr) -> io::Result<UdpSocket> {
     if let Some(ttl) = cfg.multicast_ttl {
         s.set_multicast_ttl_v4(ttl)?;
     }
+    // audit: outbound on the joined socket is recorded in UdpSender::send_to
     UdpSocket::from_std(s.into())
 }
 
+// audit: outbound on the joined socket is recorded in UdpSender::send_to
 fn join_v6(group: SocketAddr) -> io::Result<UdpSocket> {
     let SocketAddr::V6(g) = group else {
         return Err(io::Error::other("IPv6 group expected"));
@@ -525,6 +539,7 @@ fn join_v6(group: SocketAddr) -> io::Result<UdpSocket> {
     s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, g.port())).into())?;
     s.join_multicast_v6(g.ip(), 0)?;
     s.set_multicast_loop_v6(true)?;
+    // audit: outbound on the joined socket is recorded in UdpSender::send_to
     UdpSocket::from_std(s.into())
 }
 

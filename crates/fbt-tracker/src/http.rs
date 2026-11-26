@@ -19,7 +19,7 @@ use fbt_net::proxy::{ProxyConfig, ProxyError, ProxyKind};
 
 #[cfg(test)]
 use crate::connector::StubResolver;
-use crate::connector::{ProxyConnector, Refused, Resolution, without_brackets};
+use crate::connector::{Closed, ProxyConnector, Refused, Resolution, without_brackets};
 use crate::tls::{self, Connector};
 use crate::types::{MAX_TRACKER_ID_BYTES, MIN_INTERVAL, bounded_text};
 use crate::urlencode::url_encode_bytes;
@@ -133,6 +133,10 @@ pub(crate) struct HttpClient {
     user_agent: String,
     timeout: Duration,
     max_bytes: usize,
+    /// Set when the stack this client belongs to is replaced: every connector built here reads
+    /// it before it resolves or dials, so a request the pool still holds from the replaced stack
+    /// cannot finish its connect afterwards (N3).
+    closed: Closed,
 }
 
 impl std::fmt::Debug for HttpClient {
@@ -142,6 +146,20 @@ impl std::fmt::Debug for HttpClient {
 }
 
 impl HttpClient {
+    /// Refuses every later lookup and dial on this client, and on any connection the pool still
+    /// holds from before: the session calls it when it tears the stack down. hyper-util's pool
+    /// finishes a losing connect in a task the session's own handles cannot abort, so the
+    /// refusal has to live in the connector (N3).
+    pub(crate) fn close(&self) {
+        self.closed.set();
+    }
+
+    /// Whether [`close`](Self::close) was called: every later lookup and dial on this client is
+    /// refused, so a caller that resolves a host name itself (a web seed's own origin, in
+    /// fbt-session) has to refuse its own lookup too.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.is_set()
+    }
     /// Three clients over the same TLS setup: announces go through `proxy` when it sets
     /// `proxy_trackers`, web seeds and their guarded redirect hops when it sets `proxy_peers`.
     /// Proxy round trips are bounded by `cfg.http_timeout`.
@@ -171,12 +189,14 @@ impl HttpClient {
         where_to_look: Resolution,
     ) -> Result<HttpClient, TrackerError> {
         let active = proxy.filter(|p| p.kind != ProxyKind::None);
+        let closed = Closed::new();
         let client = |use_proxy: bool, deny_internal: bool| -> Result<_, TrackerError> {
             let c = ProxyConnector::new(
                 active.filter(|_| use_proxy),
                 cfg.http_timeout,
                 deny_internal,
                 where_to_look.clone(),
+                closed.clone(),
             );
             Ok(Client::builder(TokioExecutor::new()).build(tls::build_connector(c)?))
         };
@@ -188,6 +208,7 @@ impl HttpClient {
             user_agent: cfg.user_agent.clone(),
             timeout: cfg.http_timeout,
             max_bytes: cfg.max_response_bytes,
+            closed,
         })
     }
 

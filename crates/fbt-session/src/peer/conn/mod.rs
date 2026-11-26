@@ -25,8 +25,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fbt_core::audit;
 use fbt_core::{BLOCK_SIZE, Bitfield, BlockRef, PeerId, PieceLayout};
-use fbt_net::proxy::{ProxyKind, ProxyTarget, connect_tcp};
+use fbt_net::proxy::{ProxyConfig, ProxyKind, ProxyTarget, connect_tcp};
 use fbt_utp::{UtpError, UtpSocket};
 use fbt_wire::{
     CryptoMethods, Handshake, HandshakeError, MseStream, Reserved, WireError, initiate,
@@ -34,7 +35,7 @@ use fbt_wire::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::ext::ExtConfig;
@@ -43,6 +44,7 @@ use super::transport::{PeerTransport, Transport};
 use crate::bandwidth::{Bandwidth, BucketPair};
 use crate::net::ExternalIp;
 use crate::picker::PeerKey;
+use crate::proxy_health::ProxyHealth;
 use crate::settings::Settings;
 use state::Conn;
 
@@ -109,6 +111,21 @@ pub(crate) struct PeerCtx {
     pub torrent_rate: BucketPair,
     /// The session's external address votes; the peer's `yourip` goes in.
     pub external_ip: Arc<ExternalIp>,
+    /// The network stack generation this dial or accept read; a change to a
+    /// newer one under a dial or handshake ends the connection with
+    /// [`DisconnectReason::NetworkChanged`].
+    pub net_generation: u64,
+    /// Fires on every stack change, carrying the new generation: a dial and
+    /// a handshake wait on it so they do not finish on a stack that no
+    /// longer exists.
+    pub net_changed: watch::Receiver<u64>,
+    /// The proxy [`net_generation`](Self::net_generation)'s stack dials
+    /// peers through (or none); `proxy_peers` and `kind` decide whether a
+    /// TCP dial goes through it.
+    pub proxy: ProxyConfig,
+    /// The session's proxy health: a proxied dial reports what it saw, so a
+    /// proxy that is down or refuses login is noticed from a peer dial too.
+    pub health: Arc<ProxyHealth>,
 }
 
 /// A peer connection's stream: MSE (RC4 or plaintext after the MSE
@@ -134,27 +151,48 @@ pub(crate) fn spawn_outgoing(
 ) -> mpsc::Sender<PeerCommand> {
     let (tx, rx) = mpsc::channel(command_queue(&ctx.settings));
     tokio::spawn(async move {
-        let stream = match connect(addr, transport, utp, &ctx.settings).await {
-            Ok(stream) => stream,
-            Err((reason, failed)) => {
+        // The stack this dial read: a change to a newer one before the
+        // transport opens (or during a handshake) drops the stream and
+        // reports `NetworkChanged`, so a connection is never finished on a
+        // stack the session no longer has.
+        let generation = ctx.net_generation;
+        let mut net_changed = ctx.net_changed.clone();
+        let dial = connect(addr, transport, utp, &ctx);
+        let stream = match until_unchanged(&mut net_changed, generation, dial).await {
+            Some(Ok(stream)) => stream,
+            Some(Err((reason, failed))) => {
                 let failed = failed.then_some(transport);
                 return report(&ctx, reason, Vec::new(), failed).await;
             }
+            None => {
+                return report(&ctx, DisconnectReason::NetworkChanged, Vec::new(), None).await;
+            }
         };
+        // The dial finished in the same step the change fired: the stream
+        // is still on the old stack.
+        if *net_changed.borrow() != generation {
+            drop(stream);
+            return report(&ctx, DisconnectReason::NetworkChanged, Vec::new(), None).await;
+        }
         ctx.transport = transport;
         let deadline = after(Instant::now(), ctx.settings.handshake_timeout);
         let stream: PeerStream = match mse {
             None => MseStream::plaintext(stream, Vec::new()),
             Some(provide) => {
-                match timeout_at(deadline, initiate(stream, &ctx.info_hash, provide, b"")).await {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => {
+                let attempt = timeout_at(deadline, initiate(stream, &ctx.info_hash, provide, b""));
+                match until_unchanged(&mut net_changed, generation, attempt).await {
+                    Some(Ok(Ok(s))) => s,
+                    Some(Ok(Err(e))) => {
                         let reason = DisconnectReason::Encryption(e.to_string());
                         return report(&ctx, reason, Vec::new(), None).await;
                     }
-                    Err(_) => {
+                    Some(Err(_)) => {
                         let reason = DisconnectReason::Encryption("MSE handshake timed out".into());
                         return report(&ctx, reason, Vec::new(), None).await;
+                    }
+                    None => {
+                        return report(&ctx, DisconnectReason::NetworkChanged, Vec::new(), None)
+                            .await;
                     }
                 }
             }
@@ -165,13 +203,39 @@ pub(crate) fn spawn_outgoing(
     tx
 }
 
-/// Peer TCP dials go through [`Settings::proxy`].
-fn proxied(settings: &Settings) -> bool {
-    settings.proxy.kind != ProxyKind::None && settings.proxy.proxy_peers
+/// Waits for `fut`, giving up when the session's stack generation moves
+/// away from `generation` (a change under this dial or handshake):
+/// `Some(v)` when `fut` finished first, `None` on a change. The sender
+/// dropped instead (the session gone with it) is not a change: `fut` is
+/// then left to end on its own, by its own timeout.
+async fn until_unchanged<T>(
+    net_changed: &mut watch::Receiver<u64>,
+    generation: u64,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let mut fut = std::pin::pin!(fut);
+    // Biased, with the change read first: a dial spawned just before a change
+    // can be polled first, and without this the change branch and the dial
+    // would be polled in random order, so a ready dial could open on the
+    // replaced stack (M1). The branch yields a plain `bool`, so the watch's
+    // guard is dropped inside the `select!` and never crosses the await below
+    // (the peer task's future must stay `Send`).
+    let session_gone = tokio::select! {
+        biased;
+        changed = net_changed.wait_for(|g| *g != generation) => changed.is_err(),
+        v = &mut fut => return Some(v),
+    };
+    if session_gone { Some(fut.await) } else { None }
+}
+
+/// Whether a peer TCP dial goes through `proxy` ([`ProxyConfig::proxy_peers`]
+/// and a kind other than [`ProxyKind::None`]).
+fn proxied(proxy: &ProxyConfig) -> bool {
+    proxy.kind != ProxyKind::None && proxy.proxy_peers
 }
 
 /// Opens the transport to `addr`. TCP waits up to `connect_timeout` (through
-/// the proxy when [`Settings::proxy`] covers peers); uTP up
+/// the proxy when [`PeerCtx::proxy`] covers peers); uTP up
 /// to the socket's connect timeout (`utp_connect_timeout`). Fails with
 /// [`DisconnectReason::Io`] and whether it was a connect failure that the
 /// other transport may get past: every TCP error and timeout, a uTP
@@ -182,28 +246,57 @@ async fn connect(
     addr: SocketAddr,
     transport: Transport,
     utp: Option<UtpSocket>,
-    settings: &Settings,
+    ctx: &PeerCtx,
 ) -> Result<PeerTransport, (DisconnectReason, bool)> {
+    let settings = &ctx.settings;
     let io = |msg: String| DisconnectReason::Io(msg);
+    // The dial belongs to the stack it read: a dial spawned just before a
+    // change can be polled after it (the future is created when the dial is
+    // spawned, not when it is polled), so the generation is read here, right
+    // before anything is dialled, and the dial is refused on a replaced stack
+    // (M1). The select in `until_unchanged` is biased to prefer the change,
+    // but this is what stops the dial itself.
+    if *ctx.net_changed.borrow() != ctx.net_generation {
+        return Err((DisconnectReason::NetworkChanged, false));
+    }
     match transport {
-        Transport::Tcp if proxied(settings) => {
+        Transport::Tcp if proxied(&ctx.proxy) => {
             // The proxy dial, negotiation and reply share the timeout.
             match connect_tcp(
-                &settings.proxy,
+                &ctx.proxy,
                 ProxyTarget::Addr(addr),
                 settings.connect_timeout,
             )
             .await
             {
-                Ok(s) => Ok(PeerTransport::Tcp(s)),
-                Err(e) => Err((io(e.to_string()), true)),
+                Ok(s) => {
+                    // A dial that got through says the proxy is up: probe
+                    // now rather than wait out the backoff. The report is
+                    // stamped with the stack this dial read, so a success on
+                    // a replaced stack is dropped (I1-sub).
+                    ctx.health.dial_succeeded(ctx.net_generation);
+                    Ok(PeerTransport::Tcp(s))
+                }
+                Err(e) => {
+                    // A failure about the proxy moves its state (never a
+                    // dial for the target); the dial path never blocks on it.
+                    // The report carries this dial's generation.
+                    ctx.health.dial_failed(ctx.net_generation, &e);
+                    Err((io(e.to_string()), true))
+                }
             }
         }
-        Transport::Tcp => match timeout(settings.connect_timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => Ok(PeerTransport::Tcp(s)),
-            Ok(Err(e)) => Err((io(e.to_string()), true)),
-            Err(_) => Err((io("connect timed out".to_owned()), true)),
-        },
+        Transport::Tcp => {
+            // The one direct TCP dial the session makes for a peer: recorded
+            // where it leaves the host (the proxied arm records the proxy's
+            // address instead).
+            audit::record(audit::Outbound::TcpConnect(addr));
+            match timeout(settings.connect_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => Ok(PeerTransport::Tcp(s)),
+                Ok(Err(e)) => Err((io(e.to_string()), true)),
+                Err(_) => Err((io("connect timed out".to_owned()), true)),
+            }
+        }
         Transport::Utp => {
             let Some(socket) = utp else {
                 return Err((
@@ -218,6 +311,7 @@ async fn connect(
                 .saturating_add(Duration::from_secs(1));
             // An IPv4-mapped peer is dialled from the IPv4 socket.
             let to = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+            // audit: the uTP socket's sender records outbound in OwnedSender::send_to (or the demux)
             match timeout(bound, socket.connect(to)).await {
                 Ok(Ok(s)) => Ok(PeerTransport::Utp(s)),
                 Ok(Err(e)) => {
@@ -272,7 +366,27 @@ async fn run_peer_until<S: AsyncRead + AsyncWrite + Unpin>(
     mut cmds: mpsc::Receiver<PeerCommand>,
     deadline: Instant,
 ) {
-    let (reason, outstanding) = match handshake(&mut stream, remote, &ctx, deadline).await {
+    // An outgoing dial (`remote` is `None`) records the stack generation it
+    // read: a change under the handshake ends it with `NetworkChanged`,
+    // like the dial. An incoming connection is stamped at accept and the
+    // torrent closes it (see `swarm::on_network_changed`).
+    let handshake_result = if remote.is_none() {
+        let generation = ctx.net_generation;
+        let mut net_changed = ctx.net_changed.clone();
+        match until_unchanged(
+            &mut net_changed,
+            generation,
+            handshake(&mut stream, remote, &ctx, deadline),
+        )
+        .await
+        {
+            Some(r) => r,
+            None => Err(DisconnectReason::NetworkChanged),
+        }
+    } else {
+        handshake(&mut stream, remote, &ctx, deadline).await
+    };
+    let (reason, outstanding) = match handshake_result {
         Err(reason) => (reason, Vec::new()),
         Ok(mut theirs) => {
             // As libtorrent does (`bt_peer_connection.cpp`), a connection

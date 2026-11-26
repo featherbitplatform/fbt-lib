@@ -13,11 +13,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use fbt_core::audit;
 use fbt_core::udp::{DatagramHandler, DatagramSender};
 use rand::Rng;
 use rand::rngs::StdRng;
+// audit: outbound on these sockets is recorded in StdSender::send_to (or the demux)
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -86,6 +89,16 @@ pub struct DhtConfig {
     /// entries are skipped. Empty by default: nothing is contacted unless
     /// configured.
     pub bootstrap: Vec<String>,
+    /// Whether a bootstrap entry that is a host name (not an IP literal) is
+    /// resolved locally.
+    ///
+    /// A DHT matches every reply to the address it queried, and a query sent
+    /// to a name has no such address: set this false under a proxy, where an
+    /// entry whose host is not an IP literal is skipped with a debug log
+    /// naming it and only an entry written as `IP:port` (an IPv6 literal
+    /// bracketed) is used. A malformed entry is skipped either way. `true` by
+    /// default.
+    pub resolve_bootstrap_names: bool,
     /// BEP 43: answer no queries and ask others to keep us out of tables.
     pub read_only: bool,
     /// A saved state: ids and known nodes for a fast rejoin.
@@ -125,6 +138,7 @@ impl Default for DhtConfig {
             bootstrap: Vec::new(),
             read_only: false,
             state: None,
+            resolve_bootstrap_names: true,
             query_timeout: Duration::from_secs(3),
             query_rate_per_ip: 5,
             enforce_node_id: false,
@@ -329,6 +343,9 @@ pub struct Dht {
     tx: mpsc::Sender<Cmd>,
     stats: watch::Receiver<DhtStats>,
     local: Arc<[SocketAddr]>,
+    /// Once set, the node sends no datagram at all (see
+    /// [`halt_sending`](Dht::halt_sending)); shared with the actor.
+    sending: Arc<AtomicBool>,
 }
 
 /// Votes on our external address from the `ip` field of answers (BEP 42).
@@ -420,6 +437,7 @@ pub(crate) fn backoff(base: Duration, max: Duration, attempt: u32) -> Duration {
 }
 
 /// A non-blocking IPv4 socket.
+// audit: outbound on the socket is recorded in StdSender::send_to
 fn bind_v4(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     if !addr.is_ipv4() {
         return Err(io::Error::new(
@@ -427,12 +445,14 @@ fn bind_v4(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
             "bind_v4 is not IPv4",
         ));
     }
+    // audit: outbound on this socket is recorded in StdSender::send_to
     let s = std::net::UdpSocket::bind(addr)?;
     s.set_nonblocking(true)?;
     Ok(s)
 }
 
 /// A non-blocking IPv6-only socket, so an IPv4 socket can share its port.
+// audit: outbound on the socket is recorded in StdSender::send_to
 fn bind_v6(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     if !addr.is_ipv6() {
@@ -451,17 +471,20 @@ fn bind_v6(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
 /// The receiving half (registered with tokio) and a clone for sending.
 /// Sends go straight to the non-blocking socket, so the actor never waits
 /// on write readiness; a full send buffer drops the datagram, as UDP may.
+// audit: the send half is recorded in StdSender::send_to; the recv half only receives
 fn split(s: std::net::UdpSocket) -> io::Result<(UdpSocket, std::net::UdpSocket)> {
     let send = s.try_clone()?;
     // the clone shares the file status on Unix but not necessarily on
     // Windows: never let a send block the actor
     send.set_nonblocking(true)?;
+    // audit: outbound on the send half is recorded in StdSender::send_to
     Ok((UdpSocket::from_std(s)?, send))
 }
 
 /// A [`DatagramSender`] over a standalone non-blocking socket.
 #[derive(Debug)]
 struct StdSender {
+    // audit: outbound is recorded in StdSender::send_to
     sock: std::net::UdpSocket,
     local: SocketAddr,
 }
@@ -472,6 +495,7 @@ impl DatagramSender for StdSender {
     }
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
+        audit::record(audit::Outbound::UdpSend(to));
         self.sock.send_to(data, to)
     }
 }
@@ -510,7 +534,9 @@ impl DatagramHandler for DhtInput {
 /// Where the actor's datagrams come from: its own sockets (standalone) or
 /// the [`DhtInput`] queue (shared sockets).
 struct Inbound {
+    // audit: the recv half only receives; outbound is recorded in StdSender::send_to
     v4: Option<UdpSocket>,
+    // audit: the recv half only receives; outbound is recorded in StdSender::send_to
     v6: Option<UdpSocket>,
     input: Option<mpsc::Receiver<InputDatagram>>,
 }
@@ -537,6 +563,7 @@ impl Dht {
         }
         let (recv_v4, send_v4) = sock_v4.unzip();
         let (recv_v6, send_v6) = sock_v6.unzip();
+        // audit: the sender it wraps records in StdSender::send_to
         let wrap = |s: std::net::UdpSocket| -> Result<Arc<dyn DatagramSender>, DhtError> {
             let local = s.local_addr().map_err(DhtError::Bind)?;
             Ok(Arc::new(StdSender { sock: s, local }))
@@ -611,12 +638,14 @@ impl Dht {
             ..DhtStats::default()
         };
         let (stats_tx, stats_rx) = watch::channel(stats);
+        let sending = Arc::new(AtomicBool::new(false));
         let actor = Actor::new(
             cfg,
             send_v4,
             send_v6,
             tx.downgrade(),
             stats_tx,
+            Arc::clone(&sending),
             Instant::now(),
         );
         tokio::spawn(actor.run(cmd_rx, inbound));
@@ -624,6 +653,7 @@ impl Dht {
             tx,
             stats: stats_rx,
             local: local.into(),
+            sending,
         }
     }
 
@@ -635,6 +665,24 @@ impl Dht {
     /// Pings `addr` and adds it to the routing table if it answers.
     pub fn add_node(&self, addr: SocketAddr) {
         let _ = self.tx.try_send(Cmd::AddNode(addr));
+    }
+
+    /// Stops the node's sending at once, without waiting for anything: from
+    /// this call on it sends no datagram at all (queries, answers, pings),
+    /// queued work included, and a query it would have sent fails locally.
+    /// The node itself keeps running, so [`state`](Dht::state) and
+    /// [`shutdown`](Dht::shutdown) still work. That is what a session needs
+    /// when it replaces the network stack its DHT sends over: the state of
+    /// the moment can be taken and the node stopped without a datagram
+    /// leaving the old socket in between, whatever the node had queued.
+    /// One way only: this never resumes.
+    pub fn halt_sending(&self) {
+        self.sending.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether sending was halted ([`halt_sending`](Dht::halt_sending)).
+    pub fn sending_halted(&self) -> bool {
+        self.sending.load(Ordering::SeqCst)
     }
 
     /// The latest published stats. They are published when they change, at
@@ -1007,6 +1055,8 @@ struct Actor {
     query_timeout: Duration,
     max_pending: usize,
     bootstrap: Vec<String>,
+    /// Whether a bootstrap entry that is a name is handed to the resolver.
+    resolve_bootstrap_names: bool,
     restored: Vec<SocketAddr>,
     retry_base: Duration,
     retry_max: Duration,
@@ -1023,6 +1073,10 @@ struct Actor {
     ext_v4: ExternalIpVotes,
     ext_v6: ExternalIpVotes,
     rng: StdRng,
+    /// Set by [`Dht::halt_sending`]: while it is set, [`send`](Actor::send)
+    /// drops every datagram, so nothing leaves the socket the node sends
+    /// over, however much work it still has queued.
+    sending: Arc<AtomicBool>,
 
     pending: HashMap<u16, Pending>,
     /// (deadline, tid) in send order; all queries share one timeout, so
@@ -1056,6 +1110,7 @@ fn after(now: Instant, d: Duration) -> Instant {
     now.checked_add(d.min(MAX_DELAY)).unwrap_or(now)
 }
 
+// audit: the recv half only receives; outbound is recorded in StdSender::send_to
 async fn recv(sock: &Option<UdpSocket>, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
     match sock {
         Some(s) => s.recv_from(buf).await,
@@ -1095,6 +1150,7 @@ impl Actor {
         sock_v6: Option<Arc<dyn DatagramSender>>,
         link: mpsc::WeakSender<Cmd>,
         stats_tx: watch::Sender<DhtStats>,
+        sending: Arc<AtomicBool>,
         now: Instant,
     ) -> Actor {
         let mut rng: StdRng = rand::make_rng();
@@ -1127,6 +1183,7 @@ impl Actor {
             query_timeout: cfg.query_timeout,
             max_pending: cfg.max_pending_queries.min(MAX_TIDS),
             bootstrap: cfg.bootstrap,
+            resolve_bootstrap_names: cfg.resolve_bootstrap_names,
             restored,
             retry_base: cfg.bootstrap_retry_base,
             retry_max: cfg.bootstrap_retry_max,
@@ -1142,6 +1199,7 @@ impl Actor {
             ext_v4: ExternalIpVotes::new(),
             ext_v6: ExternalIpVotes::new(),
             rng,
+            sending,
             pending: HashMap::new(),
             timeouts: VecDeque::new(),
             pinging: HashSet::new(),
@@ -1265,8 +1323,13 @@ impl Actor {
         self.tables().any(|t| t.len() >= K)
     }
 
-    /// Sends one datagram; `false` when it did not leave this host.
+    /// Sends one datagram; `false` when it did not leave this host (or when
+    /// sending was halted: then nothing reaches the socket at all, queued
+    /// work included).
     fn send(&self, to: SocketAddr, bytes: &[u8]) -> bool {
+        if self.sending.load(Ordering::SeqCst) {
+            return false;
+        }
         let sock = if to.is_ipv4() {
             &self.sock_v4
         } else {
@@ -1275,6 +1338,7 @@ impl Actor {
         let Some(s) = sock else {
             return false;
         };
+        // audit: the sender records in its concrete send_to (StdSender or the demux)
         match s.send_to(bytes, to) {
             Ok(_) => true,
             Err(e) => {
@@ -1674,8 +1738,9 @@ impl Actor {
         let link = Link::Weak(self.link.clone());
         let (bootstrap_link, entries, restored) =
             (link.clone(), self.bootstrap.clone(), self.restored.clone());
+        let resolve_names = self.resolve_bootstrap_names;
         self.boot_task = Some(tokio::spawn(async move {
-            bootstrap(bootstrap_link, entries, restored, views).await;
+            bootstrap(bootstrap_link, entries, restored, views, resolve_names).await;
             let _ = link.send(Cmd::BootstrapDone).await;
         }));
     }
@@ -1749,17 +1814,52 @@ impl Actor {
         }
     }
 }
-/// One bootstrap attempt: resolve the entries, ask every seed (and every
-/// restored node) for nodes near our id, then run a `find_node` lookup for
-/// our id from what they returned. Nodes enter the tables only by answering.
+/// The name of a `host:port` bootstrap entry: the part before the port,
+/// with brackets off an IPv6 literal. `None` for IP literals (there is no
+/// name handed to the resolver) and for entries without a numeric port.
+fn bootstrap_name(e: &str) -> Option<String> {
+    let host = match e.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        Some(_) => return None,
+        None => e,
+    };
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<IpAddr>().is_err().then(|| bare.to_owned())
+}
+
+/// One bootstrap attempt: resolve the entries (unless `resolve_names` is
+/// false, in which case only entries written as an address are used and a
+/// name is skipped: a reply can only be matched to an address, and a name
+/// sent through a proxy has none), ask every seed (and every restored node)
+/// for nodes near our id, then run a `find_node` lookup for our id from what
+/// they returned. Nodes enter the tables only by answering.
 async fn bootstrap(
     link: Link,
     entries: Vec<String>,
     restored: Vec<SocketAddr>,
     views: Vec<(Family, NodeId)>,
+    resolve_names: bool,
 ) {
     let mut routers = Vec::new();
     for e in &entries {
+        if !resolve_names {
+            // Never hand a bootstrap name to the resolver here: only an entry
+            // written as an address can be used.
+            if bootstrap_name(e).is_some() {
+                debug!(entry = %e, "DHT: bootstrap name skipped, names are not resolved here");
+            } else if let Ok(addr) = e.parse::<SocketAddr>() {
+                routers.push(addr);
+            } else {
+                debug!(entry = %e, "DHT: malformed bootstrap entry skipped");
+            }
+            continue;
+        }
+        if let Some(name) = bootstrap_name(e) {
+            audit::record(audit::Outbound::Lookup(name));
+        }
         match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(e.as_str())).await {
             Ok(Ok(found)) => routers.extend(found.take(MAX_RESOLVED)),
             Ok(Err(err)) => debug!(entry = %e, error = %err, "DHT: bootstrap entry skipped"),
@@ -2611,7 +2711,15 @@ mod tests {
         let stats = watch::channel(DhtStats::default()).0;
         let local = s.local_addr().unwrap();
         let s: Arc<dyn DatagramSender> = Arc::new(StdSender { sock: s, local });
-        let a = Actor::new(c, Some(s), None, tx.downgrade(), stats, Instant::now());
+        let a = Actor::new(
+            c,
+            Some(s),
+            None,
+            tx.downgrade(),
+            stats,
+            Arc::new(AtomicBool::new(false)),
+            Instant::now(),
+        );
         (a, tx)
     }
 
