@@ -789,6 +789,20 @@ mod tests {
     use super::*;
     use tower_service::Service;
 
+    /// Waits (bounded) until `cond` holds, giving the other tasks a turn between polls: at
+    /// most 1000 polls, then a failure that names what never happened. An unbounded sleep
+    /// loop would instead spin forever — a paused clock auto-advances it — so a regression
+    /// that stops the awaited event fails the test rather than hanging it.
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{what}");
+    }
+
     #[test]
     fn ports_default_by_scheme() {
         let p = |s: &str| port_of(&s.parse::<Uri>().unwrap());
@@ -1108,9 +1122,10 @@ mod tests {
         let dial = tokio::spawn(connector.call(uri));
         // The first attempt is in flight (parked at its gate, nothing opened yet): replace the
         // stack, then let it run on into the refusal at its own check.
-        while gate.parked() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until("the first attempt never reached its gate", || {
+            gate.parked() == 1
+        })
+        .await;
         closed.set();
         gate.release();
 
@@ -1179,9 +1194,10 @@ mod tests {
         let dial = tokio::spawn(connector.call(uri));
         // The first attempt hangs (parked at its gate): the stagger must start the second, which
         // connects, without waiting the first one out.
-        while gate.parked() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until("the first attempt never reached its gate", || {
+            gate.parked() == 1
+        })
+        .await;
         let stream = dial
             .await
             .unwrap()
@@ -1242,9 +1258,10 @@ mod tests {
             .parse::<Uri>()
             .unwrap();
         let dial = tokio::spawn(connector.call(uri));
-        while gate.parked() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until("the first attempt never reached its gate", || {
+            gate.parked() == 1
+        })
+        .await;
         // Replace the stack while the first attempt hangs, then let it run on: it must refuse at
         // its own check, and no further attempt may be started.
         closed.set();
@@ -1314,9 +1331,10 @@ mod tests {
         let dial = tokio::spawn(connector.call(uri));
         // The first attempt is past its closed check and recorded, and parked inside its
         // connect: replace the stack while the dial is in flight.
-        while gate.parked() == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        wait_until("the first attempt never reached its hang gate", || {
+            gate.parked() == 1
+        })
+        .await;
         closed.set();
         // The stagger comes due while the stack is replaced: under paused time the timer is
         // what would start the second attempt, and it must find the flag set.
@@ -1467,9 +1485,7 @@ mod tests {
         let dial = tokio::spawn(direct.call(uri));
         // Wait until the lookup is in flight (its name is recorded as taken), then replace
         // the stack and release the answer.
-        while stub.calls().is_empty() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until("the lookup never started", || !stub.calls().is_empty()).await;
         closed.set();
         gate.notify_one();
 
