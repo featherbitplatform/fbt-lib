@@ -75,8 +75,12 @@ impl TrackerClient {
     ///   and fail with [`TrackerError::Proxy`] when the proxy does.
     /// - SOCKS5 (with `proxy_peers` or `proxy_trackers`): `udp` holds the one
     ///   relayed socket, and every UDP announce, of either family, goes
-    ///   through it; no other socket is bound. Tracker host names are
-    ///   resolved locally.
+    ///   through it; no other socket is bound. A tracker URL whose host is
+    ///   not an IP literal is sent to the relay by name (the SOCKS5 UDP
+    ///   request header carries it) and is never looked up here; the reply is
+    ///   matched by its transaction id whatever source the relay reports for
+    ///   it. IP literals still go to the relay as addresses, and the
+    ///   connection-id cache is keyed by the tracker as written.
     /// - HTTP with `proxy_trackers`: UDP announces fail with
     ///   [`TrackerError::ProxyUnsupported`].
     pub fn new_with(
@@ -95,6 +99,23 @@ impl TrackerClient {
     /// The handler for tracker replies arriving on the shared sockets.
     pub fn udp_handler(&self) -> Arc<dyn DatagramHandler> {
         self.inner.udp.handler()
+    }
+
+    /// Refuses every later HTTP lookup and dial on this client, including one a pooled
+    /// connection still holds from before: the session calls it when it replaces the stack this
+    /// client belongs to, because hyper-util finishes a losing connect in a task the session's
+    /// own handles cannot abort (N3). A refused request fails with an IO error rather than
+    /// reaching the network. UDP is unaffected: its sockets belong to the stack being torn down.
+    pub fn close(&self) {
+        self.inner.http.close();
+    }
+
+    /// Whether [`close`](Self::close) was called on this client (or on a clone of it): every
+    /// later HTTP lookup and dial is refused, so a caller that looks a host name up itself
+    /// before fetching (fbt-session, judging a web seed's own origin) can refuse its own lookup
+    /// on a replaced stack instead of resolving on one that is gone.
+    pub fn is_closed(&self) -> bool {
+        self.inner.http.is_closed()
     }
 
     /// Announces to `url`, dispatching on its scheme (`http`, `https`, `udp`).

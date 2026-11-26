@@ -30,6 +30,13 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # shell: bash: on windows-latest `run:` is pwsh, where
+      # CHECK_OUTBOUND_SKIP=... bash ... is not valid syntax.
+      - name: Outbound audit
+        shell: bash
+        run: |
+          bash dev/check-outbound.sh
+          bash dev/test-check-outbound.sh
       - name: Test
         run: cargo test --workspace
 

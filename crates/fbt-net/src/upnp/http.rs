@@ -5,6 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use fbt_core::audit;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -377,6 +378,7 @@ pub async fn request_with_timeout(
 }
 
 async fn exchange(req: &HttpRequest<'_>) -> Result<(HttpResponse, SocketAddr), HttpError> {
+    audit::record(audit::Outbound::TcpConnect(req.host));
     let mut stream = TcpStream::connect(req.host).await?;
     let local = stream.local_addr()?;
     stream.write_all(&req.to_bytes()).await?;

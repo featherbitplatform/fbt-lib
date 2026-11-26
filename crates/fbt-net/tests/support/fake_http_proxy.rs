@@ -27,6 +27,10 @@ pub enum Script {
     /// Tunnels like `Ok`, after this many `100 Continue` interim heads
     /// (`u32::MAX`: interim heads without end).
     Interim(u32),
+    /// The authority is only logged, never reached: CONNECT is answered `502`
+    /// without dialling. For tests whose "remote" is a documentation address
+    /// or a name that must not be resolved here.
+    RecordOnly,
 }
 
 pub struct FakeHttpProxy {
@@ -43,7 +47,13 @@ impl Drop for FakeHttpProxy {
 
 impl FakeHttpProxy {
     pub async fn start(script: Script) -> FakeHttpProxy {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        FakeHttpProxy::start_on(SocketAddr::from(([127, 0, 0, 1], 0)), script).await
+    }
+
+    /// Starts the fake on `addr` (port 0 asks the OS for a free port), so a
+    /// test can point a client at a port it knows before the client exists.
+    pub async fn start_on(addr: SocketAddr, script: Script) -> FakeHttpProxy {
+        let listener = TcpListener::bind(addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let connects = Arc::new(Mutex::new(Vec::new()));
         let log = connects.clone();
@@ -72,6 +82,15 @@ impl FakeHttpProxy {
     pub fn connects(&self) -> Vec<String> {
         self.connects.lock().unwrap().clone()
     }
+}
+
+/// A loopback address nothing is listening on: a port bound and dropped, so a
+/// connect to it is refused at once instead of hanging.
+pub fn closed_port() -> SocketAddr {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    drop(l);
+    addr
 }
 
 async fn serve(
@@ -130,6 +149,12 @@ async fn serve(
             for _ in 0..*n {
                 s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
             }
+        }
+        Script::RecordOnly => {
+            // Logged, never dialled.
+            log.lock().unwrap().push(authority);
+            s.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            return Ok(());
         }
         Script::Ok | Script::Trailer(_) => {}
     }

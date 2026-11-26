@@ -14,8 +14,8 @@ use fbt::{
 use fbt::{BlockReason, FileStatus, IpFilter, MoveMode, PeerStatus, QueueSettings, TrackerStatus};
 use fbt::{
     CacheStats, ChokingAlgorithm, ExternalIpSource, FileReader, MapMethod, MapProtocol, MixedMode,
-    PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead, SeedChokingAlgorithm,
-    StorageError, StreamError,
+    NetworkSettings, PeerClassLimits, ProxyConfig, ProxyKind, RateLimit, ReadAhead,
+    SeedChokingAlgorithm, StorageError, StreamError,
 };
 use fbt::{
     CreateError, CreateTorrent, MAX_CREATE_FILES, MAX_PIECE_LAYER_HASHES, MAX_V2_PIECES,
@@ -94,6 +94,7 @@ fn names(
     _: Option<BlockReason>,
     _: Option<MoveMode>,
     _: Option<QueueSettings>,
+    _: Option<NetworkSettings>,
 ) {
 }
 
@@ -134,6 +135,22 @@ fn surface_compiles() {
         (p.kind, p.host, p.port, p.username, p.password);
     let _: (bool, bool, bool) = (p.proxy_peers, p.proxy_trackers, p.proxy_hostnames);
     let _: Result<(), String> = ProxyConfig::default().validate();
+    // The runtime network settings and their conversion to and from `Settings`.
+    let n = NetworkSettings::default();
+    let _: (ProxyConfig, bool, bool, bool, bool, bool, bool, bool) = (
+        n.proxy,
+        n.dht_enabled,
+        n.enable_lsd,
+        n.enable_upnp,
+        n.enable_natpmp,
+        n.enable_incoming_tcp,
+        n.enable_incoming_utp,
+        n.enable_outgoing_utp,
+    );
+    assert_eq!(NetworkSettings::default(), Settings::default().network());
+    let mut conv = Settings::default();
+    conv.set_network(NetworkSettings::default());
+    assert_eq!(conv.network(), NetworkSettings::default());
     // Where a redirect may take a fetch: the default follows as it always did; a web seed
     // on a public address sets `allow_internal` false.
     let p = fbt::RedirectPolicy::default();
@@ -144,6 +161,20 @@ fn surface_compiles() {
         SessionError::Proxy(e),
         SessionError::Proxy(fbt::ProxyError::Timeout),
     ];
+    // The proxy health state and the event that announces it.
+    let states = [
+        fbt::ProxyState::NotSet,
+        fbt::ProxyState::Reachable,
+        fbt::ProxyState::UdpNotRelayed,
+        fbt::ProxyState::Unreachable {
+            reason: String::new(),
+        },
+        fbt::ProxyState::LoginRefused,
+    ];
+    assert!(states.iter().all(|s| s == s));
+    let _ = Event::ProxyStateChanged {
+        state: fbt::ProxyState::NotSet,
+    };
     let _: [usize; 6] = [
         fbt::MAX_RESUME_BYTES,
         fbt::MAX_RESUME_ITEMS,
@@ -464,4 +495,7 @@ async fn detail_methods(s: &Session, h: &TorrentHandle) {
     let _: PeerClassLimits = s.peer_class_limits();
     let _: QueueSettings = s.queue_settings();
     let _: bool = s.is_shut_down();
+    let _: NetworkSettings = s.network_settings();
+    let _: Result<(), SessionError> = s.set_network_settings(NetworkSettings::default()).await;
+    let _: fbt::ProxyState = s.proxy_state();
 }

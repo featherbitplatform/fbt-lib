@@ -875,6 +875,26 @@ pub(crate) struct CreateTorrentRequest {
     pub(crate) private: bool,
 }
 
+/// The proxy state an [`EventDto::ProxyStateChanged`] carries, as its own
+/// schema so the OpenAPI document lists the five names as an enum rather than
+/// describing them in prose.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProxyStateDto {
+    /// No proxy is set.
+    NotSet,
+    /// The proxy answered.
+    Reachable,
+    /// The proxy answers TCP but will not relay UDP.
+    UdpNotRelayed,
+    /// The proxy could not be reached.
+    Unreachable,
+    /// The proxy refused the credentials.
+    LoginRefused,
+    /// A state a later `fbt` adds; the API does not know it.
+    Unknown,
+}
+
 /// One session event, as the `data:` of a server-sent event whose
 /// `event:` field equals `type`. Torrent ids are the 40-hex wire hash.
 #[derive(Debug, Serialize, ToSchema)]
@@ -1016,7 +1036,7 @@ pub(crate) enum EventDto {
         /// Why: `self_connection`, `info_hash_mismatch`,
         /// `handshake_timeout`, `idle_timeout`, `encryption`, `protocol`,
         /// `io`, `closed`, `shutdown`, `duplicate`, `bad_metadata`,
-        /// `upload_only`, `blocked` or `unknown`.
+        /// `upload_only`, `blocked`, `network_changed` or `unknown`.
         reason: &'static str,
         /// Details: the error text, or for `blocked` the block reason.
         detail: Option<String>,
@@ -1102,6 +1122,13 @@ pub(crate) enum EventDto {
         /// What happened.
         message: String,
     },
+    /// The proxy's health changed.
+    ProxyStateChanged {
+        /// The state, as the schema's enum names it.
+        state: ProxyStateDto,
+        /// Why, for `unreachable`; `null` otherwise.
+        reason: Option<String>,
+    },
     /// The subscriber fell behind and `missed` events were dropped.
     Lagged {
         /// Number of events dropped.
@@ -1145,6 +1172,7 @@ impl EventDto {
             EventDto::PortMappingFailed { .. } => "port_mapping_failed",
             EventDto::ExternalIpChanged { .. } => "external_ip_changed",
             EventDto::ProxyError { .. } => "proxy_error",
+            EventDto::ProxyStateChanged { .. } => "proxy_state_changed",
             EventDto::Lagged { .. } => "lagged",
             EventDto::Other { .. } => "other",
         }
@@ -1171,6 +1199,7 @@ fn disconnect_reason(reason: &DisconnectReason) -> (&'static str, Option<String>
         DisconnectReason::BadMetadata => ("bad_metadata", None),
         DisconnectReason::UploadOnly => ("upload_only", None),
         DisconnectReason::Blocked(r) => ("blocked", Some(block_reason(*r).to_owned())),
+        DisconnectReason::NetworkChanged => ("network_changed", None),
         // A reason a later `fbt` adds.
         _ => ("unknown", None),
     }
@@ -1183,6 +1212,21 @@ fn block_reason(reason: BlockReason) -> &'static str {
         BlockReason::PerIpLimit => "per_ip_limit",
         // A reason a later `fbt` adds.
         _ => "unknown",
+    }
+}
+
+/// A proxy state's name and, for an unreachable proxy, its reason.
+fn proxy_state(state: &fbt::ProxyState) -> (ProxyStateDto, Option<String>) {
+    match state {
+        fbt::ProxyState::NotSet => (ProxyStateDto::NotSet, None),
+        fbt::ProxyState::Reachable => (ProxyStateDto::Reachable, None),
+        fbt::ProxyState::UdpNotRelayed => (ProxyStateDto::UdpNotRelayed, None),
+        fbt::ProxyState::Unreachable { reason } => {
+            (ProxyStateDto::Unreachable, Some(reason.clone()))
+        }
+        fbt::ProxyState::LoginRefused => (ProxyStateDto::LoginRefused, None),
+        // A state a later `fbt` adds.
+        _ => (ProxyStateDto::Unknown, None),
     }
 }
 
@@ -1406,6 +1450,10 @@ impl From<&Event> for EventDto {
             Event::ProxyError { message } => EventDto::ProxyError {
                 message: message.clone(),
             },
+            Event::ProxyStateChanged { state } => {
+                let (state, reason) = proxy_state(state);
+                EventDto::ProxyStateChanged { state, reason }
+            }
             Event::Lagged { missed } => EventDto::Lagged { missed: *missed },
             // An event a later `fbt` adds.
             other => EventDto::Other {
@@ -1542,6 +1590,10 @@ mod tests {
             EventDto::ProxyError {
                 message: String::new(),
             },
+            EventDto::ProxyStateChanged {
+                state: ProxyStateDto::Unreachable,
+                reason: None,
+            },
             EventDto::Lagged { missed: 0 },
             EventDto::Other {
                 debug: String::new(),
@@ -1580,8 +1632,9 @@ mod tests {
             EventDto::PortMappingFailed { .. } => 24,
             EventDto::ExternalIpChanged { .. } => 25,
             EventDto::ProxyError { .. } => 26,
-            EventDto::Lagged { .. } => 27,
-            EventDto::Other { .. } => 28,
+            EventDto::ProxyStateChanged { .. } => 27,
+            EventDto::Lagged { .. } => 28,
+            EventDto::Other { .. } => 29,
         }
     }
 
@@ -1589,11 +1642,38 @@ mod tests {
     fn event_kind_is_the_serde_type_for_every_variant() {
         let events = every_event();
         let ordinals: Vec<usize> = events.iter().map(ordinal).collect();
-        assert_eq!(ordinals, (0..29).collect::<Vec<_>>());
+        assert_eq!(ordinals, (0..30).collect::<Vec<_>>());
         for event in &events {
             let value = serde_json::to_value(event).unwrap();
             assert_eq!(value["type"], event.kind(), "{event:?}");
         }
+    }
+
+    /// A proxy state change is its own event kind, with the state's name and
+    /// the reason only for an unreachable proxy.
+    #[test]
+    fn proxy_state_event_dto() {
+        let unreachable = Event::ProxyStateChanged {
+            state: fbt::ProxyState::Unreachable {
+                reason: "x".to_owned(),
+            },
+        };
+        let dto = EventDto::from(&unreachable);
+        assert_eq!(dto.kind(), "proxy_state_changed");
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "proxy_state_changed", "state": "unreachable", "reason": "x"})
+        );
+
+        let reachable = Event::ProxyStateChanged {
+            state: fbt::ProxyState::Reachable,
+        };
+        let value = serde_json::to_value(EventDto::from(&reachable)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "proxy_state_changed", "state": "reachable", "reason": null})
+        );
     }
 
     #[test]

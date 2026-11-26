@@ -15,7 +15,7 @@ use fbt_wire::{
 };
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 use tracing::debug;
@@ -174,17 +174,26 @@ fn refused(shared: &Shared, state: &ListenerState, addr: SocketAddr) -> bool {
     true
 }
 
-/// Runs one TCP accept loop until the session goes away or the task is
-/// aborted.
+/// Runs one TCP accept loop until the session goes away, its stack shuts
+/// down or the task is aborted. `stop` fires when the stack this listener
+/// belongs to is replaced or shut down: the loop returns and drops the
+/// listener, releasing the port the next stack binds again. Each accepted
+/// connection is stamped with `generation`, the stack it arrived on; its
+/// routing task ends with the same `stop`.
 pub(crate) fn spawn(
     listener: TcpListener,
     state: Arc<ListenerState>,
     session: Weak<SessionInner>,
     shared: Arc<Shared>,
+    generation: u64,
+    mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let (stream, addr) = match listener.accept().await {
+            let (stream, addr) = match tokio::select! {
+                _ = stop.changed() => return,
+                r = listener.accept() => r,
+            } {
                 Ok(c) => c,
                 Err(e) => {
                     debug!(error = %e, "accept failed");
@@ -204,8 +213,16 @@ pub(crate) fn spawn(
             };
             let session = session.clone();
             let shared = Arc::clone(&shared);
+            // The routing task belongs to the stack too: it is dropped when
+            // the stack is replaced, so a handshake never outlives it.
+            let mut stop = stop.clone();
             tokio::spawn(async move {
-                route(PeerTransport::Tcp(stream), addr, &session, &shared).await;
+                tokio::select! {
+                    () = route(PeerTransport::Tcp(stream), addr, generation, &session, &shared) => {}
+                    _ = stop.changed() => {
+                        debug!(%addr, "incoming connection dropped with its stack");
+                    }
+                }
                 drop(permit);
             });
         }
@@ -214,17 +231,26 @@ pub(crate) fn spawn(
 
 /// Runs one uTP accept loop on `socket` until the socket shuts down, the
 /// session goes away or the task is aborted. Accepted streams take a
-/// pending-handshake permit from the same `state` as TCP ones.
+/// pending-handshake permit from the same `state` as TCP ones. `stop` fires
+/// when the stack this socket belongs to is replaced or shut down; each
+/// accepted stream is stamped with `generation` as the TCP loop stamps its
+/// own.
 pub(crate) fn spawn_utp(
     socket: UtpSocket,
     state: Arc<ListenerState>,
     session: Weak<SessionInner>,
     shared: Arc<Shared>,
+    generation: u64,
+    mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             // The only error is the socket shutting down.
-            let Ok((stream, addr)) = socket.accept().await else {
+            let accepted = tokio::select! {
+                _ = stop.changed() => return,
+                r = socket.accept() => r,
+            };
+            let Ok((stream, addr)) = accepted else {
                 return;
             };
             if session.strong_count() == 0 || shared.is_shutdown() {
@@ -239,8 +265,14 @@ pub(crate) fn spawn_utp(
             };
             let session = session.clone();
             let shared = Arc::clone(&shared);
+            let mut stop = stop.clone();
             tokio::spawn(async move {
-                route(PeerTransport::Utp(stream), addr, &session, &shared).await;
+                tokio::select! {
+                    () = route(PeerTransport::Utp(stream), addr, generation, &session, &shared) => {}
+                    _ = stop.changed() => {
+                        debug!(%addr, "incoming connection dropped with its stack");
+                    }
+                }
                 drop(permit);
             });
         }
@@ -253,10 +285,12 @@ type Refusal = std::borrow::Cow<'static, str>;
 /// Classifies, decrypts and routes one accepted connection. Everything up
 /// to handing it to the torrent (MSE included) shares one
 /// `handshake_timeout` deadline, so a stalled peer gives its pending slot
-/// back in time.
+/// back in time. `generation` is the stack the connection was accepted on:
+/// the torrent drops a connection that reaches it after the stack is gone.
 async fn route(
     stream: PeerTransport,
     addr: SocketAddr,
+    generation: u64,
     session: &Weak<SessionInner>,
     shared: &Shared,
 ) {
@@ -292,7 +326,7 @@ async fn route(
     };
     match handle {
         Some(h) => {
-            if !h.offer_incoming(stream, hs, addr) {
+            if !h.offer_incoming(stream, hs, addr, generation) {
                 debug!(%addr, "torrent busy; dropping incoming connection");
             }
         }

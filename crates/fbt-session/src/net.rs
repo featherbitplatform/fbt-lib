@@ -7,20 +7,21 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use fbt_core::udp::DatagramSender;
-use fbt_dht::ExternalIpVotes;
+use fbt_core::udp::{DatagramHandler, DatagramSender};
+use fbt_dht::{Dht, DhtConfig, DhtState, ExternalIpVotes};
 use fbt_net::demux::{PacketKind, SharedUdpSocket};
 use fbt_net::lsd::{LSD_HASHES_PER_MESSAGE, Lsd, LsdConfig, LsdPeer};
 use fbt_net::{MapEvent, MapProtocol, PortMapConfig, PortMapper};
 use fbt_utp::{UtpConfig, UtpSocket};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::error::SessionError;
 use crate::event::{Event, ExternalIpSource};
-use crate::settings::Settings;
+use crate::netstack::NetStack;
+use crate::settings::{NetworkSettings, Settings};
 
 /// Tries per port-0 address to find a port free for both TCP and UDP. The
 /// attempts between the first and the last pick their own ports (see
@@ -65,21 +66,24 @@ pub(crate) struct Endpoint {
     pub udp: Option<SharedUdpSocket>,
 }
 
-/// Binds every address of `settings.listen_addrs`, in order. An address
-/// whose TCP bind fails is skipped; one whose UDP bind fails keeps TCP only.
-/// Both are reported as [`ListenError`]s. Without `udp` (a SOCKS5 relay
-/// carries all UDP) only TCP is bound. Fails with the first error when
-/// nothing binds.
+/// Binds every address of `addrs`, in order: [`Settings::listen_addrs`] at
+/// the session's start, or the addresses the previous stack had bound on a
+/// runtime change (so the listen ports stay). An address whose TCP bind
+/// fails is skipped; one whose UDP bind fails keeps TCP only. Both are
+/// reported as [`ListenError`]s. Without `udp` (a SOCKS5 relay carries all
+/// UDP) only TCP is bound. Fails with the first error when nothing binds.
 pub(crate) async fn bind_all(
     settings: &Settings,
+    net: &NetworkSettings,
+    addrs: &[SocketAddr],
     udp: bool,
 ) -> Result<(Vec<Endpoint>, Vec<ListenError>), SessionError> {
     let mut endpoints = Vec::new();
     let mut errors = Vec::new();
     let mut first: Option<io::Error> = None;
-    for &addr in &settings.listen_addrs {
+    for &addr in addrs {
         // NAT emulation refuses incoming TCP as `enable_incoming_tcp` off does.
-        let listen = settings.enable_incoming_tcp && !settings.nat_emulation;
+        let listen = net.enable_incoming_tcp && !settings.nat_emulation;
         let bound = if udp {
             bind_one(addr, listen)
         } else {
@@ -295,11 +299,15 @@ impl LsdHub {
         LsdHub::default()
     }
 
-    /// Starts LSD as the settings say; the found peers arrive on the
+    /// Starts LSD when `enable` says so (the effective value of
+    /// [`NetworkSettings::enable_lsd`]); the found peers arrive on the
     /// returned receiver. Must run inside a tokio runtime. A failure is
     /// logged and leaves LSD off.
-    pub(crate) fn start(settings: &Settings) -> (Self, Option<mpsc::Receiver<LsdPeer>>) {
-        if !settings.enable_lsd {
+    pub(crate) fn start(
+        settings: &Settings,
+        enable: bool,
+    ) -> (Self, Option<mpsc::Receiver<LsdPeer>>) {
+        if !enable {
             return (LsdHub::disabled(), None);
         }
         let (tx, rx) = mpsc::channel(LSD_FOUND_QUEUE);
@@ -413,16 +421,20 @@ impl LsdHub {
 }
 
 /// The task that sends the queued announces every [`LSD_FLUSH`] and routes
-/// found peers to the torrent with their wire hash. Ends with the session.
+/// found peers to the torrent with their wire hash. Ends with the session,
+/// with its stack, or when `stop` says so.
 pub(crate) fn spawn_lsd_task(
     mut found: mpsc::Receiver<LsdPeer>,
     session: std::sync::Weak<crate::session::SessionInner>,
+    stack: std::sync::Weak<NetStack>,
+    mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(LSD_FLUSH);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = stop.changed() => return,
                 peer = found.recv() => {
                     let Some(peer) = peer else { return };
                     // One batch per torrent for everything already waiting.
@@ -450,9 +462,8 @@ pub(crate) fn spawn_lsd_task(
                     }
                 }
                 _ = tick.tick() => {
-                    let Some(inner) = session.upgrade() else { return };
-                    let shared = &inner.shared;
-                    shared.lsd.flush(shared.listen_port, Instant::now());
+                    let Some(stack) = stack.upgrade() else { return };
+                    stack.lsd.flush(stack.listen_port, Instant::now());
                 }
             }
         }
@@ -531,14 +542,15 @@ impl ExternalIp {
 /// tests' fake gateway). `None` with UPnP and NAT-PMP both off.
 pub(crate) fn start_port_mapping(
     settings: &Settings,
+    net: &NetworkSettings,
     local_addrs: &[SocketAddr],
 ) -> Option<(PortMapper, mpsc::Receiver<MapEvent>)> {
-    if !(settings.enable_upnp || settings.enable_natpmp) {
+    if !(net.enable_upnp || net.enable_natpmp) {
         return None;
     }
     let mut cfg = PortMapConfig::default();
-    cfg.upnp = settings.enable_upnp;
-    cfg.natpmp = settings.enable_natpmp;
+    cfg.upnp = net.enable_upnp;
+    cfg.natpmp = net.enable_natpmp;
     cfg.gateway = settings.nat_gateway;
     cfg.ssdp = settings.upnp_ssdp_addr;
     cfg.natpmp_port = settings.natpmp_port;
@@ -566,9 +578,17 @@ pub(crate) fn start_port_mapping(
 pub(crate) fn spawn_nat_task(
     mut rx: mpsc::Receiver<MapEvent>,
     shared: std::sync::Weak<crate::session::Shared>,
+    mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
+        loop {
+            let ev = tokio::select! {
+                _ = stop.changed() => return,
+                ev = rx.recv() => match ev {
+                    Some(ev) => ev,
+                    None => return,
+                },
+            };
             let Some(shared) = shared.upgrade() else {
                 return;
             };
@@ -677,6 +697,7 @@ impl DatagramSender for RecordingSender {
 
     fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
         self.recent.record(to, Instant::now());
+        // audit: the wrapped sender records where the datagram reaches (the demux for a shared socket)
         self.inner.send_to(data, to)
     }
 }
@@ -688,10 +709,9 @@ impl DatagramSender for RecordingSender {
 /// a socket nobody accepts on; with NAT emulation (`recent`) it accepts only
 /// sources the socket sent to within [`NAT_MAPPING_LIFETIME`].
 pub(crate) fn utp_accept_filter(
-    settings: &Settings,
+    incoming: bool,
     recent: Option<Arc<RecentSends>>,
 ) -> Option<AcceptFilter> {
-    let incoming = settings.enable_incoming_utp;
     if incoming && recent.is_none() {
         return None;
     }
@@ -707,7 +727,11 @@ pub(crate) fn utp_accept_filter(
 /// its uTP handler and given the session's accept filter (with NAT
 /// emulation, each socket its own mappings, fed by its sends). Must run
 /// inside a tokio runtime.
-pub(crate) fn utp_sockets(settings: &Settings, udp: &[SharedUdpSocket]) -> Vec<UtpSocket> {
+pub(crate) fn utp_sockets(
+    settings: &Settings,
+    incoming: bool,
+    udp: &[SharedUdpSocket],
+) -> Vec<UtpSocket> {
     let mut cfg = UtpConfig::default();
     cfg.connect_timeout = settings.utp_connect_timeout;
     udp.iter()
@@ -723,7 +747,7 @@ pub(crate) fn utp_sockets(settings: &Settings, udp: &[SharedUdpSocket]) -> Vec<U
                 None => u.sender(),
             };
             let socket = UtpSocket::new(sender, cfg.clone());
-            socket.set_accept_filter(utp_accept_filter(settings, recent));
+            socket.set_accept_filter(utp_accept_filter(incoming, recent));
             u.set_handler(PacketKind::Utp, socket.handler());
             socket
         })
@@ -736,6 +760,93 @@ pub(crate) fn utp_sockets(settings: &Settings, udp: &[SharedUdpSocket]) -> Vec<U
 pub(crate) fn utp_for<'a>(sockets: &'a [UtpSocket], peer: &SocketAddr) -> Option<&'a UtpSocket> {
     let v4 = peer.ip().to_canonical().is_ipv4();
     sockets.iter().find(|s| s.local_addr().is_ipv4() == v4)
+}
+
+/// A UDP socket on a free port for each address family that has a listener
+/// but no shared UDP socket (its port was taken), on the IP of the family's
+/// first listener, so the DHT and UDP trackers still run over that family.
+/// One that cannot be bound is logged and left out.
+pub(crate) fn fallback_udp(endpoints: &[Endpoint]) -> Vec<SharedUdpSocket> {
+    let mut out = Vec::new();
+    for v4 in [true, false] {
+        let mut family = endpoints.iter().filter(|e| e.addr.is_ipv4() == v4);
+        let Some(first) = family.clone().next() else {
+            continue;
+        };
+        if family.any(|e| e.udp.is_some()) {
+            continue;
+        }
+        let addr = SocketAddr::new(first.addr.ip(), 0);
+        match SharedUdpSocket::bind(addr) {
+            Ok(u) => {
+                warn!(
+                    listener = %first.addr,
+                    udp = %u.local_addr(),
+                    "UDP port taken; the DHT and UDP trackers use a free port"
+                );
+                out.push(u);
+            }
+            Err(e) => warn!(%addr, error = %e, "cannot bind a UDP socket for this family"),
+        }
+    }
+    out
+}
+
+/// Starts a DHT on the shared UDP sockets, the first one of each address
+/// family, and registers it as their DHT handler (so replies leave from the
+/// address a query reached), restoring the state in `state` when given. The
+/// bootstrap entries that are host names are resolved locally only without a
+/// proxy; under one they are skipped, so no bootstrap lookup leaves the host
+/// (an IP-literal entry still works, relayed). A DHT that cannot start at all
+/// (no socket, say) is logged and left out.
+pub(crate) async fn start_dht(
+    settings: &Settings,
+    udp: &[SharedUdpSocket],
+    state: Option<&[u8]>,
+) -> Option<Dht> {
+    let state = state.and_then(|b| match DhtState::from_bytes(b) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(error = %e, "ignoring the saved DHT state; starting fresh");
+            None
+        }
+    });
+    let mut c = DhtConfig::default();
+    c.bootstrap = settings.dht_bootstrap_nodes.clone();
+    // A DHT matches every reply to the address it queried, and a query sent
+    // to a name has no such address: under any proxy the bootstrap entries
+    // that are names are skipped (an IP literal is still used, relayed), so
+    // no bootstrap name is ever resolved on the host's own address (M3).
+    c.resolve_bootstrap_names = settings.proxy.kind == fbt_net::proxy::ProxyKind::None;
+    c.read_only = settings.dht_read_only;
+    c.state = state;
+    c.query_timeout = settings.dht_query_timeout;
+    c.query_rate_per_ip = settings.dht_query_rate_per_ip;
+    // At most one socket per family: the first one wins.
+    let mut sockets: Vec<&SharedUdpSocket> = Vec::new();
+    for u in udp {
+        if !sockets
+            .iter()
+            .any(|s| s.local_addr().is_ipv4() == u.local_addr().is_ipv4())
+        {
+            sockets.push(u);
+        }
+    }
+    let senders = sockets.iter().map(|s| s.sender()).collect();
+    let r = Dht::spawn_on(c, senders).await.map(|(dht, input)| {
+        let input: Arc<dyn DatagramHandler> = Arc::new(input);
+        for s in &sockets {
+            s.set_handler(PacketKind::Dht, Arc::clone(&input));
+        }
+        dht
+    });
+    match r {
+        Ok(d) => Some(d),
+        Err(e) => {
+            warn!(error = %e, "cannot start the DHT; running without it");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -788,16 +899,14 @@ mod tests {
 
     #[test]
     fn accept_filter_composes_both_rules() {
-        let mut s = Settings::default();
-        assert!(utp_accept_filter(&s, None).is_none());
+        assert!(utp_accept_filter(true, None).is_none());
         let recent = Arc::new(RecentSends::default());
         recent.record(sa("10.0.0.1:1"), Instant::now());
-        let f = utp_accept_filter(&s, Some(Arc::clone(&recent))).expect("filter");
+        let f = utp_accept_filter(true, Some(Arc::clone(&recent))).expect("filter");
         assert!(f(sa("10.0.0.1:1")) && !f(sa("10.0.0.2:1")));
-        s.enable_incoming_utp = false;
-        let f = utp_accept_filter(&s, Some(recent)).expect("filter");
+        let f = utp_accept_filter(false, Some(recent)).expect("filter");
         assert!(!f(sa("10.0.0.1:1")), "incoming uTP off wins");
-        let f = utp_accept_filter(&s, None).expect("filter");
+        let f = utp_accept_filter(false, None).expect("filter");
         assert!(!f(sa("10.0.0.1:1")));
     }
 

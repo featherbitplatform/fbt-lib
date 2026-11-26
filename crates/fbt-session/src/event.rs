@@ -50,6 +50,63 @@ pub enum ExternalIpSource {
     Peers,
 }
 
+/// The health of the session's proxy ([`Settings::proxy`](crate::Settings::proxy)),
+/// as [`Session::proxy_state`](crate::Session::proxy_state) reports it and
+/// [`Event::ProxyStateChanged`] announces it. A session starts and keeps
+/// running whatever it is: while the proxy cannot carry what the session
+/// wanted, nothing goes direct in its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum ProxyState {
+    /// No proxy is set ([`ProxyKind::None`](crate::ProxyKind::None)):
+    /// everything goes direct.
+    NotSet,
+    /// The proxy answered and, where UDP has to be relayed, its UDP
+    /// association was taken. A SOCKS5 proxy that relays UDP has a relayed
+    /// UDP socket; every other reachable proxy carries TCP only.
+    Reachable,
+    /// The proxy answers TCP but will not relay UDP: the DHT, uTP and UDP
+    /// trackers do not run. This is a property of the proxy, not something a
+    /// retry changes, so it is checked again only on a settings change.
+    UdpNotRelayed,
+    /// The proxy could not be reached: the dial to it failed or timed out,
+    /// or a network change could not build its stack (a listen address that
+    /// cannot be bound), which the reason names. Re-probed with a backoff
+    /// from `Settings::proxy_retry_base` up to `Settings::proxy_retry_max`.
+    Unreachable {
+        /// Why, made display-safe and bounded (at most 200 characters).
+        reason: String,
+    },
+    /// The proxy refused the credentials, or wanted some and none were set.
+    /// Re-probed with a backoff, as [`Unreachable`](Self::Unreachable) is.
+    LoginRefused,
+}
+
+/// Longest [`ProxyState::Unreachable`] reason kept, in characters.
+const MAX_PROXY_REASON_CHARS: usize = 200;
+
+impl ProxyState {
+    /// [`Unreachable`](ProxyState::Unreachable) with `text` as its reason,
+    /// made display-safe (control and bidi characters dropped, whitespace
+    /// collapsed) and bounded. Proxy error text comes from the network.
+    pub(crate) fn unreachable(text: &str) -> ProxyState {
+        ProxyState::Unreachable {
+            reason: fbt_core::display_safe(text, MAX_PROXY_REASON_CHARS),
+        }
+    }
+
+    /// Whether the health task retries this state: `Unreachable` and
+    /// `LoginRefused` are the states a later probe can change; `NotSet`,
+    /// `Reachable` and `UdpNotRelayed` are not.
+    pub(crate) fn retried(&self) -> bool {
+        matches!(
+            self,
+            ProxyState::Unreachable { .. } | ProxyState::LoginRefused
+        )
+    }
+}
+
 /// Something that happened in the session.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -316,10 +373,26 @@ pub enum Event {
     /// way that affects the whole session. Emitted once when the SOCKS5
     /// proxy closes the UDP association: the relayed UDP socket stops, so
     /// the DHT, uTP and UDP trackers fail (closed, never direct) until the
-    /// session is restarted.
+    /// proxy comes back or the session is restarted. Superseded by
+    /// [`ProxyStateChanged`](Event::ProxyStateChanged), which reports the
+    /// same loss as [`ProxyState::Unreachable`] and every later recovery;
+    /// kept for the 0.13.0 line.
     ProxyError {
         /// What happened.
         message: String,
+    },
+    /// The proxy's health changed
+    /// ([`Session::proxy_state`](crate::Session::proxy_state)). Emitted when
+    /// the state's *variant* differs from the last one reported, and never
+    /// for a new reason under an unchanged variant (an `Unreachable` that
+    /// fails again differently does not re-emit). Switching between two
+    /// proxies that land in the same variant (two unreachable ones, say)
+    /// therefore emits nothing; the first event after
+    /// [`Session::set_network_settings`](crate::Session::set_network_settings)
+    /// describes the new proxy only when its variant differs.
+    ProxyStateChanged {
+        /// The new state.
+        state: ProxyState,
     },
     /// The subscriber fell behind and `missed` events were dropped.
     Lagged {
@@ -369,7 +442,8 @@ impl Event {
             | Event::MetadataReceived { .. }
             | Event::TorrentFinished { .. }
             | Event::SeedLimitReached { .. }
-            | Event::ProxyError { .. } => EventMask::STATUS,
+            | Event::ProxyError { .. }
+            | Event::ProxyStateChanged { .. } => EventMask::STATUS,
             Event::PieceFinished { .. } | Event::HashFailed { .. } => EventMask::PIECE,
             Event::TrackerReply { .. }
             | Event::TrackerError { .. }

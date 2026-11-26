@@ -522,4 +522,85 @@ fn events_route_is_documented() {
     let get = &doc["paths"]["/api/v1/events"]["get"];
     assert!(get.is_object(), "{doc}");
     assert!(get["responses"]["200"]["content"]["text/event-stream"].is_object());
+    // The proxy health event is in the document, and its `state` names the
+    // five states as a schema *enum* (not prose, and not a set of words a
+    // `contains` could satisfy by accident: "reachable" inside
+    // "unreachable" would not count).
+    let schemas = &doc["components"]["schemas"];
+    let event = schemas["EventDto"]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("EventDto is not a union: {schemas}"))
+        .iter()
+        .find(|v| {
+            v["properties"]["type"]["enum"]
+                .as_array()
+                .is_some_and(|e| e.iter().any(|n| n == "proxy_state_changed"))
+        })
+        .unwrap_or_else(|| panic!("no proxy_state_changed variant in {schemas}"));
+    let state = &event["properties"]["state"];
+    // The field points at the state's own schema; follow the `$ref`.
+    let names: Vec<String> =
+        if let Some(reference) = state["$ref"].as_str().and_then(|r| r.rsplit('/').next()) {
+            serde_json::from_value(schemas[reference]["enum"].clone()).expect("the enum")
+        } else {
+            serde_json::from_value(state["enum"].clone()).expect("an inline enum")
+        };
+    let mut names = names;
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "login_refused",
+            "not_set",
+            "reachable",
+            "udp_not_relayed",
+            "unknown",
+            "unreachable",
+        ],
+        "the documented proxy states"
+    );
+}
+
+/// A change of the session's proxy reaches an open event stream as a
+/// `proxy_state_changed` event.
+#[tokio::test]
+async fn proxy_state_change_reaches_the_stream() {
+    let (session, _server, base, token) = api().await;
+    let (status, _, sse) = Sse::open(&format!("{base}/api/v1/events"), Some(token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut sse = sse.expect("stream");
+
+    // A SOCKS5 proxy nothing listens on: the session classifies it
+    // unreachable (the dial is refused at once).
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = l.local_addr().expect("addr");
+        drop(l);
+        addr
+    };
+    let mut proxy = fbt::ProxyConfig::default();
+    proxy.kind = fbt::ProxyKind::Socks5;
+    proxy.host = dead.ip().to_string();
+    proxy.port = dead.port();
+    let mut net = session.network_settings();
+    net.proxy = proxy;
+    session
+        .set_network_settings(net)
+        .await
+        .expect("the change applies");
+
+    let got = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some((event, data)) = sse.next().await {
+            if event == "proxy_state_changed" {
+                return Some(data);
+            }
+        }
+        None
+    })
+    .await
+    .expect("an event within 10 s");
+    let data = got.expect("a proxy_state_changed event");
+    assert_eq!(data["state"], "unreachable", "{data}");
+    assert!(data["reason"].is_string(), "{data}");
+    session.shutdown().await;
 }

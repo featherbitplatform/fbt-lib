@@ -129,15 +129,21 @@ fn test_knobs_are_not_serialised() {
     s.per_ip_exempt_loopback = !s.per_ip_exempt_loopback;
     s.ban_endpoints = !s.ban_endpoints;
     s.serve_hashes = !s.serve_hashes;
+    s.proxy_retry_base = Duration::from_millis(7);
+    s.proxy_retry_max = Duration::from_millis(70);
     let json = serde_json::to_string(&s).unwrap();
     assert!(!json.contains("per_ip_exempt_loopback"), "{json}");
     assert!(!json.contains("ban_endpoints"), "{json}");
     assert!(!json.contains("serve_hashes"), "{json}");
+    assert!(!json.contains("proxy_retry_base"), "{json}");
+    assert!(!json.contains("proxy_retry_max"), "{json}");
     let back: Settings = serde_json::from_str(&json).unwrap();
     let d = Settings::default();
     assert_eq!(back.per_ip_exempt_loopback, d.per_ip_exempt_loopback);
     assert_eq!(back.ban_endpoints, d.ban_endpoints);
     assert_eq!(back.serve_hashes, d.serve_hashes, "the default serves");
+    assert_eq!(back.proxy_retry_base, d.proxy_retry_base);
+    assert_eq!(back.proxy_retry_max, d.proxy_retry_max);
     // A saved file that has them is still read; they keep their defaults.
     let back: Settings = serde_json::from_str(
         r#"{"per_ip_exempt_loopback": false, "ban_endpoints": true, "serve_hashes": false}"#,

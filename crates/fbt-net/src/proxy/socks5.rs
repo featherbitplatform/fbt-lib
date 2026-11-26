@@ -214,3 +214,33 @@ pub fn decode_udp(datagram: &[u8]) -> Option<(SocketAddr, &[u8])> {
     }
     read_addr(*atyp, rest)
 }
+
+/// Frames `payload` for the host name `host` and port as a SOCKS5 UDP request
+/// (`RSV RSV FRAG=0 ATYP=3 DST.ADDR DST.PORT DATA`), replacing `out`'s
+/// contents, so the proxy resolves the name (RFC 1928, section 7).
+///
+/// The name is checked before anything is written: 1 to 255 bytes of
+/// `[A-Za-z0-9._-]` (an internationalised name must be given in its punycode
+/// `xn--` form), else [`ProxyError::Protocol`] and `out` is left as it was.
+pub fn encode_udp_host(
+    host: &str,
+    port: u16,
+    payload: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), ProxyError> {
+    let Ok(len) = u8::try_from(host.len()) else {
+        return Err(ProxyError::Protocol(
+            "SOCKS5 host name longer than 255 bytes",
+        ));
+    };
+    if len == 0 || !host.bytes().all(super::is_host_byte) {
+        return Err(ProxyError::Protocol("invalid target host name"));
+    }
+    out.clear();
+    out.reserve(4 + 1 + host.len() + 2 + payload.len());
+    out.extend_from_slice(&[0, 0, 0, ATYP_DOMAIN, len]);
+    out.extend_from_slice(host.as_bytes());
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(payload);
+    Ok(())
+}

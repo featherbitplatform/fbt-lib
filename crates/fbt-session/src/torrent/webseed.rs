@@ -49,6 +49,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use fbt_bencode::{Limits, decode_with};
+use fbt_core::audit;
 use fbt_core::{BlockRef, FileLayout, MAX_DISPLAY_CHARS, PieceLayout, display_safe};
 use fbt_metainfo::Metainfo;
 use fbt_net::addr::is_internal;
@@ -429,9 +430,15 @@ impl SeedOrigin {
     /// A name is judged only where it can be: through a proxy that resolves names the origin
     /// counts as public unless its URL spells an internal address, because the proxy is what
     /// decides where that name goes. A lookup that fails or comes back late counts as public too
-    /// — the seed's redirects stay guarded — rather than trusting a redirect inward to a resolver
+    /// (the seed's redirects stay guarded) rather than trusting a redirect inward to a resolver
     /// that said nothing; such a fetch fails on the same resolver anyway.
-    async fn allows_internal(&self) -> bool {
+    ///
+    /// A client whose stack was replaced resolves nothing here either: `tracker` is refused
+    /// ([`TrackerClient::is_closed`], the flag its connector reads before it resolves or dials),
+    /// so a fetch spawned before a change cannot look its host up locally after the closed stack
+    /// is installed: the dial it would lead to is refused by that same flag (M2). The origin
+    /// then gets the guarded verdict, as one nobody can place gets.
+    async fn allows_internal(&self, tracker: &TrackerClient) -> bool {
         if let Some(known) = self.known {
             return known;
         }
@@ -445,21 +452,30 @@ impl SeedOrigin {
         if self.proxy_resolves_names {
             return false;
         }
-        let first =
-            match tokio::time::timeout(self.dns_timeout, tokio::net::lookup_host((host, port)))
-                .await
-            {
-                // The first address of the answer: the one the fetch itself dials.
-                Ok(Ok(found)) => found.take(1).next().map(|a| a.ip()),
-                Ok(Err(e)) => {
-                    debug!(url = %self.url, error = %e, "web seed host did not resolve");
-                    None
-                }
-                Err(_) => {
-                    debug!(url = %self.url, "web seed host did not resolve in time");
-                    None
-                }
-            };
+        if tracker.is_closed() {
+            // The stack this fetch belongs to is gone: nothing may be
+            // resolved on this host any more (M2).
+            return false;
+        }
+        let first = match tokio::time::timeout(self.dns_timeout, {
+            // The origin's own host, resolved here only when the proxy
+            // does not: recorded where it leaves the host.
+            audit::record(audit::Outbound::Lookup(host.to_owned()));
+            tokio::net::lookup_host((host, port))
+        })
+        .await
+        {
+            // The first address of the answer: the one the fetch itself dials.
+            Ok(Ok(found)) => found.take(1).next().map(|a| a.ip()),
+            Ok(Err(e)) => {
+                debug!(url = %self.url, error = %e, "web seed host did not resolve");
+                None
+            }
+            Err(_) => {
+                debug!(url = %self.url, "web seed host did not resolve in time");
+                None
+            }
+        };
         let Some(first) = first else {
             // Fail closed: an origin nobody can place gets the guard a public origin gets.
             return false;
@@ -704,7 +720,14 @@ impl Actor {
     /// nothing to fetch or no room for it.
     fn start_web_seed(&mut self, key: PeerKey) -> bool {
         let generation = self.generation;
-        let tracker = self.shared.tracker.clone();
+        // One read of the stack, and nothing at all on a closed one (a
+        // change in flight): a request started now would take the closed
+        // stack's no-proxy default and look the seed's name up locally.
+        let stack = self.shared.net();
+        if stack.closed {
+            return false;
+        }
+        let tracker = stack.tracker.clone();
         let pace = self.web_seed_throttle.clone();
         let limit = pace.min_rate();
         let Some(l) = self.loaded.as_mut() else {
@@ -803,14 +826,17 @@ impl Actor {
         let origin = SeedOrigin {
             url: seed.url.clone(),
             treat_loopback_as_public: settings.web_seed_treat_loopback_as_public,
-            proxy_resolves_names: names_go_to_the_proxy(&settings.proxy),
+            proxy_resolves_names: names_go_to_the_proxy(&stack.net.proxy),
             dns_timeout: settings.tracker.http_timeout,
             known: seed.allow_internal,
         };
         debug!(url = %seed.url, first = blocks.first().map(|b| b.piece), bytes = total, "web seed request");
         self.jobs.spawn(async move {
-            // Off the actor loop, and once per failure cycle: a cached verdict asks nothing.
-            let allow_internal = origin.allows_internal().await;
+            // Off the actor loop, and once per failure cycle: a cached verdict
+            // asks nothing. The client goes in whole: it is what says whether
+            // this fetch's stack was replaced, so nothing is resolved on one
+            // that is gone (M2).
+            let allow_internal = origin.allows_internal(&tracker).await;
             let result = tokio::select! {
                 r = fetch(tracker, pace, allow_internal, parts, total, cuts) => r,
                 _ = cancel_rx => Err(FetchError::cancelled()),
@@ -1188,8 +1214,8 @@ mod tests {
 
     /// Only a public origin has its redirects guarded: a loopback seed is a LAN seed and may stay
     /// on one, which is what the hidden hook flips so a test can ask about the guard at all. The
-    /// address decides — spelled as a literal or resolved from a name, `localhost` exactly as
-    /// `127.0.0.1`. Through a proxy that resolves names nothing is looked up locally, so only a
+    /// address decides (spelled as a literal or resolved from a name, `localhost` exactly as
+    /// `127.0.0.1`). Through a proxy that resolves names nothing is looked up locally, so only a
     /// literal says where the seed is and a named origin is guarded; and a verdict another run
     /// already reached is used without asking anything at all.
     #[tokio::test]
@@ -1201,27 +1227,38 @@ mod tests {
             dns_timeout: Duration::from_secs(10),
             known: None,
         };
-        assert!(origin("http://127.0.0.1:1/", false).allows_internal().await);
-        assert!(!origin("http://127.0.0.1:1/", true).allows_internal().await);
-        assert!(!origin("http://[::1]:1/", true).allows_internal().await);
+        let live = TrackerClient::new(fbt_tracker::TrackerConfig::default()).unwrap();
         assert!(
-            !origin("http://localhost:1/", true).allows_internal().await,
+            origin("http://127.0.0.1:1/", false)
+                .allows_internal(&live)
+                .await
+        );
+        assert!(
+            !origin("http://127.0.0.1:1/", true)
+                .allows_internal(&live)
+                .await
+        );
+        assert!(!origin("http://[::1]:1/", true).allows_internal(&live).await);
+        assert!(
+            !origin("http://localhost:1/", true)
+                .allows_internal(&live)
+                .await,
             "localhost resolves to loopback here"
         );
         // Nothing to resolve: the fetch itself fails, so nothing to guard.
-        assert!(origin("ftp://host/", false).allows_internal().await);
+        assert!(origin("ftp://host/", false).allows_internal(&live).await);
 
         let proxied = |url: &str| SeedOrigin {
             proxy_resolves_names: true,
             ..origin(url, false)
         };
         assert!(
-            proxied("http://127.0.0.1:1/").allows_internal().await,
+            proxied("http://127.0.0.1:1/").allows_internal(&live).await,
             "a loopback seed stays a LAN seed through a proxy that resolves names"
         );
         assert!(
             !proxied("http://seed.internal.test:1/")
-                .allows_internal()
+                .allows_internal(&live)
                 .await,
             "nobody here can say where that name lands, so its redirects are guarded"
         );
@@ -1230,8 +1267,48 @@ mod tests {
             known: Some(verdict),
             ..origin("http://127.0.0.1:1/", true)
         };
-        assert!(cached(true).allows_internal().await);
-        assert!(!cached(false).allows_internal().await);
+        assert!(cached(true).allows_internal(&live).await);
+        assert!(!cached(false).allows_internal(&live).await);
+    }
+
+    /// A fetch started before a change must not resolve its host on a stack
+    /// that was replaced meanwhile: the flag the client's own connector reads
+    /// before it resolves or dials refuses the lookup here too, so a seed by
+    /// name is judged without a local lookup (and the request itself is
+    /// refused by that same flag) (M2). The hidden hook makes the origin a
+    /// public one, so its verdict is the guarded one either way: what the test
+    /// reads is the lookup the audit records, and `localhost` is the name it
+    /// would resolve.
+    #[tokio::test]
+    async fn a_replaced_stack_resolves_no_seed_host() {
+        let tracker = TrackerClient::new(fbt_tracker::TrackerConfig::default()).unwrap();
+        let origin = SeedOrigin {
+            url: "http://localhost:1/file".to_owned(),
+            treat_loopback_as_public: true,
+            proxy_resolves_names: false,
+            dns_timeout: Duration::from_secs(10),
+            known: None,
+        };
+        // Live: the lookup runs, and the audit records the name.
+        let cap = fbt_core::audit::capture();
+        assert!(!origin.allows_internal(&tracker).await);
+        assert!(
+            cap.take()
+                .iter()
+                .any(|o| matches!(o, fbt_core::audit::Outbound::Lookup(h) if h == "localhost")),
+            "the live origin did not resolve its host"
+        );
+        // Replaced: nothing is resolved at all, and the verdict fails closed.
+        tracker.close();
+        assert!(tracker.is_closed());
+        assert!(
+            !origin.allows_internal(&tracker).await,
+            "a replaced stack's origin is not guarded"
+        );
+        assert!(
+            cap.take().is_empty(),
+            "a replaced stack resolved the seed's host"
+        );
     }
 
     /// Who resolves web-seed host names, which is what decides whether their addresses can be
@@ -1400,6 +1477,32 @@ mod tests {
             Metainfo::from_bytes(&encode(&root.build())).unwrap(),
             payload,
         )
+    }
+
+    /// A web seed added while the network stack is closed (a change in
+    /// flight) starts nothing: no request, and so no local lookup of its
+    /// name.
+    #[tokio::test]
+    async fn no_web_seed_lookup_while_closed() {
+        let (meta, payload) = torrent(64 * 1024, 16 * 1024);
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::MemStorage::new(payload.len() as u64));
+        let mut actor = crate::torrent::data::tests::test_actor(meta, storage, 64 << 20);
+        actor
+            .shared
+            .set_net(Arc::new(crate::netstack::NetStack::closed(2)));
+        // A name only this host can resolve: asking for it would be a
+        // local lookup, which a closed stack must not cause.
+        actor
+            .add_web_seed("http://localhost:1/x/".to_owned())
+            .unwrap();
+        assert!(
+            matches!(actor.web_seeds.seeds[0].state, SeedState::Idle),
+            "a request was started while the stack was closed: {:?}",
+            actor.web_seeds.seeds[0].state
+        );
+        assert_eq!(actor.web_seeds.seeds[0].request, 0, "a request was made");
+        crate::torrent::actor::EMITTED.take();
     }
 
     /// A seed retired with a request in flight and revived at once: the

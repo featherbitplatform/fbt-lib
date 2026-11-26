@@ -120,11 +120,12 @@ impl Actor {
         let n = layout.num_pieces();
         self.leave_public_discovery();
         let keys: Vec<PeerKey> = self.peers.keys().copied().collect();
+        let stack = self.shared.net();
         for key in keys {
             let Some(addr) = self.peers.get(&key).map(|p| p.addr) else {
                 continue;
             };
-            let ext = self.ext_config(&addr);
+            let ext = self.ext_config(&stack, &addr);
             if let Some(p) = self.peers.get_mut(&key) {
                 p.bits = Bitfield::new(n);
                 p.fast_has = None;

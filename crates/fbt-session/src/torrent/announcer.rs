@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use fbt_core::InfoHashes;
-use fbt_tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerClient, TrackerError};
+use fbt_tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, TrackerError};
 use rand::RngExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -266,7 +266,6 @@ pub(super) fn spawn(p: Params) -> Option<(Announcer, mpsc::Receiver<Vec<SocketAd
                 info_hash,
                 scrapes: info_hash == scrape_hash,
                 key,
-                client: p.shared.tracker.clone(),
                 tiers: tiers.clone(),
                 shared: Arc::clone(&p.shared),
                 status: p.status.clone(),
@@ -291,12 +290,17 @@ enum Walk {
     Failed,
     /// Every tracker was dropped as unusable.
     NoTrackers,
+    /// The network stack changed mid-walk: the walk stops before its next
+    /// request, which would go through the stack it started on.
+    Abandoned,
 }
 
 /// What the announcer was told while waiting or announcing.
 enum Interrupt {
     /// `running`, `starts` or `exit` changed: re-plan now.
     Lifecycle,
+    /// The network stack changed: the walk went with the stack it read.
+    NetworkChanged,
     /// Every sender is gone.
     Closed,
 }
@@ -310,7 +314,6 @@ struct Task {
     /// wire hash.
     scrapes: bool,
     key: u32,
-    client: TrackerClient,
     tiers: Tiers,
     shared: Arc<Shared>,
     status: watch::Receiver<TorrentStatus>,
@@ -338,49 +341,63 @@ impl Drop for ScrapeTask {
 
 /// Scrapes each of `urls` for `info_hash` in parallel and reports each
 /// outcome as [`Event::ScrapeReply`] or [`Event::ScrapeFailed`]. Scrape
-/// errors never drop a tracker.
+/// errors never drop a tracker. The stack is read for each URL (and its
+/// generation recorded): a change of stack abandons the scrape before its
+/// next request, and the requests already out go with it.
 fn start_scrape(
-    client: &TrackerClient,
     shared: &Arc<Shared>,
     ih: InfoHashes,
     info_hash: [u8; 20],
     urls: Vec<String>,
 ) -> ScrapeTask {
-    let client = client.clone();
     let shared = Arc::clone(shared);
     ScrapeTask(tokio::spawn(async move {
+        let generation = shared.net().generation;
+        let mut net_changed = shared.net_changed();
         let mut set = JoinSet::new();
         for url in urls {
-            let client = client.clone();
+            let stack = shared.net();
+            if stack.generation != generation {
+                return;
+            }
+            let client = stack.tracker.clone();
             set.spawn(async move {
                 let r = client.scrape(&url, &[info_hash]).await;
                 (url, r)
             });
         }
-        while let Some(joined) = set.join_next().await {
-            let Ok((url, r)) = joined else { continue };
-            let found = r.map(|infos| infos.into_iter().find(|i| i.info_hash == info_hash));
-            match found {
-                Ok(Some(info)) => shared.emit(Event::ScrapeReply {
-                    torrent: ih,
-                    url,
-                    complete: info.complete,
-                    incomplete: info.incomplete,
-                    downloaded: info.downloaded,
-                }),
-                Ok(None) => shared.emit(Event::ScrapeFailed {
-                    torrent: ih,
-                    url,
-                    message: "the scrape reply left the torrent out".to_owned(),
-                }),
-                Err(e) => {
-                    debug!(%url, error = %e, "scrape failed");
-                    shared.emit(Event::ScrapeFailed {
-                        torrent: ih,
-                        url,
-                        message: e.to_string(),
-                    });
+        loop {
+            tokio::select! {
+                joined = set.join_next() => {
+                    let Some(joined) = joined else { return };
+                    let Ok((url, r)) = joined else { continue };
+                    let found = r.map(|infos| infos.into_iter().find(|i| i.info_hash == info_hash));
+                    match found {
+                        Ok(Some(info)) => shared.emit(Event::ScrapeReply {
+                            torrent: ih,
+                            url,
+                            complete: info.complete,
+                            incomplete: info.incomplete,
+                            downloaded: info.downloaded,
+                        }),
+                        Ok(None) => shared.emit(Event::ScrapeFailed {
+                            torrent: ih,
+                            url,
+                            message: "the scrape reply left the torrent out".to_owned(),
+                        }),
+                        Err(e) => {
+                            debug!(%url, error = %e, "scrape failed");
+                            shared.emit(Event::ScrapeFailed {
+                                torrent: ih,
+                                url,
+                                message: e.to_string(),
+                            });
+                        }
+                    }
                 }
+                // A change of stack abandons the scrape; the set aborts the
+                // requests still out.
+                _ = net_changed.changed() => return,
             }
         }
     }))
@@ -413,13 +430,11 @@ impl Task {
             if self.scrapes && !sig.exit && sig.scrapes != self.scrapes_seen {
                 self.scrapes_seen = sig.scrapes;
                 let urls = self.tiers.firsts();
-                self.scrape = Some(start_scrape(
-                    &self.client,
-                    &self.shared,
-                    self.ih,
-                    self.info_hash,
-                    urls,
-                ));
+                // The stack is read for each request (and its generation
+                // recorded): a stack change replaces it whole (with its
+                // connection pool and its proxy), so a request is never sent
+                // through a stack the session no longer has.
+                self.scrape = Some(start_scrape(&self.shared, self.ih, self.info_hash, urls));
             }
             if sig.exit || !sig.running {
                 self.publish_next(None);
@@ -448,7 +463,9 @@ impl Task {
             if due > now {
                 match self.wait_lifecycle(Some(due)).await {
                     Interrupt::Closed => return,
-                    Interrupt::Lifecycle => continue,
+                    // `wait_lifecycle` waits on the lifecycle signals only,
+                    // never on the network stack.
+                    Interrupt::Lifecycle | Interrupt::NetworkChanged => continue,
                 }
             }
             if event == AnnounceEvent::Completed {
@@ -462,6 +479,16 @@ impl Task {
             {
                 Err(Interrupt::Closed) => return,
                 Err(Interrupt::Lifecycle) => continue,
+                // The stack changed under the walk. If the session is
+                // between stacks, wait for the next one before walking
+                // again: the closed client fails at once, and its errors are
+                // not the trackers'.
+                Err(Interrupt::NetworkChanged) | Ok(Walk::Abandoned) => {
+                    if matches!(self.wait_for_net_change().await, Interrupt::Closed) {
+                        return;
+                    }
+                    continue;
+                }
                 Ok(Walk::NoTrackers) => {
                     self.publish_next(None);
                     // Nothing left to announce to; wait for the end.
@@ -535,6 +562,37 @@ impl Task {
         }
     }
 
+    /// Waits for the next network stack (or for the torrent or the session
+    /// to end) while the closed stack of a change in flight is installed.
+    /// The stack is read after subscribing, so a change that lands in
+    /// between is still seen.
+    async fn wait_for_net_change(&mut self) -> Interrupt {
+        loop {
+            let mut net_changed = self.shared.net_changed();
+            if !self.shared.net().closed {
+                return Interrupt::Lifecycle;
+            }
+            tokio::select! {
+                r = self.signals.changed() => {
+                    if r.is_err() {
+                        return Interrupt::Closed;
+                    }
+                    let sig = self.signals.borrow_and_update().clone();
+                    // Stopped or going away: the run loop handles it.
+                    if sig.exit || !sig.running {
+                        return Interrupt::Lifecycle;
+                    }
+                    // Anything else: keep waiting for the new stack.
+                }
+                r = net_changed.changed() => {
+                    if r.is_err() {
+                        return Interrupt::Closed;
+                    }
+                }
+            }
+        }
+    }
+
     /// Walks the tiers, abandoning the walk if the torrent stops or starts
     /// over meanwhile. Other signal changes are handled after the walk.
     async fn walk_interruptible(
@@ -545,11 +603,14 @@ impl Task {
     ) -> Result<Walk, Interrupt> {
         let before = self.signals.borrow_and_update().clone();
         let mut signals = self.signals.clone();
+        // A change of network stack abandons the walk: it would otherwise
+        // keep its client, and send the next request through the stack it
+        // started on.
+        let mut net_changed = self.shared.net_changed();
         let req = self.request_template(event, checking_left);
         // Where a scrape asked for during the walk goes.
         let scrape_urls = self.tiers.firsts();
         let walk = walk(
-            &self.client,
             &mut self.tiers,
             req,
             started_urls,
@@ -589,7 +650,6 @@ impl Task {
                     if self.scrapes && now.scrapes != self.scrapes_seen {
                         self.scrapes_seen = now.scrapes;
                         self.scrape = Some(start_scrape(
-                            &self.client,
                             &self.shared,
                             self.ih,
                             self.info_hash,
@@ -597,6 +657,7 @@ impl Task {
                         ));
                     }
                 }
+                _ = net_changed.changed() => return Err(Interrupt::NetworkChanged),
             }
         }
     }
@@ -606,13 +667,14 @@ impl Task {
     /// is [`NO_METADATA_LEFT`], `stopped` included.
     fn request_template(&self, event: AnnounceEvent, checking_left: u64) -> AnnounceRequest {
         let st = self.status.borrow();
+        let stack = self.shared.net();
         let left = announce_left(&st, checking_left);
         AnnounceRequest {
             info_hash: self.info_hash,
             peer_id: self.shared.peer_id,
-            port: self.shared.listen_port,
-            port_v4: self.shared.listen_port_v4,
-            port_v6: self.shared.listen_port_v6,
+            port: stack.listen_port,
+            port_v4: stack.listen_port_v4,
+            port_v6: stack.listen_port_v6,
             uploaded: st.total_uploaded,
             downloaded: st.total_downloaded,
             left,
@@ -628,12 +690,17 @@ impl Task {
     /// never retried.
     async fn stopped(&mut self, urls: &HashSet<String>, left: u64) {
         let base = self.request_template(AnnounceEvent::Stopped, left);
+        // A change of network stack abandons the stop: its cloned client
+        // would otherwise keep the old pool (and the request in flight) alive
+        // and finish it through the stack it started on. Subscribed before
+        // the stack is read, so a change that lands in between is still seen.
+        let mut net_changed = self.shared.net_changed();
         let mut set = JoinSet::new();
         let mut ids = HashMap::new();
         for url in urls {
             let mut req = request_for(url, &base, &self.tracker_ids);
             req.num_want = Some(0);
-            let client = self.client.clone();
+            let client = self.shared.net().tracker.clone();
             let task_url = url.clone();
             let handle = set.spawn(async move {
                 let r = client.announce(&task_url, &req).await;
@@ -643,7 +710,19 @@ impl Task {
         }
         let mut pending = urls.clone();
         let deadline = Instant::now() + STOPPED_TIMEOUT;
-        while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, set.join_next()).await {
+        loop {
+            let joined = tokio::select! {
+                joined = tokio::time::timeout_at(deadline, set.join_next()) => joined,
+                _ = net_changed.changed() => {
+                    // The stack changed: the requests still out go with the
+                    // set (aborted), so none of them reports a timeout it
+                    // did not have.
+                    return;
+                }
+            };
+            let Ok(Some(joined)) = joined else {
+                break;
+            };
             let (url, r) = match joined {
                 Ok(done) => done,
                 Err(e) => {
@@ -794,9 +873,11 @@ struct Report<'a> {
 }
 
 /// One walk through the tiers from the first URL until a tracker answers or
-/// every one has failed. Each tracker is sent [`event_for`] it.
+/// every one has failed. Each tracker is sent [`event_for`] it. The stack is
+/// read for each request and its generation recorded: when it is not the
+/// one the walk started on (a change installed another, a closed one first),
+/// the walk stops before the request, which would go through the old stack.
 async fn walk(
-    client: &TrackerClient,
     tiers: &mut Tiers,
     req: AnnounceRequest,
     started_urls: &HashSet<String>,
@@ -805,10 +886,16 @@ async fn walk(
 ) -> Walk {
     let Report { shared, table, ih } = report;
     tiers.restart();
+    let generation = shared.net().generation;
     loop {
         let Some(url) = tiers.current().map(str::to_owned) else {
             return Walk::NoTrackers;
         };
+        let stack = shared.net();
+        if stack.generation != generation {
+            return Walk::Abandoned;
+        }
+        let client = stack.tracker.clone();
         let mut req = request_for(&url, &req, tracker_ids);
         req.event = event_for(&url, req.event, started_urls);
         match client.announce(&url, &req).await {
