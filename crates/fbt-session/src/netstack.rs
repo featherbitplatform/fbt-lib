@@ -12,6 +12,17 @@
 //! The order is the safety guarantee: the closed stack is installed before the
 //! old one is torn down, so no dial started before or during a change can
 //! reach the network on a stack that no longer matches the settings.
+//!
+//! Tearing the old stack down stops its two outbound engines synchronously,
+//! before anything awaits: the tracker client refuses every later resolve and
+//! dial, and the DHT halts its sending, so no outbound datagram or name leaves
+//! the old stack after the change began. LSD and the port mapper are the
+//! documented exceptions: their shutdown runs last, after the new stack is in
+//! place. They talk only to the local network (multicast on the LAN, UPnP and
+//! NAT-PMP to the router) and their shutdown **removes the state the session
+//! itself created there** (the port mappings and the LSD announces), so it is
+//! deliberately not skipped: leaving a mapping behind would keep the router
+//! forwarding to a session that no longer listens, under any proxy.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -313,15 +324,30 @@ impl NetStack {
     /// this stack's own address) and finally LSD, port mapping and the UDP
     /// sockets under them. Waiting for the tasks is what frees the listen
     /// ports for the next stack to bind again.
+    ///
+    /// The first two calls are synchronous and stop the two things that
+    /// would otherwise send out of a replaced stack: the tracker client
+    /// refuses every later resolve and dial, and the DHT halts its sending
+    /// before anything here awaits, so no DHT datagram leaves after the
+    /// change begins even though the node keeps answering commands (its
+    /// state is taken and it is stopped further down, both of which await).
     pub(crate) async fn shutdown(&self) -> Option<Vec<u8>> {
         // Nothing in flight on this stack may resolve or dial once it is
         // being replaced: hyper-util's connection pool finishes a losing
         // connect in a task the session's handles cannot abort, so the
         // tracker client refuses before resolving or dialling instead (N3).
         self.tracker.close();
+        // Nothing may be sent from this stack's own address either, and the
+        // awaits below (the tasks, then the state) would let the DHT keep
+        // querying: its sending stops here, synchronously, before the first
+        // of them (M1).
+        if let Some(dht) = &self.dht {
+            dht.halt_sending();
+        }
         self.stop_tasks().await;
-        // The DHT's state goes with us; the DHT itself stops at once, so
-        // nothing keeps querying directly through the change.
+        // The DHT's state goes with us; the node keeps running until the
+        // `shutdown` below (its sending is already halted), so the state is
+        // the one of the moment the change began.
         let dht_state = match &self.dht {
             Some(dht) => dht.state().await.ok().map(|s| s.to_bytes()),
             None => None,
@@ -350,8 +376,13 @@ impl NetStack {
     /// sockets at once.
     pub(crate) fn abort(&self) {
         // As in `shutdown`: a losing connect of the pool must not resolve or
-        // dial after this stack is gone (N3).
+        // dial after this stack is gone (N3), and the DHT sends nothing more
+        // (M1): its node lives on until its handle is dropped, and its
+        // sockets are closed just below.
         self.tracker.close();
+        if let Some(dht) = &self.dht {
+            dht.halt_sending();
+        }
         let _ = self.stop.send(true);
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
         for t in tasks {
@@ -442,5 +473,109 @@ impl NetStack {
             tasks: Mutex::new(Vec::new()),
             stop: watch::channel(false).0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    use fbt_core::audit::{self, Outbound};
+
+    /// A direct stack with the DHT on, on a loopback listener, with no LSD,
+    /// UPnP, NAT-PMP or bootstrap node (nothing here leaves the host, and the
+    /// node starts with an empty routing table).
+    async fn stack_with_dht() -> NetStack {
+        let settings = Settings {
+            listen_addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
+            dht_enabled: true,
+            dht_bootstrap_nodes: Vec::new(),
+            enable_lsd: false,
+            enable_upnp: false,
+            enable_natpmp: false,
+            ..Settings::default()
+        };
+        let net = settings.network();
+        NetStack::build(&settings, &net, &settings.listen_addrs, None, 1, None)
+            .await
+            .expect("the stack")
+    }
+
+    /// The addresses `flood` pings, so a test can look for datagrams to them.
+    fn flood_addrs() -> Vec<SocketAddr> {
+        (0..FLOOD)
+            .map(|i| SocketAddr::from((Ipv4Addr::LOCALHOST, 30_000 + u16::try_from(i).unwrap())))
+            .collect()
+    }
+
+    /// How many `add_node` pings the flood queues: the node's command channel
+    /// (256) filled in one synchronous loop, so the actor has them all to work
+    /// through when it next runs.
+    const FLOOD: usize = 256;
+
+    /// Queues one `add_node` per flooded address, without awaiting: on a
+    /// current-thread runtime the node's actor cannot run until the next await,
+    /// so the whole queue is still pending when the caller goes on.
+    fn flood(dht: &Dht) {
+        for addr in flood_addrs() {
+            dht.add_node(addr);
+        }
+    }
+
+    /// Whether `recs` holds a datagram to any flooded address.
+    fn pinged(recs: &[Outbound]) -> bool {
+        let flooded = flood_addrs();
+        recs.iter().any(|o| match o {
+            Outbound::UdpSend(addr) => flooded.contains(addr),
+            _ => false,
+        })
+    }
+
+    /// The control for the test below: the same flood, with the stack staying
+    /// up, does send those pings, so an absence there is the halt and not a
+    /// fixture that never sends anything.
+    #[tokio::test]
+    async fn the_flood_sends_while_the_stack_is_up() {
+        let cap = audit::capture();
+        let stack = stack_with_dht().await;
+        let dht = stack.dht.as_ref().expect("the stack runs a DHT").clone();
+        flood(&dht);
+        // Let the actor work through the queue (a yield is enough for it to be
+        // polled, and the sleep gives it the whole time it needs).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let recs = cap.take();
+        assert!(pinged(&recs), "the flood sent nothing: {:?}", recs.len());
+        stack.shutdown().await;
+    }
+
+    /// A stack that is being replaced sends no DHT datagram once its shutdown
+    /// begins, whatever the node still has queued (M1): the sending is halted
+    /// before the first await, so the pings the flood left in the command
+    /// channel (which the actor works through while the shutdown waits for the
+    /// state) never reach the socket. Stopping the node only later, or reading
+    /// its state first, would let them out of a stack that is already gone.
+    #[tokio::test]
+    async fn a_shutdown_sends_no_dht_datagram_after_it_begins() {
+        let cap = audit::capture();
+        let stack = stack_with_dht().await;
+        let dht = stack.dht.as_ref().expect("the stack runs a DHT").clone();
+        flood(&dht);
+        // Nothing has run yet: the queue is full and no ping has left.
+        let _ = cap.take();
+        let state = stack.shutdown().await;
+        let recs = cap.take();
+        assert!(
+            !pinged(&recs),
+            "a DHT datagram left the replaced stack: {:?}",
+            recs.iter()
+                .filter(|o| matches!(o, Outbound::UdpSend(_)))
+                .count()
+        );
+        assert!(dht.sending_halted(), "the node's sending was not halted");
+        assert!(
+            state.is_some(),
+            "the DHT state was not taken for the next stack"
+        );
     }
 }

@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fbt_core::audit;
@@ -342,6 +343,9 @@ pub struct Dht {
     tx: mpsc::Sender<Cmd>,
     stats: watch::Receiver<DhtStats>,
     local: Arc<[SocketAddr]>,
+    /// Once set, the node sends no datagram at all (see
+    /// [`halt_sending`](Dht::halt_sending)); shared with the actor.
+    sending: Arc<AtomicBool>,
 }
 
 /// Votes on our external address from the `ip` field of answers (BEP 42).
@@ -634,12 +638,14 @@ impl Dht {
             ..DhtStats::default()
         };
         let (stats_tx, stats_rx) = watch::channel(stats);
+        let sending = Arc::new(AtomicBool::new(false));
         let actor = Actor::new(
             cfg,
             send_v4,
             send_v6,
             tx.downgrade(),
             stats_tx,
+            Arc::clone(&sending),
             Instant::now(),
         );
         tokio::spawn(actor.run(cmd_rx, inbound));
@@ -647,6 +653,7 @@ impl Dht {
             tx,
             stats: stats_rx,
             local: local.into(),
+            sending,
         }
     }
 
@@ -658,6 +665,24 @@ impl Dht {
     /// Pings `addr` and adds it to the routing table if it answers.
     pub fn add_node(&self, addr: SocketAddr) {
         let _ = self.tx.try_send(Cmd::AddNode(addr));
+    }
+
+    /// Stops the node's sending at once, without waiting for anything: from
+    /// this call on it sends no datagram at all (queries, answers, pings),
+    /// queued work included, and a query it would have sent fails locally.
+    /// The node itself keeps running, so [`state`](Dht::state) and
+    /// [`shutdown`](Dht::shutdown) still work. That is what a session needs
+    /// when it replaces the network stack its DHT sends over: the state of
+    /// the moment can be taken and the node stopped without a datagram
+    /// leaving the old socket in between, whatever the node had queued.
+    /// One way only: this never resumes.
+    pub fn halt_sending(&self) {
+        self.sending.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether sending was halted ([`halt_sending`](Dht::halt_sending)).
+    pub fn sending_halted(&self) -> bool {
+        self.sending.load(Ordering::SeqCst)
     }
 
     /// The latest published stats. They are published when they change, at
@@ -1048,6 +1073,10 @@ struct Actor {
     ext_v4: ExternalIpVotes,
     ext_v6: ExternalIpVotes,
     rng: StdRng,
+    /// Set by [`Dht::halt_sending`]: while it is set, [`send`](Actor::send)
+    /// drops every datagram, so nothing leaves the socket the node sends
+    /// over, however much work it still has queued.
+    sending: Arc<AtomicBool>,
 
     pending: HashMap<u16, Pending>,
     /// (deadline, tid) in send order; all queries share one timeout, so
@@ -1121,6 +1150,7 @@ impl Actor {
         sock_v6: Option<Arc<dyn DatagramSender>>,
         link: mpsc::WeakSender<Cmd>,
         stats_tx: watch::Sender<DhtStats>,
+        sending: Arc<AtomicBool>,
         now: Instant,
     ) -> Actor {
         let mut rng: StdRng = rand::make_rng();
@@ -1169,6 +1199,7 @@ impl Actor {
             ext_v4: ExternalIpVotes::new(),
             ext_v6: ExternalIpVotes::new(),
             rng,
+            sending,
             pending: HashMap::new(),
             timeouts: VecDeque::new(),
             pinging: HashSet::new(),
@@ -1292,8 +1323,13 @@ impl Actor {
         self.tables().any(|t| t.len() >= K)
     }
 
-    /// Sends one datagram; `false` when it did not leave this host.
+    /// Sends one datagram; `false` when it did not leave this host (or when
+    /// sending was halted: then nothing reaches the socket at all, queued
+    /// work included).
     fn send(&self, to: SocketAddr, bytes: &[u8]) -> bool {
+        if self.sending.load(Ordering::SeqCst) {
+            return false;
+        }
         let sock = if to.is_ipv4() {
             &self.sock_v4
         } else {
@@ -2675,7 +2711,15 @@ mod tests {
         let stats = watch::channel(DhtStats::default()).0;
         let local = s.local_addr().unwrap();
         let s: Arc<dyn DatagramSender> = Arc::new(StdSender { sock: s, local });
-        let a = Actor::new(c, Some(s), None, tx.downgrade(), stats, Instant::now());
+        let a = Actor::new(
+            c,
+            Some(s),
+            None,
+            tx.downgrade(),
+            stats,
+            Arc::new(AtomicBool::new(false)),
+            Instant::now(),
+        );
         (a, tx)
     }
 
