@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-26
+
 ### Added
 
 - `fbt-session`: the proxy and the network switches change at runtime, without a restart. `NetworkSettings` (also re-exported by `fbt`) holds the proxy and exactly the switches that decide whether traffic goes through it; `Session::network_settings` reads what was set and the async `Session::set_network_settings` replaces it while the session runs, with `Settings::network` and `Settings::set_network` converting to and from the flat fields. `NetworkSettings::effective` returns the settings the session actually runs with (the proxy's own rules applied), so `network_settings` reports what the caller set while the session binds, listens and announces as the effective value says. A change rebinds the listeners and UDP sockets on the same ports and, with a different proxy, closes every peer connection, web seed request and tracker request of the old stack with the new `DisconnectReason::NetworkChanged`. ([#46](https://github.com/featherbitplatform/fbt-lib/pull/46))
@@ -373,6 +375,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Security CI: semgrep, cargo-deny, grype and gitleaks (`.github/workflows/security.yml`, `dev/sast.sh`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 - Release workflow: tag check against the workspace version, CycloneDX SBOM and a GitHub release with the changelog section (`.github/workflows/release.yml`) ([#1](https://github.com/featherbitplatform/fbt-lib/pull/1))
 
+[0.13.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.13.0
 [0.12.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.12.0
 [0.11.1]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.11.1
 [0.11.0]: https://github.com/featherbitplatform/fbt-lib/releases/tag/v0.11.0
