@@ -1067,7 +1067,9 @@ mod tests {
     ///
     /// Runs on a paused clock: the 250 ms stagger cannot fire before the replacement on a
     /// stalled machine, and the wait loop below advances the clock a fixed step at a time.
-    /// No real dial ever completes, so the paused clock needs no real I/O to end the test.
+    /// No dial is ever issued: the parked attempt is refused at its own check and the second
+    /// address is never started. The accept timeout is a virtual timer the paused clock
+    /// elapses by auto-advance, and the audit assertion carries the check.
     #[tokio::test(start_paused = true)]
     async fn a_second_address_is_not_dialled_once_the_stack_is_replaced() {
         let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
@@ -1209,7 +1211,8 @@ mod tests {
     ///
     /// Runs on a paused clock: the 250 ms stagger cannot fire before the replacement on a
     /// stalled machine, and the wait loop below advances the clock a fixed step at a time.
-    /// No real dial ever completes, so the paused clock needs no real I/O to end the test.
+    /// No dial is ever issued: the parked attempt is refused at its own check and the second
+    /// address is never started, and the audit assertion carries the check.
     #[tokio::test(start_paused = true)]
     async fn a_replacement_while_the_first_attempt_hangs_starts_no_further_attempt() {
         // Dead loopback addresses: nothing listens, so a dial that does run cannot connect.
@@ -1268,14 +1271,15 @@ mod tests {
     /// not dial the next address once the stack it belongs to is replaced (N1). The attempt is
     /// held at a hang gate *after* the check and the record (see [`hang_connect`]), so the
     /// switch lands in the only gap the dial gates cannot cover: while an attempt is inside its
-    /// connect, with the stagger still owing the next address. The gate is released before the
-    /// dial is awaited, and the release fails the attempt, so no packet leaves the machine
-    /// (N2) and the dial ends in an error either way.
+    /// connect, with the stagger still owing the next address. The second attempt is proved
+    /// started — it parks at its own dial gate, before its check — and is released to be
+    /// refused there, so the test cannot pass if the stagger never runs. Both attempts are
+    /// released before the dial is awaited, each fails or is refused before any dial, no
+    /// packet leaves the machine (N2), and the dial ends in an error either way.
     ///
     /// Runs on a paused clock: the 250 ms stagger comes due exactly when the test advances it,
-    /// so the ordering does not depend on a stalled machine. The first attempt never dials
-    /// (it parks at the gate) and the second is refused at its own check, so no real I/O has
-    /// to complete for the test to end.
+    /// so the ordering does not depend on a stalled machine; the audit assertion carries the
+    /// check.
     #[tokio::test(start_paused = true)]
     async fn a_replacement_while_a_connect_is_in_flight_starts_no_further_attempt() {
         // A dead loopback port: nothing listens, so a dial that does run cannot connect.
@@ -1287,7 +1291,10 @@ mod tests {
 
         let first: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
         let second: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+        // The first attempt hangs inside its connect (past its check and record); the second
+        // parks at a dial gate before its check, so the test can see the stagger start it.
         let gate = hang_connect(first);
+        let g2 = gate_dial(second);
 
         let stub = StubResolver::default();
         stub.push(&["127.0.0.1", "::1"]);
@@ -1314,8 +1321,27 @@ mod tests {
         // The stagger comes due while the stack is replaced: under paused time the timer is
         // what would start the second attempt, and it must find the flag set.
         tokio::time::advance(Duration::from_millis(300)).await;
-        // Let the stagger timer and whatever it starts run before the asserts.
-        for _ in 0..8 {
+        // The stagger must have started the second attempt: it parks at its own dial gate,
+        // before its check. Bounded: the timer is ready the moment the clock is advanced, so
+        // it runs on the next free turn of the scheduler.
+        for _ in 0..100 {
+            if g2.parked() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            g2.parked() == 1,
+            "the stagger timer never started the second attempt"
+        );
+        // Release it: the attempt must refuse at its own check, recording and dialling
+        // nothing. It has run once its park ends (the counter falls back to zero), so the
+        // capture is complete by then.
+        g2.release();
+        for _ in 0..100 {
+            if g2.parked() == 0 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         let recs = cap.take();
