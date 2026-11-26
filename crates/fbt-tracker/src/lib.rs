@@ -75,8 +75,12 @@ impl TrackerClient {
     ///   and fail with [`TrackerError::Proxy`] when the proxy does.
     /// - SOCKS5 (with `proxy_peers` or `proxy_trackers`): `udp` holds the one
     ///   relayed socket, and every UDP announce, of either family, goes
-    ///   through it; no other socket is bound. Tracker host names are
-    ///   resolved locally.
+    ///   through it; no other socket is bound. A tracker URL whose host is
+    ///   not an IP literal is sent to the relay by name (the SOCKS5 UDP
+    ///   request header carries it) and is never looked up here; the reply is
+    ///   matched by its transaction id whatever source the relay reports for
+    ///   it. IP literals still go to the relay as addresses, and the
+    ///   connection-id cache is keyed by the tracker as written.
     /// - HTTP with `proxy_trackers`: UDP announces fail with
     ///   [`TrackerError::ProxyUnsupported`].
     pub fn new_with(

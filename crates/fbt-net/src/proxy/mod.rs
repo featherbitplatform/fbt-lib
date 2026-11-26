@@ -50,10 +50,15 @@ pub enum ProxyKind {
 ///   unless it is disabled.
 /// - **Many HTTP proxies refuse `CONNECT` to port 80** (Squid's default
 ///   `SSL_ports` rule, for one), so plain-HTTP trackers may fail through them.
-/// - **Not every lookup or packet uses the proxy.** `proxy_hostnames` covers
-///   TCP connections only: UDP tracker host names and DHT bootstrap host names
-///   are resolved locally. Local service discovery (LSD), UPnP and NAT-PMP
-///   stay direct on the local network and are never proxied.
+/// - **Not every lookup uses the proxy.** `proxy_hostnames` covers TCP
+///   connections. A SOCKS5 relay also carries a UDP tracker named by host
+///   (RFC 1928 lets the UDP request header hold the name), so that name is
+///   never looked up here; an IP literal still goes to the relay as an
+///   address. A DHT bootstrap entry that is a name is resolved locally unless
+///   the DHT is told not to (`resolve_bootstrap_names` false, which a session
+///   behind a proxy sets: its DHT bootstraps from IP literals, a saved state
+///   and the nodes it reaches). Local service discovery (LSD), UPnP and
+///   NAT-PMP stay direct on the local network and are never proxied.
 /// - **No proxy-only mode by default.** Whatever the proxy cannot carry goes
 ///   direct, from the host's own address: with an HTTP proxy the DHT (which
 ///   names every torrent's info hash to other nodes) and incoming uTP

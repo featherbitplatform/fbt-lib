@@ -88,6 +88,16 @@ pub struct DhtConfig {
     /// entries are skipped. Empty by default: nothing is contacted unless
     /// configured.
     pub bootstrap: Vec<String>,
+    /// Whether a bootstrap entry that is a host name (not an IP literal) is
+    /// resolved locally.
+    ///
+    /// A DHT matches every reply to the address it queried, and a query sent
+    /// to a name has no such address: set this false under a proxy, where an
+    /// entry whose host is not an IP literal is skipped with a debug log
+    /// naming it and only an entry written as `IP:port` (an IPv6 literal
+    /// bracketed) is used. A malformed entry is skipped either way. `true` by
+    /// default.
+    pub resolve_bootstrap_names: bool,
     /// BEP 43: answer no queries and ask others to keep us out of tables.
     pub read_only: bool,
     /// A saved state: ids and known nodes for a fast rejoin.
@@ -127,6 +137,7 @@ impl Default for DhtConfig {
             bootstrap: Vec::new(),
             read_only: false,
             state: None,
+            resolve_bootstrap_names: true,
             query_timeout: Duration::from_secs(3),
             query_rate_per_ip: 5,
             enforce_node_id: false,
@@ -1019,6 +1030,8 @@ struct Actor {
     query_timeout: Duration,
     max_pending: usize,
     bootstrap: Vec<String>,
+    /// Whether a bootstrap entry that is a name is handed to the resolver.
+    resolve_bootstrap_names: bool,
     restored: Vec<SocketAddr>,
     retry_base: Duration,
     retry_max: Duration,
@@ -1140,6 +1153,7 @@ impl Actor {
             query_timeout: cfg.query_timeout,
             max_pending: cfg.max_pending_queries.min(MAX_TIDS),
             bootstrap: cfg.bootstrap,
+            resolve_bootstrap_names: cfg.resolve_bootstrap_names,
             restored,
             retry_base: cfg.bootstrap_retry_base,
             retry_max: cfg.bootstrap_retry_max,
@@ -1688,8 +1702,9 @@ impl Actor {
         let link = Link::Weak(self.link.clone());
         let (bootstrap_link, entries, restored) =
             (link.clone(), self.bootstrap.clone(), self.restored.clone());
+        let resolve_names = self.resolve_bootstrap_names;
         self.boot_task = Some(tokio::spawn(async move {
-            bootstrap(bootstrap_link, entries, restored, views).await;
+            bootstrap(bootstrap_link, entries, restored, views, resolve_names).await;
             let _ = link.send(Cmd::BootstrapDone).await;
         }));
     }
@@ -1779,17 +1794,33 @@ fn bootstrap_name(e: &str) -> Option<String> {
     bare.parse::<IpAddr>().is_err().then(|| bare.to_owned())
 }
 
-/// One bootstrap attempt: resolve the entries, ask every seed (and every
-/// restored node) for nodes near our id, then run a `find_node` lookup for
-/// our id from what they returned. Nodes enter the tables only by answering.
+/// One bootstrap attempt: resolve the entries (unless `resolve_names` is
+/// false, in which case only entries written as an address are used and a
+/// name is skipped: a reply can only be matched to an address, and a name
+/// sent through a proxy has none), ask every seed (and every restored node)
+/// for nodes near our id, then run a `find_node` lookup for our id from what
+/// they returned. Nodes enter the tables only by answering.
 async fn bootstrap(
     link: Link,
     entries: Vec<String>,
     restored: Vec<SocketAddr>,
     views: Vec<(Family, NodeId)>,
+    resolve_names: bool,
 ) {
     let mut routers = Vec::new();
     for e in &entries {
+        if !resolve_names {
+            // Never hand a bootstrap name to the resolver here: only an entry
+            // written as an address can be used.
+            if bootstrap_name(e).is_some() {
+                debug!(entry = %e, "DHT: bootstrap name skipped, names are not resolved here");
+            } else if let Ok(addr) = e.parse::<SocketAddr>() {
+                routers.push(addr);
+            } else {
+                debug!(entry = %e, "DHT: malformed bootstrap entry skipped");
+            }
+            continue;
+        }
         if let Some(name) = bootstrap_name(e) {
             audit::record(audit::Outbound::Lookup(name));
         }
