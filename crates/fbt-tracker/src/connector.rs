@@ -111,6 +111,12 @@ impl Resolution {
         if let Resolution::Stub(state) = self {
             return match state.take(host) {
                 Answer::Addresses(addrs) => judge_answers(deny_internal, addrs, host),
+                Answer::Gated(addrs, gate) => {
+                    // The name is already in `calls()` (the answer was taken first), so a test
+                    // can see the lookup is in flight and then release it.
+                    gate.notified().await;
+                    judge_answers(deny_internal, addrs, host)
+                }
                 Answer::NotFound => Err(stub_not_found(host)),
                 Answer::Silence => {
                     std::future::pending::<()>().await;
@@ -221,10 +227,27 @@ impl tower_service::Service<Name> for GuardedResolver {
             if this.closed.is_set() {
                 return Err(this.closed.refuse());
             }
-            this.where_to_look
+            let addrs = this
+                .where_to_look
                 .resolve(this.deny_internal, name.as_str(), 0)
-                .await
-                .map(Vec::into_iter)
+                .await?;
+            // The lookup itself takes time, and hyper dials exactly the addresses this
+            // returns: for a connect the pool started under a replaced stack (N3) the
+            // replacement can land while it runs, so refuse again before handing anything
+            // over and hyper never dials. This is the only guard that covers the gap between
+            // the lookup finishing and the dial it feeds.
+            if this.closed.is_set() {
+                return Err(this.closed.refuse());
+            }
+            // What hyper is about to dial: recorded here, so a direct dial by host name is
+            // visible to the outbound audit (`call` records an IP literal, which hyper dials
+            // without asking the resolver at all). The resolver is asked without the port —
+            // hyper puts the URI's back on the answers — so the record carries the address as
+            // it was resolved.
+            for addr in &addrs {
+                audit::record(audit::Outbound::TcpConnect(*addr));
+            }
+            Ok(addrs.into_iter())
         })
     }
 }
@@ -390,6 +413,12 @@ impl tower_service::Service<Uri> for ProxyConnector {
                         }
                         _ => ProxyTarget::Host(host.to_owned(), port),
                     };
+                    // The guarded lookup above takes time: refuse the proxy dial if the stack
+                    // was replaced while it ran (N3), the same gap the direct arm's resolver
+                    // closes between its lookup and the dial.
+                    if closed.is_set() {
+                        return Err(closed.refuse());
+                    }
                     let stream = connect_tcp(&proxy, target, timeout).await?;
                     Ok(TokioIo::new(stream))
                 })
@@ -415,6 +444,9 @@ pub(crate) enum Answer {
     NotFound,
     /// Nothing comes back: only the request's own timeout ends it.
     Silence,
+    /// These hosts answered, but only once the gate fires: a test can prove the lookup is in
+    /// flight and release it after a replacement.
+    Gated(Vec<IpAddr>, Arc<tokio::sync::Notify>),
 }
 
 #[cfg(test)]
@@ -465,6 +497,21 @@ impl StubResolver {
     pub(crate) fn hang_next(&self) -> &StubResolver {
         self.locked().push_back(Answer::Silence);
         self
+    }
+
+    /// Queues `addrs` as the next lookup's answer, but the lookup parks until the returned
+    /// `Notify` fires: a test can prove a lookup is in flight (the name is in
+    /// [`calls`](Self::calls) as soon as it is taken) and release it later, after replacing
+    /// the stack the lookup belongs to.
+    pub(crate) fn push_gated(&self, addrs: &[&str]) -> Arc<tokio::sync::Notify> {
+        let addrs = addrs
+            .iter()
+            .map(|s| s.parse::<IpAddr>().expect("stub address"))
+            .collect();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        self.locked()
+            .push_back(Answer::Gated(addrs, Arc::clone(&gate)));
+        gate
     }
 
     /// The names looked up, in order: empty means nothing was resolved locally at all.
@@ -711,6 +758,108 @@ mod tests {
         assert!(
             recs.contains(&audit::Outbound::TcpConnect(addr6)),
             "the bracketed IPv6 literal must be recorded: {recs:?}"
+        );
+    }
+
+    /// A direct dial by host name is recorded at the moment hyper is handed the addresses it
+    /// will dial: hyper dials a name only through this resolver (`call` covers an IP literal,
+    /// which hyper does not resolve), so without this a direct dial by name would leave the
+    /// outbound audit blind. Uses a documentation address no other test answers with, so the
+    /// record cannot be confused with another test's in the process-wide capture (the
+    /// resolver's carries no port — hyper puts the URI's back on the addresses afterwards).
+    /// The connect to a documentation address is left to the OS to time out, so the dial
+    /// future is polled until the record is made and then abandoned.
+    #[tokio::test]
+    async fn direct_http_dial_by_name_is_recorded() {
+        let stub = StubResolver::default();
+        stub.push(&["198.51.100.9"]);
+        let mut connector = ProxyConnector::new(
+            None,
+            Duration::from_secs(5),
+            false,
+            stub.resolution(),
+            Closed::new(),
+        );
+        let cap = audit::capture();
+        let uri = "http://tracker.invalid:9/announce".parse::<Uri>().unwrap();
+        let mut dial = connector.call(uri);
+        // The resolution (and its record) runs on the first poll; the connect that follows to
+        // a documentation address is abandoned here rather than waited out.
+        let _ = tokio::time::timeout(Duration::from_millis(100), &mut dial).await;
+        drop(dial);
+        let recs = cap.take();
+        drop(cap);
+        assert!(
+            recs.contains(&audit::Outbound::TcpConnect(SocketAddr::new(
+                "198.51.100.9".parse().unwrap(),
+                0
+            ))),
+            "a direct dial by name must be recorded: {recs:?}"
+        );
+    }
+
+    /// A lookup started under one stack and still in flight when the stack is replaced
+    /// (hyper-util's pool finishes a losing connect in a task the session cannot abort: N3)
+    /// must not dial once it answers. hyper dials exactly the addresses the resolver hands
+    /// back, so the closed flag has to be read again *after* the lookup returns, not only
+    /// before it: otherwise the answered connect opens a direct socket past the proxy that
+    /// replaced the stack, and leaves no `TcpConnect` record either (the direct arm records
+    /// only IP literals; a named dial records only the `Lookup`, made before the switch).
+    ///
+    /// Uses the IPv6 loopback: the process-wide capture also holds other tests' loopback
+    /// dials, so the absence assertion needs an address only this test answers with.
+    #[tokio::test]
+    async fn a_lookup_in_flight_when_the_stack_is_replaced_dials_nothing() {
+        // The port the URI carries, and a listener the bug's dial would reach.
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // no IPv6 loopback on this host
+        };
+        let port = listener.local_addr().unwrap().port();
+        let dialed = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+        });
+
+        let stub = StubResolver::default();
+        // The answer the in-flight lookup is parked on.
+        let gate = stub.push_gated(&["::1"]);
+        let closed = Closed::new();
+        let mut direct = ProxyConnector::new(
+            None,
+            Duration::from_secs(5),
+            false,
+            stub.resolution(),
+            closed.clone(),
+        );
+
+        let cap = audit::capture();
+        let uri = format!("http://tracker.invalid:{port}/announce")
+            .parse::<Uri>()
+            .unwrap();
+        let dial = tokio::spawn(direct.call(uri));
+        // Wait until the lookup is in flight (its name is recorded as taken), then replace
+        // the stack and release the answer.
+        while stub.calls().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        closed.set();
+        gate.notify_one();
+
+        assert!(
+            dial.await.unwrap().is_err(),
+            "a replaced stack must not dial once its lookup answers"
+        );
+        let recs = cap.take();
+        drop(cap);
+        assert!(
+            !recs.contains(&audit::Outbound::TcpConnect(SocketAddr::new(
+                "::1".parse().unwrap(),
+                0
+            ))),
+            "a replaced stack dialled an address once its lookup answered: {recs:?}"
+        );
+        assert!(
+            dialed.await.unwrap().is_err(),
+            "the listener accepted a direct dial a replaced stack made after its lookup answered"
         );
     }
 }

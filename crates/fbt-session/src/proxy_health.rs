@@ -58,6 +58,13 @@ const RELAY_LOST_REASON: &str = "the proxy closed the UDP association";
 /// It decides whether the session opens a relayed UDP socket at all: a proxy
 /// that does not relay UDP leaves the session with no UDP socket (no DHT, no
 /// uTP, no UDP trackers).
+///
+/// [`classify`] reads this on [`NetworkSettings::effective`]'s proxy, not the
+/// stored one: a `proxy_only` value whose stored `proxy_peers`/`proxy_trackers`
+/// are off has both turned on there (and documents the DHT and uTP as
+/// relayed), so the association must be taken on the same proxy the stack is
+/// built from, or the session would hold no UDP at all while reporting
+/// `Reachable`.
 pub(crate) fn relays_udp(proxy: &ProxyConfig) -> bool {
     proxy.kind == ProxyKind::Socks5 && (proxy.proxy_peers || proxy.proxy_trackers)
 }
@@ -81,8 +88,14 @@ fn state_of(e: &ProxyError) -> ProxyState {
 ///
 /// Used by [`Session::new`](crate::Session::new) and every rebuild, so the
 /// session never fails to start or to change because the proxy is down.
+///
+/// The relaying decision is made on the proxy the session will actually run,
+/// [`NetworkSettings::effective`]'s, so a `proxy_only` value whose stored
+/// switches are off still takes the association the stack it is built with
+/// expects (I2); without `proxy_only` the two are equal.
 pub(crate) async fn classify(settings: &Settings) -> (ProxyState, Option<Socks5Udp>) {
-    let proxy = &settings.proxy;
+    let effective = settings.network().effective();
+    let proxy = &effective.proxy;
     if proxy.kind == ProxyKind::None {
         return (ProxyState::NotSet, None);
     }

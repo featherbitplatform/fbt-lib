@@ -428,10 +428,11 @@ pub struct Settings {
     /// [`NetworkSettings::effective`] derives from it (every bypass off, the
     /// three proxy switches on) and warns about nothing. Without it,
     /// [`Session::new`](crate::Session::new) logs a warning for each enabled
-    /// feature that still bypasses the proxy (with an HTTP proxy the DHT,
-    /// which names every torrent's info hash, and uTP; with any proxy
-    /// LSD, UPnP and NAT-PMP): turn those off, or set `proxy_only`, for a
-    /// session whose traffic should all go through the proxy.
+    /// feature that still sends from the host's own address: LSD, UPnP and
+    /// NAT-PMP under any proxy. Turn those off, or set `proxy_only`, for a
+    /// session whose traffic should all go through the proxy. (The DHT, uTP
+    /// and UDP trackers are not listed: they need UDP, so a proxy that does
+    /// not relay UDP leaves them off rather than direct.)
     ///
     /// Serialising the settings (the `serde` feature) writes the proxy
     /// password in clear text.
@@ -804,10 +805,13 @@ impl NetworkSettings {
     ///
     /// Otherwise `self` is returned unchanged, except the 0.12.0 rule: an
     /// HTTP proxy with `proxy_peers` turns `enable_outgoing_utp` off (an HTTP
-    /// proxy carries peer connections over TCP only). Without it, what the
-    /// proxy cannot carry still goes direct — the DHT and incoming uTP under
-    /// an HTTP proxy or a SOCKS5 one that relays no UDP, and LSD, UPnP and
-    /// NAT-PMP under any proxy (see [`proxy_bypasses`](Self::proxy_bypasses)).
+    /// proxy carries peer connections over TCP only). What the proxy cannot
+    /// carry and needs UDP for — the DHT, uTP and UDP trackers — does not run
+    /// at all under a proxy that relays no UDP: the session binds no UDP
+    /// socket for it, so those switches only ever *add* the UDP socket a
+    /// relayed proxy provides, they never make anything go direct. Only LSD,
+    /// UPnP and NAT-PMP still send from the host's own address, whatever the
+    /// proxy is (see [`proxy_bypasses`](Self::proxy_bypasses)).
     ///
     /// [`proxy_only`](ProxyConfig::proxy_only) with
     /// [`ProxyKind::None`] is ignored: there is no proxy to send through. The
@@ -841,33 +845,20 @@ impl NetworkSettings {
         e
     }
 
-    /// The enabled features that send from the real address whatever
+    /// The enabled features that send from the host's own address whatever
     /// [`proxy`](Self::proxy) says; empty without a proxy. Meant to be read
     /// on [`effective`](Self::effective), where a proxy-only session lists
     /// nothing.
     ///
-    /// Without `proxy_only`, under an HTTP proxy (or a SOCKS5 one that
-    /// carries neither peers nor trackers, so relays no UDP): the DHT,
-    /// outgoing uTP (unless `proxy_peers` turns it off) and incoming uTP.
-    /// Under any proxy: LSD, UPnP and NAT-PMP, which are never proxied.
+    /// Only LSD, UPnP and NAT-PMP, which are never proxied. The DHT, uTP and
+    /// UDP trackers are *not* listed: they need UDP, and a proxy that carries
+    /// no UDP leaves the session with no UDP socket at all (see
+    /// [`effective`](Self::effective)), so they are off, not sent from the
+    /// host's own address.
     pub fn proxy_bypasses(&self) -> Vec<&'static str> {
-        let p = &self.proxy;
         let mut out = Vec::new();
-        if p.kind == ProxyKind::None {
+        if self.proxy.kind == ProxyKind::None {
             return out;
-        }
-        let relays_udp = p.kind == ProxyKind::Socks5 && (p.proxy_peers || p.proxy_trackers);
-        if !relays_udp {
-            if self.dht_enabled {
-                out.push("the DHT");
-            }
-            // An HTTP proxy carrying peers turns outgoing uTP off.
-            if self.enable_outgoing_utp && !(p.kind == ProxyKind::Http && p.proxy_peers) {
-                out.push("outgoing uTP");
-            }
-            if self.enable_incoming_utp {
-                out.push("incoming uTP");
-            }
         }
         for (on, name) in [
             (self.enable_lsd, "LSD"),
@@ -915,40 +906,34 @@ mod tests {
         assert_eq!(NetworkSettings::default(), Settings::default().network());
     }
 
+    /// Only the never-proxied local-network features are bypasses: the DHT, uTP and UDP
+    /// trackers need UDP, and a proxy that relays no UDP leaves the session with no UDP
+    /// socket at all, so they are off rather than direct (I3). Whatever the proxy kind or
+    /// the UDP switches say, the list is the same.
     #[test]
     fn features_bypassing_the_proxy_are_listed() {
         let mut s = Settings::default();
         assert!(s.proxy_bypasses().is_empty(), "no proxy");
         s.proxy.kind = ProxyKind::Http;
         s.proxy.host = "proxy.example".to_owned();
-        assert_eq!(
-            s.proxy_bypasses(),
-            ["the DHT", "incoming uTP", "LSD", "UPnP", "NAT-PMP"]
-        );
+        assert_eq!(s.proxy_bypasses(), ["LSD", "UPnP", "NAT-PMP"]);
+        // Whatever the UDP switches say: the DHT and uTP never bypass.
         s.proxy.proxy_peers = false;
-        assert_eq!(
-            s.proxy_bypasses(),
-            [
-                "the DHT",
-                "outgoing uTP",
-                "incoming uTP",
-                "LSD",
-                "UPnP",
-                "NAT-PMP"
-            ]
-        );
-        // SOCKS5 relays every UDP packet: only the local-network ones stay.
+        s.enable_outgoing_utp = true;
+        s.enable_incoming_utp = true;
+        s.dht_enabled = true;
+        assert_eq!(s.proxy_bypasses(), ["LSD", "UPnP", "NAT-PMP"]);
+        // SOCKS5 relays every UDP packet: the local-network features stay.
         s.proxy.kind = ProxyKind::Socks5;
         assert_eq!(s.proxy_bypasses(), ["LSD", "UPnP", "NAT-PMP"]);
         s.enable_lsd = false;
         s.enable_upnp = false;
         s.enable_natpmp = false;
         assert!(s.proxy_bypasses().is_empty());
-        // SOCKS5 carrying neither peers nor trackers relays no UDP.
+        // SOCKS5 carrying neither peers nor trackers relays no UDP: still only those.
         s.proxy.proxy_trackers = false;
-        s.dht_enabled = false;
-        s.enable_incoming_utp = false;
-        assert_eq!(s.proxy_bypasses(), ["outgoing uTP"]);
+        s.enable_lsd = true;
+        assert_eq!(s.proxy_bypasses(), ["LSD"]);
     }
 
     /// A proxy-only value turns every bypass off, on the effective settings

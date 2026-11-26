@@ -214,12 +214,16 @@ async fn until_unchanged<T>(
     fut: impl std::future::Future<Output = T>,
 ) -> Option<T> {
     let mut fut = std::pin::pin!(fut);
-    // The branch yields a plain `bool`, so the watch's guard is dropped
-    // inside the `select!` and never crosses the await below (the peer
-    // task's future must stay `Send`).
+    // Biased, with the change read first: a dial spawned just before a change
+    // can be polled first, and without this the change branch and the dial
+    // would be polled in random order, so a ready dial could open on the
+    // replaced stack (M1). The branch yields a plain `bool`, so the watch's
+    // guard is dropped inside the `select!` and never crosses the await below
+    // (the peer task's future must stay `Send`).
     let session_gone = tokio::select! {
-        v = &mut fut => return Some(v),
+        biased;
         changed = net_changed.wait_for(|g| *g != generation) => changed.is_err(),
+        v = &mut fut => return Some(v),
     };
     if session_gone { Some(fut.await) } else { None }
 }
@@ -246,6 +250,15 @@ async fn connect(
 ) -> Result<PeerTransport, (DisconnectReason, bool)> {
     let settings = &ctx.settings;
     let io = |msg: String| DisconnectReason::Io(msg);
+    // The dial belongs to the stack it read: a dial spawned just before a
+    // change can be polled after it (the future is created when the dial is
+    // spawned, not when it is polled), so the generation is read here, right
+    // before anything is dialled, and the dial is refused on a replaced stack
+    // (M1). The select in `until_unchanged` is biased to prefer the change,
+    // but this is what stops the dial itself.
+    if *ctx.net_changed.borrow() != ctx.net_generation {
+        return Err((DisconnectReason::NetworkChanged, false));
+    }
     match transport {
         Transport::Tcp if proxied(&ctx.proxy) => {
             // The proxy dial, negotiation and reply share the timeout.

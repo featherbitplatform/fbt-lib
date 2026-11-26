@@ -13,6 +13,8 @@ use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::time::Instant;
 use tokio_util::codec::Framed;
 
+use fbt_core::audit;
+
 use super::super::messages::{DisconnectReason, PeerPiecesOwned};
 use super::*;
 
@@ -1995,4 +1997,94 @@ async fn v1_torrent_handshake_has_no_v2_bit() {
         .handshake_with(HASH, THEIR_ID, reserved(true, true, false))
         .await;
     assert!(!ours.reserved.supports_v2());
+}
+
+// ----- a replaced stack opens nothing ----------------------------------------
+
+/// A context for a real outgoing dial (the harness never dials: it runs a
+/// peer task over an in-memory pipe). `net_generation` is the stack the dial
+/// read; the watch's value is what the session's current stack is, so a test
+/// can start it already replaced.
+fn dial_ctx(
+    net_generation: u64,
+    current: u64,
+) -> (PeerCtx, mpsc::Receiver<PeerEvent>, watch::Sender<u64>) {
+    let (etx, events) = mpsc::channel(1024);
+    let (net_gen, net_changed) = watch::channel(current);
+    let ctx = PeerCtx {
+        key: KEY,
+        info_hash: HASH,
+        v2_hash: Some(V2_HASH),
+        our_id: OUR_ID,
+        layout: Some(layout(PIECES)),
+        have: Bitfield::full(PIECES),
+        ext: ext_cfg(),
+        settings: Arc::new(Settings::default()),
+        events: etx,
+        encrypted: false,
+        transport: Transport::Tcp,
+        bandwidth: Arc::new(crate::bandwidth::Bandwidth::new(&Settings::default())),
+        torrent_rate: crate::bandwidth::BucketPair::new(Default::default()),
+        external_ip: Arc::new(crate::net::ExternalIp::new(
+            tokio::sync::broadcast::channel(1).0,
+        )),
+        net_generation,
+        net_changed,
+        proxy: fbt_net::proxy::ProxyConfig::default(),
+        health: crate::proxy_health::ProxyHealth::new(
+            crate::event::ProxyState::NotSet,
+            tokio::sync::broadcast::channel(1).0,
+            net_gen.subscribe(),
+        ),
+    };
+    (ctx, events, net_gen)
+}
+
+/// A dial spawned just before the stack is replaced can be polled first, and
+/// its future can be ready at once: the change must win over it anyway, so
+/// nothing is opened on the replaced stack (M1). The dial is ready
+/// immediately, so an unbiased `select!` picks it about half the time — the
+/// loop makes a regression certain to be caught rather than a coin toss.
+#[tokio::test]
+async fn a_changed_generation_wins_over_a_ready_dial() {
+    let (net_gen, mut net_changed) = watch::channel(1u64);
+    net_gen.send_replace(2);
+    for _ in 0..200 {
+        let won = until_unchanged(&mut net_changed, 1, std::future::ready(())).await;
+        assert!(
+            won.is_none(),
+            "a ready dial won over the replaced stack and would have dialled it"
+        );
+    }
+}
+
+/// A dial whose stack was replaced before it was polled opens nothing:
+/// `connect` reads the generation immediately before it dials, so a peer
+/// dial spawned just before a change and polled after it never opens a direct
+/// TCP connection on the stack that is gone (M1) — and records none.
+#[tokio::test]
+async fn a_dial_on_a_replaced_stack_is_not_made() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+    });
+    // The dial read generation 1; the session's stack is already 2.
+    let (ctx, _events, _net_gen) = dial_ctx(1, 2);
+    let cap = audit::capture();
+    let err = connect(addr, Transport::Tcp, None, &ctx).await.unwrap_err();
+    let recs = cap.take();
+    drop(cap);
+    assert!(
+        matches!(err.0, DisconnectReason::NetworkChanged),
+        "a replaced stack must report the change, not a dial failure: {err:?}"
+    );
+    assert!(
+        !recs.contains(&audit::Outbound::TcpConnect(addr)),
+        "a replaced stack dialled {addr}: {recs:?}"
+    );
+    assert!(
+        accepted.await.unwrap().is_err(),
+        "the listener accepted a dial a replaced stack made"
+    );
 }

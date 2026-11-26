@@ -46,8 +46,10 @@ pub enum ProxyKind {
 ///   only as the relay forwards it.
 /// - **HTTP proxies cannot carry UDP.** With [`ProxyKind::Http`], outgoing uTP
 ///   is off when `proxy_peers` is set, UDP trackers fail with
-///   `ProxyUnsupported` when `proxy_trackers` is set, and the DHT runs direct
-///   unless it is disabled.
+///   `ProxyUnsupported` when `proxy_trackers` is set, and the DHT and the
+///   other UDP features do not run at all: a proxy that carries no UDP leaves
+///   the session with no UDP socket, so `dht_enabled` and the uTP switches
+///   have nothing to send from.
 /// - **Many HTTP proxies refuse `CONNECT` to port 80** (Squid's default
 ///   `SSL_ports` rule, for one), so plain-HTTP trackers may fail through them.
 /// - **Not every lookup uses the proxy.** `proxy_hostnames` covers TCP
@@ -61,15 +63,16 @@ pub enum ProxyKind {
 ///   relay) and its bootstrap comes from the literals, a saved state and the
 ///   nodes it reaches. Local service discovery (LSD), UPnP and NAT-PMP stay
 ///   direct on the local network and are never proxied.
-/// - **No proxy-only mode by default.** Whatever the proxy cannot carry goes
-///   direct, from the host's own address: with an HTTP proxy the DHT (which
-///   names every torrent's info hash to other nodes) and incoming uTP
-///   (outgoing too, without `proxy_peers`); with any proxy LSD, UPnP and
-///   NAT-PMP. The session logs a warning for each one enabled; turn them off
-///   in its settings to keep all traffic on the proxy, or set
-///   [`proxy_only`](Self::proxy_only), the single switch that has every
-///   bypass treated as off (it also turns the three proxy switches on), so a
-///   proxy-only session warns about nothing.
+/// - **No proxy-only mode by default.** What the proxy cannot carry and needs
+///   UDP for — the DHT (which names every torrent's info hash to other
+///   nodes), outgoing uTP and UDP trackers — does not run at all under a proxy
+///   that relays no UDP: the session binds no UDP socket for it, so those
+///   switches never make anything go direct. Only LSD, UPnP and NAT-PMP send
+///   from the host's own address under any proxy. The session logs a warning
+///   for each of those enabled; turn them off in its settings to keep all
+///   traffic on the proxy, or set [`proxy_only`](Self::proxy_only), the single
+///   switch that has every bypass treated as off (it also turns the three proxy
+///   switches on), so a proxy-only session warns about nothing.
 ///
 /// `Debug` prints the password as `"***"`; serialising (the `serde`
 /// feature) writes it in clear text.

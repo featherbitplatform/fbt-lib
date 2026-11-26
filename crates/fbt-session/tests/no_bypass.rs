@@ -25,7 +25,9 @@ use fake_socks5::{FakeSocks5, Script, closed_port};
 use fbt_core::audit::{self, Outbound};
 use fbt_metainfo::Metainfo;
 use fbt_session::storage::MemStorage;
-use fbt_session::{AddTorrent, ProxyConfig, ProxyKind, Session, Settings, TorrentHandle};
+use fbt_session::{
+    AddTorrent, ProxyConfig, ProxyKind, ProxyState, Session, Settings, TorrentHandle,
+};
 use support::*;
 
 /// The torrent's one file, and the length of its storage.
@@ -188,6 +190,59 @@ async fn socks5_proxy_only_opens_nothing_else() {
     );
 
     only_proxy(&cap.take(), fake.addr(), fake.relay_addr());
+    // And again after a moment, so anything that only happens later is
+    // covered too (M2).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    only_proxy(&cap.take(), fake.addr(), fake.relay_addr());
+    session.shutdown().await;
+}
+
+/// The switches that decide whether the proxy relays UDP are read on the
+/// effective settings, not the stored ones: a proxy-only SOCKS5 proxy whose
+/// stored `proxy_peers` and `proxy_trackers` are *off* still relays (I2).
+/// `effective()` turns both on (and documents the DHT and uTP as relayed), so
+/// the association must be taken on that proxy, or the session would hold no
+/// UDP at all while reporting `Reachable`. The fake records the association
+/// and every datagram without dialling anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks5_proxy_only_relays_udp_without_the_switches() {
+    let cap = audit::capture();
+    let fake = FakeSocks5::start(Script::RecordOnly).await;
+    let mut proxy = proxy_only(ProxyKind::Socks5, fake.addr());
+    // Off as stored, turned on by `effective()` for `proxy_only`.
+    proxy.proxy_peers = false;
+    proxy.proxy_trackers = false;
+    let (session, _handle) = start(proxy).await;
+
+    // The DHT bootstraps over the relay (its literal entry, never the name)
+    // and both UDP trackers go through it.
+    assert!(
+        wait_logged(
+            &fake,
+            &["tracker.invalid:80", PEER],
+            &["tracker.invalid:6969", "192.0.2.20:6969", "192.0.2.10:6881"],
+        )
+        .await,
+        "connects: {:?} udp: {:?}",
+        fake.connects(),
+        fake.udp_targets()
+    );
+    assert!(
+        fake.relay_addr().is_some(),
+        "a proxy-only session whose switches are stored off took no UDP relay"
+    );
+    assert!(
+        session.dht_stats().is_some(),
+        "the DHT does not run without a relay: {:?}",
+        session.dht_stats()
+    );
+    assert_eq!(
+        session.proxy_state(),
+        ProxyState::Reachable,
+        "a relayed proxy-only session is not reported reachable"
+    );
+
+    only_proxy(&cap.take(), fake.addr(), fake.relay_addr());
     session.shutdown().await;
 }
 
@@ -219,6 +274,10 @@ async fn http_proxy_only_opens_nothing_else() {
         session.dht_stats()
     );
 
+    only_proxy(&cap.take(), fake.addr(), None);
+    // And again after a moment, so anything that only happens later is
+    // covered too (M2).
+    tokio::time::sleep(Duration::from_secs(1)).await;
     only_proxy(&cap.take(), fake.addr(), None);
     session.shutdown().await;
 }
@@ -269,31 +328,65 @@ async fn udp_not_relayed_opens_nothing_else() {
 }
 
 /// A session running directly, switched to a proxy-only one at runtime: from
-/// the switch on, nothing it does is direct. What it did before the switch
-/// (a direct dial or lookup) is dropped from the capture, so the assertion
-/// covers the period the change is in effect.
+/// the switch on, nothing it does is direct. The capture starts just before
+/// the switch and is never discarded, so work in flight across the change is
+/// covered too, and the new stack is seen reaching the proxy (I1); what the
+/// direct phase did is excluded only by starting the capture after it. The
+/// direct phase touches loopback alone (M3: a test never contacts the public
+/// internet); the brief's names are added after the switch, where they only
+/// reach the fake proxy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn switching_to_proxy_opens_nothing_direct() {
     let cap = audit::capture();
     let fake = FakeSocks5::start(Script::RecordOnly).await;
 
-    // A direct session first: the same torrent and peer, no proxy.
+    // A direct session first: a closed loopback port for its tracker and its
+    // peer and no DHT, so its direct activity never leaves the host and, with
+    // the production retry delays, has finished before the switch.
     let mut s = settings();
     s.proxy = ProxyConfig::default();
+    s.dht_enabled = false;
+    s.dht_bootstrap_nodes = Vec::new();
+    s.enable_outgoing_utp = false;
     let session = Session::new(s).await.unwrap();
+    let (mut m, _payload) = make_torrent(&[("a", LEN)], 16_384);
+    let tracker = closed_port();
+    m.trackers = vec![vec![format!("http://{tracker}/announce")]];
+    let mut p = AddTorrent::new(m, PathBuf::from("unused"));
+    p.storage = Some(Arc::new(MemStorage::new(LEN as u64)));
+    let direct = session.add_torrent(p).await.unwrap();
+    let peer = closed_port();
+    direct.add_peer(peer).await.unwrap();
+    // Let it work directly for a moment (a refused direct dial, recorded).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The switch: the capture starts here, so what the direct phase did is
+    // excluded by starting after it, and nothing in flight across the change
+    // is dropped.
+    let mut net = session.network_settings();
+    net.proxy = proxy_only(ProxyKind::Socks5, fake.addr());
+    let _ = cap.take();
+    session.set_network_settings(net).await.unwrap();
+
+    // The new stack does its work through the proxy: the brief's torrent (its
+    // names reach only the fake) and its peer.
     let mut p = AddTorrent::new(torrent(), PathBuf::from("unused"));
     p.storage = Some(Arc::new(MemStorage::new(LEN as u64)));
     let handle = session.add_torrent(p).await.unwrap();
     handle.add_peer(PEER.parse().unwrap()).await.unwrap();
-    // Let it work directly for a moment (a direct dial or lookup, recorded).
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        wait_logged(
+            &fake,
+            &["tracker.invalid:80", PEER],
+            &["tracker.invalid:6969"]
+        )
+        .await,
+        "the new stack never reached the proxy: connects {:?} udp {:?}",
+        fake.connects(),
+        fake.udp_targets()
+    );
 
-    let mut net = session.network_settings();
-    net.proxy = proxy_only(ProxyKind::Socks5, fake.addr());
-    session.set_network_settings(net).await.unwrap();
-    // The switch is in effect; drop what the session did directly before it.
-    let _ = cap.take();
-
+    // Nothing direct in everything captured from just before the switch.
     tokio::time::sleep(Duration::from_secs(3)).await;
     only_proxy(&cap.take(), fake.addr(), fake.relay_addr());
     session.shutdown().await;
