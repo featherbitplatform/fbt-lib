@@ -47,4 +47,6 @@ rustls-rustcrypto = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+# `test-util`: the connector tests' paused clocks (`start_paused`), as in the
+# sibling crates; without it a standalone `-p fbt-tracker` test run cannot build.
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "test-util"] }

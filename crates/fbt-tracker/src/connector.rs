@@ -475,6 +475,16 @@ fn dial_one(addr: SocketAddr, closed: Closed) -> Dial {
         // literal is visible to the outbound audit (a lookup records the name alone, and this
         // connector dials the answers itself).
         audit::record(audit::Outbound::TcpConnect(addr));
+        // (tests) An attempt a test holds open *inside* the connect: it already passed its
+        // closed check and recorded its connect, so a test can replace the stack while the
+        // dial is in flight and see what the rest of the staggered attempts do (N1). The
+        // release fails the attempt, as a blackholed route would end it.
+        #[cfg(test)]
+        if let Some(gate) = take_hang_gate(addr) {
+            gate.park().await;
+            return Err(io::Error::other("hung connect released").into());
+        }
+        // audit: recorded above, same step as the dial (N1); the test hook between them compiles out
         TcpStream::connect(addr).await.map_err(Into::into)
     })
 }
@@ -561,6 +571,13 @@ async fn staggered(
 #[cfg(test)]
 static DIAL_GATES: Mutex<Vec<(SocketAddr, DialGate)>> = Mutex::new(Vec::new());
 
+/// (tests) Connects a test has asked to hold open, keyed by address. Unlike the dial gates,
+/// which park *before* the flag is read, a hang gate parks *after* it: the attempt has passed
+/// its closed check and recorded its connect, and now sits inside a slow dial — the position
+/// a blackholed route holds an attempt in production (N1).
+#[cfg(test)]
+static HANG_GATES: Mutex<Vec<(SocketAddr, DialGate)>> = Mutex::new(Vec::new());
+
 /// (tests) The addresses whose dials have parked, in the order they parked: a test reads this to
 /// see the order the attempts were started in, without depending on how often it polls.
 #[cfg(test)]
@@ -613,6 +630,33 @@ pub(crate) fn gate_dial(addr: SocketAddr) -> DialGate {
         .unwrap_or_else(|e| e.into_inner())
         .push((addr, gate.clone()));
     gate
+}
+
+/// (tests) Registers a hang gate for the next connect to `addr` and returns it: the attempt
+/// passes its closed check and records its connect, then parks at the gate until
+/// [`DialGate::release`] — inside the dial, not before it — so a test can hold an attempt in
+/// flight while the stack is replaced and see what the rest of the staggered dial does (N1).
+/// The release fails the attempt rather than opening a socket, so no packet leaves the
+/// machine (N2).
+#[cfg(test)]
+pub(crate) fn hang_connect(addr: SocketAddr) -> DialGate {
+    let gate = DialGate::new();
+    HANG_GATES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((addr, gate.clone()));
+    gate
+}
+
+/// (tests) Takes the hang gate for `addr`, if one is registered: `Some` lets the attempt park
+/// at it (it has already passed its closed check and recorded its connect), `None` is a no-op.
+#[cfg(test)]
+fn take_hang_gate(addr: SocketAddr) -> Option<DialGate> {
+    let mut gates = HANG_GATES.lock().unwrap_or_else(|e| e.into_inner());
+    gates
+        .iter()
+        .position(|(a, _)| *a == addr)
+        .map(|i| gates.remove(i).1)
 }
 
 /// (tests) Parks the dial to `addr` at its gate, if one is registered; a no-op otherwise. The
@@ -744,6 +788,20 @@ impl StubResolver {
 mod tests {
     use super::*;
     use tower_service::Service;
+
+    /// Waits (bounded) until `cond` holds, giving the other tasks a turn between polls: at
+    /// most 1000 polls, then a failure that names what never happened. An unbounded sleep
+    /// loop would instead spin forever — a paused clock auto-advances it — so a regression
+    /// that stops the awaited event fails the test rather than hanging it.
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{what}");
+    }
 
     #[test]
     fn ports_default_by_scheme() {
@@ -1020,7 +1078,13 @@ mod tests {
     /// The gate sits *before* the flag is read, as in production nothing stands between the check
     /// and the dial, so the parked attempt must not record or dial once it runs on
     /// (the Minor finding). No packet leaves the machine (N2).
-    #[tokio::test]
+    ///
+    /// Runs on a paused clock: the 250 ms stagger cannot fire before the replacement on a
+    /// stalled machine, and the wait loop below advances the clock a fixed step at a time.
+    /// No dial is ever issued: the parked attempt is refused at its own check and the second
+    /// address is never started. The accept timeout is a virtual timer the paused clock
+    /// elapses by auto-advance, and the audit assertion carries the check.
+    #[tokio::test(start_paused = true)]
     async fn a_second_address_is_not_dialled_once_the_stack_is_replaced() {
         let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
             return; // no IPv6 loopback on this host
@@ -1058,9 +1122,10 @@ mod tests {
         let dial = tokio::spawn(connector.call(uri));
         // The first attempt is in flight (parked at its gate, nothing opened yet): replace the
         // stack, then let it run on into the refusal at its own check.
-        while gate.parked() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until("the first attempt never reached its gate", || {
+            gate.parked() == 1
+        })
+        .await;
         closed.set();
         gate.release();
 
@@ -1091,27 +1156,28 @@ mod tests {
     /// later and wins, so a family that blackholes (an IPv6 route that drops every packet) does
     /// not spend the whole request budget before the other family is tried (RFC 8305, R1 a).
     ///
-    /// Both addresses are loopback and on the port the URI carries: the second is a live listener,
-    /// the first is loopback too but its dial is held open by a gate — a hung attempt — so nothing
-    /// leaves the machine.
+    /// Both addresses are loopback and on the port the URI carries: the second is a live
+    /// listener, the first is loopback too but its dial is held open by a gate — a hung
+    /// attempt — so nothing leaves the machine. The hung attempt is the IPv6 loopback, held
+    /// *before* its dial, so it never dials and the test runs on a host with no IPv6 loopback
+    /// at all; the live listener is IPv4.
     #[tokio::test]
     async fn a_hung_first_address_does_not_hold_up_the_dial() {
-        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
-            return; // no IPv6 loopback on this host
-        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepted = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
         });
 
-        // The first answer is IPv4 (nothing listens there) and leads; the second is the IPv6
-        // listener. Its dial is never reached, so its port need not be free.
-        let first: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
-        let second: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+        // The first answer is the gated IPv6 loopback: its dial is held open (a hung attempt)
+        // and never reaches the socket, so no IPv6 loopback is needed. The second is the live
+        // IPv4 listener.
+        let first: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+        let second: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
         let gate = gate_dial(first);
 
         let stub = StubResolver::default();
-        stub.push(&["127.0.0.1", "::1"]);
+        stub.push(&["::1", "127.0.0.1"]);
         let mut connector = ProxyConnector::new(
             None,
             Duration::from_secs(5),
@@ -1128,9 +1194,10 @@ mod tests {
         let dial = tokio::spawn(connector.call(uri));
         // The first attempt hangs (parked at its gate): the stagger must start the second, which
         // connects, without waiting the first one out.
-        while gate.parked() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until("the first attempt never reached its gate", || {
+            gate.parked() == 1
+        })
+        .await;
         let stream = dial
             .await
             .unwrap()
@@ -1157,7 +1224,12 @@ mod tests {
     /// address is neither recorded nor dialled, and the dial fails rather than opening a socket
     /// (N1, R1 b). The gate sits before the flag is read and the dial is released by the test, so
     /// the ordering does not depend on timing.
-    #[tokio::test]
+    ///
+    /// Runs on a paused clock: the 250 ms stagger cannot fire before the replacement on a
+    /// stalled machine, and the wait loop below advances the clock a fixed step at a time.
+    /// No dial is ever issued: the parked attempt is refused at its own check and the second
+    /// address is never started, and the audit assertion carries the check.
+    #[tokio::test(start_paused = true)]
     async fn a_replacement_while_the_first_attempt_hangs_starts_no_further_attempt() {
         // Dead loopback addresses: nothing listens, so a dial that does run cannot connect.
         let Ok(dead) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
@@ -1186,9 +1258,10 @@ mod tests {
             .parse::<Uri>()
             .unwrap();
         let dial = tokio::spawn(connector.call(uri));
-        while gate.parked() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until("the first attempt never reached its gate", || {
+            gate.parked() == 1
+        })
+        .await;
         // Replace the stack while the first attempt hangs, then let it run on: it must refuse at
         // its own check, and no further attempt may be started.
         closed.set();
@@ -1207,6 +1280,102 @@ mod tests {
         assert!(
             ours.is_empty(),
             "a replaced stack recorded a dial after its stack was replaced: {ours:?}"
+        );
+    }
+
+    /// A stack replaced while a connect is *in flight* — the attempt already passed its closed
+    /// check and sits inside a slow dial — starts no further attempt: the stagger timer must
+    /// not dial the next address once the stack it belongs to is replaced (N1). The attempt is
+    /// held at a hang gate *after* the check and the record (see [`hang_connect`]), so the
+    /// switch lands in the only gap the dial gates cannot cover: while an attempt is inside its
+    /// connect, with the stagger still owing the next address. The second attempt is proved
+    /// started — it parks at its own dial gate, before its check — and is released to be
+    /// refused there, so the test cannot pass if the stagger never runs. Both attempts are
+    /// released before the dial is awaited, each fails or is refused before any dial, no
+    /// packet leaves the machine (N2), and the dial ends in an error either way.
+    ///
+    /// Runs on a paused clock: the 250 ms stagger comes due exactly when the test advances it,
+    /// so the ordering does not depend on a stalled machine; the audit assertion carries the
+    /// check.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_while_a_connect_is_in_flight_starts_no_further_attempt() {
+        // A dead loopback port: nothing listens, so a dial that does run cannot connect.
+        let Ok(dead) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let first: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+        let second: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+        // The first attempt hangs inside its connect (past its check and record); the second
+        // parks at a dial gate before its check, so the test can see the stagger start it.
+        let gate = hang_connect(first);
+        let g2 = gate_dial(second);
+
+        let stub = StubResolver::default();
+        stub.push(&["127.0.0.1", "::1"]);
+        let closed = Closed::new();
+        let mut connector = ProxyConnector::new(
+            None,
+            Duration::from_secs(5),
+            false,
+            stub.resolution(),
+            closed.clone(),
+        );
+
+        let cap = audit::capture();
+        let uri = format!("http://tracker.invalid:{port}/announce")
+            .parse::<Uri>()
+            .unwrap();
+        let dial = tokio::spawn(connector.call(uri));
+        // The first attempt is past its closed check and recorded, and parked inside its
+        // connect: replace the stack while the dial is in flight.
+        wait_until("the first attempt never reached its hang gate", || {
+            gate.parked() == 1
+        })
+        .await;
+        closed.set();
+        // The stagger comes due while the stack is replaced: under paused time the timer is
+        // what would start the second attempt, and it must find the flag set.
+        tokio::time::advance(Duration::from_millis(300)).await;
+        // The stagger must have started the second attempt: it parks at its own dial gate,
+        // before its check. Bounded: the timer is ready the moment the clock is advanced, so
+        // it runs on the next free turn of the scheduler.
+        for _ in 0..100 {
+            if g2.parked() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            g2.parked() == 1,
+            "the stagger timer never started the second attempt"
+        );
+        // Release it: the attempt must refuse at its own check, recording and dialling
+        // nothing. It has run once its park ends (the counter falls back to zero), so the
+        // capture is complete by then.
+        g2.release();
+        for _ in 0..100 {
+            if g2.parked() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let recs = cap.take();
+        drop(cap);
+        assert!(
+            recs.contains(&audit::Outbound::TcpConnect(first)),
+            "the in-flight attempt was recorded before the switch: {recs:?}"
+        );
+        assert!(
+            !recs.contains(&audit::Outbound::TcpConnect(second)),
+            "the stagger timer dialled a second address after the stack was replaced: {recs:?}"
+        );
+        gate.release();
+        assert!(
+            dial.await.unwrap().is_err(),
+            "a replaced stack must not connect once its in-flight attempt ends"
         );
     }
 
@@ -1316,9 +1485,7 @@ mod tests {
         let dial = tokio::spawn(direct.call(uri));
         // Wait until the lookup is in flight (its name is recorded as taken), then replace
         // the stack and release the answer.
-        while stub.calls().is_empty() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until("the lookup never started", || !stub.calls().is_empty()).await;
         closed.set();
         gate.notify_one();
 
