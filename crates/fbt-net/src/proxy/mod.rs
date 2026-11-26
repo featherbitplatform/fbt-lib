@@ -14,6 +14,7 @@ use fbt_core::audit;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
+mod dial;
 mod http;
 mod socks5;
 
@@ -443,27 +444,51 @@ fn is_host_byte(b: u8) -> bool {
 /// Dials the proxy itself, within the time left until `deadline`. Every
 /// failure here is [`ProxyError::Unreachable`]: nothing about the proxy has
 /// been learned except that it cannot be reached.
+///
+/// An IP literal is one connect to the address it names. A host name is
+/// resolved once and its addresses dialled with RFC 8305 staggered attempts
+/// (see [`dial`]), so a first address that is dead or refuses slowly (a
+/// Windows `localhost` resolving to `::1` before an IPv4-only proxy, for one)
+/// does not spend the whole deadline before the next one is tried.
 async fn dial_proxy(cfg: &ProxyConfig, deadline: Instant) -> Result<TcpStream, ProxyError> {
     cfg.validate()
         .map_err(|_| ProxyError::Protocol("invalid proxy configuration"))?;
-    audit::record(dial_outbound(&cfg.host, cfg.port));
-    match within(deadline, TcpStream::connect((cfg.host.as_str(), cfg.port))).await {
-        Some(Ok(s)) => Ok(s),
-        Some(Err(e)) => Err(ProxyError::Unreachable(e)),
-        None => Err(unreachable_timeout("connecting to the proxy timed out")),
-    }
-}
-
-/// The record of a dial to `host`: the connect for an IP literal, the lookup
-/// for a name. The proxy's own name is the one a proxied session looks up.
-fn dial_outbound(host: &str, port: u16) -> audit::Outbound {
-    let bare = host
+    let bare = cfg
+        .host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+        .unwrap_or(&cfg.host);
     match bare.parse::<IpAddr>() {
-        Ok(ip) => audit::Outbound::TcpConnect(SocketAddr::new(ip, port)),
-        Err(_) => audit::Outbound::Lookup(host.to_owned()),
+        Ok(ip) => {
+            // An IP literal: a single dial to the address it names, recorded
+            // as the connect it is.
+            let addr = SocketAddr::new(ip, cfg.port);
+            audit::record(audit::Outbound::TcpConnect(addr));
+            match within(deadline, TcpStream::connect(addr)).await {
+                Some(Ok(s)) => Ok(s),
+                Some(Err(e)) => Err(ProxyError::Unreachable(e)),
+                None => Err(unreachable_timeout("connecting to the proxy timed out")),
+            }
+        }
+        Err(_) => {
+            // A name: the one lookup a proxied session makes, recorded once,
+            // then the addresses it resolved to dialled with staggered
+            // attempts, both within the same deadline.
+            let addrs = match within(deadline, dial::resolve_proxy(bare, cfg.port)).await {
+                Some(Ok(addrs)) => addrs,
+                Some(Err(e)) => return Err(ProxyError::Unreachable(e)),
+                None => {
+                    return Err(unreachable_timeout(
+                        "resolving the proxy host name timed out",
+                    ));
+                }
+            };
+            match within(deadline, dial::dial_addrs(&addrs)).await {
+                Some(Ok(s)) => Ok(s),
+                Some(Err(e)) => Err(ProxyError::Unreachable(e)),
+                None => Err(unreachable_timeout("connecting to the proxy timed out")),
+            }
+        }
     }
 }
 
