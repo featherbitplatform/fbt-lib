@@ -1,6 +1,6 @@
-//! The TCP connector under the HTTP clients: hyper's own connector, resolving
-//! through a resolver that can refuse an address inside the local network before
-//! dialling it, or a tunnel through a SOCKS5 or HTTP CONNECT proxy.
+//! The TCP connector under the HTTP clients: it opens every direct connection itself, refusing
+//! an address inside the local network before dialling it, or tunnels through a SOCKS5 or HTTP
+//! CONNECT proxy.
 
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -11,6 +11,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -19,16 +21,11 @@ use fbt_core::audit;
 use fbt_net::addr::is_internal;
 use fbt_net::proxy::{ProxyConfig, ProxyKind, ProxyTarget, connect_tcp};
 use hyper::Uri;
-// audit: dials through it record in call (IP literal) and in GuardedResolver (names)
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Connecting = Pin<Box<dyn Future<Output = Result<TokioIo<TcpStream>, BoxError>> + Send>>;
-type Resolving =
-    Pin<Box<dyn Future<Output = Result<std::vec::IntoIter<SocketAddr>, BoxError>> + Send>>;
 
 /// The most answers one guarded lookup judges: a name answering with more than that fails
 /// the request instead of letting the rest go unchecked, so the check stays bounded however
@@ -41,9 +38,11 @@ const MAX_GUARDED_ADDRESSES: usize = 64;
 /// session's own handles cannot abort (N3): a request that was already in flight when its stack
 /// was torn down can still be polled afterwards, and would then resolve a name and dial the
 /// address itself — directly, past whatever proxy replaced the stack. The connector reads this
-/// flag immediately before it resolves or dials anything and refuses instead, so nothing goes
-/// out from a stack that is being replaced. It is created once per client and shared by every
-/// connector and resolver that client builds.
+/// flag immediately before it resolves anything, and again immediately before **every single
+/// dial** it makes (N1): a name can answer with several addresses and a dial can be attempted
+/// one address after another, so a check made once — before the first of them — leaves every
+/// later dial to run on the replaced stack. It is created once per client and shared by every
+/// connector that client builds.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Closed(Arc<AtomicBool>);
 
@@ -185,82 +184,20 @@ fn stub_not_found(host: &str) -> BoxError {
     io::Error::new(io::ErrorKind::NotFound, format!("{host} did not resolve")).into()
 }
 
-/// hyper's resolver, with the option to refuse what it resolves: the addresses it hands back
-/// are exactly the ones the connection dials, so a name whose answer changes between two
-/// lookups cannot slip an internal address past a check made earlier somewhere else.
-#[derive(Clone, Debug)]
-pub(crate) struct GuardedResolver {
-    /// Whether an answer inside the local network refuses the target. Only false for the
-    /// client that asks first, where the address is the caller's own choice.
-    deny_internal: bool,
-    where_to_look: Resolution,
-    /// Read before the lookup runs: a replaced stack resolves nothing.
-    closed: Closed,
-}
-
-impl GuardedResolver {
-    fn new(deny_internal: bool, where_to_look: Resolution, closed: Closed) -> GuardedResolver {
-        GuardedResolver {
-            deny_internal,
-            where_to_look,
-            closed,
-        }
-    }
-}
-
-impl tower_service::Service<Name> for GuardedResolver {
-    type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = BoxError;
-    type Future = Resolving;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, name: Name) -> Self::Future {
-        let this = self.clone();
-        // hyper hands a resolver the host alone and puts the URI's port back on the answers,
-        // so they are asked for with none.
-        Box::pin(async move {
-            // The lookup runs when this future is polled, which for a connect the pool picked
-            // up but did not win can be after its stack was replaced (N3): refuse first.
-            if this.closed.is_set() {
-                return Err(this.closed.refuse());
-            }
-            let addrs = this
-                .where_to_look
-                .resolve(this.deny_internal, name.as_str(), 0)
-                .await?;
-            // The lookup itself takes time, and hyper dials exactly the addresses this
-            // returns: for a connect the pool started under a replaced stack (N3) the
-            // replacement can land while it runs, so refuse again before handing anything
-            // over and hyper never dials. This is the only guard that covers the gap between
-            // the lookup finishing and the dial it feeds.
-            if this.closed.is_set() {
-                return Err(this.closed.refuse());
-            }
-            // What hyper is about to dial: recorded here, so a direct dial by host name is
-            // visible to the outbound audit (`call` records an IP literal, which hyper dials
-            // without asking the resolver at all). The resolver is asked without the port —
-            // hyper puts the URI's back on the answers — so the record carries the address as
-            // it was resolved.
-            for addr in &addrs {
-                audit::record(audit::Outbound::TcpConnect(*addr));
-            }
-            Ok(addrs.into_iter())
-        })
-    }
-}
-
 /// Opens the TCP connection for one request URI.
 #[derive(Debug, Clone)]
 pub(crate) enum ProxyConnector {
-    /// hyper's connector (`enforce_http(false)`, so TLS can wrap it), resolving through
-    /// [`GuardedResolver`].
+    /// Dialled here, one address at a time: this connector opens every direct connection
+    /// itself, so the check that a replaced stack dials nothing stands before each connect
+    /// (N1) instead of being handed to a dialler that would dial on unchecked.
     Direct {
-        // audit: dials through it record in call (IP literal) and in GuardedResolver (names)
-        http: HttpConnector<GuardedResolver>,
-        /// Read before any record or dial: a replaced stack resolves and dials nothing (N3).
+        /// Where a name is looked up (the stub of it, in tests).
+        where_to_look: Resolution,
+        /// Whether an answer inside the local network refuses the target.
+        deny_internal: bool,
+        /// Bound on each dial attempt (the client's HTTP timeout).
+        timeout: Duration,
+        /// Read before the lookup and before every dial: a replaced stack dials nothing (N1).
         closed: Closed,
     },
     /// Through `proxy`, the whole exchange bounded by `timeout`. With `guard`, a host name is
@@ -302,16 +239,12 @@ impl ProxyConnector {
                 where_to_look,
                 closed,
             },
-            _ => {
-                // audit: dials through it record in call (IP literal) and in GuardedResolver (names)
-                let mut http = HttpConnector::new_with_resolver(GuardedResolver::new(
-                    deny_internal,
-                    where_to_look,
-                    closed.clone(),
-                ));
-                http.enforce_http(false);
-                ProxyConnector::Direct { http, closed }
-            }
+            _ => ProxyConnector::Direct {
+                where_to_look,
+                deny_internal,
+                timeout,
+                closed,
+            },
         }
     }
 }
@@ -338,17 +271,25 @@ impl tower_service::Service<Uri> for ProxyConnector {
     type Error = BoxError;
     type Future = Connecting;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match self {
-            ProxyConnector::Direct { http, .. } => http.poll_ready(cx).map_err(Into::into),
-            ProxyConnector::Proxied { .. } => Poll::Ready(Ok(())),
-        }
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Both arms dial on demand: there is nothing to reserve ahead of a request.
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         match self {
-            ProxyConnector::Direct { http, closed } => {
-                let (mut http, closed) = (http.clone(), closed.clone());
+            ProxyConnector::Direct {
+                where_to_look,
+                deny_internal,
+                timeout,
+                closed,
+            } => {
+                let (where_to_look, deny_internal, timeout, closed) = (
+                    where_to_look.clone(),
+                    *deny_internal,
+                    *timeout,
+                    closed.clone(),
+                );
                 Box::pin(async move {
                     // Read when this future is polled, which for a connect the pool started
                     // but a later stack won can be after the replacement (N3): a replaced
@@ -356,20 +297,34 @@ impl tower_service::Service<Uri> for ProxyConnector {
                     if closed.is_set() {
                         return Err(closed.refuse());
                     }
-                    // Hyper dials an IP-literal URI without asking the resolver, so the
-                    // resolver's Lookup record cannot cover it: record the connect here,
-                    // or a direct dial to an address would leave an empty capture.
-                    if let Some(host) = uri.host() {
-                        let bare = without_brackets(host);
-                        if let Ok(ip) = bare.parse::<IpAddr>() {
-                            audit::record(audit::Outbound::TcpConnect(SocketAddr::new(
-                                ip,
-                                port_of(&uri),
-                            )));
+                    let host = uri.host().ok_or("request URI has no host")?;
+                    let port = port_of(&uri);
+                    let bare = without_brackets(host);
+                    // An IP literal is dialled as it stands (a literal target was judged
+                    // before the hop: see `RedirectPolicy`); a name is resolved here — judged
+                    // whole when `deny_internal` — and every answer dialled by this connector
+                    // itself, so nothing is handed to a dialler that would connect without a
+                    // check of its own (N1).
+                    let mut addrs = match bare.parse::<IpAddr>() {
+                        Ok(ip) => vec![SocketAddr::new(ip, port)],
+                        Err(_) => where_to_look.resolve(deny_internal, bare, port).await?,
+                    };
+                    if addrs.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("{host} did not resolve"),
+                        )
+                        .into());
+                    }
+                    // A stub's answers carry no port yet: the URI's goes on them, where a
+                    // dialler used to put it back after asking the resolver for the host
+                    // alone.
+                    for addr in &mut addrs {
+                        if addr.port() == 0 {
+                            addr.set_port(port);
                         }
                     }
-                    let connecting = http.call(uri);
-                    connecting.await.map_err(Into::into)
+                    dial_direct(&addrs, timeout, &closed).await
                 })
             }
             ProxyConnector::Proxied {
@@ -425,6 +380,123 @@ impl tower_service::Service<Uri> for ProxyConnector {
             }
         }
     }
+}
+
+/// Dials `addrs` one after another until one connects, each attempt bounded by `timeout`.
+///
+/// This connector opens every direct connection itself, so the check that a replaced stack
+/// dials nothing stands **immediately before each connect** (N1), in the same poll as the dial
+/// and not only before the first of them: a name's answers are tried one at a time, and a
+/// dialler that resolved once and then connected to the answers itself would run every later
+/// attempt — the next address after a failure, or after its own happy-eyeballs delay — without
+/// ever looking at the flag again. No happy eyeballs here: a second address is tried only once
+/// the first has failed or timed out. The connect is recorded in the same step, so every
+/// direct dial — by name or by IP literal, successful or not — is visible to the outbound
+/// audit.
+async fn dial_direct(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    closed: &Closed,
+) -> Result<TokioIo<TcpStream>, BoxError> {
+    let mut last: Option<io::Error> = None;
+    for addr in addrs {
+        // Read in the same poll as the dial below: a replacement that lands between two
+        // attempts refuses the next one (N1).
+        if closed.is_set() {
+            return Err(closed.refuse());
+        }
+        // (tests) A dial a test holds open, so it can replace the stack while this attempt is
+        // in flight.
+        #[cfg(test)]
+        park_before_dial(*addr).await;
+        // audit: recorded here, in the same poll as the dial, so a direct dial by name or by
+        // literal is visible to the outbound audit (a lookup records the name alone, and this
+        // connector dials the answers itself).
+        audit::record(audit::Outbound::TcpConnect(*addr));
+        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(TokioIo::new(stream)),
+            Ok(Err(e)) => last = Some(e),
+            Err(_) => {
+                last = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("dialling {addr} timed out"),
+                ));
+            }
+        }
+    }
+    Err(match last {
+        Some(e) => e.into(),
+        None => io::Error::new(io::ErrorKind::NotFound, "no address to dial").into(),
+    })
+}
+
+/// (tests) Dials a test has asked to hold open, keyed by address. Lets a multi-address dial be
+/// held after its first attempt has started, so a test can replace the stack mid-dial and see
+/// what the rest of the list does (N1) — without a packet leaving the machine and without
+/// depending on a platform's listen-backlog behaviour.
+#[cfg(test)]
+static DIAL_GATES: Mutex<Vec<(SocketAddr, DialGate)>> = Mutex::new(Vec::new());
+
+/// (tests) A dial that parks until the test releases it: see [`gate_dial`].
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct DialGate {
+    release: Arc<tokio::sync::Notify>,
+    parked: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl DialGate {
+    /// A gate that is closed: the dial registered for it parks until [`release`](Self::release).
+    pub(crate) fn new() -> DialGate {
+        DialGate {
+            release: Arc::new(tokio::sync::Notify::new()),
+            parked: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many dials are parked at this gate now.
+    pub(crate) fn parked(&self) -> usize {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// Lets the parked dial (or a later one) go on. `notify_one` keeps a permit, so a release
+    /// that comes before the dial parks is not lost.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+
+    /// Parks until the gate is released (or the gate is dropped).
+    async fn park(&self) {
+        self.parked.fetch_add(1, Ordering::SeqCst);
+        self.release.notified().await;
+        self.parked.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// (tests) Registers a gate for the next dial to `addr` and returns it: the dial parks at it
+/// until [`DialGate::release`], so a test can hold one attempt of a dial open.
+#[cfg(test)]
+pub(crate) fn gate_dial(addr: SocketAddr) -> DialGate {
+    let gate = DialGate::new();
+    DIAL_GATES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((addr, gate.clone()));
+    gate
+}
+
+/// (tests) Parks the dial to `addr` at its gate, if one is registered; a no-op otherwise.
+#[cfg(test)]
+async fn park_before_dial(addr: SocketAddr) {
+    let gate = {
+        let mut gates = DIAL_GATES.lock().unwrap_or_else(|e| e.into_inner());
+        match gates.iter().position(|(a, _)| *a == addr) {
+            Some(i) => gates.remove(i).1,
+            None => return,
+        }
+    };
+    gate.park().await;
 }
 
 /// Canned answers to a connector's host lookups (tests): each lookup takes the next queued
@@ -711,11 +783,14 @@ mod tests {
             let (s, _) = listener.accept().await.unwrap();
             drop(s);
         });
+        // A stub with nothing queued: a literal that went through the resolver would fail
+        // here, and `calls` stays the evidence that it did not.
+        let stub = StubResolver::default();
         let mut connector = ProxyConnector::new(
             None,
             Duration::from_secs(5),
             false,
-            Resolution::System,
+            stub.resolution(),
             Closed::new(),
         );
         let cap = audit::capture();
@@ -730,10 +805,9 @@ mod tests {
             "the direct dial to the IP literal must be recorded: {recs:?}"
         );
         assert!(
-            !recs
-                .iter()
-                .any(|o| matches!(o, audit::Outbound::Lookup(h) if h == "127.0.0.1")),
-            "an IP literal is not a name: nothing may be looked up: {recs:?}"
+            stub.calls().is_empty(),
+            "an IP literal is not a name: nothing may be looked up: {:?}",
+            stub.calls()
         );
 
         // A bracketed IPv6 literal takes the same path, brackets stripped.
@@ -761,18 +835,19 @@ mod tests {
         );
     }
 
-    /// A direct dial by host name is recorded at the moment hyper is handed the addresses it
-    /// will dial: hyper dials a name only through this resolver (`call` covers an IP literal,
-    /// which hyper does not resolve), so without this a direct dial by name would leave the
-    /// outbound audit blind. Uses a documentation address no other test answers with, so the
-    /// record cannot be confused with another test's in the process-wide capture (the
-    /// resolver's carries no port — hyper puts the URI's back on the addresses afterwards).
-    /// The connect to a documentation address is left to the OS to time out, so the dial
-    /// future is polled until the record is made and then abandoned.
+    /// A direct dial by host name is recorded at the moment its connect is attempted: this
+    /// connector dials the answers itself and records each attempt, so a name cannot leave the
+    /// outbound audit blind (the lookup records the name alone). A loopback listener stands in
+    /// for the tracker, so no test sends a packet off the machine (N2).
     #[tokio::test]
     async fn direct_http_dial_by_name_is_recorded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+        });
         let stub = StubResolver::default();
-        stub.push(&["198.51.100.9"]);
+        stub.push(&["127.0.0.1"]);
         let mut connector = ProxyConnector::new(
             None,
             Duration::from_secs(5),
@@ -781,33 +856,101 @@ mod tests {
             Closed::new(),
         );
         let cap = audit::capture();
-        let uri = "http://tracker.invalid:9/announce".parse::<Uri>().unwrap();
-        let mut dial = connector.call(uri);
-        // The resolution (and its record) runs on the first poll; the connect that follows to
-        // a documentation address is abandoned here rather than waited out.
-        let _ = tokio::time::timeout(Duration::from_millis(100), &mut dial).await;
-        drop(dial);
+        let uri = format!("http://tracker.invalid:{}/announce", addr.port())
+            .parse::<Uri>()
+            .unwrap();
+        let stream = connector.call(uri).await.unwrap();
+        let recs = cap.take();
+        drop(stream);
+        drop(cap);
+        let _ = accepted.await.unwrap().unwrap();
+        assert!(
+            recs.contains(&audit::Outbound::TcpConnect(addr)),
+            "a direct dial by name must be recorded: {recs:?}"
+        );
+        assert_eq!(stub.calls(), ["tracker.invalid"], "the name was looked up");
+    }
+
+    /// A name that answers with two addresses is dialled one address at a time, with the flag
+    /// read before *each* attempt: hyper's own connector resolves once and then dials the
+    /// answers itself — the next address after a failure, or after its happy-eyeballs delay —
+    /// leaving every later dial nothing to check against a stack that was replaced meanwhile
+    /// (N1). Holds the first attempt open (its dial parked at a gate: see [`gate_dial`]),
+    /// replaces the stack while it is in flight, and asserts the second address is never
+    /// dialled and nothing is recorded after the replacement.
+    ///
+    /// Both addresses are loopback and on the port the URI carries: nothing listens on the
+    /// first (IPv4), so its attempt is refused at once and the dial moves on; the second (IPv6)
+    /// is a listener a later dial would reach. No packet leaves the machine (N2).
+    #[tokio::test]
+    async fn a_second_address_is_not_dialled_once_the_stack_is_replaced() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // no IPv6 loopback on this host
+        };
+        let port = listener.local_addr().unwrap().port();
+        // The first attempt is refused at once only if nothing listens on the IPv4 loopback
+        // at that port: hold it briefly to be sure, and skip if some other process has it.
+        let Ok(probe) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await else {
+            return;
+        };
+        drop(probe);
+        let accepted = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+        });
+
+        let first: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+        let second: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+        let gate = gate_dial(first);
+
+        let stub = StubResolver::default();
+        stub.push(&["127.0.0.1", "::1"]);
+        let closed = Closed::new();
+        let mut connector = ProxyConnector::new(
+            None,
+            Duration::from_secs(5),
+            false,
+            stub.resolution(),
+            closed.clone(),
+        );
+
+        let cap = audit::capture();
+        let uri = format!("http://tracker.invalid:{port}/announce")
+            .parse::<Uri>()
+            .unwrap();
+        let dial = tokio::spawn(connector.call(uri));
+        // The first attempt is in flight (parked at its gate, nothing opened yet): replace the
+        // stack, then let it run into the refusal and on to the second address.
+        while gate.parked() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        closed.set();
+        gate.release();
+
+        assert!(
+            dial.await.unwrap().is_err(),
+            "a replaced stack must not dial the rest of the answers"
+        );
         let recs = cap.take();
         drop(cap);
         assert!(
-            recs.contains(&audit::Outbound::TcpConnect(SocketAddr::new(
-                "198.51.100.9".parse().unwrap(),
-                0
-            ))),
-            "a direct dial by name must be recorded: {recs:?}"
+            !recs.contains(&audit::Outbound::TcpConnect(second)),
+            "a replaced stack dialled a further address after its stack was replaced: {recs:?}"
+        );
+        assert!(
+            accepted.await.unwrap().is_err(),
+            "the listener accepted a direct dial a replaced stack made between two attempts"
         );
     }
 
     /// A lookup started under one stack and still in flight when the stack is replaced
     /// (hyper-util's pool finishes a losing connect in a task the session cannot abort: N3)
-    /// must not dial once it answers. hyper dials exactly the addresses the resolver hands
-    /// back, so the closed flag has to be read again *after* the lookup returns, not only
-    /// before it: otherwise the answered connect opens a direct socket past the proxy that
-    /// replaced the stack, and leaves no `TcpConnect` record either (the direct arm records
-    /// only IP literals; a named dial records only the `Lookup`, made before the switch).
+    /// must not dial once it answers, and must leave no connect record: this connector dials
+    /// the answers itself, so a check made only *before* the lookup would open a direct socket
+    /// past the proxy that replaced the stack.
     ///
-    /// Uses the IPv6 loopback: the process-wide capture also holds other tests' loopback
-    /// dials, so the absence assertion needs an address only this test answers with.
+    /// Uses the IPv6 loopback and the port the URI carries: the process-wide capture also
+    /// holds other tests' loopback dials, so the absence assertion needs an address only this
+    /// test answers with.
     #[tokio::test]
     async fn a_lookup_in_flight_when_the_stack_is_replaced_dials_nothing() {
         // The port the URI carries, and a listener the bug's dial would reach.
@@ -853,7 +996,7 @@ mod tests {
         assert!(
             !recs.contains(&audit::Outbound::TcpConnect(SocketAddr::new(
                 "::1".parse().unwrap(),
-                0
+                port
             ))),
             "a replaced stack dialled an address once its lookup answered: {recs:?}"
         );

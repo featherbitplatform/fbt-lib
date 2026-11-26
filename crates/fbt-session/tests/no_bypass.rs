@@ -18,6 +18,7 @@ mod fake_socks5;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fake_http_proxy::FakeHttpProxy;
@@ -126,6 +127,27 @@ fn only_proxy(cap: &[Outbound], proxy: SocketAddr, relay: Option<SocketAddr>) {
             _ => panic!("unexpected {o:?}"),
         }
     }
+}
+
+/// A loopback listener that accepts and never answers, counting what it has
+/// accepted: work that stays in flight — an announce waiting for its reply, a
+/// peer handshake — for as long as the test runs, so the switching test has
+/// direct work live at the moment of the switch (N3). Returns its address and
+/// the count of connections it has accepted. Nothing here ever leaves the host.
+async fn silent_listener() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        // Hold every accepted socket open, unanswered, so the work stays in flight.
+        let mut holding: Vec<tokio::net::TcpStream> = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::SeqCst);
+            holding.push(stream);
+        }
+    });
+    (addr, accepted)
 }
 
 /// Waits (at most 10 s) until the SOCKS5 fake has been asked for all of
@@ -332,33 +354,45 @@ async fn udp_not_relayed_opens_nothing_else() {
 /// the switch and is never discarded, so work in flight across the change is
 /// covered too, and the new stack is seen reaching the proxy (I1); what the
 /// direct phase did is excluded only by starting the capture after it. The
-/// direct phase touches loopback alone (M3: a test never contacts the public
-/// internet); the brief's names are added after the switch, where they only
-/// reach the fake proxy.
+/// direct phase touches loopback alone (M3) and leaves a direct announce and a
+/// direct peer handshake in flight across the switch (N3), so the change has to
+/// tear down a stack with live direct work rather than an idle one; the brief's
+/// names are added after the switch, where they only reach the fake proxy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn switching_to_proxy_opens_nothing_direct() {
     let cap = audit::capture();
     let fake = FakeSocks5::start(Script::RecordOnly).await;
 
-    // A direct session first: a closed loopback port for its tracker and its
-    // peer and no DHT, so its direct activity never leaves the host and, with
-    // the production retry delays, has finished before the switch.
+    // A direct session first: a loopback tracker that accepts the announce and
+    // never answers it and a loopback peer whose handshake stays open, so both
+    // are in flight at the switch (N3); no DHT, and no uTP so the peer dials
+    // TCP. The HTTP timeout is long enough that the announce is still waiting
+    // for its reply when the switch lands.
     let mut s = settings();
     s.proxy = ProxyConfig::default();
     s.dht_enabled = false;
     s.dht_bootstrap_nodes = Vec::new();
     s.enable_outgoing_utp = false;
+    s.tracker.http_timeout = Duration::from_secs(3);
     let session = Session::new(s).await.unwrap();
+    let (tracker, tracker_accepted) = silent_listener().await;
     let (mut m, _payload) = make_torrent(&[("a", LEN)], 16_384);
-    let tracker = closed_port();
     m.trackers = vec![vec![format!("http://{tracker}/announce")]];
     let mut p = AddTorrent::new(m, PathBuf::from("unused"));
     p.storage = Some(Arc::new(MemStorage::new(LEN as u64)));
     let direct = session.add_torrent(p).await.unwrap();
-    let peer = closed_port();
+    let (peer, peer_accepted) = silent_listener().await;
     direct.add_peer(peer).await.unwrap();
-    // Let it work directly for a moment (a refused direct dial, recorded).
+    // Let the announce and the handshake get under way.
     tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tracker_accepted.load(Ordering::SeqCst) >= 1,
+        "the direct announce was not in flight at the switch"
+    );
+    assert!(
+        peer_accepted.load(Ordering::SeqCst) >= 1,
+        "the direct peer dial was not in flight at the switch"
+    );
 
     // The switch: the capture starts here, so what the direct phase did is
     // excluded by starting after it, and nothing in flight across the change
@@ -386,7 +420,10 @@ async fn switching_to_proxy_opens_nothing_direct() {
         fake.udp_targets()
     );
 
-    // Nothing direct in everything captured from just before the switch.
+    // Nothing direct in everything captured from just before the switch: the
+    // loopback work in flight is on sockets that are already open, so it can
+    // add no direct record — a record here would be a dial of the replaced
+    // stack.
     tokio::time::sleep(Duration::from_secs(3)).await;
     only_proxy(&cap.take(), fake.addr(), fake.relay_addr());
     session.shutdown().await;
